@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Implemented malformed response detection and logging for OpenAI Codex responses that leak raw tool-call JSON into text output
 
 ## [11.6.0] - 2026-02-07
 

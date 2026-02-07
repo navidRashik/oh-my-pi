@@ -1,4 +1,5 @@
 import * as os from "node:os";
+import * as path from "node:path";
 import { $env, abortableSleep, readSseJson } from "@oh-my-pi/pi-utils";
 import type {
 	ResponseFunctionToolCall,
@@ -227,6 +228,24 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				throw new Error("No response body");
 			}
 
+			// Tee stream: one branch for SSE parsing, one to capture raw bytes for malformed-response dumps.
+			const [parseStream, captureStream] = response.body!.tee();
+			const rawChunks: Uint8Array[] = [];
+			const capturePromise = (async () => {
+				const reader = captureStream.getReader();
+				try {
+					while (true) {
+						const { done, value } = await reader.read();
+						if (done) break;
+						rawChunks.push(value);
+					}
+				} catch {
+					// Stream may abort — that's fine, we still have partial capture.
+				} finally {
+					reader.releaseLock();
+				}
+			})();
+
 			stream.push({ type: "start", partial: output });
 
 			let currentItem: ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | null = null;
@@ -234,7 +253,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			const blocks = output.content;
 			const blockIndex = () => blocks.length - 1;
 
-			for await (const rawEvent of readSseJson<Record<string, unknown>>(response.body!, options?.signal)) {
+			for await (const rawEvent of readSseJson<Record<string, unknown>>(parseStream, options?.signal)) {
 				const eventType = typeof rawEvent.type === "string" ? rawEvent.type : "";
 				if (!eventType) continue;
 
@@ -432,6 +451,10 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					throw new Error(formatCodexFailure(rawEvent) ?? "Codex response failed");
 				}
 			}
+
+			// Wait for raw byte capture to finish, then check for malformed output.
+			await capturePromise;
+			dumpMalformedResponse(output, url, redactHeaders(headers), transformedBody, rawChunks);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -806,5 +829,62 @@ function formatCodexErrorEvent(rawEvent: Record<string, unknown>, code: string, 
 		return `Codex error event: ${truncate(JSON.stringify(rawEvent), 800)}`;
 	} catch {
 		return "Codex error event";
+	}
+}
+
+/** Patterns in text output that indicate the model emitted raw tool calls instead of structured function_call items. */
+const MALFORMED_TOOL_PATTERNS = [
+	"recipient_name",
+	'"tool_uses"',
+	'"function_call"',
+	"functions.read",
+	"functions.write",
+	"multi_tool_use.parallel",
+];
+
+/**
+ * Detect malformed model output (raw tool-call JSON leaked into text) and dump
+ * the full HTTP request + response to `~/.omp/logs/` for reporting to OpenAI.
+ */
+function dumpMalformedResponse(
+	output: AssistantMessage,
+	url: string,
+	headers: Record<string, string>,
+	requestBody: RequestBody,
+	rawChunks: Uint8Array[],
+): void {
+	// Check if any text block contains tool-call-like patterns.
+	const textBlocks = output.content.filter(b => b.type === "text") as TextContent[];
+	const isMalformed = textBlocks.some(b => MALFORMED_TOOL_PATTERNS.some(pat => b.text.includes(pat)));
+	if (!isMalformed) return;
+
+	try {
+		const logsDir = path.join(os.homedir(), ".omp", "logs");
+		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const dumpPath = path.join(logsDir, `malformed-response-${timestamp}.txt`);
+
+		const reqHeaders = Object.entries(headers)
+			.map(([k, v]) => `${k}: ${v}`)
+			.join("\n");
+
+		const rawResponseBytes = Buffer.concat(rawChunks);
+		const rawResponse = rawResponseBytes.toString("utf-8");
+
+		const dump = [
+			`=== REQUEST ===`,
+			`POST ${url}`,
+			reqHeaders,
+			``,
+			JSON.stringify(requestBody, null, 2),
+			``,
+			`=== RESPONSE ===`,
+			rawResponse,
+		].join("\n");
+
+		// Fire-and-forget write; don't block the stream.
+		Bun.write(dumpPath, dump).catch(() => {});
+		logCodexDebug("malformed response dumped", { path: dumpPath, textLength: textBlocks.map(b => b.text.length) });
+	} catch {
+		// Best-effort — never fail the response for a debug dump.
 	}
 }
