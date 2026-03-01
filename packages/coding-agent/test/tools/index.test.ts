@@ -31,6 +31,7 @@ describe("createTools", () => {
 
 		// Core tools should always be present
 		expect(names).toContain("python");
+		expect(names).toContain("javascript");
 		expect(names).toContain("bash");
 		expect(names).toContain("read");
 		expect(names).toContain("edit");

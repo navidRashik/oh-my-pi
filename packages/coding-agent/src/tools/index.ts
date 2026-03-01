@@ -27,6 +27,7 @@ import { ExitPlanModeTool } from "./exit-plan-mode";
 import { FetchTool } from "./fetch";
 import { FindTool } from "./find";
 import { GrepTool } from "./grep";
+import { JavaScriptTool } from "./javascript";
 import { NotebookTool } from "./notebook";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { PythonTool } from "./python";
@@ -62,6 +63,7 @@ export * from "./fetch";
 export * from "./find";
 export * from "./gemini-image";
 export * from "./grep";
+export * from "./javascript";
 export * from "./notebook";
 export * from "./pending-action";
 export * from "./python";
@@ -162,6 +164,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	ask: AskTool.createIf,
 	bash: s => new BashTool(s),
 	python: s => new PythonTool(s),
+	javascript: s => new JavaScriptTool(s),
 	calc: s => new CalculatorTool(s),
 	ssh: loadSshTool,
 	edit: s => new EditTool(s),

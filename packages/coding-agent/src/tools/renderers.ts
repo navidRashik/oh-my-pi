@@ -18,6 +18,7 @@ import { calculatorToolRenderer } from "./calculator";
 import { fetchToolRenderer } from "./fetch";
 import { findToolRenderer } from "./find";
 import { grepToolRenderer } from "./grep";
+import { javascriptToolRenderer } from "./javascript";
 import { notebookToolRenderer } from "./notebook";
 import { pythonToolRenderer } from "./python";
 import { readToolRenderer } from "./read";
@@ -45,6 +46,7 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	ast_edit: astEditToolRenderer as ToolRenderer,
 	bash: bashToolRenderer as ToolRenderer,
 	python: pythonToolRenderer as ToolRenderer,
+	javascript: javascriptToolRenderer as ToolRenderer,
 	calc: calculatorToolRenderer as ToolRenderer,
 	edit: editToolRenderer as ToolRenderer,
 	find: findToolRenderer as ToolRenderer,
