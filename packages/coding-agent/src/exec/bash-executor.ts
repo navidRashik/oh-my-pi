@@ -77,10 +77,108 @@ export function buildMinimizerOptions(group: ShellMinimizerSettings): MinimizerO
 	};
 }
 
+/**
+ * Execute a command by spawning the configured shell binary directly, bypassing
+ * brush-core. Used for non-bash shells (PowerShell, cmd.exe) where bash
+ * variable expansion would otherwise mangle syntax like `$env:VAR`.
+ *
+ * stdout and stderr are merged into the sink in arrival order.
+ */
+async function executeViaDirectSpawn(
+	shell: string,
+	shellArgs: string[],
+	command: string,
+	options: BashExecutorOptions | undefined,
+	commandCwd: string | undefined,
+	commandEnv: Record<string, string>,
+	shellEnv: Record<string, string>,
+	sink: OutputSink,
+	baseTimeoutMs: number,
+): Promise<BashResult> {
+	// Append the command as the final argument (e.g. pwsh -NoProfile ... -Command <cmd>).
+	const proc = Bun.spawn([shell, ...shellArgs, command], {
+		cwd: commandCwd,
+		env: { ...shellEnv, ...commandEnv },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+
+	const userSignal = options?.signal;
+	let timedOut = false;
+
+	const abortHandler = () => {
+		proc.kill();
+	};
+	if (userSignal?.aborted) {
+		proc.kill();
+	} else if (userSignal) {
+		userSignal.addEventListener("abort", abortHandler, { once: true });
+	}
+
+	const hardTimeoutMs = baseTimeoutMs + HARD_TIMEOUT_GRACE_MS;
+	const hardTimeoutTimer = setTimeout(() => {
+		timedOut = true;
+		proc.kill();
+	}, hardTimeoutMs);
+
+	const stdoutDecoder = new TextDecoder();
+	const stderrDecoder = new TextDecoder();
+
+	async function drainStream(stream: ReadableStream<Uint8Array>, dec: TextDecoder): Promise<void> {
+		const reader = (stream as ReadableStream<Uint8Array>).getReader();
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				sink.push(dec.decode(value, { stream: true }));
+			}
+			const tail = dec.decode();
+			if (tail) sink.push(tail);
+		} finally {
+			reader.releaseLock();
+		}
+	}
+
+	try {
+		await Promise.all([
+			drainStream(proc.stdout as ReadableStream<Uint8Array>, stdoutDecoder),
+			drainStream(proc.stderr as ReadableStream<Uint8Array>, stderrDecoder),
+			proc.exited,
+		]);
+
+		if (timedOut) {
+			return {
+				exitCode: undefined,
+				cancelled: true,
+				...(await sink.dump(`Command exceeded hard timeout after ${Math.round(hardTimeoutMs / 1000)} seconds`)),
+			};
+		}
+
+		if (userSignal?.aborted) {
+			return {
+				exitCode: undefined,
+				cancelled: true,
+				...(await sink.dump("Command cancelled")),
+			};
+		}
+
+		return {
+			exitCode: proc.exitCode ?? undefined,
+			cancelled: false,
+			...(await sink.dump()),
+		};
+	} finally {
+		clearTimeout(hardTimeoutTimer);
+		if (userSignal) {
+			userSignal.removeEventListener("abort", abortHandler);
+		}
+	}
+}
+
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
 	const settings = await Settings.init();
-	const { shell, env: shellEnv, prefix } = settings.getShellConfig();
-	const snapshotPath = shell.includes("bash") ? await getOrCreateSnapshot(shell, shellEnv) : null;
+	const { shell, kind: shellKind, args: shellArgs, env: shellEnv, prefix } = settings.getShellConfig();
+	const snapshotPath = shellKind === "bash" ? await getOrCreateSnapshot(shell, shellEnv) : null;
 
 	const minimizer = buildMinimizerOptions(settings.getGroup("shellMinimizer"));
 
@@ -110,12 +208,30 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		sink.push(chunk);
 	};
 
+	const baseTimeoutMs = Math.max(1_000, options?.timeout ?? 300_000);
+
 	if (options?.signal?.aborted) {
 		return {
 			exitCode: undefined,
 			cancelled: true,
 			...(await sink.dump("Command cancelled")),
 		};
+	}
+
+	// Non-bash shells (PowerShell, cmd.exe) bypass brush-core entirely so that
+	// shell-native syntax like $env:VAR is not mangled by bash variable expansion.
+	if (shellKind !== "bash") {
+		return executeViaDirectSpawn(
+			shell,
+			shellArgs,
+			finalCommand,
+			options,
+			commandCwd,
+			commandEnv,
+			shellEnv,
+			sink,
+			baseTimeoutMs,
+		);
 	}
 
 	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
@@ -153,7 +269,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	let hardTimeoutTimer: NodeJS.Timeout | undefined;
 	const hardTimeoutDeferred = Promise.withResolvers<"hard-timeout">();
-	const baseTimeoutMs = Math.max(1_000, options?.timeout ?? 300_000);
+
 	const hardTimeoutMs = baseTimeoutMs + HARD_TIMEOUT_GRACE_MS;
 	hardTimeoutTimer = setTimeout(() => {
 		abortCurrentExecution();

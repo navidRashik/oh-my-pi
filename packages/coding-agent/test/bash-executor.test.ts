@@ -300,6 +300,7 @@ describe("executeBash", () => {
 		fs.writeFileSync(snapshotPath, "export PI_SNAPSHOT_TEST=from_snapshot\n");
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: bashPath,
+			kind: "bash",
 			args: ["-l", "-c"],
 			env: {
 				PATH: Bun.env.PATH ?? "",
@@ -331,6 +332,7 @@ describe("executeBash", () => {
 		vi.spyOn(os, "homedir").mockReturnValue(tempDir);
 		vi.spyOn(Settings.prototype, "getShellConfig").mockReturnValue({
 			shell: bashPath,
+			kind: "bash",
 			args: ["-l", "-c"],
 			env: {
 				PATH: Bun.env.PATH ?? "",
@@ -470,5 +472,20 @@ describe("executeBash", () => {
 
 		// If process was killed (not orphaned), marker should NOT exist
 		expect(fs.existsSync(marker)).toBe(false);
+	});
+
+	it("passes $env:VAR syntax to PowerShell without bash expansion (Windows)", async () => {
+		// This test only runs on Windows, where the shell defaults to pwsh.exe
+		// and commands must NOT be routed through brush to avoid $env mangling.
+		if (process.platform !== "win32") return;
+
+		// $env:OMPCODE is set to "1" by buildSpawnEnv; brush would expand $env to ""
+		// producing ":OMPCODE" instead of the actual value.
+		const result = await executeBash('Write-Host $env:OMPCODE', {
+			cwd: tempDir,
+			timeout: 10_000,
+		});
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("1");
 	});
 });

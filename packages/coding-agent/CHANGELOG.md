@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `$env:VAR` PowerShell variables being mangled on Windows: brush (Rust bash) was expanding `$env` as an empty bash variable before passing commands to `powershell.exe`. Windows now defaults to `pwsh.exe` / `powershell.exe` as the shell (in preference to Git Bash), and non-bash shell commands bypass brush entirely via direct process spawn, preserving PowerShell syntax verbatim ([#1079](https://github.com/can1357/oh-my-pi/issues/1079))
+
+
 ## [15.0.1] - 2026-05-14
 ### Breaking Changes
 
