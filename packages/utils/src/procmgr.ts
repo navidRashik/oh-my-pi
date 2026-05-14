@@ -138,11 +138,12 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 		if (fs.existsSync(customShellPath)) {
 			// Detect kind from the path name.
 			const lc = customShellPath.toLowerCase();
-			const kind: ShellKind = lc.includes("pwsh") || lc.includes("powershell")
-				? "powershell"
-				: lc.includes("cmd.exe") || lc === "cmd"
-				? "cmd"
-				: "bash";
+			const kind: ShellKind =
+				lc.includes("pwsh") || lc.includes("powershell")
+					? "powershell"
+					: lc.includes("cmd.exe") || lc === "cmd"
+						? "cmd"
+						: "bash";
 			cachedShellConfig = buildConfig(customShellPath, kind);
 			return cachedShellConfig;
 		}

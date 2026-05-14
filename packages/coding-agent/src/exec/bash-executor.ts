@@ -4,7 +4,7 @@
  * Uses brush-core via native bindings for shell execution.
  */
 import * as fs from "node:fs/promises";
-import { executeShell, type MinimizerOptions, Shell } from "@oh-my-pi/pi-natives";
+import { executeShell, type MinimizerOptions, Process, Shell } from "@oh-my-pi/pi-natives";
 import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { OutputSink } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
@@ -106,19 +106,33 @@ async function executeViaDirectSpawn(
 	const userSignal = options?.signal;
 	let timedOut = false;
 
+	// Tree-kill the entire process group so child processes spawned by the shell
+	// (e.g. python, npm) do not outlive their parent after a cancel or timeout.
+	const treeKill = (): void =>
+		void Process.fromPid(proc.pid)
+			?.terminate()
+			?.catch(() => {});
+
 	const abortHandler = () => {
-		proc.kill();
+		treeKill();
 	};
 	if (userSignal?.aborted) {
-		proc.kill();
+		treeKill();
 	} else if (userSignal) {
 		userSignal.addEventListener("abort", abortHandler, { once: true });
 	}
 
+	// Soft timeout mirrors the contract of the brush path: honour options.timeout.
+	const softTimeoutTimer = setTimeout(() => {
+		timedOut = true;
+		treeKill();
+	}, baseTimeoutMs);
+
+	// Hard timeout is a backstop in case the soft kill stalls.
 	const hardTimeoutMs = baseTimeoutMs + HARD_TIMEOUT_GRACE_MS;
 	const hardTimeoutTimer = setTimeout(() => {
 		timedOut = true;
-		proc.kill();
+		treeKill();
 	}, hardTimeoutMs);
 
 	const stdoutDecoder = new TextDecoder();
@@ -150,7 +164,7 @@ async function executeViaDirectSpawn(
 			return {
 				exitCode: undefined,
 				cancelled: true,
-				...(await sink.dump(`Command exceeded hard timeout after ${Math.round(hardTimeoutMs / 1000)} seconds`)),
+				...(await sink.dump(`Command exceeded timeout after ${Math.round(baseTimeoutMs / 1000)} seconds`)),
 			};
 		}
 
@@ -168,6 +182,7 @@ async function executeViaDirectSpawn(
 			...(await sink.dump()),
 		};
 	} finally {
+		clearTimeout(softTimeoutTimer);
 		clearTimeout(hardTimeoutTimer);
 		if (userSignal) {
 			userSignal.removeEventListener("abort", abortHandler);

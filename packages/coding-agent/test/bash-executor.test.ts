@@ -481,7 +481,7 @@ describe("executeBash", () => {
 
 		// $env:OMPCODE is set to "1" by buildSpawnEnv; brush would expand $env to ""
 		// producing ":OMPCODE" instead of the actual value.
-		const result = await executeBash('Write-Host $env:OMPCODE', {
+		const result = await executeBash("Write-Host $env:OMPCODE", {
 			cwd: tempDir,
 			timeout: 10_000,
 		});
