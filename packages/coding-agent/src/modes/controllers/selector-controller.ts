@@ -55,9 +55,11 @@ const CALLBACK_SERVER_PROVIDERS = new Set<OAuthProvider>([
 ]);
 
 const MANUAL_LOGIN_TIP = "Tip: You can complete pairing with /login <redirect URL>.";
+const SESSION_CONTEXT_RENDER_CHUNK_SIZE = 32;
 
 export class SelectorController {
 	constructor(private ctx: InteractiveModeContext) {}
+	#sessionContextRenderAbortController?: AbortController;
 
 	async #refreshOAuthProviderAuthState(): Promise<void> {
 		const oauthProviders = getOAuthProviders();
@@ -84,6 +86,11 @@ export class SelectorController {
 		this.ctx.editorContainer.addChild(component);
 		this.ctx.ui.setFocus(focus);
 		this.ctx.ui.requestRender();
+	}
+
+	cancelSessionContextRender(): void {
+		this.#sessionContextRenderAbortController?.abort();
+		this.#sessionContextRenderAbortController = undefined;
 	}
 
 	showSettingsSelector(): void {
@@ -627,6 +634,7 @@ export class SelectorController {
 
 					// Set up escape handler and loader if summarizing
 					let summaryLoader: Loader | undefined;
+					let renderStatus: Text | undefined;
 					const originalOnEscape = this.ctx.editor.onEscape;
 
 					if (wantsSummary) {
@@ -661,20 +669,56 @@ export class SelectorController {
 							this.ctx.showStatus("Navigation cancelled");
 							return;
 						}
+						if (!result.sessionContext) {
+							this.ctx.showStatus("Navigation target is already selected");
+							return;
+						}
 
 						// Update UI — pass the context built by navigateTree to skip a second O(N) walk.
-						this.ctx.chatContainer.clear();
-						this.ctx.renderInitialMessages(result.sessionContext);
+						const renderAbortController = new AbortController();
+						this.cancelSessionContextRender();
+						this.#sessionContextRenderAbortController = renderAbortController;
+						renderStatus = new Text(
+							theme.fg("muted", `Rendering 0/${result.sessionContext.messages.length} entries… (esc to cancel)`),
+							1,
+							0,
+						);
+						this.ctx.statusContainer.clear();
+						this.ctx.statusContainer.addChild(renderStatus);
+						this.ctx.editor.onEscape = () => {
+							renderAbortController.abort();
+						};
+						await this.ctx.renderInitialMessagesIncrementally(result.sessionContext, {
+							signal: renderAbortController.signal,
+							chunkSize: SESSION_CONTEXT_RENDER_CHUNK_SIZE,
+							onProgress: (rendered, total) => {
+								renderStatus?.setText(
+									theme.fg("muted", `Rendering ${rendered}/${total} entries… (esc to cancel)`),
+								);
+							},
+						});
+						renderStatus = undefined;
+						this.#sessionContextRenderAbortController = undefined;
 						await this.ctx.reloadTodos();
 						if (result.editorText && !this.ctx.editor.getText().trim()) {
 							this.ctx.editor.setText(result.editorText);
 						}
 						this.ctx.showStatus("Navigated to selected point");
 					} catch (error) {
+						if (error instanceof DOMException && error.name === "AbortError") {
+							this.ctx.chatContainer.clear();
+							this.ctx.pendingTools.clear();
+							this.ctx.showStatus("Navigation render cancelled");
+							this.showTreeSelector();
+							return;
+						}
 						this.ctx.showError(error instanceof Error ? error.message : String(error));
 					} finally {
+						this.#sessionContextRenderAbortController = undefined;
 						if (summaryLoader) {
 							summaryLoader.stop();
+						}
+						if (summaryLoader || renderStatus) {
 							this.ctx.statusContainer.clear();
 						}
 						this.ctx.editor.onEscape = originalOnEscape;

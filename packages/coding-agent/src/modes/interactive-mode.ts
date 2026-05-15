@@ -2150,6 +2150,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#uiHelpers.renderInitialMessages(prebuiltContext);
 	}
 
+	renderInitialMessagesIncrementally(
+		prebuiltContext?: SessionContext,
+		options?: { signal?: AbortSignal; chunkSize?: number; onProgress?: (rendered: number, total: number) => void },
+	): Promise<void> {
+		return this.#uiHelpers.renderInitialMessagesIncrementally(prebuiltContext, options);
+	}
+
 	getUserMessageText(message: Message): string {
 		return this.#uiHelpers.getUserMessageText(message);
 	}

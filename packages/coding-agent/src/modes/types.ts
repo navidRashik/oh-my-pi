@@ -187,6 +187,10 @@ export interface InteractiveModeContext {
 		options?: { updateFooter?: boolean; populateHistory?: boolean },
 	): void;
 	renderInitialMessages(prebuiltContext?: SessionContext): void;
+	renderInitialMessagesIncrementally(
+		prebuiltContext?: SessionContext,
+		options?: { signal?: AbortSignal; chunkSize?: number; onProgress?: (rendered: number, total: number) => void },
+	): Promise<void>;
 	getUserMessageText(message: Message): string;
 	findLastAssistantMessage(): AssistantMessage | undefined;
 	extractAssistantText(message: AssistantMessage): string;

@@ -29,6 +29,28 @@ import type { SessionContext } from "../../session/session-manager";
 import { formatBytes, formatDuration } from "../../tools/render-utils";
 
 type TextBlock = { type: "text"; text: string };
+type RenderSessionContextOptions = {
+	updateFooter?: boolean;
+	populateHistory?: boolean;
+	signal?: AbortSignal;
+	chunkSize?: number;
+	onProgress?: (rendered: number, total: number) => void;
+};
+
+const DEFAULT_RENDER_SESSION_CONTEXT_CHUNK_SIZE = 32;
+
+function shouldYieldSessionRender(rendered: number, chunkSize: number): boolean {
+	return rendered > 0 && rendered % chunkSize === 0;
+}
+
+async function yieldSessionRender(signal?: AbortSignal): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setTimeout(resolve, 0);
+	await promise;
+	if (signal?.aborted) {
+		throw signal.reason ?? new DOMException("Session context render aborted", "AbortError");
+	}
+}
 
 type QueuedMessages = {
 	steering: string[];
@@ -262,10 +284,17 @@ export class UiHelpers {
 	 * @param options.updateFooter Update footer state
 	 * @param options.populateHistory Add user messages to editor history
 	 */
-	renderSessionContext(
+	renderSessionContext(sessionContext: SessionContext, options: RenderSessionContextOptions = {}): void {
+		void this.renderSessionContextIncrementally(sessionContext, {
+			...options,
+			chunkSize: Number.POSITIVE_INFINITY,
+		});
+	}
+
+	async renderSessionContextIncrementally(
 		sessionContext: SessionContext,
-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
-	): void {
+		options: RenderSessionContextOptions = {},
+	): Promise<void> {
 		// Preserved: message_start handler owns this lifecycle (see #783)
 		this.ctx.pendingTools.clear();
 
@@ -274,16 +303,15 @@ export class UiHelpers {
 			this.ctx.updateEditorBorderColor();
 		}
 
+		const chunkSize = options.chunkSize ?? DEFAULT_RENDER_SESSION_CONTEXT_CHUNK_SIZE;
+		const total = sessionContext.messages.length;
+		let rendered = 0;
 		let readGroup: ReadToolGroupComponent | null = null;
 		const readToolCallArgs = new Map<string, Record<string, unknown>>();
 		const readToolCallAssistantComponents = new Map<string, AssistantMessageComponent>();
 		const deferredMessages: AgentMessage[] = [];
-		for (const message of sessionContext.messages) {
-			// Defer compaction summaries so they render at the bottom (visible after scroll)
-			if (message.role === "compactionSummary") {
-				deferredMessages.push(message);
-				continue;
-			}
+
+		const renderMessage = (message: AgentMessage): void => {
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				this.ctx.addMessageToChat(message);
@@ -394,7 +422,7 @@ export class UiHelpers {
 						if (!hasText) {
 							readToolCallArgs.delete(message.toolCallId);
 							readToolCallAssistantComponents.delete(message.toolCallId);
-							continue;
+							return;
 						}
 					}
 					let component = this.ctx.pendingTools.get(message.toolCallId);
@@ -417,7 +445,7 @@ export class UiHelpers {
 					this.ctx.pendingTools.delete(message.toolCallId);
 					readToolCallArgs.delete(message.toolCallId);
 					readToolCallAssistantComponents.delete(message.toolCallId);
-					continue;
+					return;
 				}
 
 				// Match tool results to pending tool components
@@ -430,14 +458,37 @@ export class UiHelpers {
 				// All other messages use standard rendering
 				this.ctx.addMessageToChat(message, options);
 			}
+		};
+
+		for (const message of sessionContext.messages) {
+			options.signal?.throwIfAborted();
+			if (message.role === "compactionSummary") {
+				deferredMessages.push(message);
+			} else {
+				renderMessage(message);
+			}
+			rendered++;
+			if (shouldYieldSessionRender(rendered, chunkSize)) {
+				options.onProgress?.(rendered, total);
+				this.ctx.ui.requestRender();
+				await yieldSessionRender(options.signal);
+			}
 		}
 
 		// Render deferred messages (compaction summaries) at the bottom so they're visible
 		for (const message of deferredMessages) {
-			this.ctx.addMessageToChat(message, options);
+			options.signal?.throwIfAborted();
+			renderMessage(message);
+			rendered++;
+			if (shouldYieldSessionRender(rendered, chunkSize)) {
+				options.onProgress?.(rendered, total);
+				this.ctx.ui.requestRender();
+				await yieldSessionRender(options.signal);
+			}
 		}
 
 		this.ctx.pendingTools.clear();
+		options.onProgress?.(total, total);
 		this.ctx.ui.requestRender();
 	}
 
@@ -455,7 +506,31 @@ export class UiHelpers {
 			updateFooter: true,
 			populateHistory: true,
 		});
+		this.showCompactionStatus();
+	}
 
+	async renderInitialMessagesIncrementally(
+		prebuiltContext: SessionContext | undefined,
+		options: Pick<RenderSessionContextOptions, "signal" | "chunkSize" | "onProgress"> = {},
+	): Promise<void> {
+		// This path is used to rebuild the visible chat transcript (e.g. after custom/debug UI).
+		// Clear existing rendered chat first to avoid duplicating the full session in the container.
+		this.ctx.chatContainer.clear();
+		this.ctx.pendingMessagesContainer.clear();
+		this.ctx.pendingBashComponents = [];
+		this.ctx.pendingPythonComponents = [];
+
+		// Reuse a pre-built context when available (e.g. from navigateTree) to avoid a second O(N) walk.
+		const context = prebuiltContext ?? this.ctx.sessionManager.buildSessionContext();
+		await this.renderSessionContextIncrementally(context, {
+			updateFooter: true,
+			populateHistory: true,
+			...options,
+		});
+		this.showCompactionStatus();
+	}
+
+	showCompactionStatus(): void {
 		// Show compaction info if session was compacted
 		const allEntries = this.ctx.sessionManager.getEntries();
 		let compactionCount = 0;
@@ -469,7 +544,6 @@ export class UiHelpers {
 			this.ctx.showStatus(`Session compacted ${times}`);
 		}
 	}
-
 	clearEditor(): void {
 		if (this.ctx.isBackgrounded) {
 			return;

@@ -78,3 +78,85 @@ describe("InteractiveMode.showStatus", () => {
 		expect(ctx.optimisticUserMessageSignature).toBe("hello\u00001");
 	});
 });
+
+describe("UiHelpers.renderSessionContextIncrementally", () => {
+	beforeAll(() => {
+		initTheme();
+	});
+
+	test("yields and requests renders between transcript chunks", async () => {
+		let timerFired = false;
+		const progress: number[] = [];
+		const chatContainer = new Container();
+		const requestRender = vi.fn();
+		const ctx = {
+			chatContainer,
+			pendingTools: new Map(),
+			ui: { requestRender },
+			statusLine: { invalidate: vi.fn() },
+			updateEditorBorderColor: vi.fn(),
+			addMessageToChat: (message: { role: string }) => {
+				chatContainer.addChild({ render: () => [message.role], invalidate: () => {} });
+				return [];
+			},
+		} as unknown as InteractiveModeContext;
+		const helpers = new UiHelpers(ctx);
+		const messages = Array.from({ length: 5 }, (_, index) => ({
+			role: "custom" as const,
+			customType: "test",
+			content: `message ${index}`,
+			display: false,
+			timestamp: index,
+		}));
+
+		setTimeout(() => {
+			timerFired = true;
+		}, 0);
+		await helpers.renderSessionContextIncrementally(
+			{ ...buildSessionContext([]), messages },
+			{
+				chunkSize: 2,
+				onProgress: rendered => progress.push(rendered),
+			},
+		);
+
+		expect(timerFired).toBe(true);
+		expect(progress).toEqual([2, 4, 5]);
+		expect(ctx.chatContainer.children).toHaveLength(5);
+		expect(requestRender).toHaveBeenCalledTimes(3);
+	});
+
+	test("aborts before rendering the next chunk", async () => {
+		const abortController = new AbortController();
+		const chatContainer = new Container();
+		const ctx = {
+			chatContainer,
+			pendingTools: new Map(),
+			ui: { requestRender: vi.fn() },
+			addMessageToChat: (message: { role: string }) => {
+				chatContainer.addChild({ render: () => [message.role], invalidate: () => {} });
+				return [];
+			},
+		} as unknown as InteractiveModeContext;
+		const helpers = new UiHelpers(ctx);
+		const messages = Array.from({ length: 5 }, (_, index) => ({
+			role: "custom" as const,
+			customType: "test",
+			content: `message ${index}`,
+			display: false,
+			timestamp: index,
+		}));
+
+		await expect(
+			helpers.renderSessionContextIncrementally(
+				{ ...buildSessionContext([]), messages },
+				{
+					chunkSize: 2,
+					signal: abortController.signal,
+					onProgress: () => abortController.abort(),
+				},
+			),
+		).rejects.toThrow("The operation was aborted.");
+		expect(ctx.chatContainer.children).toHaveLength(2);
+	});
+});
