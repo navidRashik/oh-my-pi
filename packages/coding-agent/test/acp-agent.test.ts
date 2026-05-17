@@ -1594,7 +1594,7 @@ describe("ACP agent", () => {
 });
 
 describe("ACP autonomous turn guard (regression #1137)", () => {
-	it("installs a guard on sessions managed by AcpAgent and clears it on close", async () => {
+	it("installs a guard on sessions managed by AcpAgent and hard-blocks on close", async () => {
 		const harness = await createHarness();
 		const { sessionId } = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 
@@ -1609,8 +1609,11 @@ describe("ACP autonomous turn guard (regression #1137)", () => {
 
 		await harness.agent.closeSession({ sessionId });
 
-		// Guard must be cleared on dispose
-		expect(session!.autonomousTurnGuard).toBeUndefined();
+		// Guard MUST remain installed across disposal and always block. Clearing it to
+		// `undefined` would reopen the ownerless-turn path during the MCP-disconnect /
+		// session-dispose window (review feedback on #1137).
+		expect(typeof session!.autonomousTurnGuard).toBe("function");
+		expect(session!.autonomousTurnGuard!()).toBe(false);
 	});
 
 	it("guard allows turn while ACP prompt lifecycle is active", async () => {

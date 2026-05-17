@@ -1975,7 +1975,15 @@ export class AcpAgent implements Agent {
 
 	async #disposeSessionRecord(record: ManagedSessionRecord): Promise<void> {
 		record.lifetimeUnsubscribe?.();
-		record.session.setAutonomousTurnGuard(undefined);
+		// Install a hard-blocking guard for the entire disposal window. The earlier
+		// `isPromptTurnInFlight(record.promptTurn)` guard would also return false here
+		// (cancel cleanup runs before dispose and clears the slot), but a job delivery
+		// arriving between MCP disconnect and `session.dispose()` would otherwise sit
+		// behind a guard whose closure still pointed at the now-disposed record. Pinning
+		// it to `() => false` makes the close/disconnect window unambiguously safe and
+		// keeps the guard installed (rather than cleared to `undefined`) until the
+		// session is torn down — see review feedback on #1137.
+		record.session.setAutonomousTurnGuard(() => false);
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();
