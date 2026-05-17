@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Documented in `hashline.md` that `write` invalidates every anchor for the written file and that `read path:raw` returns no anchors, both of which hard-fail the next `edit` after v14.9.0 removed anchor auto-rebase ([#1045](https://github.com/can1357/oh-my-pi/issues/1045))
+
 ## [15.1.3] - 2026-05-17
 ### Breaking Changes
 

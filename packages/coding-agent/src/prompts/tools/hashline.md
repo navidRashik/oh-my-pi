@@ -63,6 +63,8 @@ When braces bound your edit, you SHOULD prefer these shapes:
 - **Anchors reference the file as last read.** NEVER shift for prior ops.
 - **One `+`/`<` op per block, NOT per line.** N lines = ONE op, N payloads. Collapse adjacent ops.
 - **NEVER fabricate anchor hashes.** Missing? Re-`read`.
+- **`write` invalidates every anchor for that file.** Re-`read` with a line range before the next `edit`. Mental anchors from before the write WILL stale-fail.
+- **`read path:raw` returns NO anchors.** NEVER `:raw` immediately before `edit` — re-read with a line range so `LINE+ID|` prefixes appear.
 </common-failures>
 
 <case file="mod.ts">
@@ -144,4 +146,6 @@ When braces bound your edit, you SHOULD prefer these shapes:
 - Multiple ops are cheap. SHOULD prefer two narrow ops over one wide `=`.
   - Before `= A..B`, mentally delete A..B. Splits an unclosed bracket/brace/string from above, or orphans a closer inside? You're bisecting a construct.
 - NEVER use this tool to reformat code (indentation, whitespace, line wrapping, style). Run the project's formatter instead.
+- After any `write` to a file, all prior anchors for that file are invalid. You MUST `read` the file with a range selector before the next `edit`.
+- `read path:raw` returns verbatim bytes WITHOUT `LINE+ID|` anchor prefixes. NEVER use `:raw` immediately before `edit`; use a line-range selector instead.
 </critical>
