@@ -155,25 +155,223 @@ async function readTarEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 	return entries;
 }
 
+// CP437 (code page 437) upper-half lookup for bytes 0x80–0xFF.
+// ZIP's historical default encoding for non-UTF-8 filenames.
+const CP437_UPPER =
+	"\u00C7\u00FC\u00E9\u00E2\u00E4\u00E0\u00E5\u00E7\u00EA\u00EB\u00E8\u00EF\u00EE\u00EC\u00C4\u00C5" +
+	"\u00C9\u00E6\u00C6\u00F4\u00F6\u00F2\u00FB\u00F9\u00FF\u00D6\u00DC\u00A2\u00A3\u00A5\u20A7\u0192" +
+	"\u00E1\u00ED\u00F3\u00FA\u00F1\u00D1\u00AA\u00BA\u00BF\u2310\u00AC\u00BD\u00BC\u00A1\u00AB\u00BB" +
+	"\u2591\u2592\u2593\u2502\u2524\u2561\u2562\u2556\u2555\u2563\u2551\u2557\u255D\u255C\u255B\u2510" +
+	"\u2514\u2534\u252C\u251C\u2500\u253C\u255E\u255F\u255A\u2554\u2569\u2566\u2560\u2550\u256C\u2567" +
+	"\u2568\u2564\u2565\u2559\u2558\u2552\u2553\u256B\u256A\u2518\u250C\u2588\u2584\u258C\u2590\u2580" +
+	"\u03B1\u00DF\u0393\u03C0\u03A3\u03C3\u00B5\u03C4\u03A6\u0398\u03A9\u03B4\u221E\u03C6\u03B5\u2229" +
+	"\u2261\u00B1\u2265\u2264\u2320\u2321\u00F7\u2248\u00B0\u2219\u00B7\u221A\u207F\u00B2\u25A0\u00A0";
+
+function decodeCp437(data: Uint8Array): string {
+	let s = "";
+	for (let i = 0; i < data.length; i++) {
+		const b = data[i];
+		s += b < 128 ? String.fromCharCode(b) : CP437_UPPER[b - 128];
+	}
+	return s;
+}
+
+/** CRC32 lookup table (IEEE 802.3, reversed polynomial 0xEDB88320). */
+const CRC32_TABLE = (() => {
+	const t = new Uint32Array(256);
+	for (let n = 0; n < 256; n++) {
+		let c = n;
+		for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+		t[n] = c;
+	}
+	return t;
+})();
+
+function crc32(data: Uint8Array): number {
+	let crc = 0xffffffff;
+	for (let i = 0; i < data.length; i++) crc = CRC32_TABLE[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+	return (crc ^ 0xffffffff) >>> 0;
+}
+
+const UTF8_DECODER = new TextDecoder("utf-8");
+
+/**
+ * Try to extract the Info-ZIP Unicode Path extra field (tag 0x7075).
+ * Returns the decoded Unicode name only when the CRC32 of the original filename
+ * bytes matches the stored checksum; returns undefined for absent or invalid fields.
+ */
+function decodeInfoZipUnicodePath(nameBytes: Uint8Array, extra: Uint8Array): string | undefined {
+	const dv = new DataView(extra.buffer, extra.byteOffset, extra.byteLength);
+	let pos = 0;
+	while (pos + 4 <= extra.length) {
+		const tag = dv.getUint16(pos, true);
+		const sz = dv.getUint16(pos + 2, true);
+		if (tag === 0x7075 && sz >= 5 && pos + 4 + sz <= extra.length) {
+			if (extra[pos + 4] === 1) {
+				const nameCrc = dv.getUint32(pos + 5, true);
+				if (crc32(nameBytes) === nameCrc) {
+					return UTF8_DECODER.decode(extra.subarray(pos + 9, pos + 4 + sz));
+				}
+			}
+		}
+		pos += 4 + sz;
+	}
+	return undefined;
+}
+
+/**
+ * Decode a ZIP central directory filename using the standard priority order:
+ * 1. General purpose bit 11 (EFS) set → UTF-8.
+ * 2. Info-ZIP Unicode Path extra field 0x7075 with valid CRC32 → UTF-8.
+ * 3. Otherwise → CP437 (ZIP historical default).
+ */
+function decodeZipEntryName(flags: number, nameBytes: Uint8Array, extra: Uint8Array): string {
+	if (flags & 0x800) return UTF8_DECODER.decode(nameBytes);
+	const unicode = decodeInfoZipUnicodePath(nameBytes, extra);
+	if (unicode !== undefined) return unicode;
+	return decodeCp437(nameBytes);
+}
+
+/** Convert a DOS date+time word pair to a Unix timestamp in ms (UTC). */
+function dosDateTimeToMs(timeWord: number, dateWord: number): number | undefined {
+	if (dateWord === 0) return undefined;
+	const sec = (timeWord & 0x1f) * 2;
+	const min = (timeWord >> 5) & 0x3f;
+	const hr = (timeWord >> 11) & 0x1f;
+	const day = dateWord & 0x1f;
+	const mo = ((dateWord >> 5) & 0x0f) - 1;
+	const yr = ((dateWord >> 9) & 0x7f) + 1980;
+	const ms = Date.UTC(yr, mo, day, hr, min, sec);
+	return Number.isNaN(ms) ? undefined : ms;
+}
+
+/**
+ * Locate the End of Central Directory record by scanning backward from the end
+ * of the buffer (accounts for optional ZIP file comment up to 65535 bytes).
+ */
+function findEOCDOffset(bytes: Uint8Array, dv: DataView): number {
+	const lo = Math.max(0, bytes.length - 22 - 65535);
+	for (let i = bytes.length - 22; i >= lo; i--) {
+		if (dv.getUint32(i, true) === 0x06054b50) {
+			if (i + 22 + dv.getUint16(i + 20, true) === bytes.length) return i;
+		}
+	}
+	return -1;
+}
+
 async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
-	const { unzipSync } = await loadFflate();
-	let files: Record<string, Uint8Array>;
-	try {
-		files = unzipSync(bytes);
-	} catch (error) {
-		throw new ToolError(error instanceof Error ? error.message : String(error));
+	const { inflateSync } = await loadFflate();
+
+	if (bytes.length < 22) throw new ToolError("Invalid ZIP: file too small");
+
+	const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+	const eocdOffset = findEOCDOffset(bytes, dv);
+	if (eocdOffset < 0) throw new ToolError("Invalid ZIP: EOCD record not found");
+
+	let cdCount = dv.getUint16(eocdOffset + 10, true);
+	let cdOffset = dv.getUint32(eocdOffset + 16, true);
+
+	// Check for ZIP64 EOCD locator immediately before the regular EOCD (20-byte record).
+	if (eocdOffset >= 20 && dv.getUint32(eocdOffset - 20, true) === 0x07064b50) {
+		const z64EocdOff = Number(dv.getBigUint64(eocdOffset - 12, true));
+		if (z64EocdOff + 56 <= bytes.length && dv.getUint32(z64EocdOff, true) === 0x06064b50) {
+			cdCount = Number(dv.getBigUint64(z64EocdOff + 32, true));
+			cdOffset = Number(dv.getBigUint64(z64EocdOff + 48, true));
+		}
 	}
 
 	const entries: ArchiveIndexEntry[] = [];
-	for (const [rawPath, fileBytes] of Object.entries(files)) {
+	let pos = cdOffset;
+
+	for (let i = 0; i < cdCount && pos + 46 <= bytes.length; i++) {
+		if (dv.getUint32(pos, true) !== 0x02014b50) break; // Central Directory File Header signature
+
+		const flags = dv.getUint16(pos + 8, true);
+		const method = dv.getUint16(pos + 10, true);
+		const modTime = dv.getUint16(pos + 12, true);
+		const modDate = dv.getUint16(pos + 14, true);
+		let compressedSize = dv.getUint32(pos + 20, true);
+		let uncompressedSize = dv.getUint32(pos + 24, true);
+		const nameLen = dv.getUint16(pos + 28, true);
+		const extraLen = dv.getUint16(pos + 30, true);
+		const commentLen = dv.getUint16(pos + 32, true);
+		let localOffset = dv.getUint32(pos + 42, true);
+
+		const nameStart = pos + 46;
+		const nameBytes = bytes.subarray(nameStart, nameStart + nameLen);
+		const extraBytes = bytes.subarray(nameStart + nameLen, nameStart + nameLen + extraLen);
+
+		// ZIP64 extended information (tag 0x0001): sizes/offset may overflow 32-bit fields.
+		if (uncompressedSize === 0xffffffff || compressedSize === 0xffffffff || localOffset === 0xffffffff) {
+			const edv = new DataView(extraBytes.buffer, extraBytes.byteOffset, extraBytes.byteLength);
+			let ep = 0;
+			while (ep + 4 <= extraBytes.length) {
+				const etag = edv.getUint16(ep, true);
+				const esz = edv.getUint16(ep + 2, true);
+				if (etag === 0x0001) {
+					let eo = ep + 4;
+					if (uncompressedSize === 0xffffffff && eo + 8 <= ep + 4 + esz) {
+						uncompressedSize = Number(edv.getBigUint64(eo, true));
+						eo += 8;
+					}
+					if (compressedSize === 0xffffffff && eo + 8 <= ep + 4 + esz) {
+						compressedSize = Number(edv.getBigUint64(eo, true));
+						eo += 8;
+					}
+					if (localOffset === 0xffffffff && eo + 8 <= ep + 4 + esz) {
+						localOffset = Number(edv.getBigUint64(eo, true));
+					}
+					break;
+				}
+				ep += 4 + esz;
+			}
+		}
+
+		pos += 46 + nameLen + extraLen + commentLen;
+
+		const rawPath = decodeZipEntryName(flags, nameBytes, extraBytes);
 		const normalizedPath = normalizeArchiveEntryPath(rawPath);
 		if (!normalizedPath) continue;
+
 		const isDirectory = isArchiveDirectoryName(rawPath);
+		const mtimeMs = dosDateTimeToMs(modTime, modDate);
+
+		if (isDirectory) {
+			entries.push({ path: normalizedPath, isDirectory: true, size: 0, mtimeMs });
+			continue;
+		}
+
+		// Read the local file header to find where the compressed data starts.
+		if (localOffset + 30 > bytes.length || dv.getUint32(localOffset, true) !== 0x04034b50) {
+			throw new ToolError(`Invalid local file header at offset ${localOffset} for '${normalizedPath}'`);
+		}
+		const lfhNameLen = dv.getUint16(localOffset + 26, true);
+		const lfhExtraLen = dv.getUint16(localOffset + 28, true);
+		const dataStart = localOffset + 30 + lfhNameLen + lfhExtraLen;
+		const compressedData = bytes.subarray(dataStart, dataStart + compressedSize);
+
+		let fileBytes: Uint8Array;
+		if (method === 0) {
+			fileBytes = compressedData.slice(); // stored; copy to avoid pinning the full ZIP buffer
+		} else if (method === 8) {
+			try {
+				fileBytes = inflateSync(compressedData, { out: uncompressedSize > 0 ? new Uint8Array(uncompressedSize) : undefined });
+			} catch (error) {
+				throw new ToolError(
+					`Failed to decompress '${normalizedPath}': ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		} else {
+			throw new ToolError(`Unsupported ZIP compression method ${method} for '${normalizedPath}'`);
+		}
+
 		entries.push({
 			path: normalizedPath,
-			isDirectory,
-			size: isDirectory ? 0 : fileBytes.byteLength,
-			storage: isDirectory ? undefined : { type: "zip", bytes: fileBytes },
+			isDirectory: false,
+			size: uncompressedSize || fileBytes.byteLength,
+			mtimeMs,
+			storage: { type: "zip", bytes: fileBytes },
 		});
 	}
 

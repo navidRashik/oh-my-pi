@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the `read` tool rendering ZIP entry names as mojibake when the archive was created with a legacy code-page filename encoding (e.g. Windows archives with Chinese/Japanese/Korean filenames). `readZipEntries` now parses the ZIP central directory directly instead of calling `fflate.unzipSync`, and decodes each filename using the ZIP standard priority chain: (1) general purpose bit 11 / EFS set → UTF-8; (2) Info-ZIP Unicode Path extra field `0x7075` with valid CRC32 → UTF-8; (3) CP437 historical ZIP default. DOS date/time is also now decoded to a Unix timestamp (`mtimeMs`). ([#1182](https://github.com/can1357/oh-my-pi/issues/1182))
+
 ## [15.1.6] - 2026-05-19
 
 ### Fixed
