@@ -598,25 +598,26 @@ function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; pat
 function getPermissionIntent(
 	toolName: string,
 	args: unknown,
-): { toolName: string; title: string; paths?: string[]; cacheKey: string } | undefined {
+): { toolName: string; title: string; paths?: string[]; cacheKey: string; kind: string } | undefined {
 	const a = args && typeof args === "object" && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
 	if (toolName === "bash") {
 		const cmd = getStringProperty(a, "command")?.slice(0, 80);
-		return { toolName, title: cmd || toolName, cacheKey: toolName };
+		return { toolName, title: cmd || toolName, cacheKey: toolName, kind: "execute" };
 	}
 	if (toolName === "delete") {
 		const p = getStringProperty(a, "path");
-		return { toolName, title: p ? `Delete ${p}` : toolName, paths: p ? [p] : undefined, cacheKey: toolName };
+		return { toolName, title: p ? `Delete ${p}` : toolName, paths: p ? [p] : undefined, cacheKey: toolName, kind: "delete" };
 	}
 	if (toolName === "move") {
 		const from = getStringProperty(a, "oldPath") ?? getStringProperty(a, "path") ?? getStringProperty(a, "from");
 		const to = getStringProperty(a, "newPath") ?? getStringProperty(a, "to") ?? getStringProperty(a, "destination");
-		if (from && to) return { toolName, title: `Move ${from} to ${to}`, paths: [from, to], cacheKey: toolName };
+		if (from && to) return { toolName, title: `Move ${from} to ${to}`, paths: [from, to], cacheKey: toolName, kind: "move" };
 		return {
 			toolName,
 			title: from ? `Move ${from}` : toolName,
 			paths: from ? [from] : undefined,
 			cacheKey: toolName,
+			kind: "move",
 		};
 	}
 	if (toolName === "edit") {
@@ -628,6 +629,7 @@ function getPermissionIntent(
 				title: `Delete ${intent.paths[0] ?? "edit target"}`,
 				paths: intent.paths,
 				cacheKey: "edit:delete",
+				kind: "delete",
 			};
 		}
 		const from = intent.paths[0];
@@ -637,6 +639,7 @@ function getPermissionIntent(
 			title: from && to ? `Move ${from} to ${to}` : `Move ${from ?? to ?? "edit target"}`,
 			paths: intent.paths,
 			cacheKey: "edit:move",
+			kind: "move",
 		};
 	}
 	return undefined;
@@ -3125,6 +3128,7 @@ export class AgentSession {
 								toolCallId,
 								toolName: target.name,
 								title: permissionIntent.title,
+								kind: permissionIntent.kind,
 								status: "pending",
 								rawInput: args,
 								locations: extractPermissionLocations(

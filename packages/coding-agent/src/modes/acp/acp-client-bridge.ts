@@ -10,6 +10,7 @@ import type {
 	AgentSideConnection,
 	ClientCapabilities,
 	RequestPermissionRequest,
+	ToolCallContent,
 	ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
 import type {
@@ -126,6 +127,10 @@ async function requestPermission(
 		...(toolCall.rawInput !== undefined ? { rawInput: toolCall.rawInput } : {}),
 		...(toolCall.locations ? { locations: toolCall.locations } : {}),
 	};
+	const content = buildPermissionContent(toolCall.toolName, toolCall.rawInput);
+	if (content !== undefined) {
+		update.content = content;
+	}
 	const acpOptions: AcpPermissionOption[] = options.map(option => ({
 		optionId: option.optionId,
 		name: option.name,
@@ -150,4 +155,18 @@ async function requestPermission(
 		optionId: outcome.optionId,
 		...(matched ? { kind: matched.kind } : {}),
 	};
+}
+
+/** Build ACP content for command-like permission requests (bash/shell/exec).
+ * Returns the `$ <command>` display block so clients can render the terminal
+ * approval button, mirroring the normal tool_call notification path. */
+function buildPermissionContent(toolName: string, rawInput: unknown): ToolCallContent[] | undefined {
+	if (toolName !== "bash" && toolName !== "shell" && toolName !== "exec") return undefined;
+	const args =
+		rawInput && typeof rawInput === "object" && !Array.isArray(rawInput)
+			? (rawInput as { command?: unknown })
+			: undefined;
+	const command = typeof args?.command === "string" ? args.command : undefined;
+	if (!command) return undefined;
+	return [{ type: "content", content: { type: "text", text: `$ ${command}` } }];
 }
