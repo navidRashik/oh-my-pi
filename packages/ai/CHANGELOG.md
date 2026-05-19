@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `minimax-code-cn` leaking raw `<think>...</think>` blocks as visible assistant text. The `<think>` tag parser gate in `streamOpenAICompletions` now covers both `minimax-code` and `minimax-code-cn` providers, matching the pattern already in place in `model-thinking.ts`, `openai-completions-compat.ts`, and `usage/minimax-code.ts` ([#1203](https://github.com/can1357/oh-my-pi/issues/1203)).
+
+
 ## [15.1.7] - 2026-05-19
 ### Added
 
