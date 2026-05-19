@@ -356,7 +356,9 @@ async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 			fileBytes = compressedData.slice(); // stored; copy to avoid pinning the full ZIP buffer
 		} else if (method === 8) {
 			try {
-				fileBytes = inflateSync(compressedData, { out: uncompressedSize > 0 ? new Uint8Array(uncompressedSize) : undefined });
+				fileBytes = inflateSync(compressedData, {
+					out: uncompressedSize > 0 ? new Uint8Array(uncompressedSize) : undefined,
+				});
 			} catch (error) {
 				throw new ToolError(
 					`Failed to decompress '${normalizedPath}': ${error instanceof Error ? error.message : String(error)}`,
