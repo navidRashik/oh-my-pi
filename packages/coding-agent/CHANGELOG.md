@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed AutoQA consent so ignored prompts keep consent unset, the default selector choice is `No`, and `report_tool_issue` records grievances only after explicit consent. ([#1224](https://github.com/can1357/oh-my-pi/issues/1224))
+
 ## [15.1.8] - 2026-05-20
 
 ### Fixed

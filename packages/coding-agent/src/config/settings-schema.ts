@@ -2697,7 +2697,7 @@ export const SETTINGS_SCHEMA = {
 	 * Owned by `packages/coding-agent/src/tools/report-tool-issue.ts` via the
 	 * process-global consent handler registered by `InteractiveMode`.
 	 */
-	"dev.autoqa.consent": {
+	"dev.autoqaConsent": {
 		type: "enum",
 		values: ["unset", "granted", "denied"] as const,
 		default: "unset" as const,

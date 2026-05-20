@@ -1,21 +1,23 @@
 /**
  * report_tool_issue — automated QA tool for tracking unexpected tool behavior.
  *
- * Enabled by default; gated behind PI_AUTO_QA=1 / `dev.autoqa` so a user
+ * Available only when PI_AUTO_QA=1 / `dev.autoqa` is enabled so a user
  * who flips the setting off short-circuits injection entirely.
- * Always injected into every agent (including subagents) regardless of tool selection.
- * Records grievances to a local SQLite database; never throws.
+ * Always injected into every enabled agent (including subagents) regardless
+ * of tool selection.
+ * Records consented grievances to a local SQLite database; never throws.
  *
  * Before the first record lands, the user's consent is checked. If they've
- * never been asked (`dev.autoqa.consent === "unset"`) the process-global
+ * never been asked (`dev.autoqaConsent === "unset"`) the process-global
  * consent handler — wired by `InteractiveMode` to a Yes/No popup — is
  * invoked exactly once and the decision is persisted. Subsequent calls
  * (including from subagents) read the cached decision without prompting.
  *
- * When the user grants consent, push is automatically active against the
- * bundled endpoint (`dev.autoqaPush.endpoint`, default `qa.omp.sh`). Each
- * insert schedules a background flush that POSTs pending rows and deletes
- * them on HTTP 2xx. `PI_AUTO_QA_PUSH=1` forces push in non-interactive
+ * When the user grants consent, the row is recorded locally and push is
+ * automatically active against the bundled endpoint
+ * (`dev.autoqaPush.endpoint`, default `qa.omp.sh`). Each insert schedules a
+ * background flush that POSTs pending rows and marks them pushed on HTTP 2xx.
+ * `PI_AUTO_QA_PUSH=1` forces recording + push in non-interactive
  * environments where the consent dialog never fires. Tool execution is
  * never blocked on the network and never throws.
  */
@@ -80,7 +82,7 @@ let persistentConsentSettings: Settings | null = null;
  * subagent boundaries (subagents share this module instance), so a grant
  * in the parent applies immediately to children — including children that
  * spawned BEFORE the grant and would otherwise see a stale snapshot of
- * `dev.autoqa.consent` in their isolated `Settings`.
+ * `dev.autoqaConsent` in their isolated `Settings`.
  *
  * `null` = never asked, never cached.
  */
@@ -115,7 +117,7 @@ export function __resetAutoQaConsentForTests(): void {
 
 function readPersistedConsent(settings: Settings | undefined): boolean | null {
 	if (!settings) return null;
-	const stored = settings.get("dev.autoqa.consent");
+	const stored = settings.get("dev.autoqaConsent");
 	if (stored === "granted") return true;
 	if (stored === "denied") return false;
 	return null;
@@ -129,7 +131,7 @@ function persistConsent(localSettings: Settings | undefined, granted: boolean): 
 	for (const target of [localSettings, persistentConsentSettings]) {
 		if (!target) continue;
 		try {
-			target.set("dev.autoqa.consent", value);
+			target.set("dev.autoqaConsent", value);
 		} catch (error) {
 			logger.debug("autoqa consent persist failed", { error: String(error) });
 		}
@@ -141,7 +143,7 @@ function persistConsent(localSettings: Settings | undefined, granted: boolean): 
  *
  * Precedence (highest first):
  *   1. Process-global cache (set on first successful resolution).
- *   2. Persistent setting (`dev.autoqa.consent` on the supplied `Settings`).
+ *   2. Persistent setting (`dev.autoqaConsent` on the supplied `Settings`).
  *   3. Persistent setting on the registered host `Settings`.
  *   4. Consent handler popup (single-flight; persists the answer).
  *   5. Default-deny when no handler is registered.
@@ -254,7 +256,7 @@ export interface FlushResult {
  */
 export interface FlushOptions {
 	/**
-	 * Skip the `dev.autoqa.consent === "granted"` gate in
+	 * Skip the `dev.autoqaConsent === "granted"` gate in
 	 * {@link resolvePushConfig}. Endpoint configuration is still required.
 	 * Reserved for explicit user-driven pushes (CLI `grievances push`,
 	 * future debug recipes); never set from the tool's auto-flush path.
@@ -315,7 +317,7 @@ function resolvePushConfig(settings: Settings | undefined, bypassConsent: boolea
 	// user clearly intends to ship regardless of dialog state. The
 	// `PI_AUTO_QA_PUSH` env flag stays as a CI/headless override too.
 	if (!bypassConsent) {
-		const consented = settings?.get("dev.autoqa.consent") === "granted";
+		const consented = settings?.get("dev.autoqaConsent") === "granted";
 		if (!consented && !$flag("PI_AUTO_QA_PUSH")) return null;
 	}
 
@@ -470,12 +472,6 @@ export function createReportToolIssueTool(session: ToolSession, activeBuiltinNam
 		parameters: buildReportToolIssueParams(activeBuiltinNames),
 		intent: "omit",
 		async execute(_toolCallId, rawParams) {
-			// Save is unconditional: the row lives in the user's own SQLite
-			// at ~/.omp/agent/autoqa.db regardless of consent — they always
-			// own their local data and can inspect or wipe it via `omp grievances`.
-			// Consent only gates whether the row is *shipped* to the shared
-			// backend; that decision rides on `dev.autoqa.consent` and is
-			// enforced inside `flushGrievances` via `resolvePushConfig`.
 			try {
 				const params = rawParams as { tool: string; report: string };
 				// Some models emit `proxy_<name>` for tools routed through a
@@ -490,32 +486,26 @@ export function createReportToolIssueTool(session: ToolSession, activeBuiltinNam
 				if (allowedToolNames.size > 0 && !allowedToolNames.has(canonicalTool)) {
 					return { content: [{ type: "text", text: "Noted, thanks!" }] };
 				}
-				const db = openAutoQaDb();
-				if (db) {
-					db.prepare("INSERT INTO grievances (model, version, tool, report) VALUES (?, ?, ?, ?)").run(
-						getModel(),
-						VERSION,
-						canonicalTool,
-						params.report,
-					);
-					// Fire-and-forget background pipeline:
-					//   1. Trigger the consent popup if it hasn't been answered
-					//      (single-flight inside `resolveAutoQaConsent`; subagents
-					//      share the same module-level state).
-					//   2. Attempt a flush — `resolvePushConfig` no-ops when consent
-					//      isn't granted, so a "no" leaves the row local for later
-					//      `omp grievances push` or a future consent change.
-					// Tool execution returns immediately; the model never waits
-					// on the dialog.
-					void (async () => {
-						try {
-							await resolveAutoQaConsent(session.settings);
-							await flushGrievances(db, session.settings);
-						} catch (error) {
-							logger.debug("autoqa post-insert pipeline failed", { error: String(error) });
-						}
-					})();
-				}
+				// Fire-and-forget consent pipeline. Nothing is written until the
+				// user grants consent (or an explicit headless push override is set),
+				// and tool execution still returns immediately so the model never
+				// waits on the dialog or network.
+				void (async () => {
+					try {
+						if (!$flag("PI_AUTO_QA_PUSH") && !(await resolveAutoQaConsent(session.settings))) return;
+						const db = openAutoQaDb();
+						if (!db) return;
+						db.prepare("INSERT INTO grievances (model, version, tool, report) VALUES (?, ?, ?, ?)").run(
+							getModel(),
+							VERSION,
+							canonicalTool,
+							params.report,
+						);
+						await flushGrievances(db, session.settings);
+					} catch (error) {
+						logger.debug("autoqa post-consent pipeline failed", { error: String(error) });
+					}
+				})();
 			} catch (error) {
 				logger.error("Failed to record tool issue", { error });
 			}

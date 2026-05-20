@@ -1946,8 +1946,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #promptAutoQaConsent(): Promise<boolean | null> {
 		const pool = InteractiveMode.#AUTOQA_CONSENT_PROMPTS;
 		const [headline, body] = pool[Math.floor(Math.random() * pool.length)];
-		const choice = await this.showHookSelector(`${headline}\n${body}`, ["Yes", "No"]);
-		return choice === "Yes";
+		const choice = await this.showHookSelector(`${headline}\n${body}`, ["Yes", "No"], { initialIndex: 1 });
+		return choice === undefined ? null : choice === "Yes";
 	}
 
 	stop(): void {
