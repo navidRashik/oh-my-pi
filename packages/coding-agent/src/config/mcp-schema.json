@@ -19,15 +19,6 @@
       "additionalProperties": {
         "$ref": "#/$defs/serverConfig"
       }
-    },
-    "disabledServers": {
-      "type": "array",
-      "description": "User-level denylist for disabling discovered servers by name.",
-      "items": {
-        "type": "string",
-        "minLength": 1
-      },
-      "uniqueItems": true
     }
   },
   "$defs": {
@@ -92,10 +83,6 @@
     "serverBase": {
       "type": "object",
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Whether OMP should try to connect this server."
-        },
         "timeout": {
           "type": "number",
           "exclusiveMinimum": 0,

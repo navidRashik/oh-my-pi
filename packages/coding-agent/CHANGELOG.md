@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/mcp enable` and `/mcp disable` persisting MCP server state in both `disabledExtensions` and `mcp.json`; slash commands now use the shared `disabledExtensions` entry and clean legacy inline `enabled` fields. ([#1262](https://github.com/can1357/oh-my-pi/issues/1262))
+
 ## [15.2.1] - 2026-05-21
 
 ### Fixed

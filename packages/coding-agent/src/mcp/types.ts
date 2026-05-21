@@ -107,7 +107,6 @@ export const MCP_CONFIG_SCHEMA_URL =
 export interface MCPConfigFile {
 	$schema?: string;
 	mcpServers?: Record<string, MCPServerConfig>;
-	disabledServers?: string[];
 }
 
 // =============================================================================

@@ -1,4 +1,8 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../src/config/settings";
 import type { AgentSession } from "../src/session/agent-session";
 import type { SessionManager } from "../src/session/session-manager";
@@ -758,6 +762,51 @@ describe("wave 5 — adapters and polish", () => {
 			});
 		} finally {
 			spy.mockRestore();
+		}
+	});
+
+	it("/mcp disable and enable persist state only in disabledExtensions", async () => {
+		const originalAgentDir = getAgentDir();
+		const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-disable-"));
+		const agentDir = path.join(tempRoot, "agent");
+		const projectDir = path.join(tempRoot, "project");
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(projectDir, { recursive: true });
+		setAgentDir(agentDir);
+		try {
+			const mcpPath = path.join(agentDir, "mcp.json");
+			await fs.writeFile(
+				mcpPath,
+				JSON.stringify(
+					{
+						mcpServers: {
+							exa: {
+								type: "http",
+								url: "https://mcp.exa.ai/mcp",
+							},
+						},
+					},
+					null,
+					2,
+				),
+			);
+
+			const { runtime } = createRuntime();
+			runtime.cwd = projectDir;
+
+			const disableResult = await executeAcpBuiltinSlashCommand("/mcp disable exa", runtime);
+			const disabledConfig = await fs.readFile(mcpPath, "utf8");
+			expect(disableResult).toEqual({ consumed: true });
+			expect(disabledConfig).not.toContain('"enabled"');
+			expect(runtime.settings.get("disabledExtensions")).toEqual(["mcp:exa"]);
+
+			const enableResult = await executeAcpBuiltinSlashCommand("/mcp enable exa", runtime);
+			const enabledConfig = await fs.readFile(mcpPath, "utf8");
+			expect(enableResult).toEqual({ consumed: true });
+			expect(enabledConfig).not.toContain('"enabled"');
+			expect(runtime.settings.get("disabledExtensions")).toEqual([]);
+		} finally {
+			setAgentDir(originalAgentDir);
 		}
 	});
 

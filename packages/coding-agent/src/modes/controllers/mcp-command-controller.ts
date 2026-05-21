@@ -9,14 +9,13 @@ import { getMCPConfigPath, getProjectDir } from "@oh-my-pi/pi-utils";
 import type { SourceMeta } from "../../capability/types";
 import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../mcp";
 import { connectToServer, disconnectServer, listTools } from "../../mcp/client";
+import { addMCPServer, readMCPConfigFile, removeMCPServer, updateMCPServer } from "../../mcp/config-writer";
 import {
-	addMCPServer,
-	readDisabledServers,
-	readMCPConfigFile,
-	removeMCPServer,
-	setServerDisabled,
-	updateMCPServer,
-} from "../../mcp/config-writer";
+	getDisabledMcpServerNames,
+	isMcpServerDisabled,
+	setMcpServerDisabled,
+	withoutInlineMcpEnabled,
+} from "../../mcp/disabled";
 import { MCPOAuthFlow } from "../../mcp/oauth-flow";
 import {
 	clearSmitheryApiKey,
@@ -930,7 +929,7 @@ export class MCPCommandController {
 
 			// Collect runtime-discovered servers not in config files
 			const configServerNames = new Set([...userServers, ...projectServers]);
-			const disabledServerNames = new Set(await readDisabledServers(userPath));
+			const disabledServerNames = getDisabledMcpServerNames(this.ctx.settings);
 			const discoveredServers: { name: string; source: SourceMeta }[] = [];
 			if (this.ctx.mcpManager) {
 				for (const name of this.ctx.mcpManager.getAllServerNames()) {
@@ -970,7 +969,7 @@ export class MCPCommandController {
 					const config = userConfig.mcpServers![name];
 					const type = config.type ?? "stdio";
 					const state =
-						config.enabled === false
+						config.enabled === false || disabledServerNames.has(name)
 							? "inactive"
 							: (this.ctx.mcpManager?.getConnectionStatus(name) ?? "disconnected");
 					const status =
@@ -993,7 +992,7 @@ export class MCPCommandController {
 					const config = projectConfig.mcpServers![name];
 					const type = config.type ?? "stdio";
 					const state =
-						config.enabled === false
+						config.enabled === false || disabledServerNames.has(name)
 							? "inactive"
 							: (this.ctx.mcpManager?.getConnectionStatus(name) ?? "disconnected");
 					const status =
@@ -1200,12 +1199,10 @@ export class MCPCommandController {
 
 		try {
 			const found = await this.#findConfiguredServer(name);
+			const isCurrentlyDisabled = isMcpServerDisabled(this.ctx.settings, name);
 			if (!found) {
 				// Check if this is a discovered server from a third-party config
-				const userConfigPath = getMCPConfigPath("user", getProjectDir());
-				const disabledServers = new Set(await readDisabledServers(userConfigPath));
 				const isDiscovered = this.ctx.mcpManager?.getSource(name);
-				const isCurrentlyDisabled = disabledServers.has(name);
 				if (!isDiscovered && !isCurrentlyDisabled) {
 					this.ctx.showError(`Server "${name}" not found.`);
 					return;
@@ -1218,7 +1215,7 @@ export class MCPCommandController {
 					);
 					return;
 				}
-				await setServerDisabled(userConfigPath, name, !enabled);
+				setMcpServerDisabled(this.ctx.settings, name, !enabled);
 				if (enabled) {
 					await this.#reloadMCP();
 					const state = await this.#waitForServerConnectionWithAnimation(name);
@@ -1239,7 +1236,9 @@ export class MCPCommandController {
 				return;
 			}
 
-			if ((found.config.enabled ?? true) === enabled) {
+			const currentlyEnabled = found.config.enabled !== false && !isCurrentlyDisabled;
+			const needsInlineCleanup = found.config.enabled !== undefined;
+			if (currentlyEnabled === enabled && !needsInlineCleanup) {
 				this.#showMessage(
 					["", theme.fg("muted", `Server "${name}" is already ${enabled ? "enabled" : "disabled"}.`), ""].join(
 						"\n",
@@ -1248,10 +1247,14 @@ export class MCPCommandController {
 				return;
 			}
 
-			const updated: MCPServerConfig = { ...found.config, enabled };
-			await updateMCPServer(found.filePath, name, updated);
+			if (needsInlineCleanup && enabled) {
+				await updateMCPServer(found.filePath, name, withoutInlineMcpEnabled(found.config));
+			}
+			setMcpServerDisabled(this.ctx.settings, name, !enabled);
+			if (needsInlineCleanup && !enabled) {
+				await updateMCPServer(found.filePath, name, withoutInlineMcpEnabled(found.config));
+			}
 			await this.#reloadMCP();
-
 			let status = "";
 			if (enabled) {
 				const state = await this.#waitForServerConnectionWithAnimation(name);
