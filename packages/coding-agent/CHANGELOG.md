@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed PLAN mode `/model` changes to the Architect role not applying to the active session until exiting and re-entering PLAN mode ([#1286](https://github.com/can1357/oh-my-pi/issues/1286)).
+
 ## [15.2.4] - 2026-05-22
 ### Breaking Changes
 

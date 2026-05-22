@@ -421,11 +421,19 @@ export class SelectorController {
 							this.ctx.showStatus(`Default model: ${selector ?? model.id}`);
 							// Don't call done() - selector stays open for role assignment
 						} else {
-							// Other roles (smol, slow): just update settings, not current model
+							// Role assignments usually update settings only; active plan mode also updates the session model.
 							this.ctx.settings.setModelRole(
 								role,
 								formatModelSelectorValue(selector ?? `${model.provider}/${model.id}`, thinkingLevel),
 							);
+							if (role === "plan" && this.ctx.session.getPlanModeState()?.enabled) {
+								await this.ctx.session.setModelTemporary(
+									model,
+									thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit ? thinkingLevel : undefined,
+								);
+								this.ctx.statusLine.invalidate();
+								this.ctx.updateEditorBorderColor();
+							}
 							const roleInfo = getRoleInfo(role, settings);
 							const roleLabel = roleInfo?.name ?? role;
 							this.ctx.showStatus(`${roleLabel} model: ${selector ?? model.id}`);
