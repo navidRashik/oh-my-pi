@@ -270,7 +270,6 @@ export class SelectorController {
 				break;
 			case "hideThinking":
 				this.ctx.hideThinkingBlock = value as boolean;
-				this.ctx.session.agent.hideThinkingSummary = value as boolean;
 				for (const child of this.ctx.chatContainer.children) {
 					if (child instanceof AssistantMessageComponent) {
 						child.setHideThinkingBlock(value as boolean);
