@@ -1066,13 +1066,31 @@ export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 
 	// Context promotion
-	"contextPromotion.enabled": {
-		type: "boolean",
-		default: true,
+	"contextPromotion.trigger": {
+		type: "enum",
+		values: ["always", "overflow-only", "off"] as const,
+		default: "always",
 		ui: {
 			tab: "context",
 			label: "Auto-Promote Context",
-			description: "Promote to a larger-context model on context overflow instead of compacting",
+			description: "Pick which events promote to a larger-context model instead of compacting",
+			options: [
+				{
+					value: "always",
+					label: "Always",
+					description: "Promote on threshold and on real context overflow",
+				},
+				{
+					value: "overflow-only",
+					label: "Overflow only",
+					description: "Compact on threshold; promote only after a provider overflow error",
+				},
+				{
+					value: "off",
+					label: "Off",
+					description: "Never promote; always compact",
+				},
+			],
 		},
 	},
 
@@ -2837,7 +2855,7 @@ export interface CompactionSettings {
 }
 
 export interface ContextPromotionSettings {
-	enabled: boolean;
+	trigger: "always" | "overflow-only" | "off";
 }
 export interface RetrySettings {
 	enabled: boolean;

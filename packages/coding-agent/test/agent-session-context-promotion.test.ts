@@ -131,7 +131,7 @@ describe("AgentSession context promotion", () => {
 
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"contextPromotion.enabled": true,
+			"contextPromotion.trigger": "always",
 		});
 
 		const agent = new Agent({
@@ -176,7 +176,7 @@ describe("AgentSession context promotion", () => {
 
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"contextPromotion.enabled": true,
+			"contextPromotion.trigger": "always",
 		});
 
 		const agent = new Agent({
@@ -363,17 +363,18 @@ describe("AgentSession context promotion", () => {
 		expect(session.providerSessionState.size).toBe(0);
 	});
 
-	it("runs threshold compaction before considering promotion targets", async () => {
+	it("compacts on threshold when trigger is overflow-only", async () => {
 		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
-		if (!sparkModel) {
-			throw new Error("Expected codex spark model to exist");
+		const codexModel = modelRegistry.find("openai-codex", "gpt-5.5");
+		if (!sparkModel || !codexModel) {
+			throw new Error("Expected codex spark and codex models to exist");
 		}
 
 		const settings = Settings.isolated({
 			"compaction.autoContinue": false,
 			"compaction.enabled": true,
 			"compaction.thresholdPercent": 50,
-			"contextPromotion.enabled": true,
+			"contextPromotion.trigger": "overflow-only",
 		});
 		const agent = new Agent({
 			initialState: {
@@ -401,7 +402,7 @@ describe("AgentSession context promotion", () => {
 			}
 		});
 
-		const assistantMessage: AssistantMessage = {
+		const thresholdMessage: AssistantMessage = {
 			...createAssistantMessage(sparkModel),
 			usage: {
 				input: 100000,
@@ -412,22 +413,23 @@ describe("AgentSession context promotion", () => {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 		};
-		session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
-		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+		session.agent.emitExternalEvent({ type: "message_end", message: thresholdMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [thresholdMessage] });
 
-		await waitFor(
-			() =>
-				sessionManager.getEntries().some(entry => entry.type === "compaction") ||
-				session.model?.id !== sparkModel.id,
-		);
+		await waitFor(() => sessionManager.getEntries().some(entry => entry.type === "compaction"));
 
-		expect(session.model?.provider).toBe(sparkModel.provider);
 		expect(session.model?.id).toBe(sparkModel.id);
 		expect(compactionReasons).toEqual(["threshold"]);
-		expect(sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
+
+		// Real overflow still promotes even when threshold compacts.
+		const overflowMessage = createOverflowMessage(sparkModel);
+		session.agent.emitExternalEvent({ type: "message_end", message: overflowMessage });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [overflowMessage] });
+		await waitFor(() => session.model?.id === codexModel.id);
+		expect(session.model?.id).toBe(codexModel.id);
 	});
 
-	it("does not promote when promotion is disabled", async () => {
+	it("does not promote when trigger is off", async () => {
 		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
 		if (!sparkModel) {
 			throw new Error("Expected codex spark model to exist");
@@ -435,7 +437,7 @@ describe("AgentSession context promotion", () => {
 
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"contextPromotion.enabled": false,
+			"contextPromotion.trigger": "off",
 		});
 
 		const agent = new Agent({

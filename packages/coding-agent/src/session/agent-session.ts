@@ -5594,7 +5594,7 @@ export class AgentSession {
 	 * Three cases (in order):
 	 * 1. Overflow + promotion: promote to larger model, retry without maintenance
 	 * 2. Overflow + no promotion target: run context maintenance, auto-retry on same model
-	 * 3. Threshold: Context over threshold, run context maintenance (no promotion)
+	 * 3. Threshold: Context over threshold, optionally promote then compact
 	 *
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
@@ -5626,7 +5626,7 @@ export class AgentSession {
 			}
 
 			// Try context promotion first - switch to a larger model and retry without compacting
-			const promoted = await this.#tryContextPromotion(assistantMessage);
+			const promoted = await this.#tryContextPromotion(assistantMessage, "overflow");
 			if (promoted) {
 				// Retry on the promoted (larger) model without compacting
 				this.#scheduleAgentContinue({ delayMs: 100, generation });
@@ -5652,7 +5652,13 @@ export class AgentSession {
 			contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
 		if (shouldCompact(contextTokens, contextWindow, compactionSettings)) {
-			await this.#runAutoCompaction("threshold", false);
+			// Promotion is opt-in for the threshold path; falls through to compaction
+			// when promotion is disabled, no target is configured, or the target is
+			// not strictly larger than the current model.
+			const promoted = await this.#tryContextPromotion(assistantMessage, "threshold");
+			if (!promoted) {
+				await this.#runAutoCompaction("threshold", false);
+			}
 		}
 	}
 	#assistantEndedWithSuccessfulYield(assistantMessage: AssistantMessage): boolean {
@@ -5892,12 +5898,20 @@ export class AgentSession {
 	}
 
 	/**
-	 * Attempt context promotion to a larger model after a real context overflow.
+	 * Attempt context promotion to a larger model.
+	 *
+	 * The `contextPromotion.trigger` setting decides which sites get promoted:
+	 * - `"always"` (default): both real overflow and threshold maintenance.
+	 * - `"overflow-only"`: only after a real provider overflow error.
+	 * - `"off"`: never; the caller falls back to compaction.
+	 *
 	 * Returns true if promotion succeeded (caller should retry without compacting).
 	 */
-	async #tryContextPromotion(assistantMessage: AssistantMessage): Promise<boolean> {
+	async #tryContextPromotion(assistantMessage: AssistantMessage, trigger: "overflow" | "threshold"): Promise<boolean> {
 		const promotionSettings = this.settings.getGroup("contextPromotion");
-		if (!promotionSettings.enabled) return false;
+		const mode = promotionSettings.trigger;
+		if (mode === "off") return false;
+		if (mode === "overflow-only" && trigger !== "overflow") return false;
 		const currentModel = this.model;
 		if (!currentModel) return false;
 		if (assistantMessage.provider !== currentModel.provider || assistantMessage.model !== currentModel.id)
@@ -5907,15 +5921,18 @@ export class AgentSession {
 		const targetModel = await this.#resolveContextPromotionTarget(currentModel, contextWindow);
 		if (!targetModel) return false;
 
+		const reason = trigger === "overflow" ? "context promotion after overflow" : "context promotion at threshold";
 		try {
-			await this.setModelTemporary(targetModel, undefined, { reason: "context promotion after overflow" });
-			logger.debug("Context promotion switched model on overflow", {
+			await this.setModelTemporary(targetModel, undefined, { reason });
+			logger.debug("Context promotion switched model", {
+				trigger,
 				from: `${currentModel.provider}/${currentModel.id}`,
 				to: `${targetModel.provider}/${targetModel.id}`,
 			});
 			return true;
 		} catch (error) {
 			logger.warn("Context promotion failed", {
+				trigger,
 				from: `${currentModel.provider}/${currentModel.id}`,
 				to: `${targetModel.provider}/${targetModel.id}`,
 				error: String(error),

@@ -109,7 +109,7 @@ describe("AgentSession handoff", () => {
 	it("does not run auto maintenance after final yield", async () => {
 		session.settings.set("compaction.strategy", "handoff");
 		session.settings.set("compaction.thresholdPercent", 1);
-		session.settings.set("contextPromotion.enabled", false);
+		session.settings.set("contextPromotion.trigger", "off");
 
 		const model = session.model;
 		if (!model) {
@@ -207,7 +207,7 @@ describe("AgentSession handoff", () => {
 	it("does not run auto maintenance when strategy is off", async () => {
 		session.settings.set("compaction.strategy", "off");
 		session.settings.set("compaction.thresholdPercent", 1);
-		session.settings.set("contextPromotion.enabled", false);
+		session.settings.set("contextPromotion.trigger", "off");
 
 		const model = session.model;
 		if (!model) {
@@ -254,7 +254,7 @@ describe("AgentSession handoff", () => {
 
 	it("falls back to context-full maintenance for overflow when strategy is handoff", async () => {
 		session.settings.set("compaction.strategy", "handoff");
-		session.settings.set("contextPromotion.enabled", false);
+		session.settings.set("contextPromotion.trigger", "off");
 
 		const model = session.model;
 		if (!model) {
@@ -299,7 +299,7 @@ describe("AgentSession handoff", () => {
 	it("uses handoff strategy for threshold-triggered auto maintenance", async () => {
 		session.settings.set("compaction.strategy", "handoff");
 		session.settings.set("compaction.thresholdPercent", 1);
-		session.settings.set("contextPromotion.enabled", false);
+		session.settings.set("contextPromotion.trigger", "off");
 
 		const model = session.model;
 		if (!model) {
@@ -410,7 +410,7 @@ describe("AgentSession handoff", () => {
 				"compaction.autoContinue": false,
 				"compaction.strategy": "handoff",
 				"compaction.thresholdPercent": 1,
-				"contextPromotion.enabled": false,
+				"contextPromotion.trigger": "off",
 			}),
 			modelRegistry,
 		});
@@ -435,7 +435,7 @@ describe("AgentSession handoff", () => {
 	it("falls back to context-full when handoff strategy returns no document", async () => {
 		session.settings.set("compaction.strategy", "handoff");
 		session.settings.set("compaction.thresholdPercent", 1);
-		session.settings.set("contextPromotion.enabled", false);
+		session.settings.set("contextPromotion.trigger", "off");
 
 		const model = session.model;
 		if (!model) {
