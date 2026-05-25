@@ -678,6 +678,30 @@ export class Settings {
 			}
 		}
 
+		const contextPromotionValue = raw.contextPromotion;
+		const contextPromotionObj =
+			contextPromotionValue && typeof contextPromotionValue === "object" && !Array.isArray(contextPromotionValue)
+				? (contextPromotionValue as Record<string, unknown>)
+				: undefined;
+		const flatContextPromotionTrigger = raw["contextPromotion.trigger"];
+		const flatContextPromotionEnabled = raw["contextPromotion.enabled"];
+		if (contextPromotionObj && typeof contextPromotionObj.enabled === "boolean") {
+			if (typeof contextPromotionObj.trigger !== "string") {
+				contextPromotionObj.trigger = contextPromotionObj.enabled ? "always" : "off";
+			}
+			delete contextPromotionObj.enabled;
+		}
+		if (typeof flatContextPromotionTrigger === "string" || typeof flatContextPromotionEnabled === "boolean") {
+			const contextPromotionRoot = contextPromotionObj ?? {};
+			if (typeof flatContextPromotionTrigger === "string") {
+				contextPromotionRoot.trigger = flatContextPromotionTrigger;
+			} else if (typeof contextPromotionRoot.trigger !== "string") {
+				contextPromotionRoot.trigger = flatContextPromotionEnabled ? "always" : "off";
+			}
+			raw.contextPromotion = contextPromotionRoot;
+			delete raw["contextPromotion.enabled"];
+			delete raw["contextPromotion.trigger"];
+		}
 		// Map legacy `memories.enabled` boolean to the explicit `memory.backend`
 		// enum if the latter hasn't been set yet. Idempotent: subsequent
 		// migrations are no-ops once memory.backend is materialised.

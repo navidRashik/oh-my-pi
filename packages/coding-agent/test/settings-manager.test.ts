@@ -223,6 +223,35 @@ describe("Settings", () => {
 			expect(settings.getEditVariantForModel("claude-opus-4-5")).toBe("hashline");
 			expect(settings.getEditVariantForModel("gpt-5.2")).toBe("apply_patch");
 		});
+		it("maps legacy contextPromotion.enabled=false onto trigger=off", async () => {
+			await writeSettings({
+				contextPromotion: { enabled: false },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("contextPromotion.trigger")).toBe("off");
+		});
+
+		it("maps legacy contextPromotion.enabled=true onto trigger=always", async () => {
+			await writeSettings({
+				contextPromotion: { enabled: true },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("contextPromotion.trigger")).toBe("always");
+		});
+
+		it("preserves explicit contextPromotion.trigger when migrating enabled", async () => {
+			await writeSettings({
+				contextPromotion: { enabled: false, trigger: "overflow-only" },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("contextPromotion.trigger")).toBe("overflow-only");
+		});
 
 		it("maps legacy hindsight.dynamicBankId=true onto hindsight.scoping=per-project", async () => {
 			await writeSettings({
