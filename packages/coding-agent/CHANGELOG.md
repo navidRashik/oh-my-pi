@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed plugins whose manifest declares an `extensions` directory entry (e.g. `pi-autoresearch`'s `pi: { extensions: ["./extensions"] }`) but lays out concrete extensions under nested subdirectories (`./extensions/<name>/index.ts`) silently resolving to zero entry points. `resolveManifestEntries` now mirrors the agent's own `discoverExtensionsInDir` rules when a manifest extensions entry points at a directory without a top-level `index.{ts,js,mjs,cjs}`: the directory's immediate children are scanned for direct `.ts`/`.js`/`.mjs`/`.cjs` files and subdirectories containing an index file. Behavior is unchanged for the tools/hooks/commands keys, which still require explicit single-file entries ([#1292](https://github.com/can1357/oh-my-pi/issues/1292))
+
 ## [15.2.4] - 2026-05-22
 ### Breaking Changes
 

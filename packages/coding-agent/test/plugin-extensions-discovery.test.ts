@@ -184,4 +184,66 @@ describe("plugin extension discovery", () => {
 		expect(extension).toBeDefined();
 		expect(extension?.commands.has("dir-entry-ext")).toBe(true);
 	});
+	it("loads installed plugin extensions whose manifest entry points at a directory of subdirectory extensions", async () => {
+		// `pi-autoresearch` layout (issue #1292): `pi.extensions: ["./extensions"]`
+		// where `extensions/` has no top-level `index.{ts,js,...}` but contains
+		// `extensions/<name>/index.ts` per nested extension. Loader must expand
+		// the directory to those nested entry points instead of silently dropping
+		// the plugin to zero extensions.
+		const pluginsDir = getPluginsDir();
+		const pluginDir = path.join(pluginsDir, "node_modules", "pi-autoresearch");
+		const nestedExtensionPath = path.join(pluginDir, "extensions", "pi-autoresearch", "index.ts");
+		const siblingExtensionPath = path.join(pluginDir, "extensions", "sibling", "index.ts");
+		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
+		fs.mkdirSync(path.dirname(nestedExtensionPath), { recursive: true });
+		fs.mkdirSync(path.dirname(siblingExtensionPath), { recursive: true });
+		fs.writeFileSync(
+			path.join(pluginsDir, "package.json"),
+			JSON.stringify({
+				name: "omp-plugins",
+				private: true,
+				dependencies: {
+					"pi-autoresearch": "1.0.0",
+				},
+			}),
+		);
+		fs.writeFileSync(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({
+				name: "pi-autoresearch",
+				version: "1.0.0",
+				pi: {
+					// Directory entry without top-level index — the loader must
+					// expand it to the nested subdirectory extensions.
+					extensions: ["./extensions"],
+				},
+			}),
+		);
+		fs.writeFileSync(
+			nestedExtensionPath,
+			[
+				"export default function(pi) {",
+				'\tpi.registerCommand("autoresearch-ext", { handler: async () => {} });',
+				"}",
+			].join("\n"),
+		);
+		fs.writeFileSync(
+			siblingExtensionPath,
+			[
+				"export default function(pi) {",
+				'\tpi.registerCommand("autoresearch-sibling", { handler: async () => {} });',
+				"}",
+			].join("\n"),
+		);
+
+		const result = await discoverAndLoadExtensions([], projectDir.path());
+		const nested = result.extensions.find(ext => ext.path === nestedExtensionPath);
+		const sibling = result.extensions.find(ext => ext.path === siblingExtensionPath);
+
+		expect(result.errors).toEqual([]);
+		expect(nested).toBeDefined();
+		expect(nested?.commands.has("autoresearch-ext")).toBe(true);
+		expect(sibling).toBeDefined();
+		expect(sibling?.commands.has("autoresearch-sibling")).toBe(true);
+	});
 });

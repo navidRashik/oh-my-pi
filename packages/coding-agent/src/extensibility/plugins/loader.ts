@@ -120,26 +120,64 @@ export async function getEnabledPlugins(cwd: string): Promise<InstalledPlugin[]>
 const MANIFEST_ENTRY_INDEX_NAMES = ["index.ts", "index.js", "index.mjs", "index.cjs"];
 
 /**
- * Resolve a plugin manifest entry to a concrete loadable file path. Returns the
- * file path itself when the entry points at a file, the matching index file when
- * the entry points at a directory containing index.{ts,js,mjs,cjs}, and null
- * when no entry exists at the joined path.
+ * Resolve a plugin manifest entry to one or more concrete loadable file paths.
+ *
+ * - A file entry resolves to itself.
+ * - A directory entry resolves to its `index.{ts,js,mjs,cjs}` when present.
+ * - When `expandDirectory` is set and the directory has no top-level index,
+ *   the directory's immediate children are scanned for entry points: direct
+ *   `.ts`/`.js`/`.mjs`/`.cjs` files and subdirectories containing an index
+ *   file. Mirrors the agent's own `discoverExtensionsInDir` rules so that
+ *   plugins declaring `pi.extensions: ["./extensions"]` and laying out
+ *   concrete extensions under `./extensions/<name>/index.ts` resolve to
+ *   those nested entries instead of silently dropping to zero.
+ *
+ * Returns an empty array when no entry exists at the joined path.
  */
-function resolveManifestEntryFile(joined: string): string | null {
+function resolveManifestEntries(joined: string, options: { expandDirectory: boolean }): string[] {
 	let stats: fs.Stats;
 	try {
 		stats = fs.statSync(joined);
 	} catch {
-		return null;
+		return [];
 	}
-	if (stats.isDirectory()) {
-		for (const name of MANIFEST_ENTRY_INDEX_NAMES) {
-			const candidate = path.join(joined, name);
-			if (fs.existsSync(candidate)) return candidate;
+	if (!stats.isDirectory()) {
+		return [joined];
+	}
+	for (const name of MANIFEST_ENTRY_INDEX_NAMES) {
+		const candidate = path.join(joined, name);
+		if (fs.existsSync(candidate)) return [candidate];
+	}
+	if (!options.expandDirectory) return [];
+
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(joined, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const results: string[] = [];
+	for (const entry of entries) {
+		const entryPath = path.join(joined, entry.name);
+		if ((entry.isFile() || entry.isSymbolicLink()) && isExtensionEntryFile(entry.name)) {
+			results.push(entryPath);
+			continue;
 		}
-		return null;
+		if (entry.isDirectory() || entry.isSymbolicLink()) {
+			for (const name of MANIFEST_ENTRY_INDEX_NAMES) {
+				const candidate = path.join(entryPath, name);
+				if (fs.existsSync(candidate)) {
+					results.push(candidate);
+					break;
+				}
+			}
+		}
 	}
-	return joined;
+	return results;
+}
+
+function isExtensionEntryFile(name: string): boolean {
+	return name.endsWith(".ts") || name.endsWith(".js") || name.endsWith(".mjs") || name.endsWith(".cjs");
 }
 
 /**
@@ -149,16 +187,16 @@ function resolveManifestEntryFile(joined: string): string | null {
 function resolvePluginPaths(plugin: InstalledPlugin, key: "tools" | "hooks" | "commands" | "extensions"): string[] {
 	const paths: string[] = [];
 	const manifest = plugin.manifest;
+	// Directory-of-extensions expansion is extensions-only; tools/hooks/commands
+	// are addressed by single explicit files in the manifest.
+	const expandDirectory = key === "extensions";
 
 	// Base entry (always included if exists)
 	const base = manifest[key];
 	if (base) {
 		const entries = Array.isArray(base) ? base : [base];
 		for (const entry of entries) {
-			const resolved = resolveManifestEntryFile(path.join(plugin.path, entry));
-			if (resolved) {
-				paths.push(resolved);
-			}
+			paths.push(...resolveManifestEntries(path.join(plugin.path, entry), { expandDirectory }));
 		}
 	}
 
@@ -171,10 +209,7 @@ function resolvePluginPaths(plugin: InstalledPlugin, key: "tools" | "hooks" | "c
 
 			if (feat[key]) {
 				for (const entry of feat[key]) {
-					const resolved = resolveManifestEntryFile(path.join(plugin.path, entry));
-					if (resolved) {
-						paths.push(resolved);
-					}
+					paths.push(...resolveManifestEntries(path.join(plugin.path, entry), { expandDirectory }));
 				}
 			}
 		}
@@ -185,10 +220,7 @@ function resolvePluginPaths(plugin: InstalledPlugin, key: "tools" | "hooks" | "c
 
 			if (feat[key]) {
 				for (const entry of feat[key]) {
-					const resolved = resolveManifestEntryFile(path.join(plugin.path, entry));
-					if (resolved) {
-						paths.push(resolved);
-					}
+					paths.push(...resolveManifestEntries(path.join(plugin.path, entry), { expandDirectory }));
 				}
 			}
 		}
