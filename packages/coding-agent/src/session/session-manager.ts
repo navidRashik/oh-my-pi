@@ -96,6 +96,8 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	model: string;
 	/** Role: "default", "smol", "slow", etc. Undefined treated as "default" */
 	role?: string;
+	/** Reason surfaced for automatic model changes. */
+	reason?: string;
 }
 
 export interface ServiceTierChangeEntry extends SessionEntryBase {
@@ -2582,8 +2584,9 @@ export class SessionManager {
 	 * Append a model change as child of current leaf, then advance leaf. Returns entry id.
 	 * @param model Model in "provider/modelId" format
 	 * @param role Optional role (default: "default")
+	 * @param options Optional metadata surfaced alongside the model change
 	 */
-	appendModelChange(model: string, role?: string): string {
+	appendModelChange(model: string, role?: string, options?: { reason?: string }): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
 			id: generateId(this.#byId),
@@ -2591,6 +2594,7 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			model,
 			role,
+			reason: options?.reason,
 		};
 		this.#appendEntry(entry);
 		return entry.id;

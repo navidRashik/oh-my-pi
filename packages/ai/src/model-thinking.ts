@@ -170,13 +170,17 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 	}
 }
 
+function hasLargerContextWindow(target: ApiModel<Api>, source: ApiModel<Api>): boolean {
+	return target.contextWindow > source.contextWindow;
+}
+
 /**
  * Link OpenAI model variants to their context promotion targets.
  *
  * When a model's context is exhausted, the agent can promote to a sibling
- * model with a larger context window on the same provider:
- * - `codex-spark` variants promote to `gpt-5.5`.
- * - `gpt-5.5` (270K input) promotes to `gpt-5.4` (1M input).
+ * model with a strictly larger context window on the same provider. Generated
+ * catalogs must not link lateral model variants because promotion skips
+ * compaction on overflow.
  */
 export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
 	for (const candidate of models) {
@@ -190,10 +194,12 @@ export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
 		} else {
 			continue;
 		}
+		delete candidate.contextPromotionTarget;
 		const fallback = models.find(
 			model => model.provider === candidate.provider && model.api === candidate.api && model.id === targetId,
 		);
 		if (!fallback) continue;
+		if (!hasLargerContextWindow(fallback, candidate)) continue;
 		candidate.contextPromotionTarget = `${fallback.provider}/${fallback.id}`;
 	}
 }
