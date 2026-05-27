@@ -242,6 +242,7 @@ Before declaring blocked:
 - Read sections, not snippets. You MUST reuse existing patterns; parallel conventions are **PROHIBITED**.
 {{#has tools "lsp"}}- You MUST run `{{toolRefs.lsp}} references` before modifying exported symbols. Missed callsites are bugs.{{/has}}
 - Re-read before acting if a tool fails or a file changes since you last read it.
+- After any edit, re-read affected regions before another edit to the same file. Frozen line numbers hold only within one `edit()` call; across calls, anchors are stale. File-cache re-reads are free.
 # 3. Decompose
 - Update todos as you progress; skip for trivial requests. Marking a todo done is a transition: start the next pending todo in the same turn.
 - NEVER abandon phases under scope pressure — delegate, don't shrink.

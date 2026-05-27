@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed hashline prompt guidance so agents re-read edited regions before reusing line anchors across edit calls ([#1436](https://github.com/can1357/oh-my-pi/issues/1436)).
+
 ## [15.5.4] - 2026-05-27
 
 ### Breaking Changes

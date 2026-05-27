@@ -7,6 +7,7 @@ import { buildSystemPrompt, buildSystemPromptToolMetadata } from "@oh-my-pi/pi-c
 import { prompt } from "@oh-my-pi/pi-utils";
 import Handlebars from "handlebars";
 import * as z from "zod/v4";
+import hashlinePrompt from "../../hashline/src/prompt.md" with { type: "text" };
 
 const baseGitContext = {
 	isRepo: true,
@@ -117,6 +118,15 @@ describe("system Handlebars prompt templates", () => {
 			expect(() => Handlebars.parse(template), `Failed parsing ${fileName}`).not.toThrow();
 			expect(() => Handlebars.compile(template), `Failed compiling ${fileName}`).not.toThrow();
 		}
+	});
+
+	test("edit prompts warn that hashline anchors are stale across calls", async () => {
+		const systemTemplate = await Bun.file(path.join(systemPromptsDir, "system-prompt.md")).text();
+
+		expect(systemTemplate).toContain("After any edit, re-read affected regions");
+		expect(systemTemplate).toContain("Frozen line numbers hold only within one `edit()` call");
+		expect(hashlinePrompt).toContain("Re-read between edit calls");
+		expect(hashlinePrompt).toContain("stale line numbers target wrong lines");
 	});
 
 	test("custom-system-prompt renders project section for context and git combinations", async () => {

@@ -29,6 +29,7 @@ A-B!     delete A..B   (or A! == A..A)
 - **NEVER replay past your range.** Stop before B+1; extend B if needed.
 - **Read lines look like replace ops.** `84:content` = "make line 84 content" — and inline content is rejected. Don't echo read-style rows.
 - **NEVER fabricate file hashes.** Missing? Re-`read`.
+- **Re-read between edit calls.** Frozen line numbers apply within one `edit()` call only. Edited region again? Re-read first; stale line numbers target wrong lines.
 </common-failures>
 
 <example>
