@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `parseKey` / `matchesKey` resolving the legacy `ESC<letter>` Alt+letter byte pair (`\x1bp`, `\x1bb`, etc.) as `alt+up` / `alt+left` aliases, shadowing the literal `alt+p` / `alt+b` bindings. The four readline-style aliases are dropped from `LEGACY_SEQUENCES`; legacy Alt+letter / Alt+Shift+letter / Ctrl+Alt+letter parsing is now active in both legacy and kitty mixed mode so multiplexers like tmux that reply to the Kitty keyboard query but still emit legacy `ESC<letter>` bytes are decoded correctly. ([#1511](https://github.com/can1357/oh-my-pi/issues/1511))
+
 ## [15.5.10] - 2026-05-28
 
 ### Fixed

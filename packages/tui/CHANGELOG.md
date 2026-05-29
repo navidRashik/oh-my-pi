@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Alt+letter keybindings (e.g. `alt+p`, `alt+b`, `alt+n`, `alt+f`) failing to fire inside tmux on macOS Ghostty even though Alt+arrow worked. tmux 3.6 with `extended-keys-format csi-u` replies to the Kitty keyboard query upstream but still forwards Alt+letter as the legacy `ESC<letter>` form; the native key parser had `\x1bp`/`\x1bn`/`\x1bb`/`\x1bf` baked in as readline aliases for `alt+up`/`alt+down`/`alt+left`/`alt+right`, shadowing the literal Alt+letter interpretation. `LEGACY_SEQUENCES` no longer aliases those four bytes, and `parse_esc_pair` / `matches_key_inner` accept legacy ESC+letter / ESC+UPPERCASE / ESC+ctrl-char as `alt+<letter>` / `alt+shift+<letter>` / `ctrl+alt+<letter>` in both legacy and kitty mixed mode. Word-navigation bindings (`tui.editor.cursorWordLeft` / `Right`) already accept `alt+b`/`alt+f` alongside `alt+left`/`alt+right`, so editor behavior is unchanged. ([#1511](https://github.com/can1357/oh-my-pi/issues/1511))
+
 ## [15.5.12] - 2026-05-29
 
 ### Fixed

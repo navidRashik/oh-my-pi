@@ -43,8 +43,8 @@ const samples = [
 
 	// Alt sequences (legacy mode)
 	{ name: "alt+backspace", data: "\x1b\x7f", expected: "alt+backspace" },
-	{ name: "alt+left", data: "\x1bb", expected: "alt+left" },
-	{ name: "alt+right", data: "\x1bf", expected: "alt+right" },
+	{ name: "alt+b", data: "\x1bb", expected: "alt+b" },
+	{ name: "alt+f", data: "\x1bf", expected: "alt+f" },
 
 	// Arrow with modifiers (legacy)
 	{ name: "shift+up", data: "\x1b[a", expected: "shift+up" },

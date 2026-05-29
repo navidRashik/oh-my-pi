@@ -1343,8 +1343,8 @@ describe("Editor component", () => {
 	});
 
 	describe("Word navigation (Option/Alt + Left/Right)", () => {
-		const wordLeft = "\x1bb"; // ESC-b (matches alt+left on most terminals / our matcher)
-		const wordRight = "\x1bf"; // ESC-f (matches alt+right on most terminals / our matcher)
+		const wordLeft = "\x1bb"; // ESC-b (alt+b — bound to cursorWordLeft by default)
+		const wordRight = "\x1bf"; // ESC-f (alt+f — bound to cursorWordRight by default)
 
 		it("moves by CJK and punctuation blocks in Chinese", () => {
 			const editor = new Editor(defaultEditorTheme);

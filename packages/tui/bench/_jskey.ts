@@ -449,10 +449,6 @@ const LEGACY_SEQUENCE_KEY_IDS: Record<string, KeyId> = {
 	"\x1b[21~": "f10",
 	"\x1b[23~": "f11",
 	"\x1b[24~": "f12",
-	"\x1bb": "alt+left",
-	"\x1bf": "alt+right",
-	"\x1bp": "alt+up",
-	"\x1bn": "alt+down",
 } as const;
 
 type LegacyModifierKey = keyof typeof LEGACY_SHIFT_SEQUENCES;
@@ -890,14 +886,14 @@ function matchesKey(data: string, keyId: KeyId): boolean {
 			return matchesKittySequence(data, FUNCTIONAL_CODEPOINTS.pageDown, modifier);
 
 		case "up":
-			if (alt && !ctrl && !shift) {
-				return data === "\x1bp" || matchesKittySequence(data, ARROW_CODEPOINTS.up, MODIFIERS.alt);
-			}
 			if (modifier === 0) {
 				return (
 					matchesLegacySequence(data, LEGACY_KEY_SEQUENCES.up) ||
 					matchesKittySequence(data, ARROW_CODEPOINTS.up, 0)
 				);
+			}
+			if (alt && !ctrl && !shift) {
+				return matchesKittySequence(data, ARROW_CODEPOINTS.up, MODIFIERS.alt);
 			}
 			if (matchesLegacyModifierSequence(data, "up", modifier)) {
 				return true;
@@ -905,14 +901,14 @@ function matchesKey(data: string, keyId: KeyId): boolean {
 			return matchesKittySequence(data, ARROW_CODEPOINTS.up, modifier);
 
 		case "down":
-			if (alt && !ctrl && !shift) {
-				return data === "\x1bn" || matchesKittySequence(data, ARROW_CODEPOINTS.down, MODIFIERS.alt);
-			}
 			if (modifier === 0) {
 				return (
 					matchesLegacySequence(data, LEGACY_KEY_SEQUENCES.down) ||
 					matchesKittySequence(data, ARROW_CODEPOINTS.down, 0)
 				);
+			}
+			if (alt && !ctrl && !shift) {
+				return matchesKittySequence(data, ARROW_CODEPOINTS.down, MODIFIERS.alt);
 			}
 			if (matchesLegacyModifierSequence(data, "down", modifier)) {
 				return true;
@@ -924,7 +920,6 @@ function matchesKey(data: string, keyId: KeyId): boolean {
 				return (
 					data === "\x1b[1;3D" ||
 					(!kittyProtocolActive && data === "\x1bB") ||
-					data === "\x1bb" ||
 					matchesKittySequence(data, ARROW_CODEPOINTS.left, MODIFIERS.alt)
 				);
 			}
@@ -951,7 +946,6 @@ function matchesKey(data: string, keyId: KeyId): boolean {
 				return (
 					data === "\x1b[1;3C" ||
 					(!kittyProtocolActive && data === "\x1bF") ||
-					data === "\x1bf" ||
 					matchesKittySequence(data, ARROW_CODEPOINTS.right, MODIFIERS.alt)
 				);
 			}
