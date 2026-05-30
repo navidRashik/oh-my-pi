@@ -1999,8 +1999,18 @@ export class AcpAgent implements Agent {
 		}
 
 		record.mcpManager = manager;
-		record.session.setDefaultSelectedMCPServers(result.connectedServers);
+		record.session.setDefaultSelectedMCPServers(this.#getMcpServerNamesWithTools(result.tools));
 		await record.session.refreshMCPTools(result.tools);
+	}
+
+	#getMcpServerNamesWithTools(tools: ReadonlyArray<{ mcpServerName?: string }>): string[] {
+		const serverNames = new Set<string>();
+		for (const tool of tools) {
+			if (tool.mcpServerName) {
+				serverNames.add(tool.mcpServerName);
+			}
+		}
+		return [...serverNames];
 	}
 
 	#toMcpConfig(server: McpServer): MCPServerConfig {

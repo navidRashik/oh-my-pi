@@ -476,7 +476,7 @@ describe("ACP agent", () => {
 		} as unknown as CustomTool;
 	}
 
-	it("auto-selects tools from ACP client-provided MCP servers", async () => {
+	it("auto-selects deferred tools from ACP client-provided MCP servers", async () => {
 		const harness = await createHarness();
 		const tools = [
 			createMcpTool("mcp__codegraph_search", "codegraph"),
@@ -485,7 +485,7 @@ describe("ACP agent", () => {
 		const connectSpy = spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
 			tools,
 			errors: new Map(),
-			connectedServers: ["codegraph"],
+			connectedServers: [],
 			exaApiKeys: [],
 		});
 		try {
