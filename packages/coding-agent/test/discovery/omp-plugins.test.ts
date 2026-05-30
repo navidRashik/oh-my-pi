@@ -61,15 +61,15 @@ async function loadFromPlugin<T>(capabilityId: string, ctx: LoadContext): Promis
 	return result.items as T[];
 }
 
-function buildExtensionPackage(packageDir: string): void {
+function buildExtensionPackage(packageDir: string, skillName = "my-skill"): void {
 	writeFile(
 		path.join(packageDir, "package.json"),
 		JSON.stringify({ name: path.basename(packageDir), omp: { extensions: ["./src/main.ts"] } }),
 	);
 	writeFile(path.join(packageDir, "src", "main.ts"), "export default function (_pi) {}\n");
 	writeFile(
-		path.join(packageDir, "skills", "my-skill", "SKILL.md"),
-		"---\nname: my-skill\ndescription: Hello from extension skill\n---\nbody\n",
+		path.join(packageDir, "skills", skillName, "SKILL.md"),
+		`---\nname: ${skillName}\ndescription: Hello from extension skill\n---\nbody\n`,
 	);
 	writeFile(path.join(packageDir, "commands", "greet.md"), "---\ndescription: greet user\n---\nHello {{name}}\n");
 	writeFile(path.join(packageDir, "rules", "style.md"), "---\ndescription: style rule\n---\nUse tabs.\n");
@@ -163,6 +163,44 @@ test("user config.yml#extensions also feeds sub-discovery", async () => {
 
 	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
 	expect(skills.map(s => s.name)).toContain("my-skill");
+});
+
+test("project config.yml#extensions replaces lower-precedence configured roots", async () => {
+	const userExt = path.join(tempDir, "user-extension");
+	const projectSettingsExt = path.join(tempDir, "project-settings-extension");
+	const projectConfigExt = path.join(tempDir, "project-config-extension");
+	buildExtensionPackage(userExt, "user-skill");
+	buildExtensionPackage(projectSettingsExt, "project-settings-skill");
+	buildExtensionPackage(projectConfigExt, "project-config-skill");
+	writeFile(path.join(home, ".omp", "agent", "config.yml"), YAML.stringify({ extensions: [userExt] }, null, 2));
+	writeFile(path.join(project, ".omp", "settings.json"), JSON.stringify({ extensions: [projectSettingsExt] }));
+	writeFile(path.join(project, ".omp", "config.yml"), YAML.stringify({ extensions: [projectConfigExt] }, null, 2));
+
+	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
+	const skillNames = skills.map(s => s.name);
+	expect(skillNames).toContain("project-config-skill");
+	expect(skillNames).not.toContain("project-settings-skill");
+	expect(skillNames).not.toContain("user-skill");
+});
+
+test("empty project config.yml#extensions suppresses lower-precedence configured roots", async () => {
+	const userExt = path.join(tempDir, "user-extension");
+	buildExtensionPackage(userExt, "user-skill");
+	writeFile(path.join(home, ".omp", "agent", "config.yml"), YAML.stringify({ extensions: [userExt] }, null, 2));
+	writeFile(path.join(project, ".omp", "config.yml"), YAML.stringify({ extensions: [] }, null, 2));
+
+	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
+	expect(skills.map(s => s.name)).not.toContain("user-skill");
+});
+
+test("user config.yml without extensions suppresses legacy user settings.json", async () => {
+	const userSettingsExt = path.join(tempDir, "user-settings-extension");
+	buildExtensionPackage(userSettingsExt, "user-settings-skill");
+	writeFile(path.join(home, ".omp", "agent", "settings.json"), JSON.stringify({ extensions: [userSettingsExt] }));
+	writeFile(path.join(home, ".omp", "agent", "config.yml"), YAML.stringify({ theme: { dark: "default" } }, null, 2));
+
+	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
+	expect(skills.map(s => s.name)).not.toContain("user-settings-skill");
 });
 
 test("user config.yml is sourced from getAgentDir() so PI_CODING_AGENT_DIR redirects sub-discovery", async () => {
