@@ -2084,6 +2084,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// DSTUI tool (`pi-dstui` DSL overlay; disabled by default)
+	"dstui.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "DSTUI Overlay",
+			description:
+				"Enable the `dstui` tool — mounts a safe pi-dstui DSL component as an interactive TUI overlay. Off by default.",
+		},
+	},
+
 	// Todo tool
 	"todo.enabled": {
 		type: "boolean",

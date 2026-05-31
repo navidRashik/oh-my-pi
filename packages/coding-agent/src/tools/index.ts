@@ -31,6 +31,7 @@ import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
 import { DebugTool } from "./debug";
+import { DstuiTool } from "./dstui";
 import { EvalTool } from "./eval";
 import { FindTool } from "./find";
 import { GithubTool } from "./gh";
@@ -71,6 +72,7 @@ export * from "./bash";
 export * from "./browser";
 export * from "./checkpoint";
 export * from "./debug";
+export * from "./dstui";
 export * from "./eval";
 export * from "./find";
 export * from "./gh";
@@ -281,6 +283,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	read: s => new ReadTool(s),
 	bash: s => new BashTool(s),
 	edit: s => new EditTool(s),
+	dstui: DstuiTool.createIf,
 	ast_grep: s => new AstGrepTool(s),
 	ast_edit: s => new AstEditTool(s),
 	render_mermaid: s => new RenderMermaidTool(s),
