@@ -116,6 +116,13 @@ describe("compactAlgorithmically", () => {
 		expect(result.summary).toContain("Last assistant question/request: Do you want me to open a PR?");
 	});
 
+	test("preserves prior compaction summary verbatim instead of clipping to a context budget", () => {
+		const longPriorSummary = `Prior summary header.\n${"keep-line ".repeat(500).trim()}`;
+		const result = compactAlgorithmically(makePreparation({ previousSummary: longPriorSummary }));
+
+		expect(result.summary).toContain(`Previous compaction summary to preserve:\n${longPriorSummary}`);
+	});
+
 	test("bounds long transcript text while retaining section shape", () => {
 		const longText = `Start ${"x".repeat(2_000)}`;
 		const result = compactAlgorithmically(makePreparation({ messagesToSummarize: [user(longText)] }));

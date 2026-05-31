@@ -145,7 +145,7 @@ function renderOutstandingContext(preparation: CompactionPreparation, options: A
 		lines.push(`Compaction focus: ${clip(options.customInstructions, MAX_CONTEXT_CHARS)}`);
 	}
 	if (preparation.previousSummary?.trim()) {
-		lines.push("Previous compaction summary to preserve:", clip(preparation.previousSummary, MAX_CONTEXT_CHARS));
+		lines.push("Previous compaction summary to preserve:", preparation.previousSummary);
 	}
 	if (options.extraContext && options.extraContext.length > 0) {
 		lines.push("Additional context:", ...formatList(options.extraContext.map(item => clip(item, MAX_CONTEXT_CHARS))));
