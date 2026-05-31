@@ -1032,6 +1032,13 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 	if (initialContainerNormalization.changed) {
 		normalizedArgs = initialContainerNormalization.value;
 		changed = true;
+		// Parsing a stringified container can expose nested null/"null" values that
+		// the first null-normalization pass could not see; rerun it so optional
+		// nullable fields are stripped before validation rejects them.
+		const postContainerNullNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
+		if (postContainerNullNormalization.changed) {
+			normalizedArgs = postContainerNullNormalization.value;
+		}
 	}
 
 	let result = validateContext(ctx, normalizedArgs);
@@ -1053,6 +1060,12 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 		if (containerNormalization.changed) {
 			normalizedArgs = containerNormalization.value;
 			changed = true;
+			// Same reasoning as the initial pass: re-strip optional nulls that became
+			// visible only after the stringified container was parsed into real shape.
+			const postContainerNullNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
+			if (postContainerNullNormalization.changed) {
+				normalizedArgs = postContainerNullNormalization.value;
+			}
 		}
 
 		result = validateContext(ctx, normalizedArgs);
