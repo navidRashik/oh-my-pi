@@ -153,22 +153,29 @@ export function instantiate(
 
 	// Timers: clamp to the minimum interval, cap count via maxTimers (already
 	// checked at the top), catch every body error so a misbehaving DSL timer
-	// cannot kill the host loop.
-	for (const timer of def.timers) {
-		budget.reset();
-		const requested = Math.floor(Number(evaluate(timer.ms, env, budget)) || 0);
-		const intervalMs = Math.max(limits.minTimerIntervalMs, requested);
-		const handle = clock.setInterval(() => {
-			if (settled || disposed) return;
-			try {
-				budget.reset();
-				evaluate(timer.body, env, budget);
-				if (!settled && !disposed) onRender();
-			} catch (err) {
-				onError(err);
-			}
-		}, intervalMs);
-		timers.push(handle);
+	// cannot kill the host loop. If registration aborts part-way through,
+	// clear any handles already created before rethrowing; callers cannot
+	// dispose an instance that failed construction.
+	try {
+		for (const timer of def.timers) {
+			budget.reset();
+			const requested = Math.floor(Number(evaluate(timer.ms, env, budget)) || 0);
+			const intervalMs = Math.max(limits.minTimerIntervalMs, requested);
+			const handle = clock.setInterval(() => {
+				if (settled || disposed) return;
+				try {
+					budget.reset();
+					evaluate(timer.body, env, budget);
+					if (!settled && !disposed) onRender();
+				} catch (err) {
+					onError(err);
+				}
+			}, intervalMs);
+			timers.push(handle);
+		}
+	} catch (err) {
+		teardownTimers();
+		throw err;
 	}
 
 	const render = (width: number): string[] => {

@@ -12,9 +12,11 @@ function makeMount(): {
 	drive: (input: string) => void;
 	rendered(width: number): string[];
 	options(): { overlay?: boolean } | undefined;
+	customCalls(): number;
 } {
 	let active: Component | undefined;
 	let opts: { overlay?: boolean } | undefined;
+	let calls = 0;
 	const mount: OverlayMount = {
 		custom: async <T>(
 			factory: (
@@ -25,6 +27,7 @@ function makeMount(): {
 			) => Component | Promise<Component>,
 			options?: { overlay?: boolean },
 		): Promise<T> => {
+			calls += 1;
 			opts = options;
 			const { promise, resolve } = Promise.withResolvers<T>();
 			active = await factory(null, null, null, value => resolve(value));
@@ -36,6 +39,7 @@ function makeMount(): {
 		drive: input => active?.handleInput?.(input),
 		rendered: width => active?.render(width) ?? [],
 		options: () => opts,
+		customCalls: () => calls,
 	};
 }
 
@@ -110,5 +114,29 @@ describe("mountDstuiOverlay", () => {
 				componentName: "missing",
 			}),
 		).rejects.toThrow(/missing/);
+	});
+
+	test("rejects instantiation errors before entering custom", async () => {
+		const harness = makeMount();
+		await expect(
+			mountDstuiOverlay(harness.mount, {
+				source: `(defcomponent t () (state (x (missing-fn))) (view (text "x")))`,
+			}),
+		).rejects.toThrow(/missing-fn/);
+		expect(harness.customCalls()).toBe(0);
+	});
+
+	test("aborts the overlay via AbortSignal", async () => {
+		const harness = makeMount();
+		const controller = new AbortController();
+		const promise = mountDstuiOverlay(harness.mount, {
+			source: `(defcomponent t () (view (text "waiting")) (bind :enter (emit 1)))`,
+			signal: controller.signal,
+		});
+		await Promise.resolve();
+		expect(stripAnsi(harness.rendered(20)[0] ?? "")).toBe("waiting");
+		controller.abort();
+		await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+		expect(harness.rendered(20)).toEqual([]);
 	});
 });

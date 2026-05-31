@@ -49,6 +49,8 @@ export interface OverlayOptions {
 	limits?: Partial<DstuiLimits>;
 	/** Forwarded to `ui.custom(factory, { overlay })`. */
 	overlay?: boolean;
+	/** Abort the overlay, dispose the instance, and reject with AbortError. */
+	signal?: AbortSignal;
 	/** Callback invoked on every DSL `(emit ...)` or `(cancel)`. */
 	onSettle?: (event: SettleEvent) => void;
 	/** Callback invoked on every DSL evaluation error. */
@@ -66,6 +68,12 @@ function pickComponent(module: ModuleDef, name: string | undefined): ComponentDe
 	return found;
 }
 
+function abortError(): Error {
+	const err = new Error("dstui overlay aborted");
+	err.name = "AbortError";
+	return err;
+}
+
 /**
  * Compile (if needed), instantiate, and mount a DSL module as an
  * overlay. Resolves to the {@link SettleEvent} the component emitted
@@ -77,24 +85,54 @@ export async function mountDstuiOverlay(mount: OverlayMount, options: OverlayOpt
 	if (!options.source && !options.module) {
 		throw new Error("mountDstuiOverlay requires either `source` or `module`");
 	}
+	if (options.signal?.aborted) throw abortError();
+
 	const module = options.module ?? compileModule(options.source as string, { limits: options.limits });
 	const def = pickComponent(module, options.componentName);
-	return mount.custom<SettleEvent>(
-		(_tui, _theme, _keybindings, done) => {
-			const instance = instantiate(def, options.config ?? {}, module.views, {
-				limits: options.limits,
-				onError: options.onError,
-				onSettled: event => {
-					try {
-						options.onSettle?.(event);
-					} finally {
-						instance.dispose();
-						done(event);
-					}
-				},
-			});
-			return new DstuiComponent(instance);
-		},
-		{ overlay: options.overlay ?? true },
-	);
+
+	let doneOverlay: ((event: SettleEvent) => void) | undefined;
+	let completed: SettleEvent | undefined;
+	const complete = (event: SettleEvent): void => {
+		if (completed) return;
+		completed = event;
+		try {
+			options.onSettle?.(event);
+		} finally {
+			instance.dispose();
+			doneOverlay?.(event);
+		}
+	};
+
+	// Instantiate before entering `custom(...)`. Some hosts do not reject the
+	// custom promise when the factory throws, so all compile/init failures must
+	// happen before the host creates the overlay wait promise.
+	const instance = instantiate(def, options.config ?? {}, module.views, {
+		limits: options.limits,
+		onError: options.onError,
+		onSettled: complete,
+	});
+
+	const abort = Promise.withResolvers<never>();
+	const abortListener = (): void => {
+		complete({ reason: "cancel", value: null });
+		abort.reject(abortError());
+	};
+	options.signal?.addEventListener("abort", abortListener, { once: true });
+
+	try {
+		const custom = mount.custom<SettleEvent>(
+			(_tui, _theme, _keybindings, done) => {
+				doneOverlay = done;
+				if (completed) done(completed);
+				return new DstuiComponent(instance);
+			},
+			{ overlay: options.overlay ?? true },
+		);
+		return await Promise.race([custom, abort.promise]);
+	} catch (err) {
+		instance.dispose();
+		throw err;
+	} finally {
+		options.signal?.removeEventListener("abort", abortListener);
+	}
 }

@@ -22,8 +22,10 @@ function makeContext(): {
 	context: AgentToolContext;
 	rendered(width: number): string[];
 	drive(input: string): void;
+	aborted(): boolean;
 } {
 	let active: Component | undefined;
+	let aborted = false;
 	const ui = {
 		custom: async <T>(
 			factory: (
@@ -39,9 +41,10 @@ function makeContext(): {
 		},
 	};
 	return {
-		context: { hasUI: true, ui, abort: () => {} } as unknown as AgentToolContext,
+		context: { hasUI: true, ui, abort: () => (aborted = true) } as unknown as AgentToolContext,
 		rendered: width => active?.render(width) ?? [],
 		drive: input => active?.handleInput?.(input),
+		aborted: () => aborted,
 	};
 }
 
@@ -52,15 +55,15 @@ describe("DstuiTool.createIf", () => {
 		expect(DstuiTool.createIf(session)).toBeNull();
 	});
 
-	it("returns null when dstui.enabled is false (default)", () => {
+	it("returns null when dstui.enabled is explicitly false", () => {
 		const session = makeSession();
-		expect(session.settings.get("dstui.enabled")).toBe(false);
+		session.settings.set("dstui.enabled", false);
 		expect(DstuiTool.createIf(session)).toBeNull();
 	});
 
-	it("returns a tool instance when enabled and UI is available", () => {
+	it("returns a tool instance by default when UI is available", () => {
 		const session = makeSession();
-		session.settings.set("dstui.enabled", true);
+		expect(session.settings.get("dstui.enabled")).toBe(true);
 		const tool = DstuiTool.createIf(session);
 		expect(tool).not.toBeNull();
 		expect(tool?.name).toBe("dstui");
@@ -121,6 +124,24 @@ describe("DstuiTool.execute", () => {
 		const result = await promise;
 		expect(result.details).toMatchObject({ source: "inline", settle: { reason: "emit", value: 2 } });
 		expect(result.content?.[0]).toMatchObject({ type: "text", text: "User confirmed: 2" });
+	});
+
+	it("aborts the overlay when the execution signal is cancelled", async () => {
+		const tool = makeTool();
+		const ctx = makeContext();
+		const controller = new AbortController();
+		const promise = tool.execute(
+			"id",
+			{ source: `(defcomponent t () (view (text "waiting")) (bind :enter (emit 1)))` },
+			controller.signal,
+			undefined,
+			ctx.context,
+		);
+		await Promise.resolve();
+		expect(ctx.rendered(20).length).toBe(1);
+		controller.abort();
+		await expect(promise).rejects.toBeInstanceOf(ToolAbortError);
+		expect(ctx.aborted()).toBe(true);
 	});
 
 	it("reports cancel on Esc and never persists state", async () => {

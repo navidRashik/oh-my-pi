@@ -74,7 +74,7 @@ export class DstuiTool implements AgentTool<typeof dstuiSchema, DstuiToolDetails
 	async execute(
 		_toolCallId: string,
 		params: DstuiToolInput,
-		_signal?: AbortSignal,
+		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<DstuiToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<DstuiToolDetails>> {
@@ -126,12 +126,22 @@ export class DstuiTool implements AgentTool<typeof dstuiSchema, DstuiToolDetails
 		}
 
 		const mount = context.ui as unknown as OverlayMount;
-		const settle = await mountDstuiOverlay(mount, {
-			source: module ? undefined : params.source,
-			module,
-			componentName: params.componentName,
-			config: params.config,
-		});
+		let settle: SettleEvent;
+		try {
+			settle = await mountDstuiOverlay(mount, {
+				source: module ? undefined : params.source,
+				module,
+				componentName: params.componentName,
+				config: params.config,
+				signal,
+			});
+		} catch (err) {
+			if (err instanceof Error && err.name === "AbortError") {
+				context.abort();
+				throw new ToolAbortError("dstui overlay was cancelled");
+			}
+			throw err;
+		}
 
 		if (params.store && params.saveState && settle.reason === "emit") {
 			try {

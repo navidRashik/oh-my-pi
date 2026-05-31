@@ -2084,15 +2084,15 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	// DSTUI tool (`pi-dstui` DSL overlay; disabled by default)
+	// DSTUI tool (`pi-dstui` DSL overlay; enabled by default in interactive sessions)
 	"dstui.enabled": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "tools",
 			label: "DSTUI Overlay",
 			description:
-				"Enable the `dstui` tool — mounts a safe pi-dstui DSL component as an interactive TUI overlay. Off by default.",
+				"Enable the `dstui` tool — mounts a safe pi-dstui DSL component as an interactive TUI overlay. Requires interactive mode.",
 		},
 	},
 

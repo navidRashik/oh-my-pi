@@ -451,12 +451,16 @@ export function buildLayout(expr: SExpr, env: Env, budget: Budget, views: ViewLo
 	return { type: "empty" };
 }
 
+function clampColumns(value: number, maxCols: number): number {
+	return Math.min(Math.max(0, value), maxCols);
+}
+
 /** Render a layout tree into a styled grid of `Cell`s sized to `width`. */
 export function renderNode(node: LayoutNode, env: Env, budget: Budget, views: ViewLookup, width: number): Grid {
 	budget.tick();
 	const limits = budget.limits;
 	const maxRows = limits.maxOutputRows;
-	const maxCols = Math.min(width, limits.maxOutputColumns);
+	const maxCols = Math.max(0, Math.min(width, limits.maxOutputColumns));
 
 	switch (node.type) {
 		case "empty":
@@ -487,23 +491,25 @@ export function renderNode(node: LayoutNode, env: Env, budget: Budget, views: Vi
 				return vstack(children, node.gap, maxRows);
 			}
 			const children = node.children;
-			const basis = children.map(child => (child.type === "item" ? child.basis : 0));
+			const basis = children.map(child => (child.type === "item" ? clampColumns(child.basis, maxCols) : 0));
 			let fixedWidth = Math.max(0, children.length - 1) * node.gap;
 			let totalGrow = 0;
 			const staticGrids: Array<Grid | null> = new Array(children.length);
 			for (let i = 0; i < children.length; i++) {
 				const child = children[i] as LayoutNode;
+				const childBasis = basis[i] ?? 0;
 				if (child.type === "item" && child.grow > 0) {
 					totalGrow += child.grow;
-					fixedWidth += basis[i] ?? 0;
+					fixedWidth += childBasis;
 					staticGrids[i] = null;
 				} else if (child.type === "item") {
+					const childWidth = childBasis || maxCols;
 					const inner = vstack(
-						child.children.map(part => renderNode(part, env, budget, views, child.basis || maxCols)),
+						child.children.map(part => renderNode(part, env, budget, views, childWidth)),
 						0,
 						maxRows,
 					);
-					const sized = child.basis > 0 ? padGrid(inner, child.basis) : inner;
+					const sized = childBasis > 0 ? padGrid(inner, childBasis) : inner;
 					staticGrids[i] = sized;
 					fixedWidth += gridWidth(sized);
 				} else {
@@ -523,7 +529,7 @@ export function renderNode(node: LayoutNode, env: Env, budget: Budget, views: Vi
 					const extra =
 						growSeen === totalGrow ? remaining - used : Math.floor((remaining * child.grow) / totalGrow);
 					used += extra;
-					const alloc = (child.basis ?? 0) + extra;
+					const alloc = clampColumns((basis[i] ?? 0) + extra, maxCols);
 					const inner = vstack(
 						child.children.map(part => renderNode(part, env, budget, views, alloc)),
 						0,
@@ -548,7 +554,7 @@ export function renderNode(node: LayoutNode, env: Env, budget: Budget, views: Vi
 			return vstack(rows, 0, maxRows);
 		}
 		case "item": {
-			const childWidth = node.basis || maxCols;
+			const childWidth = clampColumns(node.basis, maxCols) || maxCols;
 			return padGrid(
 				vstack(
 					node.children.map(child => renderNode(child, env, budget, views, childWidth)),

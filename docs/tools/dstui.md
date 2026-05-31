@@ -9,15 +9,11 @@
 - Runtime: [`@oh-my-pi/pi-dstui`](../../packages/dstui/README.md)
 - TUI adapter: [`@oh-my-pi/pi-dstui-tui`](../../packages/dstui-tui/README.md)
 - Persistence: [`@oh-my-pi/pi-dstui-store`](../../packages/dstui-store/README.md)
-- Setting: `dstui.enabled` (default `false`)
+- Setting: `dstui.enabled` (default `true`)
 
 ## Gating
 
-The tool is unloaded unless **both** preconditions are true:
-
-1. The current session is interactive (`hasUI` is true). Print mode, RPC mode, and headless agent harnesses never load it.
-2. `dstui.enabled = true` in `settings.json` (or via `omp config set dstui.enabled true`).
-
+The tool is unloaded when the current session is not interactive (`hasUI` is false). Print mode, RPC mode, and headless agent harnesses never load it. Interactive sessions load it by default; set `dstui.enabled = false` in `settings.json` (or via `omp config set dstui.enabled false`) to opt out.
 Both checks happen inside `DstuiTool.createIf(session)`, so a non-interactive run cannot accidentally hit the runtime even if the LLM emits a stray call.
 
 ## Inputs

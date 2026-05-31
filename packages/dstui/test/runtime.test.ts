@@ -130,6 +130,18 @@ describe("instantiate", () => {
 		expect(() => instantiate(module.components[0], {}, module.views, { limits: { maxTimers: 2 } })).toThrow();
 	});
 
+	test("timer registration clears already-created handles when a later timer throws", () => {
+		const clock = manualClock();
+		const module = compileModule(`
+			(defcomponent t ()
+				(view (text "x"))
+				(every 100 (emit "never"))
+				(every (missing-fn) (emit "never")))
+		`);
+		expect(() => instantiate(module.components[0], {}, module.views, { clock })).toThrow();
+		expect(clock.intervals).toEqual([100]);
+		expect(clock.cleared()).toBe(1);
+	});
 	test("config supports kebab/snake/camel aliases", () => {
 		const module = compileModule(`
 			(defcomponent t (selected-index)
@@ -226,6 +238,22 @@ describe("render", () => {
 		instance.dispose();
 	});
 
+	test("item basis is clamped before padding", () => {
+		const module = compileModule(`
+			(defcomponent t ()
+				(view
+					(flex-row
+						(item :basis 1000000 (text "x"))
+						(text "y"))))
+		`);
+		const instance = instantiate(module.components[0], {}, module.views, {
+			limits: { maxOutputColumns: 5 },
+		});
+		const line = stripAnsi(instance.render(5)[0] ?? "");
+		expect(Bun.stringWidth(line)).toBeLessThanOrEqual(5);
+		expect(line).toContain("x");
+		instance.dispose();
+	});
 	test("output rows are capped by maxOutputRows", () => {
 		const module = compileModule(`
 			(defcomponent t ()
