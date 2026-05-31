@@ -45,6 +45,8 @@ export interface MnemosyneOptions {
 }
 
 export interface RememberInput extends MemoryInput {
+	readonly memoryId?: string | null;
+	readonly memory_id?: string | null;
 	readonly extract?: boolean;
 	readonly extractEntities?: boolean;
 	readonly extract_entities?: boolean;
@@ -55,6 +57,8 @@ export interface RememberInput extends MemoryInput {
 }
 
 export interface RememberFacadeOptions {
+	readonly memoryId?: string | null;
+	readonly memory_id?: string | null;
 	readonly source?: string | null;
 	readonly importance?: number;
 	readonly metadata?: Metadata | null;
@@ -121,6 +125,8 @@ type ModuleRememberOptions = RememberFacadeOptions & { readonly bank?: string | 
 type ModuleRecallOptions = RecallFacadeOptions & { readonly bank?: string | null };
 type ModuleRecallEnhancedOptions = RecallFacadeOptions & RecallEnhancedOptions & { readonly bank?: string | null };
 type FacadeRememberOptions = {
+	memoryId: string | null | undefined;
+	memory_id: string | null | undefined;
 	source: string;
 	importance: number;
 	metadata: Metadata | null;
@@ -245,6 +251,8 @@ function toRememberOptions(input: string | RememberInput, options: RememberFacad
 	const memory = typeof input === "string" ? null : input;
 	const timestamp = normalizeDate(options.timestamp ?? memory?.timestamp);
 	const rememberOptions: FacadeRememberOptions = {
+		memoryId: options.memoryId ?? memory?.memoryId ?? undefined,
+		memory_id: options.memory_id ?? memory?.memory_id ?? undefined,
 		source: options.source ?? memory?.source ?? "conversation",
 		importance: options.importance ?? memory?.importance ?? 0.5,
 		metadata: options.metadata ?? memory?.metadata ?? null,

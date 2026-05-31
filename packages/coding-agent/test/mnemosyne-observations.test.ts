@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	buildObservationMetadata,
+	buildObservationId,
 	importanceFromRelevance,
 	OBSERVATION_METADATA_KIND,
 	OBSERVATION_METADATA_VERSION,
@@ -58,6 +59,21 @@ describe("buildObservationMetadata", () => {
 		expect(meta.worker_model).toBe("smol");
 		expect(meta.kind).toBe(OBSERVATION_METADATA_KIND);
 		expect(meta.version).toBe(OBSERVATION_METADATA_VERSION);
+	});
+
+	test("builds stable ids from content, timestamp, and source ids", () => {
+		const first = buildObservationId({
+			content: "User prefers boring changes",
+			timestamp: "2026-05-31 04:14",
+			sourceEntryIds: ["e1", "e2"],
+		});
+		const second = buildObservationId({
+			content: "User prefers boring changes",
+			timestamp: "2026-05-31 04:14",
+			sourceEntryIds: ["e1", "e2"],
+		});
+		expect(first).toBe(second);
+		expect(first).toStartWith("obs_");
 	});
 });
 

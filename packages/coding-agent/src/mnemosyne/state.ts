@@ -3,6 +3,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { Mnemosyne, type RecallResult } from "@oh-my-pi/pi-mnemosyne";
 import { BankManager } from "@oh-my-pi/pi-mnemosyne/core";
 import { logger } from "@oh-my-pi/pi-utils";
+import { resolveRoleSelection } from "../config/model-resolver";
 import {
 	composeRecallQuery,
 	formatCurrentTime,
@@ -12,6 +13,18 @@ import {
 import { extractMessages } from "../hindsight/transcript";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { MnemosyneBackendConfig, MnemosyneScoping } from "./config";
+import {
+	buildObservationChunks,
+	collectObservationSummaries,
+	currentObservationTime,
+	findObservationCheckpoint,
+	formatObservationSummaryLines,
+	OBSERVATION_CHECKPOINT_CUSTOM_TYPE,
+	type ObservationCheckpoint,
+} from "./observation-pipeline";
+import { runObservationWorker } from "./observation-worker";
+import { recordObservation } from "./observations";
+import { WorkerCooldownStore } from "./worker-cooldown";
 
 const kMnemosyneSessionState = Symbol("mnemosyne.sessionState");
 
@@ -330,6 +343,92 @@ export class MnemosyneSessionState {
 			memoryType: "episode",
 		});
 	}
+	async maybeObserveOnAgentEnd(): Promise<void> {
+		if (!this.config.observerEnabled || this.aliasOf) return;
+		const branch = this.session.sessionManager.getBranch();
+		const checkpoint = findObservationCheckpoint(branch);
+		const chunks = buildObservationChunks(branch, {
+			afterEntryId: checkpoint?.lastSourceEntryId,
+			maxChunkChars: this.config.observerMaxChunkChars,
+			maxChunks: this.config.observerMaxChunksPerRun,
+		});
+		if (chunks.length === 0) return;
+
+		const cooldowns = new WorkerCooldownStore(this.config.workerCooldownPath);
+		const resolved = resolveRoleSelection(["smol"], this.session.settings, this.session.modelRegistry.getAvailable(), this.session.modelRegistry);
+		const model = resolved?.model;
+		if (!model) {
+			if (this.config.debug) logger.debug("Mnemosyne observer skipped: no smol model resolved.");
+			return;
+		}
+		if (cooldowns.isCooled("observer", model.provider, model.id)) {
+			if (this.config.debug) {
+				logger.debug("Mnemosyne observer skipped: model is cooled down.", { provider: model.provider, model: model.id });
+			}
+			return;
+		}
+		const apiKey = await this.session.modelRegistry.getApiKey(model, this.session.sessionId);
+		if (!apiKey) {
+			if (this.config.debug) logger.debug("Mnemosyne observer skipped: no API key.", { provider: model.provider, model: model.id });
+			return;
+		}
+
+		let observedCount = 0;
+		let writtenCount = 0;
+		let lastSourceEntryId = checkpoint?.lastSourceEntryId;
+		const existing = formatObservationSummaryLines(
+			collectObservationSummaries(dedupeScopedTargets([this.scoped.retain, ...this.scoped.recall]), this.config.recallLimit),
+		);
+		try {
+			for (const chunk of chunks) {
+				const observations = await runObservationWorker({
+					model,
+					apiKey,
+					thinkingLevel: resolved?.thinkingLevel,
+					chunk,
+					existingObservations: existing,
+					currentTime: currentObservationTime(),
+					maxTokens: this.config.observerMaxOutputTokens,
+				});
+				observedCount += observations.length;
+				for (const observation of observations) {
+					const id = recordObservation(this, {
+						...observation,
+						extra: {
+							worker_kind: "observer",
+							worker_provider: model.provider,
+							worker_model: model.id,
+						},
+					});
+					if (id) {
+						writtenCount++;
+						existing.push(
+							`[${id}] ${observation.timestamp ?? currentObservationTime()} [${observation.relevance}] ${observation.content} (sources: ${observation.sourceEntryIds.join(", ")})`,
+						);
+					}
+				}
+				lastSourceEntryId = chunk.sourceEntryIds[chunk.sourceEntryIds.length - 1] ?? lastSourceEntryId;
+			}
+		} catch (error) {
+			cooldowns.record("observer", model.provider, model.id, error, { hours: this.config.workerCooldownHours });
+			logger.warn("Mnemosyne observer failed.", { provider: model.provider, model: model.id, error: String(error) });
+			return;
+		}
+		if (!lastSourceEntryId) return;
+		const data: ObservationCheckpoint = {
+			lastSourceEntryId,
+			observedCount,
+			writtenCount,
+			timestamp: currentObservationTime(),
+			workerModel: `${model.provider}/${model.id}`,
+		};
+		this.session.sessionManager.appendCustomEntry(OBSERVATION_CHECKPOINT_CUSTOM_TYPE, data);
+	}
+
+	async handleAgentEnd(messages: AgentMessage[]): Promise<void> {
+		await this.maybeRetainOnAgentEnd(messages);
+		await this.maybeObserveOnAgentEnd();
+	}
 
 	attachSessionListeners(): void {
 		this.unsubscribe?.();
@@ -337,7 +436,7 @@ export class MnemosyneSessionState {
 			if (event.type === "agent_start") {
 				void this.maybeRecallOnAgentStart();
 			} else if (event.type === "agent_end") {
-				void this.maybeRetainOnAgentEnd(event.messages);
+				void this.handleAgentEnd(event.messages);
 			}
 		});
 	}

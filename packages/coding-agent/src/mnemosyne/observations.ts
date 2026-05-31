@@ -19,6 +19,7 @@
  * migration is required.  See {@link OBSERVATION_METADATA_VERSION} for the
  * version pin that future migrations must check before mutating shape.
  */
+import type { JsonValue, Metadata } from "@oh-my-pi/pi-mnemosyne";
 import type { MnemosyneSessionState } from "./state";
 
 /**
@@ -67,18 +68,18 @@ export interface ObservationInput {
 	 * batch numbers). Merged shallowly with the framework-managed fields, but
 	 * may NOT overwrite the reserved `kind`/`version` keys.
 	 */
-	extra?: Record<string, unknown>;
+	extra?: Metadata;
 }
 
 /** Persisted shape stored under Mnemosyne `metadata`. */
-export interface ObservationMetadata {
+export type ObservationMetadata = Metadata & {
 	kind: typeof OBSERVATION_METADATA_KIND;
 	version: typeof OBSERVATION_METADATA_VERSION;
 	relevance: ObservationRelevance;
-	source_entry_ids: readonly string[];
+	source_entry_ids: string[];
 	captured_at: string;
-	[key: string]: unknown;
-}
+	[key: string]: JsonValue;
+};
 
 /**
  * Build the Mnemosyne metadata payload for an observation. Pure / deterministic;
@@ -102,6 +103,12 @@ export function buildObservationMetadata(observation: ObservationInput): Observa
 	};
 }
 
+/** Build the deterministic Mnemosyne id for an observation. */
+export function buildObservationId(observation: Pick<ObservationInput, "content" | "timestamp" | "sourceEntryIds">): string {
+	const sourceIds = dedupeSourceEntryIds(observation.sourceEntryIds);
+	const timestamp = observation.timestamp?.trim() ?? "";
+	return `obs_${Bun.hash(`${observation.content}\u0000${timestamp}\u0000${sourceIds.join("\u0000")}`).toString(36)}`;
+}
 /**
  * Map an {@link ObservationRelevance} to the importance score Mnemosyne uses
  * for ranking and dropper decisions.
@@ -145,17 +152,18 @@ export function recordObservation(state: MnemosyneSessionState, observation: Obs
 	return state.rememberInScope(
 		{ content: observation.content },
 		{
+			memoryId: buildObservationId({ ...observation, timestamp: metadata.captured_at }),
 			source: "blackhole-observation",
 			memoryType: "observation",
 			veracity: "inferred",
 			importance: importanceFromRelevance(observation.relevance),
 			timestamp: metadata.captured_at,
-			metadata: metadata as unknown as Record<string, never>,
+			metadata,
 		},
 	);
 }
 
-function dedupeSourceEntryIds(ids: readonly string[]): readonly string[] {
+function dedupeSourceEntryIds(ids: readonly string[]): string[] {
 	const seen = new Set<string>();
 	const out: string[] = [];
 	for (const id of ids) {

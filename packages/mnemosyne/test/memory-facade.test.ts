@@ -95,6 +95,21 @@ describe("Mnemosyne facade", () => {
 		}
 	});
 
+	it("passes caller-provided memory ids through the facade", () => {
+		const dbPath = join(tempRoot(), "mnemosyne.db");
+		const memory = new Mnemosyne({ dbPath, sessionId: "session-a" });
+		try {
+			const id = memory.remember("Source-addressed observation", { memoryId: "obs_test_id" });
+			expect(id).toBe("obs_test_id");
+			expect(memory.get("obs_test_id")).toMatchObject({
+				id: "obs_test_id",
+				content: "Source-addressed observation",
+			});
+		} finally {
+			memory.close();
+		}
+	});
+
 	it("accepts an already-open Database handle for memory, annotations, and episodic graph writes", () => {
 		const previousProactiveLinking = process.env.MNEMOSYNE_PROACTIVE_LINKING;
 		process.env.MNEMOSYNE_PROACTIVE_LINKING = "1";

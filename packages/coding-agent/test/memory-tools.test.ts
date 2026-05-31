@@ -126,6 +126,12 @@ function makeMnemosyneConfig(
 		recallMaxQueryChars: 800,
 		injectionTokenLimit: 1024,
 		debug: false,
+		observerEnabled: false,
+		observerMaxChunkChars: 12_000,
+		observerMaxChunksPerRun: 2,
+		observerMaxOutputTokens: 1_500,
+		workerCooldownPath: path.join(path.dirname(tempDbPath), "worker-cooldowns.json"),
+		workerCooldownHours: 1,
 		providerOptions: {
 			noEmbeddings: true,
 			embeddingModel: undefined,

@@ -29,21 +29,27 @@ export interface MnemosyneBackendConfig {
 	recallMaxQueryChars: number;
 	injectionTokenLimit: number;
 	debug: boolean;
+	observerEnabled: boolean;
+	observerMaxChunkChars: number;
+	observerMaxChunksPerRun: number;
+	observerMaxOutputTokens: number;
+	workerCooldownPath: string;
+	workerCooldownHours: number;
 	providerOptions: MnemosyneProviderOptions;
 	llmMode: MnemosyneLlmMode;
 	llmBaseUrl?: string;
 	llmApiKey?: string;
 	llmModel?: string;
 }
-
 export function loadMnemosyneConfig(settings: Settings, agentDir: string): MnemosyneBackendConfig {
 	const configuredDbPath = settings.get("mnemosyne.dbPath");
 	const cwd = settings.getCwd();
 	const scoping = settings.get("mnemosyne.scoping");
 	const scope = resolveBankScope(settings.get("mnemosyne.bank"), cwd, scoping);
 	const llmMode = settings.get("mnemosyne.llmMode");
+	const memoriesDir = getMemoriesDir(agentDir);
 	return {
-		dbPath: configuredDbPath ?? path.join(getMemoriesDir(agentDir), "mnemosyne", "mnemosyne.db"),
+		dbPath: configuredDbPath ?? path.join(memoriesDir, "mnemosyne", "mnemosyne.db"),
 		baseBank: scope.baseBank,
 		bank: scope.bank,
 		globalBank: scope.globalBank,
@@ -58,6 +64,13 @@ export function loadMnemosyneConfig(settings: Settings, agentDir: string): Mnemo
 		recallMaxQueryChars: Math.max(256, Math.floor(settings.get("mnemosyne.recallMaxQueryChars"))),
 		injectionTokenLimit: Math.max(256, Math.floor(settings.get("mnemosyne.injectionTokenLimit"))),
 		debug: settings.get("mnemosyne.debug"),
+		observerEnabled: settings.get("mnemosyne.observerEnabled"),
+		observerMaxChunkChars: Math.max(1_000, Math.floor(settings.get("mnemosyne.observerMaxChunkChars"))),
+		observerMaxChunksPerRun: Math.max(1, Math.floor(settings.get("mnemosyne.observerMaxChunksPerRun"))),
+		observerMaxOutputTokens: Math.max(128, Math.floor(settings.get("mnemosyne.observerMaxOutputTokens"))),
+		workerCooldownPath:
+			settings.get("mnemosyne.workerCooldownPath") ?? path.join(memoriesDir, "mnemosyne", "worker-cooldowns.json"),
+		workerCooldownHours: Math.max(0.25, settings.get("mnemosyne.workerCooldownHours")),
 		providerOptions: {
 			noEmbeddings: settings.get("mnemosyne.noEmbeddings"),
 			embeddingModel: settings.get("mnemosyne.embeddingModel"),

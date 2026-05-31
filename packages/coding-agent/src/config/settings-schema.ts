@@ -1518,6 +1518,30 @@ export const SETTINGS_SCHEMA = {
 	"mnemosyne.recallMaxQueryChars": { type: "number", default: 4000 },
 	"mnemosyne.injectionTokenLimit": { type: "number", default: 5000 },
 	"mnemosyne.debug": { type: "boolean", default: false },
+	"mnemosyne.observerEnabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "memory",
+			label: "Mnemosyne Observer",
+			description: "Run the source-addressed observation worker after completed agent turns",
+			condition: "mnemosyneActive",
+		},
+	},
+	"mnemosyne.observerMaxChunkChars": { type: "number", default: 12000 },
+	"mnemosyne.observerMaxChunksPerRun": { type: "number", default: 2 },
+	"mnemosyne.observerMaxOutputTokens": { type: "number", default: 1500 },
+	"mnemosyne.workerCooldownPath": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "memory",
+			label: "Mnemosyne Worker Cooldowns",
+			description: "Optional path for persistent observer worker cooldown state",
+			condition: "mnemosyneActive",
+		},
+	},
+	"mnemosyne.workerCooldownHours": { type: "number", default: 1 },
 
 	// Hindsight (https://hindsight.vectorize.io)
 	"hindsight.apiUrl": {

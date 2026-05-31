@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added `memoryId` / `memory_id` support to `Mnemosyne.remember()` facade inputs so callers can make source-derived memory writes idempotent ([#1565](https://github.com/can1357/oh-my-pi/issues/1565)).
+
 ### Changed
 
 - Changed embedding result normalization to return `Float32Array` vectors so `embed` and `embedQuery` now cache and emit float32 rows

@@ -10,6 +10,8 @@
 - Added `WorkerCooldownStore` for per-(worker, provider, model) persistent cooldown state with structured error classification that explicitly excludes auth, schema, and abort errors. Derived from the MIT-licensed pi-blackhole cooldown design ([#1565](https://github.com/can1357/oh-my-pi/issues/1565)).
 - Added an `id:<…>` form to the `recall` tool so the model can re-fetch a memory it saw in prior recall output without rerunning BM25/vector search ([#1565](https://github.com/can1357/oh-my-pi/issues/1565)).
 - Added source-addressed observation helpers (`buildObservationMetadata`, `recordObservation`, `readObservationMetadata`) that store observation evidence in Mnemosyne's existing metadata column with a versioned schema. Derived from the MIT-licensed pi-observational-memory observation model ([#1565](https://github.com/can1357/oh-my-pi/issues/1565)).
+- Added an opt-in Mnemosyne observation worker (`mnemosyne.observerEnabled`) that chunks new session entries after `agent_end`, invokes the smol model with source-entry ids, writes validated observations with deterministic ids, and persists worker checkpoints/cooldowns. Derived from the MIT-licensed pi-observational-memory observer prompt model ([#1565](https://github.com/can1357/oh-my-pi/issues/1565)).
+- Added `/memory diagnose` observation counts and worker cooldown reporting for the Mnemosyne backend ([#1565](https://github.com/can1357/oh-my-pi/issues/1565)).
 
 ### Changed
 

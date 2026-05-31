@@ -2,6 +2,7 @@ import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import * as z from "zod/v4";
 import { formatCurrentTime, formatMemories } from "../hindsight/content";
+import { readObservationMetadata } from "../mnemosyne/observations";
 import recallDescription from "../prompts/tools/recall.md" with { type: "text" };
 import type { ToolSession } from ".";
 
@@ -145,6 +146,11 @@ function formatMemoryRow(row: Record<string, unknown>): string {
 	if (timestamp) metaFields.push(`timestamp: ${timestamp}`);
 	if (importance) metaFields.push(`importance: ${importance}`);
 	if (veracity) metaFields.push(`veracity: ${veracity}`);
+	const observation = readObservationMetadata(row);
+	if (observation) {
+		metaFields.push(`source_entry_ids: ${observation.source_entry_ids.join(", ")}`);
+		metaFields.push(`relevance: ${observation.relevance}`);
+	}
 	return metaFields.length > 0 ? `${content}\n(${metaFields.join(", ")})` : content;
 }
 

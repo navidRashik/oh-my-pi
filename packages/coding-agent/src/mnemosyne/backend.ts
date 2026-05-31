@@ -20,6 +20,7 @@ import {
 	type MnemosyneProviderOptions,
 	truncateApproxTokens,
 } from "./config";
+import { collectObservationDiagnostics, type ObservationDiagnostics } from "./observation-pipeline";
 import {
 	getMnemosyneScopedBanks,
 	getMnemosyneScopedDbPaths,
@@ -27,6 +28,7 @@ import {
 	MnemosyneSessionState,
 	setMnemosyneSessionState,
 } from "./state";
+import { WorkerCooldownStore, type CooldownEntry } from "./worker-cooldown";
 
 const STATIC_INSTRUCTIONS = [
 	"# Memory",
@@ -97,6 +99,7 @@ export const mnemosyneBackend: MemoryBackend = {
 		const config = previous?.config ?? (session ? loadMnemosyneConfig(session.settings, agentDir) : undefined);
 		if (!config) return;
 		await removeDbFiles(getMnemosyneScopedDbPaths(config));
+		new WorkerCooldownStore(config.workerCooldownPath).clear();
 	},
 
 	async enqueue(agentDir, _cwd, session): Promise<void> {
@@ -142,7 +145,15 @@ export const mnemosyneBackend: MemoryBackend = {
 			bank: banks[index] ?? "unknown",
 			summary: inspectDatabase({ dbPath, initialize: false }),
 		}));
-		return renderMnemosyneDiagnostics(summaries);
+		const { targets, owned } = createStatsTargets(agentDir, session);
+		try {
+			return renderMnemosyneDiagnostics(summaries, {
+				observations: collectObservationDiagnostics(targets),
+				cooldowns: new WorkerCooldownStore(config.workerCooldownPath).snapshot(),
+			});
+		} finally {
+			for (const memory of owned) memory.close();
+		}
 	},
 
 	async preCompactionContext(messages, _settings, session): Promise<string | undefined> {
@@ -224,7 +235,13 @@ function renderMnemosyneStats(targets: readonly MnemosyneStatsTarget[]): string 
 	return lines.join("\n");
 }
 
-function renderMnemosyneDiagnostics(entries: readonly { bank: string; summary: DiagnosticSummary }[]): string {
+function renderMnemosyneDiagnostics(
+	entries: readonly { bank: string; summary: DiagnosticSummary }[],
+	extra: {
+		observations?: readonly ObservationDiagnostics[];
+		cooldowns?: readonly CooldownEntry[];
+	} = {},
+): string {
 	const lines = [
 		"# Mnemosyne Memory Diagnostics",
 		"",
@@ -242,6 +259,26 @@ function renderMnemosyneDiagnostics(entries: readonly { bank: string; summary: D
 	);
 	lines.push("", "## Key Findings");
 	lines.push(...(findings.length > 0 ? findings : ["- none"]));
+	if (extra.observations) {
+		lines.push("", "## Observations", "", "| Bank | Total | Low | Medium | High | Critical |", "|---|---:|---:|---:|---:|---:|");
+		for (const row of extra.observations) {
+			lines.push(
+				`| ${escapeMarkdownTableCell(row.bank)} | ${row.total} | ${row.low} | ${row.medium} | ${row.high} | ${row.critical} |`,
+			);
+		}
+	}
+	lines.push("", "## Worker Cooldowns");
+	const cooldowns = extra.cooldowns ?? [];
+	if (cooldowns.length === 0) {
+		lines.push("- none");
+	} else {
+		lines.push("", "| Worker | Provider | Model | Bucket | Until | Reason |", "|---|---|---|---|---|---|");
+		for (const entry of cooldowns) {
+			lines.push(
+				`| ${escapeMarkdownTableCell(entry.workerKind)} | ${escapeMarkdownTableCell(entry.provider)} | ${escapeMarkdownTableCell(entry.modelId)} | ${entry.bucket} | ${new Date(entry.untilMs).toISOString()} | ${escapeMarkdownTableCell(entry.reason)} |`,
+			);
+		}
+	}
 	return lines.join("\n");
 }
 
