@@ -584,8 +584,13 @@ function normalizeStringifiedContainersForSchema(
 		for (const propertySchema of propertySchemas) {
 			const normalized = normalizeStringifiedContainersForSchema(propertySchema, current);
 			if (!normalized.changed) continue;
-			if (!next) next = { ...value };
-			next[key] = normalized.value;
+			// Speculatively apply the rewrite and verify it does not break the
+			// surrounding schema. With anyOf/oneOf variants this prevents pulling
+			// `{kind:"text", value:"[...]"}` into the array branch's shape just
+			// because some sibling branch declares `value` as an array.
+			const candidate = { ...(next ?? value), [key]: normalized.value };
+			if (!isJsonSchemaValueValid(schema, candidate)) continue;
+			next = candidate;
 			changed = true;
 			break;
 		}

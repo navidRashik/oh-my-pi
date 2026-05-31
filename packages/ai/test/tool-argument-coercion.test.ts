@@ -122,6 +122,26 @@ describe("Tool argument coercion", () => {
 		expect(result.label).toBe('["literal"]');
 	});
 
+	it("does not pull a JSON-looking string into a sibling union branch's array shape", () => {
+		const tool: Tool = {
+			name: "tagged-union",
+			description: "",
+			parameters: z.union([
+				z.object({ kind: z.literal("text"), value: z.string() }),
+				z.object({ kind: z.literal("array"), value: z.array(z.string()) }),
+			]),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-tagged-union",
+			name: "tagged-union",
+			arguments: { kind: "text", value: '["literal"]' },
+		}) as { kind: string; value: string };
+
+		expect(result).toEqual({ kind: "text", value: '["literal"]' });
+	});
+
 	it("preserves unknown root fields after Zod validation so tools can reject disabled arguments", () => {
 		const tool: Tool = {
 			name: "t4b",
