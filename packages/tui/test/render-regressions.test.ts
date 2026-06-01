@@ -1792,7 +1792,7 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
-		it("defers large native Windows Terminal shrink when the probe is suppressed", async () => {
+		it("repaints large native Windows Terminal shrink when deferred padding would be blank", async () => {
 			const originalPlatform = process.platform;
 			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
 			try {
@@ -1807,17 +1807,28 @@ describe("TUI terminal-state regressions", () => {
 						try {
 							tui.start();
 							await settle(term);
-							term.scrollLines(-5);
 							const before = term.getBufferPosition();
-							expect(before.viewportY).toBeLessThan(before.baseY);
+							expect(before.viewportY).toBe(before.baseY);
 
 							const writes = captureWrites(term);
 							component.setLines([...rows("short-", 19), "prompt-row"]);
 							tui.requestRender();
 							await settle(term);
-
 							expect(writes.join("")).not.toContain(ERASE_SCROLLBACK);
-							expect(term.getBufferPosition().viewportY).toBe(before.viewportY);
+							expect(visible(term).map(line => line.trim())).toEqual([
+								"short-10",
+								"short-11",
+								"short-12",
+								"short-13",
+								"short-14",
+								"short-15",
+								"short-16",
+								"short-17",
+								"short-18",
+								"prompt-row",
+							]);
+							const after = term.getBufferPosition();
+							expect(after.viewportY).toBe(after.baseY);
 						} finally {
 							tui.stop();
 						}

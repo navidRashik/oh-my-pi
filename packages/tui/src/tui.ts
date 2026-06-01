@@ -1321,7 +1321,12 @@ export class TUI extends Container {
 			!isMultiplexerSession()
 		) {
 			const nativeViewportAtBottom = this.#readNativeViewportAtBottom();
-			if (this.#nativeViewportIsUnsafeForShrink(nativeViewportAtBottom, allowUnknownViewportMutation)) {
+			const paddedViewportTop = Math.max(0, this.#previousLines.length - height);
+			const deferredShrinkHasVisibleRows = newLines.length > paddedViewportTop;
+			if (
+				deferredShrinkHasVisibleRows &&
+				this.#nativeViewportIsUnsafeForShrink(nativeViewportAtBottom, allowUnknownViewportMutation)
+			) {
 				this.#markNativeScrollbackDirty();
 				return { kind: "deferredShrink", paddedLength: this.#previousLines.length };
 			}
@@ -1363,11 +1368,22 @@ export class TUI extends Container {
 			// `scrollbackHighWater` is far below `previousLines.length - height`, because
 			// prior unknown-POSIX viewport repaints commit longer logical frames without
 			// moving the native scrollback boundary. For a shrink that large a blank,
-			// uninteractable viewport is the greater evil, so yank with `historyRebuild`.
-			// Unknown win32 shrink probes defer above and never reach this; the yank only
-			// lands on non-win32 hosts whose probe is genuinely unavailable.
-			const paddedViewportTop = Math.max(0, this.#previousLines.length - height);
+			// uninteractable viewport is the greater evil. On POSIX, yank with
+			// `historyRebuild`; on native Windows, where an unreportable viewport was
+			// historically treated as unsafe, repaint the visible tail without clearing
+			// scrollback so a bottom-anchored reader does not lose the prompt.
+			// Unknown win32 shrink probes that can carry real content defer above and
+			// never reach this; the POSIX yank only lands on non-win32 hosts whose probe
+			// is genuinely unavailable.
 			if (newLines.length <= paddedViewportTop) {
+				if (nativeViewportAtBottom === false) {
+					this.#markNativeScrollbackDirty();
+					return { kind: "deferredMutation" };
+				}
+				if (nativeViewportAtBottom === undefined && process.platform === "win32") {
+					this.#markNativeScrollbackDirty();
+					return { kind: "viewportRepaint" };
+				}
 				return { kind: "historyRebuild" };
 			}
 			this.#markNativeScrollbackDirty();
