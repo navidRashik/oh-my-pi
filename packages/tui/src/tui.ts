@@ -1180,8 +1180,8 @@ export class TUI extends Container {
 		const prevHardwareCursorRow = this.#hardwareCursorRow;
 		const widthChanged = this.#previousWidth > 0 && this.#previousWidth !== width;
 		const heightChanged = this.#previousHeight > 0 && this.#previousHeight !== height;
-		const allowUnknownViewportMutation =
-			this.#allowUnknownViewportMutationOnNextRender || this.#eagerNativeScrollbackRebuild;
+		const allowUnknownViewportMutation = this.#allowUnknownViewportMutationOnNextRender;
+		const eagerNativeScrollbackRebuild = this.#eagerNativeScrollbackRebuild;
 		this.#allowUnknownViewportMutationOnNextRender = false;
 
 		// 3. Classify intent.
@@ -1192,6 +1192,7 @@ export class TUI extends Container {
 			prevViewportTop,
 			height,
 			allowUnknownViewportMutation,
+			eagerNativeScrollbackRebuild,
 		);
 		this.#logRedraw(intent, lines.length, height);
 		// 4. Execute.
@@ -1279,6 +1280,7 @@ export class TUI extends Container {
 		prevViewportTop: number,
 		height: number,
 		allowUnknownViewportMutation: boolean,
+		eagerNativeScrollbackRebuild: boolean,
 	): RenderIntent {
 		// Initial paint after start(): scrollback must keep its prior shell
 		// content, but the viewport must be cleared so stale rows do not bleed
@@ -1293,7 +1295,11 @@ export class TUI extends Container {
 			const nativeViewportAtBottom = this.#readNativeViewportAtBottom();
 			if (
 				this.#nativeScrollbackDirty &&
-				this.#canRebuildNativeScrollbackLive(nativeViewportAtBottom, allowUnknownViewportMutation)
+				this.#canRebuildNativeScrollbackLive(
+					nativeViewportAtBottom,
+					allowUnknownViewportMutation,
+					eagerNativeScrollbackRebuild,
+				)
 			) {
 				return { kind: "overlayRebuild" };
 			}
@@ -1331,7 +1337,11 @@ export class TUI extends Container {
 			// known-scrolled case already deferred above.
 			if (
 				widthChanged ||
-				this.#canRebuildNativeScrollbackLive(nativeViewportAtBottom, allowUnknownViewportMutation)
+				this.#canRebuildNativeScrollbackLive(
+					nativeViewportAtBottom,
+					allowUnknownViewportMutation,
+					eagerNativeScrollbackRebuild,
+				)
 			) {
 				return { kind: "historyRebuild" };
 			}
@@ -1397,7 +1407,13 @@ export class TUI extends Container {
 				return { kind: "viewportRepaint" };
 			}
 			const nativeViewportAtBottom = this.#readNativeViewportAtBottom();
-			if (this.#canRebuildNativeScrollbackLive(nativeViewportAtBottom, allowUnknownViewportMutation)) {
+			if (
+				this.#canRebuildNativeScrollbackLive(
+					nativeViewportAtBottom,
+					allowUnknownViewportMutation,
+					eagerNativeScrollbackRebuild,
+				)
+			) {
 				return { kind: "historyRebuild" };
 			}
 			this.#markNativeScrollbackDirty();
@@ -1460,7 +1476,7 @@ export class TUI extends Container {
 			if (
 				contentGrew &&
 				diff.firstChanged < prevViewportTop &&
-				this.#canRebuildNativeScrollbackLive(nativeViewportAtBottom, false)
+				this.#canRebuildNativeScrollbackLive(nativeViewportAtBottom, false, false)
 			) {
 				const appendedTailStart = diff.appendedLines ? this.#findAppendedTailStart(newLines) : newLines.length;
 				const tailAppendCount = newLines.length - appendedTailStart;
@@ -1472,7 +1488,11 @@ export class TUI extends Container {
 			if (
 				newLines.length !== this.#previousLines.length &&
 				this.#scrollbackHighWater > 0 &&
-				this.#canRebuildNativeScrollbackLive(nativeViewportAtBottom, allowUnknownViewportMutation)
+				this.#canRebuildNativeScrollbackLive(
+					nativeViewportAtBottom,
+					allowUnknownViewportMutation,
+					eagerNativeScrollbackRebuild,
+				)
 			) {
 				return { kind: "historyRebuild" };
 			}
@@ -1518,7 +1538,11 @@ export class TUI extends Container {
 				diff.appendedLines && this.#findAppendedTailStart(newLines) === this.#previousLines.length;
 			if (
 				!isMultiplexerSession() &&
-				this.#canRebuildNativeScrollbackLive(nativeViewportAtBottom, allowUnknownViewportMutation)
+				this.#canRebuildNativeScrollbackLive(
+					nativeViewportAtBottom,
+					allowUnknownViewportMutation,
+					eagerNativeScrollbackRebuild,
+				)
 			) {
 				return { kind: "historyRebuild" };
 			}
@@ -1642,35 +1666,36 @@ export class TUI extends Container {
 	 * viewport to the tail) is safe to emit *during ordinary rendering*. POSIX
 	 * terminals cannot report whether the user has scrolled up
 	 * (`isNativeViewportAtBottom()` is `undefined`), so an unknown position is
-	 * treated as unsafe: defer to a non-destructive viewport repaint, mark
-	 * scrollback dirty, and reconcile history at the next explicit checkpoint
-	 * ({@link refreshNativeScrollbackIfDirty} on prompt submit) where the
-	 * editor keystroke has already pinned the terminal to the bottom. Without
-	 * this, every offscreen transcript edit while streaming wiped scrollback
-	 * and yanked a scrolled-up reader back down. `allowUnknownViewportMutation`
-	 * (autocomplete/IME, plus the eager-streaming rebuild flag) opts unknown
-	 * POSIX frames back into the rebuild — the trade-off is a clean,
-	 * duplicate-free history above the fold while a tool/assistant block
-	 * actively re-lays out.
+	 * treated as unsafe unless the frame is explicitly opted in. Without this,
+	 * every offscreen transcript edit while streaming wiped scrollback and
+	 * yanked a scrolled-up reader back down.
+	 *
+	 * A direct `allowUnknownViewportMutation` render (autocomplete/IME/tool-output
+	 * expansion) opts into the rebuild on every platform because the user just
+	 * acted at the prompt and expects the live UI mutation to reach native
+	 * history. The separate eager-streaming rebuild flag opts unknown POSIX
+	 * frames into the rebuild, trading the anti-yank guarantee for clean,
+	 * duplicate-free history above the fold while a tool/assistant block actively
+	 * re-lays out.
 	 *
 	 * Windows Terminal hosts ConPTY whose `GetConsoleScreenBufferInfo` reports
 	 * the pseudo-console (always at tail) rather than the user-visible host
 	 * scrollback, so the WT probe also returns `undefined` (see
-	 * {@link shouldTrustNativeViewportProbe} and #1635). On win32 the
-	 * `allowUnknownViewportMutation` override is therefore unsafe: keep the
-	 * deferral, mirroring the same `process.platform === "win32"` asymmetry as
-	 * {@link #nativeViewportIsScrolled}. Fixes #1651 (assistant-text streaming
-	 * was yanking WT scrollback through the pure-append branch in
-	 * {@link #planRender}). Resize and checkpoint replays keep using
+	 * {@link shouldTrustNativeViewportProbe} and #1635). On win32 only the
+	 * eager-streaming override is unsafe: keep the deferral for passive stream
+	 * frames, but continue honoring explicit user-driven opt-ins. Fixes #1651.
+	 * Resize and checkpoint replays keep using
 	 * {@link #canReplayNativeScrollbackAtCheckpoint}'s POSIX optimism.
 	 */
 	#canRebuildNativeScrollbackLive(
 		nativeViewportAtBottom: boolean | undefined,
 		allowUnknownViewportMutation: boolean,
+		eagerNativeScrollbackRebuild: boolean,
 	): boolean {
 		return (
 			nativeViewportAtBottom === true ||
-			(nativeViewportAtBottom === undefined && allowUnknownViewportMutation && process.platform !== "win32")
+			(nativeViewportAtBottom === undefined &&
+				(allowUnknownViewportMutation || (eagerNativeScrollbackRebuild && process.platform !== "win32")))
 		);
 	}
 

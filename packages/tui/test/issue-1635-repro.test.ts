@@ -158,15 +158,14 @@ describe("issue #1635: TUI must not emit \\x1b[3J when probe is unreliable", () 
 //
 // Follow-up to #1635: even with the WT probe correctly returning `undefined`,
 // the pure-append branch in `#planRender` still emitted `historyRebuild` while
-// the assistant message was streaming. The cause is `event-controller.ts`
-// flipping `setEagerNativeScrollbackRebuild(true)` for `#assistantMessageStreaming`,
-// which the TUI ORs into `allowUnknownViewportMutation`. Before the fix,
-// `#canRebuildNativeScrollbackLive(undefined, true)` returned `true` on every
-// platform, so the offscreen edit fell through to `\x1b[3J` on WT.
+// the assistant message was streaming. The cause was treating the passive
+// eager-streaming flag as equivalent to direct user-driven
+// `allowUnknownViewportMutation` renders. Before the fix,
+// `#canRebuildNativeScrollbackLive(undefined, false, true)` returned `true` on
+// every platform, so the offscreen edit fell through to `\x1b[3J` on WT.
 //
-// Fix: mirror the `process.platform === "win32"` asymmetry that
-// `#nativeViewportIsScrolled` already carries — on win32 with an unreportable
-// probe, defer the rebuild even when the eager flag is set.
+// Fix: keep explicit user-driven opt-ins effective on win32, but defer passive
+// eager-streaming rebuilds when the WT probe is unreportable.
 describe("issue #1651: eager-streaming rebuild must defer on Windows Terminal", () => {
 	const originalPlatform = process.platform;
 
@@ -227,6 +226,30 @@ describe("issue #1651: eager-streaming rebuild must defer on Windows Terminal", 
 			// reaches scrollback (the `\x1b[3J` clear + rewrite is acceptable
 			// because we cannot observe the user being scrolled up anyway, and the
 			// alternative is stale duplicated tail rows above the fold).
+			expect(writes.join("").match(ERASE_SCROLLBACK)).not.toBeNull();
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("still honors explicit user-driven rebuild opt-ins on WT", async () => {
+		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		const term = new VirtualTerminal(60, 8);
+		overrideProbe(term, undefined);
+		const tui = new TUI(term);
+		const transcript = new LineList(Array.from({ length: 40 }, (_, i) => `line-${i}`));
+		tui.addChild(transcript);
+		try {
+			tui.start();
+			await settle(term);
+			const writes = capture(term);
+			transcript.setLines([
+				...Array.from({ length: 20 }, (_, i) => `line-${i}`),
+				"USER-EXPANDED-OFFSCREEN-ROW",
+				...Array.from({ length: 19 }, (_, i) => `line-${20 + i}`),
+			]);
+			tui.requestRender(false, { allowUnknownViewportMutation: true });
+			await settle(term);
 			expect(writes.join("").match(ERASE_SCROLLBACK)).not.toBeNull();
 		} finally {
 			tui.stop();
