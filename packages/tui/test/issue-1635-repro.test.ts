@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { type Component, TUI } from "@oh-my-pi/pi-tui";
 import { shouldTrustNativeViewportProbe } from "@oh-my-pi/pi-tui/terminal";
 import { VirtualTerminal } from "./virtual-terminal";
@@ -148,6 +148,86 @@ describe("issue #1635: TUI must not emit \\x1b[3J when probe is unreliable", () 
 			term.resize(99, 24);
 			await settle(term);
 			expect(writes.join("").match(ERASE_SCROLLBACK)).toBeNull();
+		} finally {
+			tui.stop();
+		}
+	});
+});
+
+// Regression test for https://github.com/can1357/oh-my-pi/issues/1651
+//
+// Follow-up to #1635: even with the WT probe correctly returning `undefined`,
+// the pure-append branch in `#planRender` still emitted `historyRebuild` while
+// the assistant message was streaming. The cause is `event-controller.ts`
+// flipping `setEagerNativeScrollbackRebuild(true)` for `#assistantMessageStreaming`,
+// which the TUI ORs into `allowUnknownViewportMutation`. Before the fix,
+// `#canRebuildNativeScrollbackLive(undefined, true)` returned `true` on every
+// platform, so the offscreen edit fell through to `\x1b[3J` on WT.
+//
+// Fix: mirror the `process.platform === "win32"` asymmetry that
+// `#nativeViewportIsScrolled` already carries — on win32 with an unreportable
+// probe, defer the rebuild even when the eager flag is set.
+describe("issue #1651: eager-streaming rebuild must defer on Windows Terminal", () => {
+	const originalPlatform = process.platform;
+
+	afterEach(() => {
+		Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+	});
+
+	it("does not emit \\x1b[3J while assistant text streams on WT (unknown viewport + eager)", async () => {
+		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		const term = new VirtualTerminal(60, 8);
+		overrideProbe(term, undefined);
+		const tui = new TUI(term);
+		const transcript = new LineList(Array.from({ length: 40 }, (_, i) => `line-${i}`));
+		tui.addChild(transcript);
+		try {
+			tui.start();
+			await settle(term);
+			// Streaming kicks in: event-controller flips eager rebuild on while
+			// `#assistantMessageStreaming` is true.
+			tui.setEagerNativeScrollbackRebuild(true);
+			const writes = capture(term);
+			// Offscreen edit (a row above the viewport gains content) — the same
+			// shape produced by an assistant message rewriting an earlier paragraph
+			// once a markdown fence closes or a wrap recalculates above the fold.
+			transcript.setLines([
+				...Array.from({ length: 20 }, (_, i) => `line-${i}`),
+				"OFFSCREEN-EDIT",
+				...Array.from({ length: 19 }, (_, i) => `line-${20 + i}`),
+			]);
+			tui.requestRender();
+			await settle(term);
+			expect(writes.join("").match(ERASE_SCROLLBACK)).toBeNull();
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps the POSIX eager rebuild path (control: same scenario on linux still rebuilds)", async () => {
+		Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+		const term = new VirtualTerminal(60, 8);
+		overrideProbe(term, undefined);
+		const tui = new TUI(term);
+		const transcript = new LineList(Array.from({ length: 40 }, (_, i) => `line-${i}`));
+		tui.addChild(transcript);
+		try {
+			tui.start();
+			await settle(term);
+			tui.setEagerNativeScrollbackRebuild(true);
+			const writes = capture(term);
+			transcript.setLines([
+				...Array.from({ length: 20 }, (_, i) => `line-${i}`),
+				"OFFSCREEN-EDIT",
+				...Array.from({ length: 19 }, (_, i) => `line-${20 + i}`),
+			]);
+			tui.requestRender();
+			await settle(term);
+			// POSIX side: the eager rebuild is intentional — the offscreen edit
+			// reaches scrollback (the `\x1b[3J` clear + rewrite is acceptable
+			// because we cannot observe the user being scrolled up anyway, and the
+			// alternative is stale duplicated tail rows above the fold).
+			expect(writes.join("").match(ERASE_SCROLLBACK)).not.toBeNull();
 		} finally {
 			tui.stop();
 		}

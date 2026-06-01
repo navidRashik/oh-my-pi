@@ -1646,17 +1646,32 @@ export class TUI extends Container {
 	 * scrollback dirty, and reconcile history at the next explicit checkpoint
 	 * ({@link refreshNativeScrollbackIfDirty} on prompt submit) where the
 	 * editor keystroke has already pinned the terminal to the bottom. Without
-	 * this, every offscreen transcript edit while streaming wiped scrollback and
-	 * yanked a scrolled-up reader back down. `allowUnknownViewportMutation`
-	 * (autocomplete/IME) opts directly user-driven frames back into the rebuild.
-	 * Unlike the checkpoint predicate this carries no `process.platform`
-	 * optimism — resize and checkpoint replays keep using that one.
+	 * this, every offscreen transcript edit while streaming wiped scrollback
+	 * and yanked a scrolled-up reader back down. `allowUnknownViewportMutation`
+	 * (autocomplete/IME, plus the eager-streaming rebuild flag) opts unknown
+	 * POSIX frames back into the rebuild — the trade-off is a clean,
+	 * duplicate-free history above the fold while a tool/assistant block
+	 * actively re-lays out.
+	 *
+	 * Windows Terminal hosts ConPTY whose `GetConsoleScreenBufferInfo` reports
+	 * the pseudo-console (always at tail) rather than the user-visible host
+	 * scrollback, so the WT probe also returns `undefined` (see
+	 * {@link shouldTrustNativeViewportProbe} and #1635). On win32 the
+	 * `allowUnknownViewportMutation` override is therefore unsafe: keep the
+	 * deferral, mirroring the same `process.platform === "win32"` asymmetry as
+	 * {@link #nativeViewportIsScrolled}. Fixes #1651 (assistant-text streaming
+	 * was yanking WT scrollback through the pure-append branch in
+	 * {@link #planRender}). Resize and checkpoint replays keep using
+	 * {@link #canReplayNativeScrollbackAtCheckpoint}'s POSIX optimism.
 	 */
 	#canRebuildNativeScrollbackLive(
 		nativeViewportAtBottom: boolean | undefined,
 		allowUnknownViewportMutation: boolean,
 	): boolean {
-		return nativeViewportAtBottom === true || (nativeViewportAtBottom === undefined && allowUnknownViewportMutation);
+		return (
+			nativeViewportAtBottom === true ||
+			(nativeViewportAtBottom === undefined && allowUnknownViewportMutation && process.platform !== "win32")
+		);
 	}
 
 	#padDeferredShrinkLines(lines: string[], paddedLength: number): string[] {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Windows Terminal scrollback still being yanked to the top during assistant-text streaming after the 15.7.5 fix for [#1635](https://github.com/can1357/oh-my-pi/issues/1635). The earlier fix routed the WT probe to `undefined`, but `#canRebuildNativeScrollbackLive` lacked the `process.platform === "win32"` guard that `#nativeViewportIsScrolled` carries, so `event-controller.ts`'s `setEagerNativeScrollbackRebuild(true)` (set whenever `#assistantMessageStreaming` is true) ORed into `allowUnknownViewportMutation` and pushed the WT/undefined frame through the destructive `historyRebuild` branch in `#planRender`'s pure-append path. The live-rebuild predicate now mirrors the same Windows asymmetry — on win32 an unreportable probe stays in the deferred-repaint path even with the eager streaming flag set. POSIX terminals keep the eager rebuild behavior (clean, duplicate-free history above the fold). ([#1651](https://github.com/can1357/oh-my-pi/issues/1651))
+
 ## [15.7.5] - 2026-06-01
 
 ### Fixed
