@@ -27,6 +27,8 @@ import {
 	PROVIDER_DESCRIPTORS,
 } from "../src/provider-models/descriptors";
 import {
+	buildMiniMaxCodingPlanStaticSeed,
+	buildMiniMaxPaygStaticSeed,
 	buildXaiOAuthStaticSeed,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
@@ -327,6 +329,12 @@ async function generateModels() {
 	if (!allModels.some(model => model.provider === "cloudflare-ai-gateway")) {
 		allModels.push(CLOUDFLARE_FALLBACK_MODEL);
 	}
+
+	// MiniMax catalogs are documented by the provider but lag in models.dev;
+	// seed the current headline model so regeneration does not depend on a stale
+	// previous models.json snapshot.
+	allModels.push(...buildMiniMaxCodingPlanStaticSeed());
+	allModels.push(...buildMiniMaxPaygStaticSeed());
 
 	// xai-oauth has no upstream catalog source (not in models.dev or
 	// MODELS_DEV_PROVIDER_DESCRIPTORS). The curated chat models live in
