@@ -1321,7 +1321,7 @@ export class TUI extends Container {
 			!isMultiplexerSession()
 		) {
 			const nativeViewportAtBottom = this.#readNativeViewportAtBottom();
-			if (this.#nativeViewportIsScrolled(nativeViewportAtBottom, allowUnknownViewportMutation)) {
+			if (this.#nativeViewportIsUnsafeForShrink(nativeViewportAtBottom, allowUnknownViewportMutation)) {
 				this.#markNativeScrollbackDirty();
 				return { kind: "deferredShrink", paddedLength: this.#previousLines.length };
 			}
@@ -1335,11 +1335,12 @@ export class TUI extends Container {
 			) {
 				return { kind: "historyRebuild" };
 			}
-			// POSIX terminals — and Windows Terminal/ConPTY — that cannot report the
-			// viewport position fall through here (`canRebuildNativeScrollbackLive` is
-			// false). A destructive rebuild emits `\x1b[3J`, which on modern terminals
-			// resets the viewport to the top of scrollback and yanks a scrolled-up
-			// reader (issue #1635), so it is unsafe while the probe is unavailable.
+			// POSIX terminals — including WSL under Windows Terminal — cannot report
+			// viewport position and fall through here (`canRebuildNativeScrollbackLive`
+			// is false). A destructive rebuild emits `\x1b[3J`, which on modern
+			// terminals resets the viewport to the top of scrollback and yanks a
+			// scrolled-up reader (issue #1635), so it is unsafe while the probe is
+			// unavailable.
 			//
 			// When the shrunk transcript now fits entirely in the viewport there is no
 			// new native history to preserve during the live frame: repaint the screen
@@ -1363,8 +1364,8 @@ export class TUI extends Container {
 			// prior unknown-POSIX viewport repaints commit longer logical frames without
 			// moving the native scrollback boundary. For a shrink that large a blank,
 			// uninteractable viewport is the greater evil, so yank with `historyRebuild`.
-			// Real win32 unknown probes defer as scrolled above and never reach this; the
-			// yank only lands on non-win32 hosts whose probe is genuinely unavailable.
+			// Unknown win32 shrink probes defer above and never reach this; the yank only
+			// lands on non-win32 hosts whose probe is genuinely unavailable.
 			const paddedViewportTop = Math.max(0, this.#previousLines.length - height);
 			if (newLines.length <= paddedViewportTop) {
 				return { kind: "historyRebuild" };
@@ -1620,6 +1621,14 @@ export class TUI extends Container {
 		return process.platform === "win32" && !Bun.env.WT_SESSION;
 	}
 
+	#nativeViewportIsUnsafeForShrink(
+		nativeViewportAtBottom: boolean | undefined,
+		allowUnknownViewportMutation = false,
+	): boolean {
+		if (nativeViewportAtBottom === false) return true;
+		if (nativeViewportAtBottom !== undefined || allowUnknownViewportMutation) return false;
+		return process.platform === "win32";
+	}
 	#nativeViewportIsAtBottom(nativeViewportAtBottom: boolean | undefined): boolean {
 		return nativeViewportAtBottom === true;
 	}

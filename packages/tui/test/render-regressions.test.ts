@@ -93,6 +93,18 @@ function visible(term: VirtualTerminal): string[] {
 	return term.getViewport().map(line => line.trimEnd());
 }
 
+const ERASE_SCROLLBACK = "\x1b[3J";
+
+function captureWrites(term: VirtualTerminal): string[] {
+	const writes: string[] = [];
+	const realWrite = term.write.bind(term);
+	term.write = (data: string) => {
+		writes.push(data);
+		realWrite(data);
+	};
+	return writes;
+}
+
 function countMatches(lines: string[], pattern: RegExp): number {
 	let count = 0;
 	for (const line of lines) {
@@ -1770,6 +1782,42 @@ describe("TUI terminal-state regressions", () => {
 								expect(viewport).toContain(`token-${i}`);
 								expect(viewport[viewport.length - 1]).toBe("prompt>");
 							}
+						} finally {
+							tui.stop();
+						}
+					},
+				);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+
+		it("defers large native Windows Terminal shrink when the probe is suppressed", async () => {
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			try {
+				await withEnvPatch(
+					{ WT_SESSION: "wt-test", TMUX: undefined, STY: undefined, ZELLIJ: undefined },
+					async () => {
+						const term = new UnknownViewportTerminal(40, 10);
+						const tui = new TUI(term);
+						const component = new MutableLinesComponent([...rows("line-", 99), "prompt-row"]);
+						tui.addChild(component);
+
+						try {
+							tui.start();
+							await settle(term);
+							term.scrollLines(-5);
+							const before = term.getBufferPosition();
+							expect(before.viewportY).toBeLessThan(before.baseY);
+
+							const writes = captureWrites(term);
+							component.setLines([...rows("short-", 19), "prompt-row"]);
+							tui.requestRender();
+							await settle(term);
+
+							expect(writes.join("")).not.toContain(ERASE_SCROLLBACK);
+							expect(term.getBufferPosition().viewportY).toBe(before.viewportY);
 						} finally {
 							tui.stop();
 						}
