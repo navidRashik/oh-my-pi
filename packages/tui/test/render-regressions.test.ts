@@ -1734,6 +1734,51 @@ describe("TUI terminal-state regressions", () => {
 				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
 			}
 		});
+		it("renders streaming row inserts on native Windows Terminal when the probe is suppressed", async () => {
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			try {
+				await withEnvPatch(
+					{ WT_SESSION: "wt-test", TMUX: undefined, STY: undefined, ZELLIJ: undefined },
+					async () => {
+						// Windows Terminal hosts native win32 apps behind ConPTY; the native
+						// viewport probe is intentionally suppressed and returns undefined.
+						const term = new UnknownViewportTerminal(32, 5);
+						const tui = new TUI(term);
+						const transcript = new MutableLinesComponent(rows("seed-", 4));
+						const footer = new MutableLinesComponent(["prompt>"]);
+						tui.addChild(transcript);
+						tui.addChild(footer);
+
+						try {
+							tui.start();
+							await settle(term);
+							expect(visible(term).map(line => line.trim())).toEqual([
+								"seed-0",
+								"seed-1",
+								"seed-2",
+								"seed-3",
+								"prompt>",
+							]);
+
+							for (let i = 0; i < 4; i++) {
+								transcript.setLines([...rows("seed-", 4), ...rows("token-", i + 1)]);
+								tui.requestRender();
+								await settle(term);
+
+								const viewport = visible(term).map(line => line.trim());
+								expect(viewport).toContain(`token-${i}`);
+								expect(viewport[viewport.length - 1]).toBe("prompt>");
+							}
+						} finally {
+							tui.stop();
+						}
+					},
+				);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
 
 		it("keeps a scrolled-up reader anchored while streaming inserts arrive on POSIX (unknown viewport)", async () => {
 			// POSIX terminals cannot report scrollback position, so isNativeViewportAtBottom()

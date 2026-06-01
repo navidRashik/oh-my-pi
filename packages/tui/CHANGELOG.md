@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed native Windows + Windows Terminal streaming output staying invisible until resize when `WT_SESSION` suppresses the ConPTY viewport probe. Unknown native viewport state under Windows Terminal is now treated like WSL for live streaming row inserts while bare native Windows keeps the conservative unknown-as-scrolled guard. ([#1643](https://github.com/can1357/oh-my-pi/issues/1643))
+
 ## [15.7.5] - 2026-06-01
 
 ### Fixed

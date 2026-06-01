@@ -1615,10 +1615,9 @@ export class TUI extends Container {
 		nativeViewportAtBottom: boolean | undefined,
 		allowUnknownViewportMutation = false,
 	): boolean {
-		return (
-			nativeViewportAtBottom === false ||
-			(nativeViewportAtBottom === undefined && process.platform === "win32" && !allowUnknownViewportMutation)
-		);
+		if (nativeViewportAtBottom === false) return true;
+		if (nativeViewportAtBottom !== undefined || allowUnknownViewportMutation) return false;
+		return process.platform === "win32" && !Bun.env.WT_SESSION;
 	}
 
 	#nativeViewportIsAtBottom(nativeViewportAtBottom: boolean | undefined): boolean {
