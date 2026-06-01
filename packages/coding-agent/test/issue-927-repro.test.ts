@@ -58,6 +58,24 @@ describe("issue #927 optimistic pending spinner", () => {
 		tempDir?.removeSync();
 		resetSettingsForTest();
 	});
+	it("echoes submitted text before running a dirty scrollback checkpoint", async () => {
+		const events: string[] = [];
+		mode.ui.requestRender = vi.fn((force?: boolean) => {
+			events.push(force === true ? "render:force" : "render");
+		});
+		vi.spyOn(mode.ui, "refreshNativeScrollbackIfDirty").mockImplementation(() => {
+			events.push("refresh");
+			return true;
+		});
+
+		mode.startPendingSubmission({ text: "hello" });
+
+		expect(events).toContain("render:force");
+		expect(events).not.toContain("refresh");
+		await Bun.sleep(1);
+		expect(events.at(-1)).toBe("refresh");
+		expect(mode.ui.refreshNativeScrollbackIfDirty).toHaveBeenCalledWith({ allowUnknownViewport: true });
+	});
 
 	it("clears the optimistic loading animation when prompt returns without a model turn", async () => {
 		const input = mode.startPendingSubmission({ text: "/extension-no-turn" });

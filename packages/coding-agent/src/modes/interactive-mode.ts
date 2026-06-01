@@ -866,9 +866,14 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#pendingSubmissionDispose = undefined;
 		}
 		this.editor.setText("");
-		this.ui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true });
 		this.ensureLoadingAnimation();
-		this.ui.requestRender();
+		this.ui.requestRender(true);
+		// A dirty native scrollback checkpoint can rewrite the full transcript.
+		// Echo the submitted message and loader first so Enter never blocks on
+		// terminal scrollback reconciliation (notably Windows Terminal after #1635).
+		setTimeout(() => {
+			this.ui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true });
+		}, 0);
 		return submission;
 	}
 
