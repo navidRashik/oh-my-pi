@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed scrolled-up readers being yanked to the top of scrollback under WSL inside Windows Terminal while a foreground tool was streaming. `setEagerNativeScrollbackRebuild(true)` (set by coding-agent while a foreground tool is pending) promoted `allowUnknownViewportMutation`, which routed every offscreen edit through a destructive `historyRebuild` (`\x1b[3J` clear scrollback + full repaint) on a terminal whose outer Windows Terminal viewport we cannot probe. Eager rebuild is now a no-op under WSL+Windows Terminal — the trade-off flips back to "stale duplicated rows above the fold are preferable to disrupting the user's scroll position." `#canReplayNativeScrollbackAtCheckpoint` mirrors win32's conservative handling for the same environment so unintended checkpoint paths cannot replay without an explicit user-driven `allowUnknownViewport` opt-in. ([#1610](https://github.com/can1357/oh-my-pi/issues/1610))
+
 ## [15.7.3] - 2026-05-31
 
 ### Added

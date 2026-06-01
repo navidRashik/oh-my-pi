@@ -167,6 +167,22 @@ function isMultiplexerSession(): boolean {
 }
 
 /**
+ * Detect WSL running inside Windows Terminal. The outer Windows Terminal owns
+ * a user-visible scrollback we cannot probe — `kernel32.dll` FFI is
+ * unreachable from a Linux user-space process — so destructive native
+ * scrollback replays cannot rely on viewport-position evidence. Mirrors the
+ * conservative win32 handling: treat unknown viewport as scrolled unless the
+ * caller asserts an explicit user-driven checkpoint.
+ */
+function isWindowsSubsystemForLinuxWindowsTerminal(): boolean {
+	return (
+		process.platform === "linux" &&
+		(!!Bun.env.WSL_DISTRO_NAME || !!Bun.env.WSL_INTEROP) &&
+		!!Bun.env.WT_SESSION
+	);
+}
+
+/**
  * Options for overlay positioning and sizing.
  * Values can be absolute numbers or percentage strings (e.g., "50%").
  */
@@ -389,6 +405,12 @@ export class TUI extends Container {
 	 * re-laying-out rows that have already scrolled into history. A snap to the tail
 	 * is acceptable there. A terminal that can report a *known*-scrolled viewport
 	 * (Windows) still defers; only the unknown case is forced to rebuild.
+	 *
+	 * WSL inside Windows Terminal is the documented exception: the outer terminal
+	 * owns user-visible scrollback we cannot probe, and a snap to the tail there
+	 * yanks a reader who deliberately scrolled up (see #1610). Eager rebuild is a
+	 * no-op in that environment — the trade-off flips back to "stale duplicated
+	 * rows above the fold are preferable to disrupting the user's scroll position."
 	 */
 	setEagerNativeScrollbackRebuild(enabled: boolean): void {
 		this.#eagerNativeScrollbackRebuild = enabled;
@@ -1181,7 +1203,8 @@ export class TUI extends Container {
 		const widthChanged = this.#previousWidth > 0 && this.#previousWidth !== width;
 		const heightChanged = this.#previousHeight > 0 && this.#previousHeight !== height;
 		const allowUnknownViewportMutation =
-			this.#allowUnknownViewportMutationOnNextRender || this.#eagerNativeScrollbackRebuild;
+			this.#allowUnknownViewportMutationOnNextRender ||
+			(this.#eagerNativeScrollbackRebuild && !isWindowsSubsystemForLinuxWindowsTerminal());
 		this.#allowUnknownViewportMutationOnNextRender = false;
 
 		// 3. Classify intent.
@@ -1595,10 +1618,16 @@ export class TUI extends Container {
 		nativeViewportAtBottom: boolean | undefined,
 		allowUnknownViewport: boolean,
 	): boolean {
-		return (
-			nativeViewportAtBottom === true ||
-			(nativeViewportAtBottom === undefined && (allowUnknownViewport || process.platform !== "win32"))
-		);
+		if (nativeViewportAtBottom === true) return true;
+		if (nativeViewportAtBottom !== undefined) return false;
+		if (allowUnknownViewport) return true;
+		// POSIX terminals are optimistic: no observable scrollback to yank. The
+		// exceptions are platforms whose outer terminal owns a scrollback we
+		// cannot probe — native Win32 (kernel32 FFI may fail) and WSL inside
+		// Windows Terminal (FFI never reachable from a Linux user-space process).
+		// Both treat unknown viewport as scrolled and defer until an explicit
+		// user-driven opt-in (`allowUnknownViewport: true`).
+		return process.platform !== "win32" && !isWindowsSubsystemForLinuxWindowsTerminal();
 	}
 
 	/**

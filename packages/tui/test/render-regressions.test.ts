@@ -1699,6 +1699,126 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("preserves a scrolled-up reader on WSL Windows Terminal even with eager rebuild active (#1610)", async () => {
+			// WSL+Windows-Terminal cannot probe the outer Windows Terminal viewport
+			// (kernel32 FFI is unreachable from a Linux user-space process). The
+			// reporter observed that while a foreground tool was streaming and they
+			// had scrolled up to read history, OMP's eager rebuild path emitted a
+			// destructive `historyRebuild` (\x1b[3J clear scrollback + full repaint)
+			// on every offscreen edit, yanking the viewport to the top. The fix
+			// makes eager rebuild a no-op under WSL+WT: stale rows above the fold
+			// are preferable to losing the user's reading position.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+			try {
+				await withEnvPatch(
+					{ WT_SESSION: "wt-test", WSL_DISTRO_NAME: "Ubuntu", WSL_INTEROP: undefined },
+					async () => {
+						const term = new UnknownViewportTerminal(40, 5, 200);
+						const tui = new TUI(term);
+						const component = new MutableLinesComponent(rows("row-", 16));
+						tui.addChild(component);
+
+						try {
+							tui.start();
+							await settle(term);
+
+							// Reader scrolls up to inspect committed history.
+							term.scrollLines(-4);
+							const before = term.getBufferPosition();
+							const anchored = visible(term).map(line => line.trim());
+							expect(before.viewportY).toBeGreaterThan(0);
+							expect(before.viewportY).toBeLessThan(before.baseY);
+
+							// Foreground tool active — coding-agent flips this flag (see
+							// `event-controller.ts:#refreshToolRenderMode`).
+							tui.setEagerNativeScrollbackRebuild(true);
+
+							// Streaming tool result that re-lays out an offscreen header and
+							// grows past the fold. Pre-fix this routed to historyRebuild and
+							// yanked the WT viewport because eager rebuild promoted
+							// `allowUnknownViewportMutation` even under WSL+WT.
+							for (let i = 0; i < 4; i++) {
+								component.setLines([
+									"HEADER-EDITED",
+									...rows("row-", 16).slice(1),
+									...rows("tail-", i + 1),
+								]);
+								tui.requestRender();
+								await settle(term);
+
+								const pos = term.getBufferPosition();
+								// Reader stays at the same scrollback position they chose.
+								expect(pos.viewportY).toBe(before.viewportY);
+								expect(visible(term).map(line => line.trim())).toEqual(anchored);
+							}
+
+							// The deferred edit is still reconciled at the user-driven
+							// checkpoint (Enter / submission), where the WT scrollOnInput
+							// behaviour pins the outer viewport to the tail.
+							term.scrollLines(999);
+							expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBe(true);
+							await settle(term);
+							expect(term.getScrollBuffer().join("\n")).toContain("HEADER-EDITED");
+						} finally {
+							tui.stop();
+						}
+					},
+				);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+
+		it("requires explicit opt-in before checkpoint replay on WSL Windows Terminal (#1610)", async () => {
+			// `refreshNativeScrollbackIfDirty()` without `allowUnknownViewport: true`
+			// must refuse to clear scrollback on WSL+WT: the outer Windows Terminal
+			// owns the viewport state and we cannot probe it. Production only opts
+			// in from user-driven submission paths where WT scrollOnInput has
+			// pinned the viewport to the tail; everywhere else defers. Pre-fix the
+			// predicate optimistically replayed on every POSIX platform regardless.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+			try {
+				await withEnvPatch(
+					{ WT_SESSION: "wt-test", WSL_DISTRO_NAME: "Ubuntu", WSL_INTEROP: undefined },
+					async () => {
+						const term = new UnknownViewportTerminal(32, 5, 200);
+						const tui = new TUI(term);
+						const component = new MutableLinesComponent(rows("row-", 12));
+						tui.addChild(component);
+
+						try {
+							tui.start();
+							await settle(term);
+
+							// Trigger a deferred scrollback edit while the reader is scrolled up.
+							term.scrollLines(-3);
+							component.setLines(["HEADER-EDIT", ...rows("row-", 12).slice(1)]);
+							tui.requestRender();
+							await settle(term);
+
+							// Without the opt-in: WSL+WT defers the destructive replay so the
+							// reader is not yanked. Plain POSIX (no WSL+WT env) would have
+							// returned true here and cleared scrollback.
+							expect(tui.refreshNativeScrollbackIfDirty()).toBe(false);
+
+							// The explicit user-driven opt-in (matches the submission path)
+							// still reconciles deferred edits into clean history.
+							term.scrollLines(999);
+							expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBe(true);
+							await settle(term);
+							expect(term.getScrollBuffer().join("\n")).toContain("HEADER-EDIT");
+						} finally {
+							tui.stop();
+						}
+					},
+				);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+
 		it("refreshes deferred native scrollback when the native viewport reaches bottom", async () => {
 			const term = new VirtualTerminal(32, 5);
 			const tui = new TUI(term);
