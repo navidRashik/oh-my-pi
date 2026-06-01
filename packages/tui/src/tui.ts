@@ -175,11 +175,7 @@ function isMultiplexerSession(): boolean {
  * caller asserts an explicit user-driven checkpoint.
  */
 function isWindowsSubsystemForLinuxWindowsTerminal(): boolean {
-	return (
-		process.platform === "linux" &&
-		(!!Bun.env.WSL_DISTRO_NAME || !!Bun.env.WSL_INTEROP) &&
-		!!Bun.env.WT_SESSION
-	);
+	return process.platform === "linux" && (!!Bun.env.WSL_DISTRO_NAME || !!Bun.env.WSL_INTEROP) && !!Bun.env.WT_SESSION;
 }
 
 /**

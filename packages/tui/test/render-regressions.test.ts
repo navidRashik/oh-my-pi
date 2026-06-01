@@ -1739,11 +1739,7 @@ describe("TUI terminal-state regressions", () => {
 							// yanked the WT viewport because eager rebuild promoted
 							// `allowUnknownViewportMutation` even under WSL+WT.
 							for (let i = 0; i < 4; i++) {
-								component.setLines([
-									"HEADER-EDITED",
-									...rows("row-", 16).slice(1),
-									...rows("tail-", i + 1),
-								]);
+								component.setLines(["HEADER-EDITED", ...rows("row-", 16).slice(1), ...rows("tail-", i + 1)]);
 								tui.requestRender();
 								await settle(term);
 
