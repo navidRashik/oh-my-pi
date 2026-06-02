@@ -1227,6 +1227,25 @@ function buildParams(
 		delete params.tool_choice;
 	}
 
+	if (typeof params.tool_choice === "object" && params.tool_choice !== null && "function" in params.tool_choice) {
+		// Symmetric to the `tool_choice: "none"` guard above: a forced named
+		// `tool_choice` that points at a tool absent from `params.tools` is a
+		// self-inconsistent request. Spec-strict OpenAI-compatible endpoints
+		// reject it with `400 invalid_parameter_error: The tool specified in
+		// tool_choice does not match any of the specified tools`. The agent
+		// loop already refreshes ToolChoice against `state.tools`, so this is
+		// the request-builder's last line of defense against any other caller
+		// (e.g. raw `streamOpenAICompletions` use) emitting a mismatched pair.
+		// See issue #1701.
+		const forcedName = params.tool_choice.function.name;
+		const offered =
+			Array.isArray(params.tools) &&
+			params.tools.some(tool => tool.type === "function" && tool.function.name === forcedName);
+		if (!offered) {
+			delete params.tool_choice;
+		}
+	}
+
 	if (supportsReasoningParams && compat.thinkingFormat === "zai" && model.reasoning) {
 		// Z.ai uses binary thinking: { type: "enabled" | "disabled" }
 		// Must explicitly disable since z.ai defaults to thinking enabled.

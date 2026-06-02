@@ -280,4 +280,22 @@ describe("AgentSession eager todo enforcement", () => {
 			lastMessageText: "actually skip that, just fix the typo",
 		});
 	});
+
+	it("skips eager todo enforcement when todo_write is filtered out of the active tools", async () => {
+		// Regression for #1701. The eager-todo prelude must gate on the per-turn
+		// active tool set (what `context.tools` will serialize as), not the global
+		// `#toolRegistry`. MCP-scoped / restricted-toolset / subagent turns can drop
+		// `todo_write` from `agent.state.tools` while the registry still carries it.
+		// Forcing a tool_choice for a tool that is not in `params.tools` produces a
+		// self-inconsistent request that strict OpenAI-compatible endpoints reject
+		// with `400 invalid_parameter_error: The tool specified in tool_choice does
+		// not match any of the specified tools`.
+		session.agent.setTools(session.agent.state.tools.filter(tool => tool.name !== "todo_write"));
+
+		await session.prompt("refactor the parser module");
+
+		expect(observedCalls).toHaveLength(1);
+		expect(observedCalls[0]?.toolChoice).toBeUndefined();
+		expect(observedCalls[0]?.toolNames).toEqual(["bash"]);
+	});
 });

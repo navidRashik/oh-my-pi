@@ -6401,9 +6401,17 @@ export class AgentSession {
 			return undefined;
 		}
 
-		if (!this.#toolRegistry.has("todo_write")) {
-			logger.warn("Eager todo enforcement skipped because todo_write is unavailable", {
-				activeToolNames: this.agent.state.tools.map(tool => tool.name),
+		// Gate on the per-turn active tool set (what `context.tools` will serialize as),
+		// not the global registry. Registry membership is a superset: MCP-scoped /
+		// restricted-toolset / subagent turns can drop `todo_write` from the active set
+		// while the registry still carries it. Forcing a `tool_choice` for a tool that
+		// won't be in `params.tools` produces a self-inconsistent request that
+		// spec-strict OpenAI-compatible endpoints reject with 400 "tool_choice does
+		// not match any of the specified tools" (issue #1701).
+		const activeTools = this.agent.state.tools;
+		if (!activeTools.some(tool => tool.name === "todo_write")) {
+			logger.warn("Eager todo enforcement skipped because todo_write is not active for this turn", {
+				activeToolNames: activeTools.map(tool => tool.name),
 			});
 			return undefined;
 		}

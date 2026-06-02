@@ -914,7 +914,7 @@ export class Agent {
 				: undefined;
 
 		const getToolChoice = () =>
-			this.#getToolChoice?.() ?? refreshToolChoiceForActiveTools(options?.toolChoice, this.#state.tools);
+			refreshToolChoiceForActiveTools(this.#getToolChoice?.() ?? options?.toolChoice, this.#state.tools);
 
 		const config: AgentLoopConfig = {
 			model,

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the openai-completions request builder emitting a forced `tool_choice` naming a function absent from `params.tools`. Symmetric to the existing `tool_choice: "none"` guard, `buildParams` now drops a forced named `tool_choice` whenever its tool is not in the serialized `tools` array, so the wire body cannot be internally inconsistent — spec-strict OpenAI-compatible endpoints would otherwise reject it with `400 invalid_parameter_error: The tool specified in tool_choice does not match any of the specified tools` ([#1701](https://github.com/can1357/oh-my-pi/issues/1701)).
+
 ## [15.8.0] - 2026-06-02
 ### Added
 

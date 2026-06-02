@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `Agent.prompt()` forwarding a queued forced `toolChoice` whose target tool is no longer present in `state.tools`. `refreshToolChoiceForActiveTools` now runs on the choice returned by the caller-supplied `getToolChoice` hook (e.g. `AgentSession`'s tool-choice queue), not just `options.toolChoice`, so an MCP-scoped / subagent / restricted-toolset turn cannot send a `tool_choice` naming a function absent from the per-turn tool set ([#1701](https://github.com/can1357/oh-my-pi/issues/1701)).
+
 ## [15.8.0] - 2026-06-02
 
 ### Fixed

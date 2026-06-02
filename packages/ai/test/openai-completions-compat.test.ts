@@ -874,6 +874,18 @@ describe("kimi model detection via detectCompat", () => {
 						timestamp: Date.now(),
 					},
 				],
+				// Provide the matching tool so the forced `tool_choice` is internally
+				// consistent. Without it, the request-builder's #1701 guard drops
+				// `tool_choice` and the disable-reasoning-on-forced-choice path
+				// never fires — but that is a request-shape issue, not the kimi
+				// reasoning-suppression behavior this test guards.
+				tools: [
+					{
+						name: "read",
+						description: "Read a file",
+						parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+					},
+				],
 			},
 			{
 				apiKey: "test-key",

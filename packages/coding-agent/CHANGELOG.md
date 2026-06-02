@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed eager-todo enforcement forcing `tool_choice: todo_write` on turns whose serialized tools omit `todo_write` (MCP-scoped, restricted-toolset, and subagent turns). The prelude now gates on the per-turn `agent.state.tools` rather than the global `#toolRegistry`, so it no longer queues a forced choice that produces a self-inconsistent request body (`tool_choice` naming a function absent from `tools`) and trips spec-strict OpenAI-compatible providers with `400 invalid_parameter_error: The tool specified in tool_choice does not match any of the specified tools` ([#1701](https://github.com/can1357/oh-my-pi/issues/1701)).
+
 ## [15.8.0] - 2026-06-02
 
 ### Added
