@@ -339,6 +339,25 @@ function isCompiledGrammarTooLargeStrictError(
 	);
 }
 
+// Some Chinese-origin reasoning models emit a tokenizer/chat-template artifact as
+// a space followed by a period inside thinking streams. Normalize it to normal
+// punctuation while leaving ordinary text deltas untouched.
+function normalizeThinkingSpacePeriodArtifacts(text: string): string {
+	const firstArtifactIndex = text.indexOf(" .");
+	if (firstArtifactIndex < 0) return text;
+
+	let normalized = "";
+	let start = 0;
+	let artifactIndex = firstArtifactIndex;
+	do {
+		normalized += text.slice(start, artifactIndex);
+		normalized += ".";
+		start = artifactIndex + 2;
+		artifactIndex = text.indexOf(" .", start);
+	} while (artifactIndex >= 0);
+	return normalized + text.slice(start);
+}
+
 // DeepSeek models leak chat-template special tokens (e.g. `<｜tool_calls_begin｜>`,
 // `<｜DSML｜tool_calls｜>`) into visible `content` deltas when hosted behind providers
 // (such as NVIDIA NIM) that don't strip them server-side. The structured `tool_calls`
@@ -544,6 +563,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			const pendingToolCallBlocks: ToolCallStreamBlock[] = [];
 			const toolCallBlockByIndex = new Map<number, ToolCallStreamBlock>();
 			let currentBlock: OpenAIStreamBlock | undefined;
+			let hasPendingThinkingSpace = false;
+			let pendingThinkingSpaceSignature: string | undefined;
 			const blockIndex = (block: OpenAIStreamBlock | undefined): number => {
 				if (!block) return Math.max(0, output.content.length - 1);
 				return output.content.indexOf(block);
@@ -570,6 +591,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			};
 			const finishCurrentBlock = (block: OpenAIStreamBlock | undefined): void => {
 				if (!block) return;
+				if (block.type === "thinking") flushPendingThinkingSpace();
 				const contentIndex = blockIndex(block);
 				if (contentIndex < 0) return;
 				if (block.type === "text") {
@@ -632,6 +654,14 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				});
 			};
 
+			function flushPendingThinkingSpace(): void {
+				if (!hasPendingThinkingSpace) return;
+				const signature = pendingThinkingSpaceSignature;
+				hasPendingThinkingSpace = false;
+				pendingThinkingSpaceSignature = undefined;
+				appendThinking(output, stream, " ", signature);
+			}
+
 			const appendTextDelta = (text: string): void => {
 				if (!text) return;
 				if (!firstTokenTime) firstTokenTime = Date.now();
@@ -639,8 +669,27 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			};
 			const appendThinkingDelta = (thinking: string, signature?: string): void => {
 				if (!thinking) return;
+				if (hasPendingThinkingSpace) {
+					if (
+						pendingThinkingSpaceSignature === signature &&
+						(thinking.startsWith(".") || thinking.startsWith(" ."))
+					) {
+						hasPendingThinkingSpace = false;
+						pendingThinkingSpaceSignature = undefined;
+					} else {
+						flushPendingThinkingSpace();
+					}
+				}
+
+				let normalized = normalizeThinkingSpacePeriodArtifacts(thinking);
+				if (normalized.endsWith(" ")) {
+					normalized = normalized.slice(0, -1);
+					hasPendingThinkingSpace = true;
+					pendingThinkingSpaceSignature = signature;
+				}
+				if (!normalized) return;
 				if (!firstTokenTime) firstTokenTime = Date.now();
-				appendThinking(output, stream, thinking, signature);
+				appendThinking(output, stream, normalized, signature);
 			};
 
 			let deepseekStripBuffer = "";
@@ -897,6 +946,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			if (stripDeepseekChatTemplateTokens) {
 				flushDeepseekStripBuffer(true);
 			}
+			flushPendingThinkingSpace();
 
 			if (currentBlock?.type === "toolCall") {
 				finishPendingToolCallBlocks();

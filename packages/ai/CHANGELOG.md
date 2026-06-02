@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Fixed OpenAI-compatible thinking streams from Chinese-origin models normalizing stray ` .` punctuation artifacts across reasoning fields and MiniMax `<think>` tags. ([#1688](https://github.com/can1357/oh-my-pi/issues/1688))
 - Fixed Cursor provider requests failing with `Cannot send empty user message to Cursor API` after tool-result history by selecting the latest user/developer turn instead of assuming the final context message is the active user turn.
 
 ### Fixed

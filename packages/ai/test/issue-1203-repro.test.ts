@@ -77,4 +77,23 @@ describe("issue #1203 - MiniMax Coding Plan CN think tags", () => {
 			{ type: "text", text: "visible answer" },
 		]);
 	});
+	it("normalizes MiniMax thinking punctuation artifacts across tag chunks", async () => {
+		const model = getBundledModel("minimax-code-cn", "MiniMax-M2.5") as Model<"openai-completions">;
+		global.fetch = createMockFetch([
+			minimaxChunk(model, "<think>Plan "),
+			minimaxChunk(model, ". Inspect files . Then answer.</think>"),
+			minimaxChunk(model, "visible answer"),
+			stopChunk(model),
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const thinking = result.content
+			.filter((b): b is { type: "thinking"; thinking: string } => b.type === "thinking")
+			.map(b => b.thinking)
+			.join("");
+
+		expect(thinking).toBe("Plan. Inspect files. Then answer.");
+		expect(thinking).not.toContain(" .");
+	});
 });
