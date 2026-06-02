@@ -107,10 +107,12 @@ export function buildCacheAlignmentPadding(args: {
 export function calculateCacheHitRate(usage: {
 	readonly input?: number;
 	readonly cacheRead?: number;
+	readonly cacheWrite?: number;
 }): number | undefined {
 	const input = usage.input ?? 0;
 	const cacheRead = usage.cacheRead ?? 0;
-	const total = input + cacheRead;
+	const cacheWrite = usage.cacheWrite ?? 0;
+	const total = input + cacheRead + cacheWrite;
 	if (total <= 0) return undefined;
 	return cacheRead / total;
 }

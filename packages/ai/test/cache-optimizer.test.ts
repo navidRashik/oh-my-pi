@@ -59,8 +59,10 @@ describe("CacheOptimizer", () => {
 		expect(padding).toBe("");
 	});
 
-	it("computes cache hit rate from normalized usage counters", () => {
+	it("computes cache hit rate from all normalized prompt usage counters", () => {
 		expect(calculateCacheHitRate({ input: 25, cacheRead: 75 })).toBe(0.75);
-		expect(calculateCacheHitRate({ input: 0, cacheRead: 0 })).toBeUndefined();
+		expect(calculateCacheHitRate({ cacheRead: 50, cacheWrite: 50 })).toBe(0.5);
+		expect(calculateCacheHitRate({ cacheWrite: 50 })).toBe(0);
+		expect(calculateCacheHitRate({ input: 0, cacheRead: 0, cacheWrite: 0 })).toBeUndefined();
 	});
 });
