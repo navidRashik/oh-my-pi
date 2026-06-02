@@ -5,6 +5,7 @@ import type {
 	ResponseCreateParamsStreaming,
 	ResponseInput,
 } from "openai/resources/responses/responses";
+import { buildCacheAlignmentPadding, type CachePrefixSegment } from "../cache-optimizer";
 import { getEnvApiKey } from "../stream";
 import type {
 	AssistantMessage,
@@ -85,6 +86,59 @@ export function normalizeOpenAIResponsesPromptCacheKey(sessionId: string | undef
 	const wellFormed = sessionId.toWellFormed();
 	if (wellFormed.length <= 64) return wellFormed;
 	return `pc_${Bun.hash(wellFormed).toString(36)}`;
+}
+function isResponseItemWithStringContent(
+	item: ResponseInput[number],
+): item is ResponseInput[number] & { role: string; content: string } {
+	return (
+		typeof item === "object" &&
+		item !== null &&
+		"role" in item &&
+		"content" in item &&
+		typeof item.content === "string"
+	);
+}
+
+function updateOpenAIResponsesSegment(segments: CachePrefixSegment[], segmentIndex: number, text: string): void {
+	const segment = segments[segmentIndex];
+	if (!segment) return;
+	segments[segmentIndex] = { ...segment, text };
+}
+
+function optimizeOpenAIResponsesCacheAlignment(
+	model: Model<"openai-responses">,
+	messages: ResponseInput,
+	systemInstructions: string | undefined,
+	options: OpenAIResponsesOptions | undefined,
+	promptCacheKey: string | undefined,
+): string | undefined {
+	const cacheOptimizer = options?.cacheOptimizer;
+	if (!cacheOptimizer?.enabled || !promptCacheKey) return systemInstructions;
+	const segments: CachePrefixSegment[] = [];
+	if (systemInstructions) {
+		const segmentIndex = segments.length;
+		segments.push({ kind: "system", text: systemInstructions });
+		const padding = buildCacheAlignmentPadding({ options: cacheOptimizer, model, segments, segmentIndex });
+		if (!padding) return systemInstructions;
+		return systemInstructions + padding;
+	}
+
+	for (let index = 0; index < messages.length; index++) {
+		const item = messages[index];
+		if (!isResponseItemWithStringContent(item)) continue;
+		const segmentIndex = segments.length;
+		segments.push({ kind: "message", role: item.role, text: item.content });
+		if (item.role !== "developer") continue;
+		const nextItem = messages[index + 1];
+		if (nextItem && isResponseItemWithStringContent(nextItem) && nextItem.role === "developer") continue;
+		const padding = buildCacheAlignmentPadding({ options: cacheOptimizer, model, segments, segmentIndex });
+		if (!padding) continue;
+		const content = item.content + padding;
+		item.content = content;
+		updateOpenAIResponsesSegment(segments, segmentIndex, content);
+	}
+
+	return systemInstructions;
 }
 
 // OpenAI Responses-specific options
@@ -452,6 +506,13 @@ function buildParams(
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 	const promptCacheKey = getOpenAIResponsesPromptCacheKey(options);
+	systemInstructions = optimizeOpenAIResponsesCacheAlignment(
+		model,
+		messages,
+		systemInstructions,
+		options,
+		promptCacheKey,
+	);
 	const params: OpenAIResponsesSamplingParams = {
 		model: model.id,
 		input: messages,

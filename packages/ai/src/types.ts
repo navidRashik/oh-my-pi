@@ -1,4 +1,5 @@
 import type { ZodType, z } from "zod/v4";
+import type { CacheOptimizerOptions } from "./cache-optimizer";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
@@ -302,6 +303,8 @@ export interface StreamOptions {
 	 */
 	onAuthError?: (provider: string, apiKey: string, error: unknown) => Promise<string | undefined>;
 	cacheRetention?: CacheRetention;
+	/** Opt-in prefix-cache block alignment. Requires a provider/model token counter. */
+	cacheOptimizer?: CacheOptimizerOptions;
 	/**
 	 * Additional headers to include in provider requests.
 	 * These are merged on top of model-defined headers.

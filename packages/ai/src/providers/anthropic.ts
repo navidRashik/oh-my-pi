@@ -21,6 +21,7 @@ import {
 	logger,
 	readSseEvents,
 } from "@oh-my-pi/pi-utils";
+import { buildCacheAlignmentPadding, type CachePrefixSegment } from "../cache-optimizer";
 import {
 	disablesParallelToolUse,
 	hasOpus47ApiRestrictions,
@@ -1941,6 +1942,75 @@ function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?:
 	}
 }
 
+function pushAnthropicTextSegment(
+	segments: CachePrefixSegment[],
+	kind: CachePrefixSegment["kind"],
+	text: string,
+	role?: string,
+): number {
+	const segment: CachePrefixSegment = role ? { kind, role, text } : { kind, text };
+	segments.push(segment);
+	return segments.length - 1;
+}
+
+function updateAnthropicTextSegment(segments: CachePrefixSegment[], segmentIndex: number, text: string): void {
+	const segment = segments[segmentIndex];
+	if (!segment) return;
+	segments[segmentIndex] = { ...segment, text };
+}
+
+function optimizeAnthropicCacheAlignment(
+	params: MessageCreateParamsStreaming,
+	model: Model<"anthropic-messages">,
+	options?: AnthropicOptions,
+): void {
+	const cacheOptimizer = options?.cacheOptimizer;
+	if (!cacheOptimizer?.enabled) return;
+	const segments: CachePrefixSegment[] = [];
+
+	if (params.tools) {
+		for (const tool of params.tools as Array<Anthropic.Messages.Tool & CacheControlBlock>) {
+			const { cache_control: _cacheControl, ...promptTool } = tool;
+			segments.push({ kind: "tool", text: JSON.stringify(promptTool) });
+		}
+	}
+
+	if (params.system && Array.isArray(params.system)) {
+		const systemBlocks = params.system as Array<AnthropicSystemBlock & CacheControlBlock>;
+		for (let index = 0; index < systemBlocks.length; index++) {
+			const block = systemBlocks[index];
+			if (block?.type !== "text") continue;
+			const segmentIndex = pushAnthropicTextSegment(segments, "system", block.text);
+			if (!block.cache_control) continue;
+			const padding = buildCacheAlignmentPadding({ options: cacheOptimizer, model, segments, segmentIndex });
+			if (!padding) continue;
+			const text = block.text + padding;
+			systemBlocks[index] = { ...block, text };
+			updateAnthropicTextSegment(segments, segmentIndex, text);
+		}
+	}
+
+	for (const message of params.messages) {
+		if (typeof message.content === "string") {
+			pushAnthropicTextSegment(segments, "message", message.content, message.role);
+			continue;
+		}
+		if (!Array.isArray(message.content)) continue;
+		const blocks = message.content as Array<ContentBlockParam & CacheControlBlock>;
+		for (let index = 0; index < blocks.length; index++) {
+			const block = blocks[index];
+			if (block?.type !== "text") continue;
+			const segmentIndex = pushAnthropicTextSegment(segments, "message", block.text, message.role);
+			if (!block.cache_control) continue;
+			const padding = buildCacheAlignmentPadding({ options: cacheOptimizer, model, segments, segmentIndex });
+			if (!padding) continue;
+			const text = block.text + padding;
+			blocks[index] = { ...block, text };
+			updateAnthropicTextSegment(segments, segmentIndex, text);
+		}
+	}
+}
+
 function normalizeCacheControlBlockTtl(block: CacheControlBlock, seenFiveMinute: { value: boolean }): void {
 	const cacheControl = block.cache_control;
 	if (!cacheControl) return;
@@ -2220,6 +2290,7 @@ function buildParams(
 	disableThinkingIfToolChoiceForced(params);
 	ensureMaxTokensForThinking(params, model);
 	applyPromptCaching(params, cacheControl);
+	optimizeAnthropicCacheAlignment(params, model, options);
 	enforceCacheControlLimit(params, 4);
 	normalizeCacheControlTtlOrdering(params);
 

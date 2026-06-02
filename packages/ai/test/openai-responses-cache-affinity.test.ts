@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import type { CachePrefixSegment } from "../src/cache-optimizer";
 import { getBundledModel } from "../src/models";
 import { type OpenAIResponsesOptions, streamOpenAIResponses } from "../src/providers/openai-responses";
 import type { Context, Model } from "../src/types";
@@ -16,6 +17,10 @@ function createSseResponse(events: unknown[]): Response {
 
 function getHeader(headers: RequestInit["headers"], name: string): string | null {
 	return new Headers(headers).get(name);
+}
+
+function countCacheOptimizerCharacters(segments: readonly CachePrefixSegment[]): number {
+	return segments.reduce((total, segment) => total + segment.text.length, 0);
 }
 
 async function captureOpenAIResponseHeaders(
@@ -133,5 +138,24 @@ describe("openai-responses cache affinity", () => {
 		expect(captured.sessionId).toBeNull();
 		expect(captured.clientRequestId).toBeNull();
 		expect(captured.body?.prompt_cache_key).toBeUndefined();
+	});
+
+	it("pads OpenAI Responses developer prefixes when CacheOptimizer is enabled", async () => {
+		const captured = await captureOpenAIResponseHeaders({
+			sessionId: "session-123",
+			cacheOptimizer: {
+				enabled: true,
+				blockSize: 8,
+				paddingText: ".",
+				countTokens: countCacheOptimizerCharacters,
+			},
+		});
+		const input = captured.body?.input as Array<{ role?: string; content?: unknown }> | undefined;
+		const paddedDeveloper = input?.find(
+			item =>
+				item.role === "developer" && typeof item.content === "string" && item.content.startsWith("stable durable"),
+		);
+
+		expect(paddedDeveloper?.content).toBe("stable durable context.....");
 	});
 });

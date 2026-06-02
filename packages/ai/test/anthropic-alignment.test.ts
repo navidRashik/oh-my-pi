@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as tls from "node:tls";
 import { Effort } from "@oh-my-pi/pi-ai";
+import type { CacheOptimizerOptions } from "@oh-my-pi/pi-ai/cache-optimizer";
 import {
 	applyClaudeToolPrefix,
 	buildAnthropicClientOptions,
@@ -59,6 +60,7 @@ type CaptureAnthropicOptions = {
 	topK?: number;
 	taskBudget?: TokenTaskBudget;
 	toolChoice?: "auto" | "any" | "none" | { type: "tool"; name: string };
+	cacheOptimizer?: CacheOptimizerOptions;
 };
 
 function captureAnthropicPayload(
@@ -80,8 +82,13 @@ function captureAnthropicPayload(
 		taskBudget: options?.taskBudget,
 		toolChoice: options?.toolChoice,
 		onPayload: payload => resolve(payload),
+		cacheOptimizer: options?.cacheOptimizer,
 	});
 	return promise;
+}
+
+function countCacheOptimizerCharacters(segments: readonly { readonly text: string }[]): number {
+	return segments.reduce((total, segment) => total + segment.text.length, 0);
 }
 
 describe("Anthropic request fingerprint alignment", () => {
@@ -145,6 +152,27 @@ describe("Anthropic request fingerprint alignment", () => {
 			{ type: "text", text: "stable system" },
 			{ type: "text", text: "stable durable context", cache_control: { type: "ephemeral" } },
 		]);
+	});
+
+	it("pads Anthropic cached system prefixes when CacheOptimizer is enabled", async () => {
+		const payload = (await captureAnthropicPayload(
+			ANTHROPIC_MODEL,
+			{
+				systemPrompt: ["stable"],
+				messages: [{ role: "user", content: "variable context", timestamp: Date.now() }],
+			},
+			{
+				isOAuth: false,
+				cacheOptimizer: {
+					enabled: true,
+					blockSize: 8,
+					paddingText: ".",
+					countTokens: countCacheOptimizerCharacters,
+				},
+			},
+		)) as { system?: Array<{ type: string; text?: string; cache_control?: unknown }> };
+
+		expect(payload.system).toEqual([{ type: "text", text: "stable..", cache_control: { type: "ephemeral" } }]);
 	});
 
 	it("uses Bearer auth for non-Anthropic API bases with api-key credentials", () => {

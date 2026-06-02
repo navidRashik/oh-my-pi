@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added opt-in CacheOptimizer prefix-cache block alignment for Anthropic and OpenAI Responses requests with caller-supplied token counters. ([#1699](https://github.com/can1357/oh-my-pi/issues/1699))
+
 ### Fixed
 
 - Fixed Cursor provider requests failing with `Cannot send empty user message to Cursor API` after tool-result history by selecting the latest user/developer turn instead of assuming the final context message is the active user turn.
