@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Fixed `config.yml` saves leaving a trailing space after object-valued root keys such as `theme:` and `modelRoles:` ([#1670](https://github.com/can1357/oh-my-pi/issues/1670)).
+
 - Fixed a module-load crash (`ReferenceError: Cannot access 'evalToolRenderer' before initialization`) triggered whenever `tools/eval` was imported before `tools/renderers`. The eval JS backend statically pulls the agent/task/sdk/extension chain, which re-enters the root barrel → `modes/components` → `tool-execution` → `renderers` while `eval.ts` was still initializing, so `renderers.ts` read `evalToolRenderer` in its TDZ. The eval TUI renderer is now split into a dependency-light `tools/eval-render.ts` that `renderers.ts` imports directly (decoupling pure rendering from the eval runtime); `eval.ts` re-exports `evalToolRenderer`/`EVAL_DEFAULT_PREVIEW_LINES` for compatibility.
 
 ## [15.7.6] - 2026-06-01

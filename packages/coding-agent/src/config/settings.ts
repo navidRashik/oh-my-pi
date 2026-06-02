@@ -99,7 +99,12 @@ function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 	current[segments[segments.length - 1]] = value;
 }
 
+function stringifySettingsYaml(value: RawSettings): string {
+	return YAML.stringify(value, null, 2).replaceAll(": \n", ":\n");
+}
+
 const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
+
 type PathScopedStringArrayEntry = {
 	path?: unknown;
 	paths?: unknown;
@@ -582,7 +587,7 @@ export class Settings {
 		// 3. Write merged settings
 		if (migrated && Object.keys(settings).length > 0) {
 			try {
-				await Bun.write(this.#configPath, YAML.stringify(settings, null, 2));
+				await Bun.write(this.#configPath, stringifySettingsYaml(settings));
 				logger.debug("Settings: migrated to config.yml", { path: this.#configPath });
 			} catch {}
 		}
@@ -786,7 +791,7 @@ export class Settings {
 
 				// Update our global with any external changes we preserved
 				this.#global = current;
-				await Bun.write(configPath, YAML.stringify(this.#global, null, 2));
+				await Bun.write(configPath, stringifySettingsYaml(this.#global));
 			});
 		} catch (error) {
 			logger.warn("Settings: save failed", { error: String(error) });
