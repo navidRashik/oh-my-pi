@@ -154,6 +154,26 @@ describe("tool path arrays", () => {
 		expect(details?.scopePath).toBe("apps/, packages/, phases/");
 	});
 
+	it("search accepts serialized path arrays", async () => {
+		const tools = await createTools(createTestSession(tempDir));
+		const tool = tools.find(entry => entry.name === "search");
+		expect(tool).toBeDefined();
+		if (!tool) throw new Error("Missing search tool");
+
+		const result = await tool.execute("search-serialized-path-array", {
+			pattern: "shared-needle",
+			paths: '["apps/", "packages/"]',
+		});
+		const text = getText(result);
+		const details = result.details as { fileCount?: number; scopePath?: string } | undefined;
+
+		expect(text).toMatch(/^# apps\/\n## grep\.txt#[0-9A-F]{4}/m);
+		expect(text).toMatch(/^# packages\/\n## grep\.txt#[0-9A-F]{4}/m);
+		expect(text).not.toContain("# phases");
+		expect(details?.fileCount).toBe(2);
+		expect(details?.scopePath).toBe("apps/, packages/");
+	});
+
 	it("search expands delimited path entries", async () => {
 		const tools = await createTools(createTestSession(tempDir));
 		const tool = tools.find(entry => entry.name === "search");

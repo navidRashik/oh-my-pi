@@ -3114,7 +3114,7 @@ async function executePrCreate(
 	const title = normalizeOptionalString(params.title);
 	const body = params.body;
 	const base = normalizeOptionalString(params.base);
-	const head = normalizeOptionalString(params.head);
+	const head = normalizeOptionalString(params.head) ?? normalizeOptionalString(params.branch);
 	const draft = params.draft ?? false;
 	const fill = params.fill ?? false;
 	const reviewers = normalizePrIdentifierList(params.reviewer);

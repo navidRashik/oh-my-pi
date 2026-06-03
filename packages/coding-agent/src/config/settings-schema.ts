@@ -215,9 +215,9 @@ const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
 export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 	{
-		pattern: "^\\s*(cat|head|tail|less|more)\\s+",
+		pattern: "^\\s*(cat|head|tail|less|more|ls)\\s+",
 		tool: "read",
-		message: "Use the `read` tool instead of cat/head/tail. It provides better context and handles binary files.",
+		message: "Use the `read` tool instead of cat/head/tail/ls. It provides better context and handles binary files.",
 	},
 	{
 		pattern: "^\\s*(grep|rg|ripgrep|ag|ack)\\s+",
@@ -1979,7 +1979,7 @@ export const SETTINGS_SCHEMA = {
 	// Bash interceptor
 	"bashInterceptor.enabled": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: { tab: "editing", label: "Bash Interceptor", description: "Block shell commands that have dedicated tools" },
 	},
 	"bashInterceptor.patterns": { type: "array", default: DEFAULT_BASH_INTERCEPTOR_RULES },

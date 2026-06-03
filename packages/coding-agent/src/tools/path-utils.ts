@@ -474,6 +474,32 @@ async function tryDelimitedPathSplit(
 	return valid ? parts : null;
 }
 
+async function splitJsonArrayPathEntry(
+	entry: string,
+	cwd: string,
+	splitter: PathEntrySplitter,
+): Promise<string[] | null> {
+	const trimmed = entry.trim();
+	if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return null;
+	if (isInternalUrlPath(trimmed)) return null;
+	if (!hasGlobPathChars(splitPathAndSel(trimmed).path) && (await delimitedPathPartResolves(trimmed, cwd, splitter))) {
+		return null;
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return null;
+	}
+	if (!Array.isArray(parsed) || parsed.length === 0 || !parsed.every(item => typeof item === "string")) {
+		return null;
+	}
+
+	const parts = parsed.map(item => normalizePathLikeInput(item)).filter(part => part.length > 0);
+	return parts.length > 0 ? parts : null;
+}
+
 /**
  * Split one path-like entry whose multiple targets were flattened into one
  * string. Existing paths are kept intact, so real filenames containing spaces,
@@ -509,9 +535,15 @@ export async function expandDelimitedPathEntries(
 	options: { splitter?: PathEntrySplitter } = {},
 ): Promise<string[]> {
 	const expanded: string[] = [];
+	const splitter = options.splitter ?? parseSearchPath;
 	for (const entry of entries) {
 		const normalizedEntry = normalizePathLikeInput(entry);
-		const split = await splitDelimitedPathEntry(normalizedEntry, cwd, options);
+		const jsonArray = await splitJsonArrayPathEntry(normalizedEntry, cwd, splitter);
+		if (jsonArray) {
+			expanded.push(...jsonArray);
+			continue;
+		}
+		const split = await splitDelimitedPathEntry(normalizedEntry, cwd, { splitter });
 		if (split) expanded.push(...split);
 		else expanded.push(normalizedEntry);
 	}

@@ -316,6 +316,36 @@ describe("github tool", () => {
 		expect(text).toContain("Adds a gizmo.");
 	});
 
+	it("uses branch as the pr_create head when head is omitted", async () => {
+		const textSpy = vi.spyOn(git.github, "text").mockResolvedValue("https://github.com/owner/repo/pull/78\n");
+		vi.spyOn(git.github, "json").mockResolvedValue({
+			number: 78,
+			title: "Add gizmo",
+			state: "OPEN",
+			isDraft: false,
+			baseRefName: "main",
+			headRefName: "feature/from-branch",
+			author: { login: "octocat" },
+			createdAt: "2026-05-01T09:00:00Z",
+			labels: [],
+			body: "",
+			url: "https://github.com/owner/repo/pull/78",
+		} as never);
+
+		const tool = new GithubTool(createSession("/tmp/outside-checkout"));
+		await tool.execute("pr-create-branch-head", {
+			op: "pr_create",
+			repo: "owner/repo",
+			title: "Add gizmo",
+			base: "main",
+			branch: "feature/from-branch",
+		});
+
+		const createArgs = textSpy.mock.calls[0]?.[1] ?? [];
+		expect(createArgs).toEqual(expect.arrayContaining(["--repo", "owner/repo"]));
+		expect(createArgs).toEqual(expect.arrayContaining(["--head", "feature/from-branch"]));
+	});
+
 	it("rejects pr_create when neither title nor fill is supplied", async () => {
 		const textSpy = vi.spyOn(git.github, "text");
 		const jsonSpy = vi.spyOn(git.github, "json");
