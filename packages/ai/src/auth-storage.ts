@@ -44,6 +44,17 @@ function getProviderAuthFallbacks(provider: string): readonly string[] {
 	return PROVIDER_AUTH_FALLBACKS[provider] ?? [];
 }
 
+const PROVIDER_AUTH_MIRRORS: Record<string, readonly string[]> = {
+	minimax: ["minimax-code"],
+	"minimax-cn": ["minimax-code-cn"],
+	"minimax-code": ["minimax"],
+	"minimax-code-cn": ["minimax-cn"],
+};
+
+function getProviderAuthMirrors(provider: string): readonly string[] {
+	return PROVIDER_AUTH_MIRRORS[provider] ?? [];
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Credential Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1329,10 +1340,7 @@ export class AuthStorage {
 		this.#resetProviderAssignments(provider);
 	}
 
-	/**
-	 * Remove credential for a provider.
-	 */
-	async remove(provider: string): Promise<void> {
+	async #removeProviderCredentials(provider: string): Promise<void> {
 		if (this.#store.deleteAuthCredentialsRemote) {
 			await this.#store.deleteAuthCredentialsRemote(provider, "deleted by user");
 		} else {
@@ -1340,6 +1348,16 @@ export class AuthStorage {
 		}
 		this.#setStoredCredentials(provider, []);
 		this.#resetProviderAssignments(provider);
+	}
+
+	/**
+	 * Remove credential for a provider.
+	 */
+	async remove(provider: string): Promise<void> {
+		await this.#removeProviderCredentials(provider);
+		for (const mirrorProvider of getProviderAuthMirrors(provider)) {
+			await this.#removeProviderCredentials(mirrorProvider);
+		}
 	}
 
 	/**

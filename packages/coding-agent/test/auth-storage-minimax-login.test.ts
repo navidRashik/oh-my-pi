@@ -99,4 +99,21 @@ describe("AuthStorage MiniMax login", () => {
 		});
 		expect(await authStorage.getApiKey("minimax-code-cn")).toBe("sk-cn");
 	});
+
+	test("MiniMax Token Plan logout removes mirrored provider credentials", async () => {
+		using _hook = hookFetch(
+			() => new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
+		);
+
+		await authStorage.login("minimax-cn", {
+			onAuth: () => {},
+			onPrompt: async () => "sk-cn",
+		});
+		await authStorage.logout("minimax-cn");
+
+		expect(authStorage.get("minimax-cn")).toBeUndefined();
+		expect(authStorage.get("minimax-code-cn")).toBeUndefined();
+		expect(await authStorage.getApiKey("minimax-cn")).toBeUndefined();
+		expect(await authStorage.getApiKey("minimax-code-cn")).toBeUndefined();
+	});
 });
