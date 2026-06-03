@@ -123,15 +123,11 @@ const PROVIDER_META = [
 // Compile-time exhaustiveness: a new `SearchProviderId` without a
 // `PROVIDER_META` entry fails type-checking here, which in turn means it would
 // be missing from the TUI/CLI selectors.
-type _AllIdsRegistered = Exclude<SearchProviderId, (typeof PROVIDER_META)[number]["id"]> extends never
-	? true
-	: never;
+type _AllIdsRegistered = Exclude<SearchProviderId, (typeof PROVIDER_META)[number]["id"]> extends never ? true : never;
 const _allIdsRegistered: _AllIdsRegistered = true;
 void _allIdsRegistered;
 
-const META_BY_ID: ReadonlyMap<SearchProviderId, ProviderMeta> = new Map(
-	PROVIDER_META.map(meta => [meta.id, meta]),
-);
+const META_BY_ID: ReadonlyMap<SearchProviderId, ProviderMeta> = new Map(PROVIDER_META.map(meta => [meta.id, meta]));
 
 const instanceCache = new Map<SearchProviderId, SearchProvider>();
 

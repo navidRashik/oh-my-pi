@@ -11,13 +11,13 @@ import {
 	selectSetupScenes,
 } from "../src/modes/setup-wizard";
 import { WebSearchTab } from "../src/modes/setup-wizard/scenes/web-search";
+import { initTheme, theme } from "../src/modes/theme/theme";
+import type { InteractiveModeContext } from "../src/modes/types";
 import {
 	SEARCH_PROVIDER_OPTIONS,
 	SEARCH_PROVIDER_ORDER,
 	SEARCH_PROVIDER_PREFERENCES,
 } from "../src/web/search/provider";
-import { initTheme, theme } from "../src/modes/theme/theme";
-import type { InteractiveModeContext } from "../src/modes/types";
 
 function fakeContextWithConfiguredModel(): InteractiveModeContext {
 	return {
@@ -205,9 +205,7 @@ describe("setup wizard web search tab", () => {
 	it("offers auto plus every registered provider in chain order", () => {
 		const expected: string[] = ["auto", ...SEARCH_PROVIDER_ORDER];
 		const schemaValues: string[] = [...SETTINGS_SCHEMA["providers.webSearch"].values];
-		const schemaOptionValues: string[] = SETTINGS_SCHEMA["providers.webSearch"].ui.options.map(
-			o => o.value,
-		);
+		const schemaOptionValues: string[] = SETTINGS_SCHEMA["providers.webSearch"].ui.options.map(o => o.value);
 
 		expect(schemaValues).toEqual(expected);
 		expect(schemaOptionValues).toEqual(expected);
