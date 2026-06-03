@@ -85,6 +85,20 @@ describe("builtin-defaults rule provider", () => {
 		expect(rules).toEqual([]);
 	});
 
+	it("returns no bundled rules when no builtinRuleMode is provided (opt-in default)", async () => {
+		const cwd = await makeWorkspace(["src/index.ts", "src/main.rs"]);
+		const rules = await loadBuiltinRules({ cwd, home: cwd, repoRoot: null });
+		expect(rules).toEqual([]);
+	});
+
+	it("returns no bundled rules when builtinRuleMode is explicitly off, even with matching files", async () => {
+		const tsRules = await loadFromWorkspace(["src/index.ts"], "off");
+		expect(tsRules).toEqual([]);
+
+		const rustRules = await loadFromWorkspace(["src/main.rs"], "off");
+		expect(rustRules).toEqual([]);
+	});
+
 	it("loads only language rule packs with matching workspace files in auto mode", async () => {
 		const tsRules = await loadFromWorkspace(["src/index.ts"]);
 		expect(tsRules.map(r => r.name).sort()).toEqual(EXPECTED_RULE_NAMES.filter(name => name.startsWith("ts-")));

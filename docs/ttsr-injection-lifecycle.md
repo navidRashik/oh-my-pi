@@ -35,7 +35,7 @@ const { rulebookRules, alwaysApplyRules } = bucketRules(
 );
 ```
 
-`builtin-defaults` is filtered during discovery by `ttsr.builtinRuleMode`: `"auto"` loads bundled Rust rules only for workspaces with `*.rs` files and TypeScript rules only for `*.ts`/`*.tsx` files, `"always"` forces every bundled language pack on, and `"off"` suppresses them. `bucketRules(...)` then drops names listed in `ttsr.disabledRules`, drops embedded `builtin-defaults` rules when `ttsr.builtinRules === false`, registers accepted TTSR rules, and routes the remaining rules to always-apply/rulebook buckets.
+`builtin-defaults` is opt-in: the default `ttsr.builtinRuleMode: "off"` keeps every bundled language pack out of session discovery. Set `"auto"` to load bundled Rust rules only for workspaces with `*.rs` files and TypeScript rules only for `*.ts`/`*.tsx` files, or `"always"` to force every bundled language pack on. `bucketRules(...)` then drops names listed in `ttsr.disabledRules`, drops embedded `builtin-defaults` rules when `ttsr.builtinRules === false`, registers accepted TTSR rules, and routes the remaining rules to always-apply/rulebook buckets.
 
 ### Pre-registration dedupe behavior
 

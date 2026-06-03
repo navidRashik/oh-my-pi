@@ -59,7 +59,7 @@ Consequence: precedence and deduplication are **name-based only**. Two different
 - `cline` (priority `40`)
 - `builtin-defaults` (priority `1`)
 
-`builtin-defaults` is workspace-aware: in `ttsr.builtinRuleMode: "auto"` (the default), it contributes Rust rules only when the workspace contains `*.rs` files and TypeScript rules only when the workspace contains `*.ts`/`*.tsx` files. Set `ttsr.builtinRuleMode: "always"` to force every bundled language pack on, `ttsr.builtinRuleMode: "off"` to suppress them at discovery time, or `ttsr.builtinRules: false` to disable the bundled provider's rules before bucketing.
+`builtin-defaults` is opt-in. The default `ttsr.builtinRuleMode: "off"` keeps every bundled language pack out of session rule discovery, so OMP core ships no language-specific policy unless a project opts in. Set `ttsr.builtinRuleMode: "auto"` to contribute Rust rules only when the workspace contains `*.rs` files and TypeScript rules only when the workspace contains `*.ts`/`*.tsx` files, `ttsr.builtinRuleMode: "always"` to force every bundled language pack on, or `ttsr.builtinRules: false` to disable the bundled provider's rules before bucketing.
 
 ### Native provider (`builtin.ts`)
 

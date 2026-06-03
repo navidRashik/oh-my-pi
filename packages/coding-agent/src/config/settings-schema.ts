@@ -1743,16 +1743,17 @@ export const SETTINGS_SCHEMA = {
 	"ttsr.builtinRuleMode": {
 		type: "enum",
 		values: BUILTIN_RULE_MODE_VALUES,
-		default: "auto",
+		default: "off",
 		ui: {
 			tab: "context",
 			label: "Builtin Rule Mode",
-			description: "Load bundled language rules automatically for matching workspaces, always, or never",
+			description:
+				"Opt in to bundled Rust/TypeScript rule packs (off by default; auto loads packs for matching workspaces; always forces them on)",
 			options: [
 				{
 					value: "auto",
 					label: "auto",
-					description: "Load Rust/TypeScript built-ins only when matching files exist",
+					description: "Load Rust/TypeScript built-ins only when matching files exist (opt in)",
 				},
 				{ value: "always", label: "always", description: "Force all bundled Rust/TypeScript rule packs on" },
 				{ value: "off", label: "off", description: "Disable bundled Rust/TypeScript rule packs" },

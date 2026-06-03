@@ -9,7 +9,7 @@
 ### Fixed
 
 - Fixed `/review`'s uncommitted-change mode in Jujutsu repositories to read `jj diff --git` from the current workspace, so non-default JJ workspaces include their working-copy changes instead of falling back to the colocated Git checkout.
-- Fixed bundled Rust/TypeScript TTSR rule packs loading in unrelated workspaces by making `builtin-defaults` workspace-aware by default; `ttsr.builtinRuleMode: "always"` still forces the packs on, and `"off"` disables them at discovery time ([#1768](https://github.com/can1357/oh-my-pi/issues/1768)).
+- Fixed bundled Rust/TypeScript TTSR rule packs loading in unrelated workspaces by making `builtin-defaults` opt-in. The new `ttsr.builtinRuleMode` setting defaults to `"off"` so OMP core ships no language-specific policy by default; set it to `"auto"` to load packs only when matching `.rs`/`.ts`/`.tsx` files exist, or `"always"` to force every pack on ([#1768](https://github.com/can1357/oh-my-pi/issues/1768)).
 - Fixed empty assistant stop retry continuations preserving auto-retry state until a non-empty assistant turn completes or recovery reaches its retry cap.
 
 ### Changed

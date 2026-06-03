@@ -2,13 +2,16 @@
  * Builtin Defaults Provider
  *
  * Ships bundled language-specific TTSR rule packs embedded into the binary.
- * The provider defaults to workspace-aware loading so Rust/TypeScript rules do
- * not appear in unrelated projects, while project/user/tool rules with the same
- * `name` still override bundled copies through first-wins deduplication.
+ * The provider is opt-in: the default `ttsr.builtinRuleMode: "off"` keeps
+ * bundled rules out of every session, so OMP core never implies style choices
+ * the project did not opt into. Project/user/tool rules with the same `name`
+ * still override bundled copies through first-wins deduplication.
  *
- * Users control bundled rules three ways:
- *   - set `ttsr.builtinRuleMode: "always"` to force every bundled language pack,
- *   - set `ttsr.builtinRules: false` or `ttsr.builtinRuleMode: "off"` to drop the set,
+ * Users opt in three ways:
+ *   - set `ttsr.builtinRuleMode: "auto"` to load packs only when matching
+ *     workspace files exist (`.rs`, `.ts`/`.tsx`),
+ *   - set `ttsr.builtinRuleMode: "always"` to force every bundled language
+ *     pack on,
  *   - list a name in `ttsr.disabledRules` to drop one rule after discovery.
  */
 import { FileType, glob } from "@oh-my-pi/pi-natives";
@@ -21,7 +24,7 @@ import { buildRuleFromMarkdown, createSourceMeta } from "./helpers";
 const DISPLAY_NAME = "Builtin Defaults";
 // Lowest priority: every other rule provider wins a name conflict.
 const PRIORITY = 1;
-const AUTO_MODE = "auto";
+const DEFAULT_MODE = "off";
 const BUILTIN_LANGUAGES: readonly BuiltinRuleLanguage[] = ["rust", "typescript"];
 
 const LANGUAGE_PATTERNS: Record<BuiltinRuleLanguage, string> = {
@@ -47,7 +50,7 @@ async function hasWorkspaceFiles(ctx: LoadContext, language: BuiltinRuleLanguage
 }
 
 async function activeLanguages(ctx: LoadContext): Promise<Set<BuiltinRuleLanguage>> {
-	const mode = ctx.builtinRuleMode ?? AUTO_MODE;
+	const mode = ctx.builtinRuleMode ?? DEFAULT_MODE;
 	if (mode === "off") return new Set<BuiltinRuleLanguage>();
 	if (mode === "always") return new Set(BUILTIN_LANGUAGES);
 
@@ -73,7 +76,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 registerProvider<Rule>(ruleCapability.id, {
 	id: BUILTIN_DEFAULTS_PROVIDER_ID,
 	displayName: DISPLAY_NAME,
-	description: "Workspace-aware language rule packs shipped with the agent",
+	description: "Opt-in language rule packs shipped with the agent",
 	priority: PRIORITY,
 	load: loadRules,
 });
