@@ -85,6 +85,16 @@ describe("builtin-defaults rule provider", () => {
 		expect(rules).toEqual([]);
 	});
 
+	it("limits auto language detection to cwd instead of the containing repo root", async () => {
+		const repoRoot = await makeWorkspace(["packages/web/src/index.ts", "packages/api/src/main.rs"]);
+		const cwd = path.join(repoRoot, "packages", "python");
+		await fs.mkdir(cwd, { recursive: true });
+		await Bun.write(path.join(cwd, "app.py"), "");
+
+		const rules = await loadBuiltinRules({ cwd, home: repoRoot, repoRoot, builtinRuleMode: "auto" });
+		expect(rules).toEqual([]);
+	});
+
 	it("returns no bundled rules when no builtinRuleMode is provided (opt-in default)", async () => {
 		const cwd = await makeWorkspace(["src/index.ts", "src/main.rs"]);
 		const rules = await loadBuiltinRules({ cwd, home: cwd, repoRoot: null });

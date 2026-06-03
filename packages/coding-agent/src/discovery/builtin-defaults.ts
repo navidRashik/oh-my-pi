@@ -33,7 +33,7 @@ const LANGUAGE_PATTERNS: Record<BuiltinRuleLanguage, string> = {
 };
 
 async function hasWorkspaceFiles(ctx: LoadContext, language: BuiltinRuleLanguage): Promise<boolean> {
-	const root = ctx.repoRoot ?? ctx.cwd;
+	const root = ctx.cwd;
 	try {
 		const result = await glob({
 			pattern: LANGUAGE_PATTERNS[language],
