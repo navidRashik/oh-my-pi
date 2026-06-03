@@ -99,6 +99,16 @@ replace 3..3:
 # RIGHT
 replace 3..3:
 +   return msg
+
+# WRONG — pure-insert payload includes the anchor line as adjacent context.
+# `insert after N:` starting with line N (or `insert before N:` ending with line N)
+# is rejected; the anchor stays untouched, the body is ONLY the new lines.
+insert after 2:
++bbb
++NEW
+# RIGHT
+insert after 2:
++NEW
 </anti-patterns>
 
 <critical>

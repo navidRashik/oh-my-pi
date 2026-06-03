@@ -126,3 +126,21 @@ export const HEADTAIL_DRIFT_WARNING =
 export function missingSnapshotTagMessage(sectionPath: string): string {
 	return `Missing hashline snapshot tag for edit to ${sectionPath}; use \`${HL_FILE_PREFIX}${sectionPath}${HL_FILE_HASH_SEP}tag\` from your latest read/search output. To create a new file, use the write tool.`;
 }
+
+/**
+ * Error text emitted when a pure `insert before N:` or `insert after N:`
+ * payload echoes the anchor line on the side adjacent to the anchor. Hashline
+ * inserts the payload literally, so an echoed anchor line silently duplicates
+ * the surrounding context — the common mistake is pasting the anchor as
+ * leading/trailing context inside the payload. Surface the precise offender so
+ * the author can drop the echo or re-author as `replace N..N:` when the
+ * duplicate is intentional.
+ */
+export function insertAnchorEchoMessage(side: "before" | "after", anchorLine: number, anchorText: string): string {
+	const edge = side === "after" ? "starts with" : "ends with";
+	return (
+		`\`insert ${side} ${anchorLine}:\` payload ${edge} the anchor line ${JSON.stringify(anchorText)}, ` +
+		`which would silently duplicate it. Insert payloads must contain only new lines — drop the echoed copy, ` +
+		`or use \`replace ${anchorLine}..${anchorLine}:\` listing both copies if the duplicate is intentional.`
+	);
+}

@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed delimiter-balance boundary repair to also drop a single duplicated structural opener (e.g. a restated `foo(` / `if (x) {` signature line surviving just above the range), not only duplicated closers. Zero-balance duplicates remain untouched.
+- Fixed `insert before N:` / `insert after N:` silently duplicating the anchor line when the payload's adjacent edge re-stated it (e.g. `insert after 2:\n+bbb\n+NEW` on `bbb` yielded `bbb\nbbb\nNEW`). The applier now rejects pure anchor-targeted inserts whose adjacent payload line equals the anchor with a focused diagnostic that names the offender and points at the canonical `replace N..N:` re-authoring; mid-payload duplicates, head/tail inserts, and inserts combined with a delete or replacement at the same anchor are unaffected ([#1759](https://github.com/can1357/oh-my-pi/issues/1759)).
 
 ## [15.8.0] - 2026-06-02
 

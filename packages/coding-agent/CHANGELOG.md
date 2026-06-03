@@ -10,6 +10,7 @@
 
 - Fixed `/review`'s uncommitted-change mode in Jujutsu repositories to read `jj diff --git` from the current workspace, so non-default JJ workspaces include their working-copy changes instead of falling back to the colocated Git checkout.
 - Fixed empty assistant stop retry continuations preserving auto-retry state until a non-empty assistant turn completes or recovery reaches its retry cap.
+- Fixed the `edit` tool silently duplicating a line when an `insert before N:` payload ended with the anchor text or an `insert after N:` payload began with it. Hashline now rejects those pure anchor-targeted inserts with a diagnostic that names the echoed line and points at the canonical `replace N..N:` re-authoring; head/tail inserts, mid-payload duplicates, and inserts combined with a delete or replacement at the same anchor are unaffected ([#1759](https://github.com/can1357/oh-my-pi/issues/1759)).
 
 ### Changed
 

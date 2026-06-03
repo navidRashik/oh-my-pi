@@ -7,7 +7,7 @@
  * which absorbs common model mistakes where a payload restates unchanged range
  * boundaries or duplicates/drops structural closers.
  */
-import { UNRESOLVED_BLOCK_INTERNAL } from "./messages";
+import { insertAnchorEchoMessage, UNRESOLVED_BLOCK_INTERNAL } from "./messages";
 import { cloneCursor } from "./tokenizer";
 import type { Anchor, ApplyResult, Cursor, Edit } from "./types";
 
@@ -45,6 +45,60 @@ function validateLineBounds(edits: AppliedEdit[], fileLines: string[]): void {
 			if (anchor.line < 1 || anchor.line > fileLines.length) {
 				throw new Error(`Line ${anchor.line} does not exist (file has ${fileLines.length} lines)`);
 			}
+		}
+	}
+}
+
+/**
+ * Reject pure anchor-targeted inserts whose payload edge exactly echoes the
+ * anchor line. The applier inserts payloads literally, so `insert after N:`
+ * with a first payload line equal to line N (or `insert before N:` with a last
+ * payload line equal to line N) silently duplicates the anchor — a common
+ * mistake when an author pastes the anchor as adjacent context inside the
+ * payload. Replacement groups and delete+insert combinations are exempt
+ * because their semantics already consume or restate the anchor.
+ */
+function validateInsertAnchorEcho(edits: AppliedEdit[], fileLines: string[]): void {
+	interface Slot {
+		firstAfter?: InsertEdit;
+		lastBefore?: InsertEdit;
+		hasDeleteOrReplacement: boolean;
+	}
+	const slots = new Map<number, Slot>();
+	const ensure = (line: number): Slot => {
+		let slot = slots.get(line);
+		if (!slot) {
+			slot = { hasDeleteOrReplacement: false };
+			slots.set(line, slot);
+		}
+		return slot;
+	};
+	for (const edit of edits) {
+		if (edit.kind === "delete") {
+			ensure(edit.anchor.line).hasDeleteOrReplacement = true;
+			continue;
+		}
+		const cursor = edit.cursor;
+		if (cursor.kind !== "before_anchor" && cursor.kind !== "after_anchor") continue;
+		const slot = ensure(cursor.anchor.line);
+		if (isReplacementInsert(edit)) {
+			slot.hasDeleteOrReplacement = true;
+			continue;
+		}
+		if (cursor.kind === "after_anchor") {
+			if (slot.firstAfter === undefined) slot.firstAfter = edit;
+		} else {
+			slot.lastBefore = edit;
+		}
+	}
+	for (const [line, slot] of slots) {
+		if (slot.hasDeleteOrReplacement) continue;
+		const anchorText = fileLines[line - 1] ?? "";
+		if (slot.firstAfter && slot.firstAfter.text === anchorText) {
+			throw new Error(`line ${slot.firstAfter.lineNum}: ${insertAnchorEchoMessage("after", line, anchorText)}`);
+		}
+		if (slot.lastBefore && slot.lastBefore.text === anchorText) {
+			throw new Error(`line ${slot.lastBefore.lineNum}: ${insertAnchorEchoMessage("before", line, anchorText)}`);
 		}
 	}
 }
@@ -508,6 +562,7 @@ export function applyEdits(text: string, edits: readonly Edit[]): ApplyResult {
 
 	const targetEdits = appliedEdits.map((edit, index) => cloneAppliedEdit(edit, index));
 	validateLineBounds(targetEdits, fileLines);
+	validateInsertAnchorEcho(targetEdits, fileLines);
 	const { edits: repaired, warnings } = repairReplacementBoundaries(targetEdits, fileLines);
 
 	// Partition edits into bof, eof, and anchor-targeted buckets.

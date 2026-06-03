@@ -94,9 +94,31 @@ describe("hashline apply — duplicate boundary payloads", () => {
 		expect(applyPatch(text, diff)).toBe(["// one", "// two", "// one", "// two", "new();"].join("\n"));
 	});
 
-	it("keeps pure-insert context echoes literal", () => {
+	it("keeps head/tail pure-insert context echoes literal (no anchor to echo)", () => {
 		const text = ["aaa", "bbb", "ccc"].join("\n");
-		const diff = "insert tail:\n+bbb\n+ccc\n+NEW";
-		expect(applyPatch(text, diff)).toBe("aaa\nbbb\nccc\nbbb\nccc\nNEW");
+		expect(applyPatch(text, "insert tail:\n+bbb\n+ccc\n+NEW")).toBe("aaa\nbbb\nccc\nbbb\nccc\nNEW");
+		expect(applyPatch(text, "insert head:\n+NEW\n+aaa\n+bbb")).toBe("NEW\naaa\nbbb\naaa\nbbb\nccc");
+	});
+});
+
+describe("hashline apply — insert anchor echo rejection", () => {
+	it("rejects `insert after N:` whose first payload line equals the anchor", () => {
+		const text = ["aaa", "bbb", "ccc"].join("\n");
+		expect(() => applyPatch(text, "insert after 2:\n+bbb\n+NEW")).toThrow(
+			/`insert after 2:` payload starts with the anchor line "bbb".*replace 2\.\.2:/s,
+		);
+	});
+
+	it("rejects `insert before N:` whose last payload line equals the anchor", () => {
+		const text = ["aaa", "bbb", "ccc"].join("\n");
+		expect(() => applyPatch(text, "insert before 2:\n+NEW\n+bbb")).toThrow(
+			/`insert before 2:` payload ends with the anchor line "bbb".*replace 2\.\.2:/s,
+		);
+	});
+
+	it("allows mid-payload duplicates that do not touch the anchor", () => {
+		const text = ["aaa", "bbb", "ccc"].join("\n");
+		expect(applyPatch(text, "insert after 2:\n+NEW\n+bbb")).toBe("aaa\nbbb\nNEW\nbbb\nccc");
+		expect(applyPatch(text, "insert before 2:\n+bbb\n+NEW")).toBe("aaa\nbbb\nNEW\nbbb\nccc");
 	});
 });

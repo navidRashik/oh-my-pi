@@ -373,25 +373,57 @@ describe("hashline parser — range-anchor syntax", () => {
 		expect(applyDiff(source, diff)).toBe(["if ok {", "   keep();", "   }", "   added();", "   }"].join("\n"));
 	});
 
-	it("preserves an intentional non-structural duplicate for after insert", () => {
+	it("rejects insert-after payload whose first line echoes the anchor", () => {
 		const source = ["aaa", "bbb", "ccc"].join("\n");
 		const diff = [`insert after ${tag(2, "bbb")}:`, repl("bbb"), repl("NEW")].join("\n");
 
-		expect(applyDiff(source, diff)).toBe("aaa\nbbb\nbbb\nNEW\nccc");
+		expect(() => applyDiff(source, diff)).toThrow(/`insert after 2:` payload starts with the anchor line/);
 	});
 
-	it("preserves an intentional non-structural duplicate for before insert", () => {
+	it("rejects insert-before payload whose last line echoes the anchor", () => {
 		const source = ["aaa", "bbb", "ccc"].join("\n");
 		const diff = [`insert before ${tag(2, "bbb")}:`, repl("NEW"), repl("bbb")].join("\n");
 
-		expect(applyDiff(source, diff)).toBe("aaa\nNEW\nbbb\nbbb\nccc");
+		expect(() => applyDiff(source, diff)).toThrow(/`insert before 2:` payload ends with the anchor line/);
 	});
 
-	it("keeps a single structural pure-insert suffix when it preserves balance", () => {
+	it("rejects single-line insert payload that exactly equals the anchor", () => {
+		const source = ["aaa", "bbb", "ccc"].join("\n");
+		const afterDiff = [`insert after ${tag(2, "bbb")}:`, repl("bbb")].join("\n");
+		expect(() => applyDiff(source, afterDiff)).toThrow(/`insert after 2:` payload starts with the anchor line/);
+
+		const beforeDiff = [`insert before ${tag(2, "bbb")}:`, repl("bbb")].join("\n");
+		expect(() => applyDiff(source, beforeDiff)).toThrow(/`insert before 2:` payload ends with the anchor line/);
+	});
+
+	it("rejects structural insert-before payload whose last line echoes the anchor closer", () => {
 		const source = ["if outer {", "}"].join("\n");
 		const diff = [`insert before ${tag(2, "}")}:`, repl("if inner {"), repl("}")].join("\n");
 
+		expect(() => applyDiff(source, diff)).toThrow(/`insert before 2:` payload ends with the anchor line/);
+	});
+
+	it("accepts the canonical replace re-authoring of an intentional anchor duplicate", () => {
+		const source = ["if outer {", "}"].join("\n");
+		const diff = [`${sameLineRange(tag(2, "}"))}`, repl("if inner {"), repl("}"), repl("}")].join("\n");
+
 		expect(applyDiff(source, diff)).toBe(["if outer {", "if inner {", "}", "}"].join("\n"));
+	});
+
+	it("accepts non-adjacent payload lines that happen to equal the anchor", () => {
+		const source = ["aaa", "bbb", "ccc"].join("\n");
+		const afterDiff = [`insert after ${tag(2, "bbb")}:`, repl("NEW"), repl("bbb")].join("\n");
+		expect(applyDiff(source, afterDiff)).toBe("aaa\nbbb\nNEW\nbbb\nccc");
+
+		const beforeDiff = [`insert before ${tag(2, "bbb")}:`, repl("bbb"), repl("NEW")].join("\n");
+		expect(applyDiff(source, beforeDiff)).toBe("aaa\nbbb\nNEW\nbbb\nccc");
+	});
+
+	it("does not fire on insert combined with a delete at the same anchor", () => {
+		const source = ["aaa", "bbb", "ccc"].join("\n");
+		const diff = [`delete ${tag(2, "bbb")}`, `insert after ${tag(2, "bbb")}:`, repl("bbb")].join("\n");
+
+		expect(applyDiff(source, diff)).toBe("aaa\nbbb\nccc");
 	});
 
 	it("preserves payload text exactly", () => {
