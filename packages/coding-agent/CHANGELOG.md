@@ -9,7 +9,7 @@
 ### Fixed
 
 - Fixed `/review`'s uncommitted-change mode in Jujutsu repositories to read `jj diff --git` from the current workspace, so non-default JJ workspaces include their working-copy changes instead of falling back to the colocated Git checkout.
-- Fixed Windows-hostile tool retries by recovering serialized JSON path arrays before glob compilation, defaulting the bash interceptor on for shell commands with dedicated tools (including `ls`, `grep`, and `rg`), and treating `github pr_create`'s `branch` argument as the PR head when `head` is omitted ([#1771](https://github.com/can1357/oh-my-pi/issues/1771)).
+- Fixed the `search` tool failing with `Invalid glob pattern ... invalid range` when a model serialized `paths` as a JSON-array-looking string (e.g. `'["packages/coding-agent"]'`); the path scope now recovers serialized string arrays before glob compilation while preserving real files with bracketed names. Also reused `github pr_create`'s `branch` argument as the PR head when `head` is omitted, so repo-scoped PR creation works outside a checkout ([#1771](https://github.com/can1357/oh-my-pi/issues/1771)).
 - Fixed empty assistant stop retry continuations preserving auto-retry state until a non-empty assistant turn completes or recovery reaches its retry cap.
 
 ### Changed

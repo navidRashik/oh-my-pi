@@ -1,10 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
-import { type BashInterceptorRule, DEFAULT_BASH_INTERCEPTOR_RULES } from "../../src/config/settings-schema";
+import type { BashInterceptorRule } from "../../src/config/settings-schema";
 import type { ToolSession } from "../../src/tools";
 import { BashTool, type BashToolInput } from "../../src/tools/bash";
-import { checkBashInterception } from "../../src/tools/bash-interceptor";
 
 function createBashTool(rules: BashInterceptorRule[]): BashTool {
 	const session = {
@@ -26,13 +25,6 @@ function createBashTool(rules: BashInterceptorRule[]): BashTool {
 }
 
 describe("BashTool interception", () => {
-	it("blocks listing and grep commands by default when replacement tools are available", () => {
-		expect(checkBashInterception('ls "C:\\Users\\james\\Project Files"', ["read"]).block).toBe(true);
-		expect(checkBashInterception('grep -rn "needle" src', ["search"]).block).toBe(true);
-		expect(checkBashInterception("rg -l needle src", ["search"]).block).toBe(true);
-		expect(DEFAULT_BASH_INTERCEPTOR_RULES.some(rule => rule.pattern.includes("ls"))).toBe(true);
-	});
-
 	it("checks the original command before leading cd normalization", async () => {
 		const tool = createBashTool([
 			{
