@@ -213,6 +213,9 @@ const EMPTY_STRING_RECORD: Record<string, string> = {};
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
+export const BUILTIN_RULE_MODE_VALUES = ["auto", "always", "off"] as const;
+export type BuiltinRuleMode = (typeof BUILTIN_RULE_MODE_VALUES)[number];
+
 export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 	{
 		pattern: "^\\s*(cat|head|tail|less|more)\\s+",
@@ -1733,7 +1736,27 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "context",
 			label: "Builtin Rules",
-			description: "Load the default rules shipped with the agent (override individually with ttsr.disabledRules)",
+			description: "Master switch for bundled language rule packs (fine-tune behavior with ttsr.builtinRuleMode)",
+		},
+	},
+
+	"ttsr.builtinRuleMode": {
+		type: "enum",
+		values: BUILTIN_RULE_MODE_VALUES,
+		default: "auto",
+		ui: {
+			tab: "context",
+			label: "Builtin Rule Mode",
+			description: "Load bundled language rules automatically for matching workspaces, always, or never",
+			options: [
+				{
+					value: "auto",
+					label: "auto",
+					description: "Load Rust/TypeScript built-ins only when matching files exist",
+				},
+				{ value: "always", label: "always", description: "Force all bundled Rust/TypeScript rule packs on" },
+				{ value: "off", label: "off", description: "Disable bundled Rust/TypeScript rule packs" },
+			],
 		},
 	},
 
@@ -3391,6 +3414,8 @@ export interface TtsrSettings {
 	repeatGap: number;
 	/** Bucketing-only (read by bucketRules, not the TtsrManager). */
 	builtinRules?: boolean;
+	/** Discovery-time loading behavior for bundled language rule packs. */
+	builtinRuleMode?: BuiltinRuleMode;
 	/** Bucketing-only (read by bucketRules, not the TtsrManager). */
 	disabledRules?: string[];
 }

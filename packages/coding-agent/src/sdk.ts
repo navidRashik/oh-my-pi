@@ -1114,10 +1114,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const { ttsrManager, rulebookRules, alwaysApplyRules } = await logger.time("discoverTtsrRules", async () => {
 		const ttsrSettings = settings.getGroup("ttsr");
 		const ttsrManager = new TtsrManager(ttsrSettings);
+		const builtinRuleMode = ttsrSettings.builtinRules === false ? "off" : ttsrSettings.builtinRuleMode;
 		const rulesResult =
 			options.rules !== undefined
 				? { items: options.rules, warnings: undefined }
-				: await loadCapability<Rule>(ruleCapability.id, { cwd });
+				: await loadCapability<Rule>(ruleCapability.id, { cwd, builtinRuleMode });
 		const { rulebookRules, alwaysApplyRules } = bucketRules(rulesResult.items, ttsrManager, {
 			builtinRules: ttsrSettings.builtinRules,
 			disabledRules: ttsrSettings.disabledRules,

@@ -59,6 +59,8 @@ Consequence: precedence and deduplication are **name-based only**. Two different
 - `cline` (priority `40`)
 - `builtin-defaults` (priority `1`)
 
+`builtin-defaults` is workspace-aware: in `ttsr.builtinRuleMode: "auto"` (the default), it contributes Rust rules only when the workspace contains `*.rs` files and TypeScript rules only when the workspace contains `*.ts`/`*.tsx` files. Set `ttsr.builtinRuleMode: "always"` to force every bundled language pack on, `ttsr.builtinRuleMode: "off"` to suppress them at discovery time, or `ttsr.builtinRules: false` to disable the bundled provider's rules before bucketing.
+
 ### Native provider (`builtin.ts`)
 
 Loads `.omp` rules from:
@@ -175,7 +177,7 @@ Notable source-order differences:
 - `cursor` appends user then project results.
 - `windsurf` appends user `global_rules` first, then project rules.
 - `cline` loads only nearest `.clinerules` source.
-- `builtin-defaults` uses the embedded rule source order.
+- `builtin-defaults` uses the embedded rule source order after workspace language filtering.
 
 ## 5. Split into Rulebook, Always-Apply, and TTSR buckets
 

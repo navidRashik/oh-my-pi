@@ -22,7 +22,9 @@ At session creation, `createAgentSession()` loads discovered rules, constructs a
 ```ts
 const ttsrSettings = settings.getGroup("ttsr");
 const ttsrManager = new TtsrManager(ttsrSettings);
-const rulesResult = await loadCapability<Rule>(ruleCapability.id, { cwd });
+const builtinRuleMode =
+  ttsrSettings.builtinRules === false ? "off" : ttsrSettings.builtinRuleMode;
+const rulesResult = await loadCapability<Rule>(ruleCapability.id, { cwd, builtinRuleMode });
 const { rulebookRules, alwaysApplyRules } = bucketRules(
   rulesResult.items,
   ttsrManager,
@@ -33,7 +35,7 @@ const { rulebookRules, alwaysApplyRules } = bucketRules(
 );
 ```
 
-`bucketRules(...)` drops names listed in `ttsr.disabledRules`, drops embedded `builtin-defaults` rules when `ttsr.builtinRules === false`, registers accepted TTSR rules, and then routes the remaining rules to always-apply/rulebook buckets.
+`builtin-defaults` is filtered during discovery by `ttsr.builtinRuleMode`: `"auto"` loads bundled Rust rules only for workspaces with `*.rs` files and TypeScript rules only for `*.ts`/`*.tsx` files, `"always"` forces every bundled language pack on, and `"off"` suppresses them. `bucketRules(...)` then drops names listed in `ttsr.disabledRules`, drops embedded `builtin-defaults` rules when `ttsr.builtinRules === false`, registers accepted TTSR rules, and routes the remaining rules to always-apply/rulebook buckets.
 
 ### Pre-registration dedupe behavior
 

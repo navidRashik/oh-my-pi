@@ -6,6 +6,9 @@
  * a unified array of MCP servers.
  */
 
+/** Built-in rule pack loading behavior for workspace-scoped language defaults. */
+export type BuiltinRuleMode = "auto" | "always" | "off";
+
 /**
  * Context passed to every provider loader.
  */
@@ -16,6 +19,8 @@ export interface LoadContext {
 	home: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
+	/** Built-in language rule pack loading behavior for providers that support it. */
+	builtinRuleMode?: BuiltinRuleMode;
 }
 
 /**
@@ -72,6 +77,8 @@ export interface LoadOptions {
 	includeDisabled?: boolean;
 	/** Explicit disabled extension IDs to apply instead of settings. */
 	disabledExtensions?: string[];
+	/** Built-in language rule pack loading behavior. Default: "auto". */
+	builtinRuleMode?: BuiltinRuleMode;
 }
 
 /**

@@ -14,7 +14,7 @@ import type { Rule } from "../../../capability/rule";
 import type { Skill } from "../../../capability/skill";
 import type { SlashCommand } from "../../../capability/slash-command";
 import type { CustomTool } from "../../../capability/tool";
-import type { SourceMeta } from "../../../capability/types";
+import type { BuiltinRuleMode, SourceMeta } from "../../../capability/types";
 import {
 	disableProvider,
 	enableProvider,
@@ -44,7 +44,11 @@ export interface ExtensionSettingsManager {
 /**
  * Load all extensions from all capabilities.
  */
-export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): Promise<Extension[]> {
+export async function loadAllExtensions(
+	cwd?: string,
+	disabledIds?: string[],
+	builtinRuleMode?: BuiltinRuleMode,
+): Promise<Extension[]> {
 	const extensions: Extension[] = [];
 	const disabledExtensions = new Set<string>(disabledIds ?? []);
 
@@ -98,7 +102,7 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 		}
 	}
 
-	const loadOpts = cwd ? { cwd, includeDisabled: true } : { includeDisabled: true };
+	const loadOpts = cwd ? { cwd, includeDisabled: true, builtinRuleMode } : { includeDisabled: true, builtinRuleMode };
 
 	// Load skills
 	try {
@@ -552,8 +556,12 @@ export function applyDisabledExtensionsToState(state: DashboardState, disabledId
 /**
  * Create initial dashboard state.
  */
-export async function createInitialState(cwd?: string, disabledIds?: string[]): Promise<DashboardState> {
-	const extensions = await loadAllExtensions(cwd, disabledIds);
+export async function createInitialState(
+	cwd?: string,
+	disabledIds?: string[],
+	builtinRuleMode?: BuiltinRuleMode,
+): Promise<DashboardState> {
+	const extensions = await loadAllExtensions(cwd, disabledIds, builtinRuleMode);
 	const tabs = buildProviderTabs(extensions);
 	const tabFiltered = extensions; // "all" tab by default
 	const searchFiltered = tabFiltered;
@@ -591,8 +599,9 @@ export async function refreshState(
 	state: DashboardState,
 	cwd?: string,
 	disabledIds?: string[],
+	builtinRuleMode?: BuiltinRuleMode,
 ): Promise<DashboardState> {
-	const extensions = await loadAllExtensions(cwd, disabledIds);
+	const extensions = await loadAllExtensions(cwd, disabledIds, builtinRuleMode);
 	const tabs = buildProviderTabs(extensions);
 
 	// Get current provider from tabs

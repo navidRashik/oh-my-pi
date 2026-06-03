@@ -835,7 +835,8 @@ export class AcpAgent implements Agent {
 				const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
 				const sm = await Settings.init();
 				const disabledIds = (sm.get("disabledExtensions") as string[] | undefined) ?? [];
-				const extensions = await loadAllExtensions(cwd, disabledIds);
+				const builtinRuleMode = sm.get("ttsr.builtinRules") === false ? "off" : sm.get("ttsr.builtinRuleMode");
+				const extensions = await loadAllExtensions(cwd, disabledIds, builtinRuleMode);
 				return { extensions: extensions as unknown as Array<{ [key: string]: unknown }> };
 			}
 			case "_omp/extensions/toggle": {

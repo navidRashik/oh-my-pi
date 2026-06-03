@@ -24,27 +24,31 @@ import tsNoTinyFunctions from "./ts-no-tiny-functions.md" with { type: "text" };
 import tsPromiseWithResolvers from "./ts-promise-with-resolvers.md" with { type: "text" };
 import tsSetMap from "./ts-set-map.md" with { type: "text" };
 
-/** A bundled rule's stable name and raw markdown (frontmatter + body). */
+/** Language family a bundled rule pack applies to. */
+export type BuiltinRuleLanguage = "rust" | "typescript";
+
+/** A bundled rule's stable name, language family, and raw markdown. */
 export interface BuiltinRuleSource {
 	name: string;
+	language: BuiltinRuleLanguage;
 	content: string;
 }
 
 /** All bundled default rules, ordered by name. */
 export const BUILTIN_RULE_SOURCES: readonly BuiltinRuleSource[] = [
-	{ name: "rs-box-leak", content: rsBoxLeak },
-	{ name: "rs-future-prelude", content: rsFuturePrelude },
-	{ name: "rs-lazylock", content: rsLazylock },
-	{ name: "rs-match-ergonomics", content: rsMatchErgonomics },
-	{ name: "rs-parking-lot", content: rsParkingLot },
-	{ name: "rs-result-type", content: rsResultType },
-	{ name: "ts-bare-catch", content: tsBareCatch },
-	{ name: "ts-import-type", content: tsImportType },
-	{ name: "ts-no-any", content: tsNoAny },
-	{ name: "ts-no-deprecated-leftovers", content: tsNoDeprecatedLeftovers },
-	{ name: "ts-no-dynamic-import", content: tsNoDynamicImport },
-	{ name: "ts-no-return-type", content: tsNoReturnType },
-	{ name: "ts-no-tiny-functions", content: tsNoTinyFunctions },
-	{ name: "ts-promise-with-resolvers", content: tsPromiseWithResolvers },
-	{ name: "ts-set-map", content: tsSetMap },
+	{ name: "rs-box-leak", language: "rust", content: rsBoxLeak },
+	{ name: "rs-future-prelude", language: "rust", content: rsFuturePrelude },
+	{ name: "rs-lazylock", language: "rust", content: rsLazylock },
+	{ name: "rs-match-ergonomics", language: "rust", content: rsMatchErgonomics },
+	{ name: "rs-parking-lot", language: "rust", content: rsParkingLot },
+	{ name: "rs-result-type", language: "rust", content: rsResultType },
+	{ name: "ts-bare-catch", language: "typescript", content: tsBareCatch },
+	{ name: "ts-import-type", language: "typescript", content: tsImportType },
+	{ name: "ts-no-any", language: "typescript", content: tsNoAny },
+	{ name: "ts-no-deprecated-leftovers", language: "typescript", content: tsNoDeprecatedLeftovers },
+	{ name: "ts-no-dynamic-import", language: "typescript", content: tsNoDynamicImport },
+	{ name: "ts-no-return-type", language: "typescript", content: tsNoReturnType },
+	{ name: "ts-no-tiny-functions", language: "typescript", content: tsNoTinyFunctions },
+	{ name: "ts-promise-with-resolvers", language: "typescript", content: tsPromiseWithResolvers },
+	{ name: "ts-set-map", language: "typescript", content: tsSetMap },
 ];

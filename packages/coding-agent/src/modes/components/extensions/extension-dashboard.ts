@@ -21,6 +21,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
+import type { BuiltinRuleMode } from "../../../capability/types";
 import { Settings } from "../../../config/settings";
 import { DynamicBorder } from "../../../modes/components/dynamic-border";
 import { theme } from "../../../modes/theme/theme";
@@ -36,6 +37,12 @@ import {
 	toggleProvider,
 } from "./state-manager";
 import type { DashboardState } from "./types";
+
+function getBuiltinRuleMode(settings: Settings | null): BuiltinRuleMode | undefined {
+	if (!settings) return undefined;
+	if (settings.get("ttsr.builtinRules") === false) return "off";
+	return settings.get("ttsr.builtinRuleMode");
+}
 
 export class ExtensionDashboard extends Container {
 	#state!: DashboardState;
@@ -67,7 +74,7 @@ export class ExtensionDashboard extends Container {
 	async #init(): Promise<void> {
 		const sm = this.settings ?? (await Settings.init());
 		const disabledIds = sm ? ((sm.get("disabledExtensions") as string[]) ?? []) : [];
-		this.#state = await createInitialState(this.cwd, disabledIds);
+		this.#state = await createInitialState(this.cwd, disabledIds, getBuiltinRuleMode(sm));
 
 		// Calculate max visible items based on terminal height
 		// Reserve ~10 lines for header, tabs, help text, borders
@@ -201,7 +208,7 @@ export class ExtensionDashboard extends Container {
 
 		const sm = this.settings ?? Settings.instance;
 		const disabledIds = sm ? ((sm.get("disabledExtensions") as string[]) ?? []) : [];
-		const nextState = await refreshState(this.#state, this.cwd, disabledIds);
+		const nextState = await refreshState(this.#state, this.cwd, disabledIds, getBuiltinRuleMode(sm));
 		if (refreshToken !== this.#refreshToken) return;
 		this.#state = nextState;
 

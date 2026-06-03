@@ -234,7 +234,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	const cwd = options.cwd ?? getProjectDir();
 	const home = os.homedir();
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home, repoRoot };
+	const ctx: LoadContext = { cwd, home, repoRoot, builtinRuleMode: options.builtinRuleMode };
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);
