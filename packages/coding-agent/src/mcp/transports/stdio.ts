@@ -299,22 +299,23 @@ export class StdioTransport implements MCPTransport {
 		}
 
 		const message = `${JSON.stringify(request)}\n`;
-		// Route both sync throws AND deferred Promise rejections (Windows pipe
-		// write rejecting later — see #1741) through the same reject path so
-		// the pending request never hangs and no unhandled rejection escapes.
+		// Fire-and-forget: returning `promise` immediately keeps the MCP timeout
+		// timer and abort signal observable to the caller even if the FileSink
+		// stalls (subprocess stops reading, pipe backpressured) — otherwise the
+		// caller is stuck on `await transport.request(...)` and never sees the
+		// timeout reject `promise`. `writeFrame` cannot reject; sync throws and
+		// deferred Promise rejections from write/flush are funneled into
+		// `onWriteFailure`, which rejects the pending request and tears the
+		// transport down so other pending requests / notify() / the manager's
+		// onClose observe the closure immediately instead of waiting for the
+		// read loop to see EOF (#1741).
 		const onWriteFailure = (error: unknown) => {
 			const failure = error instanceof Error ? error : new Error(String(error));
 			cleanup();
 			reject(failure);
-			// A failed write means the pipe is dead; tear the transport down
-			// so other pending requests / notify() / the manager's onClose
-			// observe the closure immediately instead of waiting for the read
-			// loop to see EOF.
 			this.#handleClose();
 		};
-		if (!(await writeFrame(this.#process.stdin, message, onWriteFailure))) {
-			return promise;
-		}
+		void writeFrame(this.#process.stdin, message, onWriteFailure);
 
 		return promise;
 	}

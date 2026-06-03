@@ -263,6 +263,46 @@ describe("StdioTransport.notify", () => {
 });
 
 // ---------------------------------------------------------------------------
+// StdioTransport.request — the request() function must return its pending
+// promise immediately so the MCP timeout `setTimeout` callback can reject
+// `promise` even if the underlying FileSink stalls (subprocess holds stdin
+// open but stops reading, pipe backpressured). Pre-#1741 follow-up the
+// `await writeFrame(...)` blocked the outer async function, defeating the
+// timeout. See PR #1742 review.
+// ---------------------------------------------------------------------------
+
+describe("StdioTransport.request", () => {
+	let transport: StdioTransport | undefined;
+
+	afterEach(async () => {
+		await transport?.close().catch(() => {});
+		transport = undefined;
+	});
+
+	it("honours the configured timeout even when the subprocess never responds", async () => {
+		// Subprocess that drains stdin (so write() never backpressures) but
+		// never sends a response. The only way `request()` settles is via the
+		// MCP timeout timer, which can only fire if `request()` returns its
+		// pending promise to the caller instead of blocking on the write.
+		transport = new StdioTransport({
+			type: "stdio",
+			command: "bun",
+			args: ["-e", 'process.stdin.on("data", () => {}); await Bun.sleep(60_000);'],
+			timeout: 50,
+		});
+
+		await transport.connect();
+
+		const started = Date.now();
+		await expect(transport.request("initialize", {})).rejects.toThrow(/Request timeout after 50ms/);
+		// Sanity check: the timer fires near its deadline rather than hanging
+		// until the subprocess exits. Generous upper bound keeps the assertion
+		// from flaking on slow CI.
+		expect(Date.now() - started).toBeLessThan(2_000);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // StdioTransport.close — authoritative resource teardown that must keep
 // cleaning up the subprocess and read loop even when `#handleClose()` has
 // already flipped `#connected` (read-loop EOF, or a notify() write failure
