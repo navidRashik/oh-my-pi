@@ -96,4 +96,40 @@ describe("bucketRules", () => {
 
 		expect(mgr.checkDelta("contains FORBIDDEN token", { source: "text" }).map(r => r.name)).toEqual(["builtin-foo"]);
 	});
+
+	it("ttsr disabled lets condition rules fall through to always-apply/rulebook buckets", () => {
+		const mgr = new TtsrManager({
+			enabled: false,
+			contextMode: "discard",
+			interruptMode: "always",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		// condition-only rule has nowhere to live once TTSR is off
+		const ttsrOnly = makeRule({ name: "ttsr-only", condition: ["FORBIDDEN"] });
+		// hybrid rules keep their non-TTSR semantics
+		const ttsrSticky = makeRule({
+			name: "ttsr-sticky",
+			condition: ["FORBIDDEN"],
+			alwaysApply: true,
+			description: "sticky desc",
+		});
+		const ttsrBook = makeRule({
+			name: "ttsr-book",
+			condition: ["FORBIDDEN"],
+			description: "rulebook desc",
+		});
+		const plainSticky = makeRule({ name: "plain-sticky", alwaysApply: true, description: "x" });
+		const plainBook = makeRule({ name: "plain-book", description: "y" });
+
+		const { rulebookRules, alwaysApplyRules } = bucketRules(
+			[ttsrOnly, ttsrSticky, ttsrBook, plainSticky, plainBook],
+			mgr,
+		);
+
+		expect(mgr.hasRules()).toBe(false);
+		expect(mgr.checkDelta("contains FORBIDDEN token", { source: "text" })).toHaveLength(0);
+		expect(alwaysApplyRules.map(r => r.name)).toEqual(["ttsr-sticky", "plain-sticky"]);
+		expect(rulebookRules.map(r => r.name)).toEqual(["ttsr-book", "plain-book"]);
+	});
 });

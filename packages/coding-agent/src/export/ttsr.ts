@@ -292,8 +292,11 @@ export class TtsrManager {
 		return false;
 	}
 
-	/** Add a TTSR rule to be monitored. */
+	/** Add a TTSR rule to be monitored. No-op when TTSR is globally disabled. */
 	addRule(rule: Rule): boolean {
+		if (!this.#settings.enabled) {
+			return false;
+		}
 		if (this.#rules.has(rule.name)) {
 			return false;
 		}
@@ -336,6 +339,9 @@ export class TtsrManager {
 	 * assistant prose, thinking text, and unrelated tool argument streams.
 	 */
 	checkDelta(delta: string, context: TtsrMatchContext): Rule[] {
+		if (!this.#settings.enabled) {
+			return [];
+		}
 		const bufferKey = this.#bufferKey(context);
 		const nextBuffer = `${this.#buffers.get(bufferKey) ?? ""}${delta}`;
 		this.#buffers.set(bufferKey, nextBuffer);
@@ -414,9 +420,9 @@ export class TtsrManager {
 		this.#buffers.clear();
 	}
 
-	/** Check if any TTSR rules are registered. */
+	/** Check if any TTSR rules are registered and TTSR is enabled. */
 	hasRules(): boolean {
-		return this.#rules.size > 0;
+		return this.#settings.enabled && this.#rules.size > 0;
 	}
 
 	/** Increment message counter (call after each turn). */

@@ -397,3 +397,58 @@ describe("TtsrManager repeat behavior", () => {
 		expect(manager.checkDelta("forbidden", turnContext)).toEqual([rule]);
 	});
 });
+
+describe("TtsrManager enabled flag", () => {
+	const ttsrRule = makeRule({
+		name: "no-foo",
+		condition: ["FORBIDDEN"],
+		scope: ["text"],
+	});
+
+	it("treats the manager as inert when enabled:false", () => {
+		const manager = new TtsrManager({
+			enabled: false,
+			contextMode: "discard",
+			interruptMode: "always",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+
+		expect(manager.addRule(ttsrRule)).toBe(false);
+		expect(manager.hasRules()).toBe(false);
+		expect(manager.checkDelta("contains FORBIDDEN token", { source: "text" })).toEqual([]);
+	});
+
+	it("hides previously registered rules from matching once enabled flips off", () => {
+		// Manager constructed with default settings (enabled:true) then re-created
+		// disabled must not surface rules the on-instance ever held.
+		const enabledManager = new TtsrManager();
+		expect(enabledManager.addRule(ttsrRule)).toBe(true);
+		expect(enabledManager.hasRules()).toBe(true);
+
+		const disabledManager = new TtsrManager({
+			enabled: false,
+			contextMode: "discard",
+			interruptMode: "always",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		expect(disabledManager.addRule(ttsrRule)).toBe(false);
+		expect(disabledManager.hasRules()).toBe(false);
+		expect(disabledManager.checkDelta("FORBIDDEN", { source: "text" })).toEqual([]);
+	});
+
+	it("matches normally when enabled:true is set explicitly", () => {
+		const manager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "always",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+
+		expect(manager.addRule(ttsrRule)).toBe(true);
+		expect(manager.hasRules()).toBe(true);
+		expect(manager.checkDelta("FORBIDDEN", { source: "text" }).map(r => r.name)).toEqual(["no-foo"]);
+	});
+});

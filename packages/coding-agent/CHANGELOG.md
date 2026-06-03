@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed `ttsr.enabled: false` being ignored at runtime. `TtsrManager.addRule`/`hasRules`/`checkDelta` now short-circuit when TTSR is disabled, so condition-bearing rules never register and never trigger mid-stream injections. Rules that also carry `alwaysApply` or `description` still fall through to the always-apply or rulebook bucket via `bucketRules`, keeping non-TTSR behavior intact ([#1767](https://github.com/can1357/oh-my-pi/issues/1767)).
 - Fixed `/review`'s uncommitted-change mode in Jujutsu repositories to read `jj diff --git` from the current workspace, so non-default JJ workspaces include their working-copy changes instead of falling back to the colocated Git checkout.
 - Fixed empty assistant stop retry continuations preserving auto-retry state until a non-empty assistant turn completes or recovery reaches its retry cap.
 
