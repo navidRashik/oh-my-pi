@@ -88,13 +88,23 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "minimax",
+		name: "MiniMax Token Plan (International)",
+		available: true,
+	},
+	{
+		id: "minimax-cn",
+		name: "MiniMax Token Plan (China)",
+		available: true,
+	},
+	{
 		id: "minimax-code",
-		name: "MiniMax Coding Plan (International)",
+		name: "MiniMax OpenAI-compatible Token Plan (International)",
 		available: true,
 	},
 	{
 		id: "minimax-code-cn",
-		name: "MiniMax Coding Plan (China)",
+		name: "MiniMax OpenAI-compatible Token Plan (China)",
 		available: true,
 	},
 	{
@@ -368,6 +378,8 @@ export async function refreshOAuthToken(
 		case "zhipu-coding-plan":
 		case "qianfan":
 		case "venice":
+		case "minimax":
+		case "minimax-cn":
 		case "minimax-code":
 		case "minimax-code-cn":
 		case "moonshot":

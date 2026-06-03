@@ -193,6 +193,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	"zhipu-coding-plan": "ZHIPU_API_KEY",
 	mistral: "MISTRAL_API_KEY",
 	minimax: "MINIMAX_API_KEY",
+	"minimax-cn": () => $pickenv("MINIMAX_CN_API_KEY", "MINIMAX_CODE_CN_API_KEY"),
 	"minimax-code": "MINIMAX_CODE_API_KEY",
 	"minimax-code-cn": "MINIMAX_CODE_CN_API_KEY",
 	"opencode-go": "OPENCODE_API_KEY",

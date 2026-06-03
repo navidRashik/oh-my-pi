@@ -27,6 +27,8 @@ export type OAuthProvider =
 	| "kagi"
 	| "litellm"
 	| "lm-studio"
+	| "minimax"
+	| "minimax-cn"
 	| "minimax-code"
 	| "minimax-code-cn"
 	| "moonshot"

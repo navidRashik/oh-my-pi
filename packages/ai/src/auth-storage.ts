@@ -35,6 +35,15 @@ import { loginDeepSeek } from "./utils/oauth/deepseek";
 import { loginOpenAICodexDevice } from "./utils/oauth/openai-codex";
 import type { OAuthController, OAuthCredentials, OAuthProvider, OAuthProviderId } from "./utils/oauth/types";
 
+const PROVIDER_AUTH_FALLBACKS: Record<string, readonly string[]> = {
+	minimax: ["minimax-code"],
+	"minimax-cn": ["minimax-code-cn"],
+};
+
+function getProviderAuthFallbacks(provider: string): readonly string[] {
+	return PROVIDER_AUTH_FALLBACKS[provider] ?? [];
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Credential Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1357,6 +1366,13 @@ export class AuthStorage {
 		if (this.#getCredentialsForProvider(provider).length > 0) return true;
 		if (getEnvApiKey(provider)) return true;
 		if (this.#fallbackResolver?.(provider)) return true;
+		for (const fallbackProvider of getProviderAuthFallbacks(provider)) {
+			if (this.#runtimeOverrides.has(fallbackProvider)) return true;
+			if (this.#configOverrides.has(fallbackProvider)) return true;
+			if (this.#getCredentialsForProvider(fallbackProvider).length > 0) return true;
+			if (getEnvApiKey(fallbackProvider)) return true;
+			if (this.#fallbackResolver?.(fallbackProvider)) return true;
+		}
 		return false;
 	}
 
@@ -1376,6 +1392,12 @@ export class AuthStorage {
 		if (this.#configOverrides.has(provider)) return true;
 		if (this.#getCredentialsForProvider(provider).length > 0) return true;
 		if (this.#fallbackResolver?.(provider)) return true;
+		for (const fallbackProvider of getProviderAuthFallbacks(provider)) {
+			if (this.#runtimeOverrides.has(fallbackProvider)) return true;
+			if (this.#configOverrides.has(fallbackProvider)) return true;
+			if (this.#getCredentialsForProvider(fallbackProvider).length > 0) return true;
+			if (this.#fallbackResolver?.(fallbackProvider)) return true;
+		}
 		return false;
 	}
 
@@ -1655,16 +1677,30 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "minimax": {
+				const { loginMiniMaxTokenPlan } = await import("./utils/oauth/minimax-code");
+				const apiKey = await loginMiniMaxTokenPlan(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
+			case "minimax-cn": {
+				const { loginMiniMaxTokenPlanCn } = await import("./utils/oauth/minimax-code");
+				const apiKey = await loginMiniMaxTokenPlanCn(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "minimax-code": {
 				const { loginMiniMaxCode } = await import("./utils/oauth/minimax-code");
 				const apiKey = await loginMiniMaxCode(ctrl);
 				await saveApiKeyCredential(apiKey);
+				await this.set("minimax", { type: "api_key", key: apiKey });
 				return;
 			}
 			case "minimax-code-cn": {
 				const { loginMiniMaxCodeCn } = await import("./utils/oauth/minimax-code");
 				const apiKey = await loginMiniMaxCodeCn(ctrl);
 				await saveApiKeyCredential(apiKey);
+				await this.set("minimax-cn", { type: "api_key", key: apiKey });
 				return;
 			}
 			case "synthetic": {
@@ -3293,6 +3329,11 @@ export class AuthStorage {
 		const envKey = getEnvApiKey(provider);
 		if (envKey) return envKey;
 
+		for (const fallbackProvider of getProviderAuthFallbacks(provider)) {
+			const apiKey = await this.peekApiKey(fallbackProvider);
+			if (apiKey) return apiKey;
+		}
+
 		return this.#fallbackResolver?.(provider) ?? undefined;
 	}
 
@@ -3341,6 +3382,11 @@ export class AuthStorage {
 		if (sessionId) this.#sessionLastCredential.get(provider)?.delete(sessionId);
 		const envKey = getEnvApiKey(provider);
 		if (envKey) return envKey;
+
+		for (const fallbackProvider of getProviderAuthFallbacks(provider)) {
+			const apiKey = await this.getApiKey(fallbackProvider, sessionId, options);
+			if (apiKey) return apiKey;
+		}
 
 		// Fall back to custom resolver (e.g., models.json custom providers)
 		return this.#fallbackResolver?.(provider) ?? undefined;
