@@ -169,6 +169,18 @@ function serializeToolArguments(value: unknown): string {
 	return "{}";
 }
 
+function serializeStreamingToolArgumentDelta(value: unknown): string {
+	if (typeof value === "string") return value;
+	if (value && typeof value === "object" && !Array.isArray(value)) {
+		try {
+			return JSON.stringify(value);
+		} catch {
+			return "";
+		}
+	}
+	return "";
+}
+
 /**
  * Check if conversation messages contain tool calls or tool results.
  * This is needed because Anthropic (via proxy) requires the tools param
@@ -845,10 +857,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 
 							if (toolCall.id) block.id = toolCall.id;
 							if (toolCall.function?.name) block.name = toolCall.function.name;
+							const argumentDelta = serializeStreamingToolArgumentDelta(toolCall.function?.arguments);
 							let delta = "";
-							if (toolCall.function?.arguments) {
-								delta = toolCall.function.arguments;
-								block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
+							if (argumentDelta.length > 0) {
+								delta = argumentDelta;
+								block.partialArgs = (block.partialArgs ?? "") + argumentDelta;
 								const throttled = parseStreamingJsonThrottled(block.partialArgs, block.lastParseLen ?? 0);
 								if (throttled) {
 									block.arguments = throttled.value;
