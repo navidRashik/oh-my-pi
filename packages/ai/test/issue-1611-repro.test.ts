@@ -41,6 +41,7 @@ describe("issue #1611 — MiniMax M3 catalogs", () => {
 
 	test("defaults MiniMax providers to the documented headline model", () => {
 		expect(DEFAULT_MODEL_PER_PROVIDER.minimax).toBe("MiniMax-M3");
+		expect(DEFAULT_MODEL_PER_PROVIDER["minimax-cn"]).toBe("MiniMax-M3");
 		expect(DEFAULT_MODEL_PER_PROVIDER["minimax-code"]).toBe("MiniMax-M3");
 		expect(DEFAULT_MODEL_PER_PROVIDER["minimax-code-cn"]).toBe("MiniMax-M3");
 	});

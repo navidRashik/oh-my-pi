@@ -125,6 +125,7 @@ export type KnownProvider =
 	| "zhipu-coding-plan"
 	| "mistral"
 	| "minimax"
+	| "minimax-cn"
 	| "opencode-go"
 	| "opencode-zen"
 	| "synthetic"

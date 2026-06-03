@@ -348,6 +348,7 @@ export const DEFAULT_MODEL_PER_PROVIDER: Record<KnownProvider, string> = {
 	"google-gemini-cli": "gemini-2.5-pro",
 	"google-vertex": "gemini-3-pro-preview",
 	minimax: "MiniMax-M3",
+	"minimax-cn": "MiniMax-M3",
 	"minimax-code": "MiniMax-M3",
 	"minimax-code-cn": "MiniMax-M3",
 	"openai-codex": "gpt-5.4",
