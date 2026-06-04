@@ -2202,6 +2202,121 @@ describe("TUI terminal-state regressions", () => {
 				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
 			}
 		});
+
+		it("defers completed async offscreen expansions on ED3-risk unknown viewports", async () => {
+			// #1823: An async `AssistantThinkingRenderer` finishes after the formal
+			// assistant output has already overflowed the viewport — the next
+			// `requestRender()` is a structural mutation whose `firstChanged` lies
+			// above `prevViewportTop`. On an ED3-risk terminal the viewport probe
+			// is unobservable, so the planner cannot safely rebuild history; the
+			// previous fallback `viewportRepaint` repainted the visible window
+			// while leaving stale rows in native scrollback above it, producing the
+			// duplicate-row symptom around the viewport boundary. The fix defers
+			// until the next checkpoint, where `refreshNativeScrollbackIfDirty`
+			// rebuilds the full transcript exactly once.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+			try {
+				await withTerminalRisk(true, async () => {
+					const term = new UnknownViewportTerminal(40, 10);
+					const tui = new TUI(term);
+					const initialThinking = "thinking-placeholder";
+					const output = rows("output-", 18);
+					const component = new MutableLinesComponent([initialThinking, ...output, "prompt-row"]);
+					tui.addChild(component);
+
+					try {
+						tui.start();
+						await settle(term);
+
+						const beforeViewport = visible(term).map(line => line.trim());
+						expect(beforeViewport[beforeViewport.length - 1]).toBe("prompt-row");
+
+						// Capture every byte the renderer writes from the async render onwards.
+						const writes = captureWrites(term);
+
+						// Async thinking renderer completes: replace a single-row placeholder
+						// with a four-row block. firstChanged = 0, prevViewportTop = 10.
+						const expandedThinking = ["thinking-a", "thinking-b", "thinking-c", "thinking-d"];
+						component.setLines([...expandedThinking, ...output, "prompt-row"]);
+						tui.requestRender();
+						await settle(term);
+
+						// Pre-fix: planner returned `viewportRepaint`, emitting at least the
+						// synchronized-output preamble plus per-row clear/content bytes.
+						// Post-fix: `deferredMutation` is a no-op, so the terminal sees nothing
+						// until the next explicit checkpoint reconciles the transcript.
+						expect(writes.join("")).toBe("");
+
+						// Visible viewport stays anchored to the previously committed slice —
+						// no live repaint was applied.
+						expect(visible(term).map(line => line.trim())).toEqual(beforeViewport);
+
+						// Explicit checkpoint reconciles: the deferred 23-row transcript
+						// gets replayed and the bottom-anchored viewport now reflects the
+						// post-expansion slice. (The checkpoint's `historyRebuild` does
+						// not retroactively dedupe rows already in native scrollback —
+						// the contract enforced here is that NO live bytes hit the
+						// terminal between the async mutation and the checkpoint, so
+						// the planner cannot make the boundary worse on its own.)
+						expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBe(true);
+						await settle(term);
+
+						const after = visible(term).map(line => line.trim());
+						expect(after[after.length - 1]).toBe("prompt-row");
+						// Last visible non-prompt row matches the new bottom-anchored slice
+						// (one row of the expansion pushed everything down by three).
+						expect(after[after.length - 2]).toBe("output-17");
+					} finally {
+						tui.stop();
+					}
+				});
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+
+		it("keeps offscreen clean tail-appends streaming on ED3-risk unknown viewports", async () => {
+			// Counterpart guarantee for the #1823 deferral: a clean tail-append
+			// (the suffix of the previous frame is preserved verbatim and only
+			// new rows land below it) MUST keep flowing through `viewportRepaint`
+			// + `emitAppendTail` so streamed output is never delayed. The
+			// deferral guard above is gated on `!cleanTailAppend` precisely so
+			// this path stays live.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+			try {
+				await withTerminalRisk(true, async () => {
+					const term = new UnknownViewportTerminal(40, 10);
+					const tui = new TUI(term);
+					const seed = rows("seed-", 12);
+					const component = new MutableLinesComponent(seed);
+					tui.addChild(component);
+
+					try {
+						tui.start();
+						await settle(term);
+
+						// Pure tail append: cleanTailAppend = true even though firstChanged
+						// lands above prevViewportTop (the previous tail still matches the
+						// new content suffix-wise after the append).
+						const writes = captureWrites(term);
+						component.setLines([...seed, "tail-row"]);
+						tui.requestRender();
+						await settle(term);
+
+						expect(writes.join("")).not.toBe("");
+						const after = visible(term).map(line => line.trim());
+						expect(after[after.length - 1]).toBe("tail-row");
+					} finally {
+						tui.stop();
+					}
+				});
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+
 		it("rebuilds history when prior POSIX repaint left the padded viewport past the new tail", async () => {
 			const term = new UnknownViewportTerminal(40, 10);
 			const tui = new TUI(term);

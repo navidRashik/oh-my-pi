@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed completed async offscreen expansions on ED3-risk terminals (Ghostty/kitty/Alacritty/iTerm2/WSL inside Windows Terminal) with an unobservable native viewport repainting the live window over stale scrollback, surfacing duplicated rows around the viewport boundary after an async `AssistantThinkingRenderer` finished above already-streamed formal output. The offscreen-edit branch of the render planner now mirrors the existing shrink-branch deferral: when the viewport probe is unavailable, the terminal is ED3-risk, no eager streaming rebuild is in progress, and the mutation is not a clean tail append, the planner defers to `deferredMutation` so the next explicit `refreshNativeScrollbackIfDirty` checkpoint replays the transcript once. Clean tail-appends, eager streaming, and multiplexer panes keep their existing repaint path so live output is never delayed ([#1823](https://github.com/can1357/oh-my-pi/issues/1823)).
+
 ## [15.9.0] - 2026-06-04
 
 ### Added

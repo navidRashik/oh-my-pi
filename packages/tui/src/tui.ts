@@ -1891,6 +1891,30 @@ export class TUI extends Container {
 				return { kind: "historyRebuild" };
 			}
 			this.#markNativeScrollbackDirty();
+			// Async-completion offscreen structural mutation on an ED3-risk
+			// terminal whose viewport position is unobservable. The fallback
+			// `viewportRepaint` below repaints the visible window in place but
+			// leaves whatever already landed in native scrollback alone — when a
+			// thinking renderer asynchronously expands above the live tail, that
+			// committed scrollback becomes stale and the next live mutate can
+			// surface duplicated rows around the boundary (issue #1823). Defer
+			// until the next explicit checkpoint where
+			// `refreshNativeScrollbackIfDirty` can rebuild the full transcript
+			// exactly once. Active eager streaming (`#eagerNativeScrollbackRebuild`)
+			// keeps its existing repaint path so streamed output is never delayed,
+			// and a clean tail-append still flows through `emitAppendTail` so newly
+			// appended rows reach scrollback. Multiplexer panes cannot rebuild
+			// history, so a deferral would freeze the UI — leave their repaint
+			// path alone.
+			if (
+				nativeViewportAtBottom === undefined &&
+				eagerEraseScrollbackRisk &&
+				!this.#eagerNativeScrollbackRebuild &&
+				!cleanTailAppend &&
+				!isMultiplexerSession()
+			) {
+				return { kind: "deferredMutation" };
+			}
 			return { kind: "viewportRepaint", appendFrom: cleanTailAppend ? this.#previousLines.length : undefined };
 		}
 
