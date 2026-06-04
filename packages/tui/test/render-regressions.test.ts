@@ -1989,6 +1989,46 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("repaints bottom-anchored viewport when an offscreen shrink changes the visible tail", async () => {
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			const term = new UnknownViewportTerminal(32, 6);
+			const tui = new TUI(term);
+			const initial = rows("line-", 30);
+			const component = new MutableLinesComponent(initial);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(visible(term).map(line => line.trim())).toEqual([
+					"line-24",
+					"line-25",
+					"line-26",
+					"line-27",
+					"line-28",
+					"line-29",
+				]);
+
+				const shrunkWithTailUpdate = [...initial.slice(0, 5), ...initial.slice(6, -1), "prompt-updated"];
+				component.setLines(shrunkWithTailUpdate);
+				tui.requestRender(true, { allowUnknownViewportMutation: true });
+				await settle(term);
+
+				expect(visible(term).map(line => line.trim())).toEqual([
+					"line-24",
+					"line-25",
+					"line-26",
+					"line-27",
+					"line-28",
+					"prompt-updated",
+				]);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+				tui.stop();
+			}
+		});
+
 		it("defers bottom-anchored shrink when POSIX viewport state is unknown", async () => {
 			// Repro for #1566 follow-up (kitty/Linux): a bottom-anchored shrink across the
 			// viewport boundary used to fall through to `viewportRepaint`, which redrew the
