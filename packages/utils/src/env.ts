@@ -160,8 +160,8 @@ for (const file of [projectEnv, agentEnv, piEnv, homeEnv]) {
  */
 export function $pickenv(...keys: string[]): string | undefined {
 	for (const key of keys) {
-		const value = $env[key];
-		if (value !== undefined && value !== "") {
+		const value = $env[key]?.trim();
+		if (value) {
 			return value;
 		}
 	}
@@ -176,7 +176,7 @@ export function $envpos(name: string, defaultValue: number): number {
 	const raw = $env[name];
 	if (!raw) return defaultValue;
 	const parsed = Number.parseInt(raw, 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) return defaultValue;
+	if (Number.isNaN(parsed) || parsed <= 0) return defaultValue;
 	return parsed;
 }
 
