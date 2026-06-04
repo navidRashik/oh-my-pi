@@ -298,6 +298,11 @@ export class Container implements Component {
 	}
 }
 
+interface DeferredCursorUpdate {
+	position: { row: number; col: number } | null;
+	totalLines: number;
+}
+
 /**
  * Render intent. `#planRender` decides which one a frame is, and the
  * corresponding `#emit*` method owns the bytes written and the state update.
@@ -316,7 +321,9 @@ export class Container implements Component {
  *   native history. Keep row indices stable with blank tail padding, repaint
  *   only the viewport, and defer the real shorter replay to a checkpoint.
  * - `deferredMutation`: a row-inserting edit would reindex native scrollback
- *   while the user is scrolled. Defer all bytes until a safe rebuild checkpoint.
+ *   while the user is scrolled. Defer content bytes until a safe rebuild
+ *   checkpoint; a cursor update may still be emitted when the visible rows are
+ *   intentionally preserved.
  * - `shrink`: trailing rows were dropped — clear extras inline.
  * - `diff`: differential repaint of visible rows / append new rows below.
  */
@@ -328,7 +335,7 @@ type RenderIntent =
 	| { kind: "overlayRebuild" }
 	| { kind: "viewportRepaint"; appendFrom?: number }
 	| { kind: "deferredShrink"; paddedLength: number }
-	| { kind: "deferredMutation" }
+	| { kind: "deferredMutation"; cursor?: DeferredCursorUpdate }
 	| { kind: "shrink" }
 	| { kind: "diff"; firstChanged: number; lastChanged: number; appendedLines: boolean };
 
@@ -1335,6 +1342,7 @@ export class TUI extends Container {
 		// 3. Classify intent.
 		const intent = this.#planRender(
 			lines,
+			cursorPos,
 			widthChanged,
 			heightChanged,
 			prevViewportTop,
@@ -1401,6 +1409,7 @@ export class TUI extends Container {
 				this.#emitViewportRepaint(lines, width, height, cursorPos);
 				return;
 			case "deferredMutation":
+				if (intent.cursor) this.#writeCursorPosition(intent.cursor.position, intent.cursor.totalLines);
 				return;
 			case "deferredShrink":
 				this.#emitViewportRepaint(
@@ -1439,6 +1448,7 @@ export class TUI extends Container {
 	 */
 	#planRender(
 		newLines: string[],
+		cursorPos: { row: number; col: number } | null,
 		widthChanged: boolean,
 		heightChanged: boolean,
 		prevViewportTop: number,
@@ -1571,7 +1581,14 @@ export class TUI extends Container {
 						return { kind: "viewportRepaint" };
 					}
 				}
-				return { kind: "deferredMutation" };
+				const mappedCursor =
+					cursorPos === null
+						? null
+						: { row: paddedViewportTop + (cursorPos.row - newViewportTop), col: cursorPos.col };
+				return {
+					kind: "deferredMutation",
+					cursor: { position: mappedCursor, totalLines: this.#previousLines.length },
+				};
 			}
 			return { kind: "deferredShrink", paddedLength: this.#previousLines.length };
 		}
