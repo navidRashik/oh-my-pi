@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { filterProcessEnv, parseEnvFile } from "../src/env";
 
 const tempDirs: string[] = [];
+const envModulePath = path.resolve(import.meta.dir, "../src/env.ts");
 
 afterEach(() => {
 	for (const dir of tempDirs.splice(0)) {
@@ -12,12 +13,41 @@ afterEach(() => {
 	}
 });
 
-function writeTempEnv(content: string): string {
+function makeTempProjectEnv(content: string): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-"));
 	tempDirs.push(dir);
-	const filePath = path.join(dir, ".env");
-	fs.writeFileSync(filePath, content);
-	return filePath;
+	fs.writeFileSync(path.join(dir, ".env"), content);
+	return dir;
+}
+
+function writeTempEnv(content: string): string {
+	return path.join(makeTempProjectEnv(content), ".env");
+}
+
+function runEnvProbe(cwd: string, env: Record<string, string>, useBunAutoload: boolean): string {
+	const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+	tempDirs.push(home);
+	const script = [
+		`await import(${JSON.stringify(envModulePath)});`,
+		`const child = Bun.spawnSync([process.execPath, "--no-env-file", "-e", "console.log(process.env.PROJECT_ONLY ?? 'missing')"], { env: Bun.env, stdout: "pipe", stderr: "pipe" });`,
+		`console.log("process=" + (Bun.env.PROJECT_ONLY ?? "missing"));`,
+		`console.log("child=" + child.stdout.toString().trim());`,
+		`console.log("alias=" + (Bun.env.PI_PROJECT_ALIAS ?? "missing"));`,
+	].join("");
+	const result = Bun.spawnSync([process.execPath, ...(useBunAutoload ? [] : ["--no-env-file"]), "-e", script], {
+		cwd,
+		env: {
+			HOME: home,
+			PATH: Bun.env.PATH ?? "",
+			...env,
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (result.exitCode !== 0) {
+		throw new Error(result.stderr.toString());
+	}
+	return result.stdout.toString();
 }
 
 describe("parseEnvFile", () => {
@@ -48,6 +78,30 @@ describe("parseEnvFile", () => {
 			OMP_FEATURE: "enabled",
 			PI_FEATURE: "enabled",
 		});
+	});
+});
+
+describe("project .env loading", () => {
+	it("loads project variables into the process and subprocess environment by default", () => {
+		const cwd = makeTempProjectEnv("PROJECT_ONLY=from-project\nOMP_PROJECT_ALIAS=from-project\n");
+
+		expect(runEnvProbe(cwd, {}, false)).toBe("process=from-project\nchild=from-project\nalias=from-project\n");
+	});
+
+	it("omits project variables from the process and subprocess environment when opted out", () => {
+		const cwd = makeTempProjectEnv("PROJECT_ONLY=from-project\n");
+
+		expect(runEnvProbe(cwd, { OMP_NO_PROJECT_ENV: "1" }, true)).toBe(
+			"process=missing\nchild=missing\nalias=missing\n",
+		);
+	});
+
+	it("keeps explicit environment values when project loading is opted out", () => {
+		const cwd = makeTempProjectEnv("PROJECT_ONLY=from-project\n");
+
+		expect(runEnvProbe(cwd, { OMP_NO_PROJECT_ENV: "1", PROJECT_ONLY: "from-real-env" }, true)).toBe(
+			"process=from-real-env\nchild=from-real-env\nalias=missing\n",
+		);
 	});
 });
 

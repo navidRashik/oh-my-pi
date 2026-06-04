@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Added `OMP_NO_PROJECT_ENV=1` to keep `$PWD/.env` out of omp's process and subprocess environments ([#1804](https://github.com/can1357/oh-my-pi/issues/1804)).
+
 ## [15.7.3] - 2026-05-31
 ### Added
 
