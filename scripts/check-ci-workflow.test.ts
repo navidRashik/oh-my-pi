@@ -33,8 +33,8 @@ describe("checkCiWorkflowNode24OptIn", () => {
 				"jobs:",
 				"   release:",
 				"      steps:",
-				"         - uses: actions/download-artifact@v4",
-				"         - uses: actions/upload-artifact@v4",
+				"         - uses:  actions/download-artifact@v4",
+				"         - uses:   actions/upload-artifact@v4",
 			].join("\n"),
 		});
 

@@ -132,8 +132,9 @@ function toAffectedAction(value: string): AffectedAction | null {
 }
 
 function readActionReference(value: string): string {
-	const separator = value.search(/\s/);
-	return separator === -1 ? value : value.slice(0, separator);
+	const normalized = value.trim();
+	const separator = normalized.search(/\s/);
+	return separator === -1 ? normalized : normalized.slice(0, separator);
 }
 
 function findTopLevelNode24OptIn(workflow: string): boolean {
