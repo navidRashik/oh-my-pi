@@ -137,6 +137,32 @@ describe("ModelSelector role badge thinking display", () => {
 		expect(menuRendered).toContain("Set as SMOL (Quick)");
 	});
 
+	test("shows Claude adaptive top effort as max in badges and model menu", async () => {
+		installTestTheme();
+		const model = getBundledModel("anthropic", "claude-opus-4-7");
+		if (!model) throw new Error("Expected bundled model anthropic/claude-opus-4-7");
+
+		const settings = Settings.isolated({
+			modelRoles: {
+				default: `${model.provider}/${model.id}:xhigh`,
+			},
+		});
+		const selector = createSelector(model, settings);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("DEFAULT (max)");
+		expect(rendered).not.toContain("DEFAULT (xhigh)");
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+		installTestTheme();
+		const menuRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(menuRendered).toContain("max");
+		expect(menuRendered).not.toContain("xhigh");
+	});
+
 	test("dims and disables models below the current context size", async () => {
 		installTestTheme();
 		const settings = Settings.isolated({});

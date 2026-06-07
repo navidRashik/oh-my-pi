@@ -36,6 +36,12 @@ const THINKING_LEVEL_METADATA: Record<ThinkingLevel, ThinkingLevelMetadata> = {
 	},
 };
 
+const CLAUDE_MAX_THINKING_METADATA: ConfiguredThinkingLevelMetadata = {
+	value: ThinkingLevel.XHigh,
+	label: "max",
+	description: "Maximum Claude adaptive reasoning",
+};
+
 const THINKING_LEVELS = new Set<string>([ThinkingLevel.Inherit, ThinkingLevel.Off, ...THINKING_EFFORTS]);
 const EFFORT_LEVELS = new Set<string>(THINKING_EFFORTS);
 
@@ -123,6 +129,17 @@ export function parseConfiguredThinkingLevel(value: string | null | undefined): 
 /** Returns display metadata for a configured selector, including `auto`. */
 export function getConfiguredThinkingLevelMetadata(level: ConfiguredThinkingLevel): ConfiguredThinkingLevelMetadata {
 	return level === AUTO_THINKING ? AUTO_THINKING_METADATA : getThinkingLevelMetadata(level);
+}
+
+/** Returns selector metadata using provider-native labels for model-specific efforts. */
+export function getConfiguredThinkingLevelMetadataForModel(
+	model: Model | undefined,
+	level: ConfiguredThinkingLevel,
+): ConfiguredThinkingLevelMetadata {
+	if (level === ThinkingLevel.XHigh && model?.thinking?.mode === "anthropic-adaptive") {
+		return CLAUDE_MAX_THINKING_METADATA;
+	}
+	return getConfiguredThinkingLevelMetadata(level);
 }
 
 /**

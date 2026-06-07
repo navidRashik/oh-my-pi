@@ -21,7 +21,11 @@ import { resolveModelRoleValue } from "../../config/model-resolver";
 import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../../modes/utils/keybinding-matchers";
-import { AUTO_THINKING, type ConfiguredThinkingLevel, getConfiguredThinkingLevelMetadata } from "../../thinking";
+import {
+	AUTO_THINKING,
+	type ConfiguredThinkingLevel,
+	getConfiguredThinkingLevelMetadataForModel,
+} from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 
@@ -879,7 +883,10 @@ export class ModelSelectorComponent extends Container {
 				if (!tag || !assigned || !modelsAreEqual(assigned.model, item.model)) continue;
 
 				const badge = makeInvertedBadge(tag, color ?? "success");
-				const thinkingLabel = getConfiguredThinkingLevelMetadata(assigned.thinkingLevel).label;
+				const thinkingLabel = getConfiguredThinkingLevelMetadataForModel(
+					assigned.model,
+					assigned.thinkingLevel,
+				).label;
 				roleBadgeTokens.push(`${badge} ${theme.fg("dim", `(${thinkingLabel})`)}`);
 			}
 			// Custom role badges
@@ -888,7 +895,10 @@ export class ModelSelectorComponent extends Container {
 				const roleInfo = getRoleInfo(role, this.#settings);
 				const badgeLabel = roleInfo.tag ?? roleInfo.name;
 				const badge = makeInvertedBadge(badgeLabel, roleInfo.color ?? "muted");
-				const thinkingLabel = getConfiguredThinkingLevelMetadata(assigned.thinkingLevel).label;
+				const thinkingLabel = getConfiguredThinkingLevelMetadataForModel(
+					assigned.model,
+					assigned.thinkingLevel,
+				).label;
 				roleBadgeTokens.push(`${badge} ${theme.fg("dim", `(${thinkingLabel})`)}`);
 			}
 			const badgeText = roleBadgeTokens.length > 0 ? ` ${roleBadgeTokens.join(" ")}` : "";
@@ -1016,7 +1026,7 @@ export class ModelSelectorComponent extends Container {
 		const optionLines = showingThinking
 			? thinkingOptions.map((thinkingLevel, index) => {
 					const prefix = index === this.#menuSelectedIndex ? `  ${theme.nav.cursor} ` : "    ";
-					const label = getConfiguredThinkingLevelMetadata(thinkingLevel).label;
+					const label = getConfiguredThinkingLevelMetadataForModel(selectedItem.model, thinkingLevel).label;
 					return `${prefix}${label}`;
 				})
 			: this.#menuRoleActions.map((action, index) => {
