@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed prior-turn reasoning blocks being demoted to text (or dropped, for `redactedThinking`) on `anthropic-messages` continuation requests whenever the conversation crossed a provider/model boundary — e.g. custom providers configured via `models.yaml`, or any session that switched between two anthropic-messages endpoints. `transformMessages` only preserved thinking content on the latest surviving assistant turn; every earlier turn fell through to the cross-API text-demotion path and lost its reasoning chain. Anthropic-compatible source/target combinations now keep all `thinking`/`redactedThinking` blocks across every prior turn (Anthropic's all-or-none replay contract), with cross-model signatures stripped so the downstream encoder applies the correct `replayUnsignedThinking` policy ([#2257](https://github.com/can1357/oh-my-pi/issues/2257)).
+
 ## [15.10.12] - 2026-06-10
 
 ### Added

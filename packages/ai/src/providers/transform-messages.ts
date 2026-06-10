@@ -184,10 +184,20 @@ export function transformMessages<TApi extends Api>(
 					assistantMsg.api === model.api &&
 					assistantMsg.model === model.id;
 
-				const mustPreserveLatestAnthropicThinking =
-					index === latestSurvivingAssistantIndex &&
-					model.api === "anthropic-messages" &&
-					assistantMsg.api === "anthropic-messages";
+				// Anthropic enforces an all-or-none contract on prior-turn thinking
+				// blocks: "if you include thinking blocks in prior assistant turns,
+				// you must include ALL thinking blocks (including redacted ones)".
+				// As long as both the source and target speak `anthropic-messages`,
+				// every prior assistant turn's thinking chain must reach the wire
+				// as native `thinking`/`redacted_thinking` blocks — even across
+				// model/provider boundaries (custom providers configured via
+				// `models.yaml`, switching between two anthropic-compatible
+				// endpoints, etc.). The previous logic only honored this for the
+				// LATEST surviving assistant; every earlier turn was demoted to
+				// text or dropped on cross-model replay, breaking continuation
+				// for Anthropic-compatible reasoning endpoints (#2257).
+				const isAnthropicReplay = model.api === "anthropic-messages" && assistantMsg.api === "anthropic-messages";
+				const isLatestSurvivingAssistant = index === latestSurvivingAssistantIndex;
 				// Thinking signatures can be untrustworthy for two distinct reasons with very
 				// different blast radii:
 				//
@@ -226,11 +236,30 @@ export function transformMessages<TApi extends Api>(
 						// untrustworthy signature so the encoder can downgrade the block to text.
 						const signatureUntrustworthy =
 							abandonedToolUse || (invalidStopReason && blockIndex === lastBlockIndex);
-						const sanitized =
+						let sanitized: typeof block =
 							signatureUntrustworthy && block.thinkingSignature
 								? { ...block, thinkingSignature: undefined }
 								: block;
-						if (mustPreserveLatestAnthropicThinking) return abandonedToolUse ? block : sanitized;
+						if (isAnthropicReplay) {
+							// Latest abandoned turn: Anthropic's byte-for-byte rule forbids
+							// even stripping a signature on the latest message.
+							if (isLatestSurvivingAssistant && abandonedToolUse) return block;
+							// Cross-model prior turns: the source provider's signature is
+							// not trusted by the new target. Strip it so the downstream
+							// encoder applies its `replayUnsignedThinking` policy
+							// (unsigned thinking is emitted natively on Anthropic-compatible
+							// reasoning endpoints and demoted to text on official Anthropic).
+							if (!isLatestSurvivingAssistant && !isSameModel && sanitized.thinkingSignature) {
+								sanitized = { ...sanitized, thinkingSignature: undefined };
+							}
+							// Drop blocks with neither a signature anchor nor any text —
+							// nothing for the next turn to replay.
+							if (!sanitized.thinkingSignature && (!sanitized.thinking || sanitized.thinking.trim() === "")) {
+								return [];
+							}
+							return sanitized;
+						}
+						// Cross-API target: keep the existing text-demotion fallback.
 						// For same model: keep thinking blocks with signatures (needed for replay)
 						// even if the thinking text is empty (OpenAI encrypted reasoning)
 						if (isSameModel && sanitized.thinkingSignature) return sanitized;
@@ -244,7 +273,9 @@ export function transformMessages<TApi extends Api>(
 					}
 
 					if (block.type === "redactedThinking") {
-						if (mustPreserveLatestAnthropicThinking) return block;
+						// Same all-or-none rule applies: a prior turn that keeps any
+						// thinking content must keep its redacted siblings too.
+						if (isAnthropicReplay) return block;
 						if (isSameModel) return block;
 						return [];
 					}
