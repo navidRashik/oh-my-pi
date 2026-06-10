@@ -29,6 +29,8 @@ import {
 	type AgentState,
 	type AgentTool,
 	AppendOnlyContextManager,
+	type BeforeToolCallContext,
+	type BeforeToolCallResult,
 	resolveTelemetry,
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
@@ -221,6 +223,7 @@ import { normalizeModelContextImages } from "../utils/image-loading";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AuthStorage } from "./auth-storage";
 import type { ClientBridge, ClientBridgePermissionOption, ClientBridgePermissionOutcome } from "./client-bridge";
+import { INVESTIGATION_GUARD_TOOL_CHOICE_LABEL, InvestigationGuard } from "./investigation-guard";
 import {
 	type BashExecutionMessage,
 	type CompactionSummaryMessage,
@@ -905,7 +908,8 @@ export class AgentSession {
 	#todoReminderCount = 0;
 	#todoPhases: TodoPhase[] = [];
 	#toolChoiceQueue = new ToolChoiceQueue();
-
+	#investigationGuard: InvestigationGuard;
+	#investigationGuardSynthesisQueued = false;
 	// Bash execution state
 	#bashAbortControllers = new Set<AbortController>();
 	#pendingBashMessages: BashExecutionMessage[] = [];
@@ -1118,6 +1122,7 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.#investigationGuard = new InvestigationGuard(this.settings);
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
 		this.#parentEvalSessionId = config.parentEvalSessionId;
@@ -1234,8 +1239,8 @@ export class AgentSession {
 			this.#preCacheStreamingEditFile(event);
 			this.#maybeAbortStreamingEdit(event);
 		});
-		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
-		this.agent.afterToolCall = ctx => this.#ttsrAfterToolCall(ctx);
+		this.agent.beforeToolCall = ctx => this.#beforeToolCall(ctx);
+		this.agent.afterToolCall = ctx => this.#afterToolCall(ctx);
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
 		this.#syncTodoPhasesFromBranch();
@@ -1301,6 +1306,21 @@ export class AgentSession {
 	/** Advance the tool-choice queue and return the next directive for the upcoming LLM call. */
 	nextToolChoice(): ToolChoice | undefined {
 		return this.#toolChoiceQueue.nextToolChoice();
+	}
+
+	#queueInvestigationGuardSynthesisTurn(): void {
+		if (this.#investigationGuardSynthesisQueued) return;
+		this.#investigationGuardSynthesisQueued = true;
+		this.#toolChoiceQueue.pushOnce("none", {
+			label: INVESTIGATION_GUARD_TOOL_CHOICE_LABEL,
+			now: true,
+			onResolved: () => {
+				this.#investigationGuardSynthesisQueued = false;
+			},
+			onRejected: () => {
+				this.#investigationGuardSynthesisQueued = false;
+			},
+		});
 	}
 
 	/**
@@ -1653,6 +1673,13 @@ export class AgentSession {
 				this.#toolChoiceQueue.reject(msg.stopReason === "error" ? "error" : "aborted");
 			} else {
 				this.#toolChoiceQueue.resolve();
+			}
+		}
+		if (event.type === "turn_end") {
+			const msg = event.message as AssistantMessage;
+			this.#investigationGuard.noteAssistantStop(msg.stopReason);
+			if (this.#investigationGuard.consumeSynthesisRequest()) {
+				this.#queueInvestigationGuardSynthesisTurn();
 			}
 		}
 		if (event.type === "tool_execution_end") {
@@ -2201,6 +2228,22 @@ export class AgentSession {
 		if (newlyAdded.length > 0) {
 			this.#ttsrManager?.markInjectedByNames(newlyAdded);
 		}
+	}
+
+	#beforeToolCall(ctx: BeforeToolCallContext): BeforeToolCallResult | undefined {
+		const result = this.#investigationGuard.beforeToolCall(ctx);
+		if (this.#investigationGuard.consumeSynthesisRequest()) {
+			this.#queueInvestigationGuardSynthesisTurn();
+		}
+		return result;
+	}
+
+	#afterToolCall(ctx: AfterToolCallContext): AfterToolCallResult | undefined {
+		this.#investigationGuard.afterToolCall(ctx);
+		if (this.#investigationGuard.consumeSynthesisRequest()) {
+			this.#queueInvestigationGuardSynthesisTurn();
+		}
+		return this.#ttsrAfterToolCall(ctx);
 	}
 
 	/** `afterToolCall` hook: fold any per-tool TTSR reminders into the result. */
@@ -4554,9 +4597,12 @@ export class AgentSession {
 			this.#flushPendingPythonMessages();
 			this.#flushPendingBackgroundExchanges();
 
-			// Reset todo reminder count on new user prompt
+			// Reset per-prompt maintenance counters
 			this.#todoReminderCount = 0;
 			this.#emptyStopRetryCount = 0;
+			this.#investigationGuard.reset();
+			this.#investigationGuardSynthesisQueued = false;
+			this.#toolChoiceQueue.removeByLabel(INVESTIGATION_GUARD_TOOL_CHOICE_LABEL);
 
 			await this.#maybeRestoreRetryFallbackPrimary();
 

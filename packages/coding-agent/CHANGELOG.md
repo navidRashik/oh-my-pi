@@ -53,6 +53,7 @@
 ### Fixed
 
 - Fixed `ask` question/result renders so option and answer rows are no longer duplicated when the component is re-rendered
+- Fixed unbounded tool-call investigation spirals (sessions where every assistant turn ended in `toolUse` until LLM calls hit 6+ minutes and the session went silent): an `InvestigationGuard` now caps per-prompt `read` calls / read-output tokens and forces a no-tool synthesis turn after a configurable number of consecutive tool-use turns, so the agent has to answer from the evidence already gathered instead of continuing to read or search ([#2234](https://github.com/can1357/oh-my-pi/issues/2234)).
 - Fixed streaming `write`/`diff` previews to keep line-number gutter widths stable while content grows, preventing already-rendered preview rows from being reflowed mid-stream
 - Fixed the welcome screen showing "No LSP servers" when `lsp.lazy` is enabled: recognized servers are now still discovered at startup and listed with a dim "available" dot (no warmup), and `/status` reports them as `available` instead of omitting the section
 - Fixed edit-tool diffs stacking adjacent `...` markers around inserted block-context rows (each row added its own gap markers from a snapshot of the diff, so neighboring insertions doubled them, and a marker could be left stranded between contiguous lines): non-contiguous regions are now separated by a single blank row, normalized after insertion, and rendered as one dim `…` in the TUI and HTML export
