@@ -25,6 +25,7 @@
 
 ### Fixed
 
+- Fixed `lsp diagnostics` so clean file-scoped queries no longer render bare `OK` when the same LSP client has other published diagnostics or the requested file never produced a fresh diagnostics publish ([#2247](https://github.com/can1357/oh-my-pi/issues/2247)).
 - Fixed Ollama chat turns using the `:off` thinking selector so requests explicitly send reasoning disablement instead of falling back to the provider default ([#2239](https://github.com/can1357/oh-my-pi/issues/2239)).
 - Fixed long-running sessions becoming sluggish because the status line recomputed context usage by walking the full message history on every refresh. Message-token totals are now cached incrementally, and status lines that do not render context segments skip context accounting entirely. ([#2089](https://github.com/can1357/oh-my-pi/issues/2089))
 - Fixed extension-registered slash commands being allowed to shadow builtin command names in the ACP/RPC command list: both the TUI and `getSessionSlashCommands()` now filter against the shared builtin reserved-name registry.

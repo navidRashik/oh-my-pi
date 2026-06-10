@@ -356,6 +356,51 @@ function limitDiagnosticMessages(messages: string[]): string[] {
 	return messages.slice(0, DIAGNOSTIC_MESSAGE_LIMIT);
 }
 
+interface PublishedProjectDiagnostic {
+	serverName: string;
+	uri: string;
+	diagnostic: Diagnostic;
+}
+
+function diagnosticIdentityKey(uri: string, diagnostic: Diagnostic): string {
+	return `${uri}:${diagnostic.range.start.line}:${diagnostic.range.start.character}:${diagnostic.range.end.line}:${diagnostic.range.end.character}:${diagnostic.message}`;
+}
+
+function appendPublishedProjectDiagnostics(
+	entries: PublishedProjectDiagnostic[],
+	seen: Set<string>,
+	serverName: string,
+	client: LspClient,
+	excludedUris: ReadonlySet<string>,
+): void {
+	for (const [uri, published] of client.diagnostics) {
+		if (excludedUris.has(uri) || published.diagnostics.length === 0) {
+			continue;
+		}
+		for (const diagnostic of published.diagnostics) {
+			const key = `${serverName}:${diagnosticIdentityKey(uri, diagnostic)}`;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			entries.push({ serverName, uri, diagnostic });
+		}
+	}
+}
+
+function formatPublishedProjectDiagnostics(entries: PublishedProjectDiagnostic[], cwd: string): string[] {
+	return limitDiagnosticMessages(
+		entries.map(entry => formatDiagnostic(entry.diagnostic, formatPathRelativeToCwd(uriToFile(entry.uri), cwd))),
+	);
+}
+
+function formatIncompleteDiagnosticTargets(targets: string[]): string {
+	if (targets.length <= 3) {
+		return targets.join(", ");
+	}
+	return `${targets.slice(0, 3).join(", ")} and ${targets.length - 3} more`;
+}
+
 const LOCATION_CONTEXT_LINES = 1;
 const REFERENCE_CONTEXT_LIMIT = 50;
 
@@ -492,11 +537,15 @@ interface WaitForDiagnosticsOptions {
 	settleMs?: number;
 }
 
+interface DiagnosticsWaitResult {
+	diagnostics: Diagnostic[];
+	fresh: boolean;
+}
 async function waitForDiagnostics(
 	client: LspClient,
 	uri: string,
 	options: WaitForDiagnosticsOptions = {},
-): Promise<Diagnostic[]> {
+): Promise<DiagnosticsWaitResult> {
 	const { timeoutMs = 3000, signal, minVersion, expectedDocumentVersion, settleMs = DIAGNOSTICS_SETTLE_MS } = options;
 	const start = Date.now();
 	let settledRef: PublishedDiagnostics | undefined;
@@ -508,7 +557,7 @@ async function waitForDiagnostics(
 		if (published && versionOk) {
 			// Server honored our exact document version → authoritative, accept now.
 			if (expectedDocumentVersion !== undefined && published.version === expectedDocumentVersion) {
-				return published.diagnostics;
+				return { diagnostics: published.diagnostics, fresh: true };
 			}
 			// Unversioned/mismatched publish: wait for the stream to go quiet so an
 			// in-flight publish for the pre-edit content is superseded by the fresh one.
@@ -516,16 +565,16 @@ async function waitForDiagnostics(
 				settledRef = published;
 				settledAt = Date.now();
 			} else if (Date.now() - settledAt >= settleMs) {
-				return published.diagnostics;
+				return { diagnostics: published.diagnostics, fresh: true };
 			}
 		}
 		await Bun.sleep(DIAGNOSTICS_POLL_MS);
 	}
 	const versionOk = minVersion === undefined || client.diagnosticsVersion > minVersion;
 	if (!versionOk) {
-		return [];
+		return { diagnostics: [], fresh: false };
 	}
-	return client.diagnostics.get(uri)?.diagnostics ?? [];
+	return { diagnostics: client.diagnostics.get(uri)?.diagnostics ?? [], fresh: false };
 }
 
 /** Project type detection result */
@@ -697,6 +746,7 @@ async function getDiagnosticsForFile(
 	const relPath = formatPathRelativeToCwd(absolutePath, cwd);
 	const allDiagnostics: Diagnostic[] = [];
 	const serverNames: string[] = [];
+	const incompleteServers: string[] = [];
 
 	// Wait for diagnostics from all servers in parallel
 	const results = await Promise.allSettled(
@@ -706,7 +756,7 @@ async function getDiagnosticsForFile(
 			if (serverConfig.createClient) {
 				const linterClient = getLinterClient(serverName, serverConfig, cwd);
 				const diagnostics = await linterClient.lint(absolutePath);
-				return { serverName, diagnostics };
+				return { serverName, diagnostics, fresh: true };
 			}
 
 			// Default: use LSP
@@ -719,19 +769,22 @@ async function getDiagnosticsForFile(
 			// Content already synced + didSave sent, wait for fresh diagnostics
 			const minVersion = minVersions?.get(serverName);
 			const expectedDocumentVersion = expectedDocumentVersions?.get(serverName);
-			const diagnostics = await waitForDiagnostics(client, uri, {
+			const result = await waitForDiagnostics(client, uri, {
 				timeoutMs: timeoutMs ?? SINGLE_DIAGNOSTICS_WAIT_TIMEOUT_MS,
 				signal,
 				minVersion,
 				expectedDocumentVersion,
 			});
-			return { serverName, diagnostics };
+			return { serverName, diagnostics: result.diagnostics, fresh: result.fresh };
 		}),
 	);
 
 	for (const result of results) {
 		if (result.status === "fulfilled") {
 			serverNames.push(result.value.serverName);
+			if (!result.value.fresh) {
+				incompleteServers.push(result.value.serverName);
+			}
 			allDiagnostics.push(...result.value.diagnostics);
 		}
 	}
@@ -741,10 +794,14 @@ async function getDiagnosticsForFile(
 	}
 
 	if (allDiagnostics.length === 0) {
+		const summary =
+			incompleteServers.length > 0
+				? `diagnostics incomplete (${incompleteServers.join(", ")}: no fresh publishDiagnostics before timeout)`
+				: "OK";
 		return {
 			server: serverNames.join(", "),
 			messages: [],
-			summary: "OK",
+			summary,
 			errored: false,
 		};
 	}
@@ -1419,11 +1476,10 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				};
 			}
 
-			let targets: string[];
-			let truncatedGlobTargets = false;
 			const resolvedTargets = await resolveDiagnosticTargets(file, this.session.cwd, MAX_GLOB_DIAGNOSTIC_TARGETS);
-			targets = resolvedTargets.matches;
-			truncatedGlobTargets = resolvedTargets.truncated;
+			const targets = resolvedTargets.matches.map(target => resolveToCwd(target, this.session.cwd));
+			const targetUris = new Set(targets.map(target => fileToUri(target)));
+			const truncatedGlobTargets = resolvedTargets.truncated;
 
 			if (targets.length === 0) {
 				return {
@@ -1438,23 +1494,25 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				: Math.min(SINGLE_DIAGNOSTICS_WAIT_TIMEOUT_MS, timeoutSec * 1000);
 			const results: string[] = [];
 			const allServerNames = new Set<string>();
+			const projectDiagnostics: PublishedProjectDiagnostic[] = [];
+			const projectDiagnosticKeys = new Set<string>();
+			const incompleteTargets: string[] = [];
 			if (truncatedGlobTargets) {
 				results.push(
-					`${theme.status.warning} Pattern matched more than ${MAX_GLOB_DIAGNOSTIC_TARGETS} files; showing first ${MAX_GLOB_DIAGNOSTIC_TARGETS}. Narrow the glob or use workspace diagnostics.`,
+					`${theme.status.warning} Diagnostics incomplete: pattern matched more than ${MAX_GLOB_DIAGNOSTIC_TARGETS} files; checked first ${MAX_GLOB_DIAGNOSTIC_TARGETS} only. Narrow the glob or use workspace diagnostics.`,
 				);
 			}
 
-			for (const target of targets) {
+			for (const resolved of targets) {
 				throwIfAborted(signal);
-				const resolved = resolveToCwd(target, this.session.cwd);
+				const relPath = formatPathRelativeToCwd(resolved, this.session.cwd);
 				const servers = getServersForFile(config, resolved);
 				if (servers.length === 0) {
-					results.push(`${theme.status.error} ${target}: No language server found`);
+					results.push(`${theme.status.error} ${relPath}: No language server found`);
 					continue;
 				}
 
 				const uri = fileToUri(resolved);
-				const relPath = formatPathRelativeToCwd(resolved, this.session.cwd);
 				const allDiagnostics: Diagnostic[] = [];
 
 				// Query all applicable servers for this file
@@ -1482,7 +1540,17 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							minVersion,
 							expectedDocumentVersion,
 						});
-						allDiagnostics.push(...diagnostics);
+						if (!diagnostics.fresh) {
+							incompleteTargets.push(`${relPath} (${serverName})`);
+						}
+						allDiagnostics.push(...diagnostics.diagnostics);
+						appendPublishedProjectDiagnostics(
+							projectDiagnostics,
+							projectDiagnosticKeys,
+							serverName,
+							client,
+							targetUris,
+						);
 					} catch (err) {
 						if (err instanceof ToolAbortError || signal?.aborted) {
 							throw err;
@@ -1495,7 +1563,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				const seen = new Set<string>();
 				const uniqueDiagnostics: Diagnostic[] = [];
 				for (const d of allDiagnostics) {
-					const key = `${d.range.start.line}:${d.range.start.character}:${d.range.end.line}:${d.range.end.character}:${d.message}`;
+					const key = diagnosticIdentityKey(uri, d);
 					if (!seen.has(key)) {
 						seen.add(key);
 						uniqueDiagnostics.push(d);
@@ -1506,8 +1574,41 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 				if (!detailed && targets.length === 1) {
 					if (uniqueDiagnostics.length === 0) {
+						if (projectDiagnostics.length > 0) {
+							const summary = formatDiagnosticsSummary(projectDiagnostics.map(entry => entry.diagnostic));
+							const formatted = formatPublishedProjectDiagnostics(projectDiagnostics, this.session.cwd);
+							const incompletePrefix =
+								incompleteTargets.length > 0
+									? `Diagnostics incomplete: no fresh publishDiagnostics received for ${formatIncompleteDiagnosticTargets(incompleteTargets)} before timeout.\n`
+									: "";
+							return {
+								content: [
+									{
+										type: "text",
+										text: `${incompletePrefix}No diagnostics for ${relPath}.\nOther published diagnostics from ${Array.from(allServerNames).join(", ")} (${summary}):\n${formatGroupedDiagnosticMessages(formatted)}`,
+									},
+								],
+								details: { action, serverName: Array.from(allServerNames).join(", "), success: true },
+							};
+						}
+						if (incompleteTargets.length > 0) {
+							return {
+								content: [
+									{
+										type: "text",
+										text: `Diagnostics incomplete: no fresh publishDiagnostics received for ${formatIncompleteDiagnosticTargets(incompleteTargets)} before timeout. No diagnostics for ${relPath} are available yet.`,
+									},
+								],
+								details: { action, serverName: Array.from(allServerNames).join(", "), success: true },
+							};
+						}
 						return {
-							content: [{ type: "text", text: "OK" }],
+							content: [
+								{
+									type: "text",
+									text: `No diagnostics for ${relPath}. Project-wide diagnostics were not checked; run workspace diagnostics or the project checker before treating the project as clean.`,
+								},
+							],
 							details: { action, serverName: Array.from(allServerNames).join(", "), success: true },
 						};
 					}
@@ -1522,13 +1623,25 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 
 				if (uniqueDiagnostics.length === 0) {
-					results.push(`${theme.status.success} ${relPath}: no issues`);
+					results.push(`${theme.status.success} ${relPath}: no diagnostics in checked file`);
 				} else {
 					const summary = formatDiagnosticsSummary(uniqueDiagnostics);
 					results.push(`${theme.status.error} ${relPath}: ${summary}`);
 					const formatted = uniqueDiagnostics.map(d => formatDiagnostic(d, relPath));
 					results.push(formatGroupedDiagnosticMessages(formatted));
 				}
+			}
+
+			if (projectDiagnostics.length > 0) {
+				const summary = formatDiagnosticsSummary(projectDiagnostics.map(entry => entry.diagnostic));
+				const formatted = formatPublishedProjectDiagnostics(projectDiagnostics, this.session.cwd);
+				results.push(`Other published diagnostics from queried server(s) (${summary}):`);
+				results.push(formatGroupedDiagnosticMessages(formatted));
+			}
+			if (incompleteTargets.length > 0) {
+				results.unshift(
+					`${theme.status.warning} Diagnostics incomplete: no fresh publishDiagnostics received for ${formatIncompleteDiagnosticTargets(incompleteTargets)} before timeout.`,
+				);
 			}
 
 			return {

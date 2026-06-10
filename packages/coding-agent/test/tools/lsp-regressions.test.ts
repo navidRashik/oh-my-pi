@@ -835,7 +835,11 @@ for await (const chunk of Bun.stdin.stream()) {
 				.map(block => block.text)
 				.join("\n");
 
-			expect(output).toBe("OK");
+			expect(output).toContain("No diagnostics for target.ts");
+			expect(output).toContain("Other published diagnostics");
+			expect(output).toContain("other file warning");
+			expect(output).not.toBe("OK");
+			expect(output).not.toContain("stale target error");
 		} finally {
 			vi.restoreAllMocks();
 			tempDir.removeSync();
