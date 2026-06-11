@@ -2505,7 +2505,7 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tools",
 			label: "Async Execution",
-			description: "Enable async bash commands",
+			description: "Enable async bash commands and background task execution",
 		},
 	},
 
@@ -2758,7 +2758,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "tasks",
 			label: "Batch Task Calls",
 			description:
-				"Switch the task tool to its batch shape: one call carries { agent, context, tasks[] } — one subagent per item (with per-item isolation) and a required shared context prepended to every assignment. Each spawn still runs as an independent background agent with the normal idle/parked lifecycle. Disable to restore the flat single-spawn schema.",
+				"Switch the task tool to its batch shape: one call carries { agent, context, tasks[] } — one subagent per item (with per-item isolation) and a required shared context prepended to every assignment. With async.enabled=true, each spawn runs as an independent background agent with the normal idle/parked lifecycle; otherwise the call blocks for merged results. Disable to restore the flat single-spawn schema.",
 		},
 	},
 
