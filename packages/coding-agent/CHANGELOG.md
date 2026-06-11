@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Mnemopi `per-project-tagged` enqueue maintenance to flush and consolidate the shared global bank alongside the project bank ([#2321](https://github.com/can1357/oh-my-pi/issues/2321)).
+
 ## [15.11.2] - 2026-06-11
 
 ### Added
@@ -16,8 +20,6 @@
 - Bash tool calls in one assistant message now run in parallel instead of serializing the batch: non-pty `bash` is scheduled as a shared tool (`pty: true` stays exclusive), and overlapping calls on the same shell session key degrade to isolated one-shot shells so they cannot queue behind or abort each other
 
 ### Fixed
-
-- Fixed Mnemopi `per-project-tagged` enqueue maintenance to flush and consolidate the shared global bank alongside the project bank ([#2321](https://github.com/can1357/oh-my-pi/issues/2321)).
 
 - Fixed CDP attach target selection for Chromium/Edge endpoints that expose page targets through discovery before `browser.pages()` is populated, and improved `ws://` `app.cdp_url` diagnostics ([#2246](https://github.com/can1357/oh-my-pi/issues/2246)).
 - Fixed local memory consolidation on Responses-style models that reject user-only requests by sending a dedicated stage-two system prompt.
