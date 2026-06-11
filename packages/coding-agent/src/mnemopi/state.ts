@@ -154,6 +154,14 @@ export class MnemopiSessionState {
 		return this.scoped.retain;
 	}
 
+	/** Flushes pending extractions and consolidation for each bank owned by this session. */
+	async drainScopedBanks(): Promise<void> {
+		for (const memory of this.scoped.owned) {
+			await memory.flushExtractions();
+			memory.sleepAllSessions(false);
+		}
+	}
+
 	editScopedMemory(
 		op: MnemopiMemoryEditOperation,
 		id: string,

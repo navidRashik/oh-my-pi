@@ -137,10 +137,10 @@ export const mnemopiBackend: MemoryBackend = {
 				setMnemopiSessionState(session, state);
 			}
 			await state?.forceRetainCurrentSession();
-			// Drain the background fact extraction scheduled by the final retain
-			// before the process can exit, otherwise the last turn's facts are lost.
-			await state?.memory.flushExtractions();
-			state?.memory.sleepAllSessions(false);
+			// Drain background extraction scheduled by the final retain for every
+			// scoped bank before the process can exit, otherwise last-turn facts
+			// in the project or global bank are lost.
+			await state?.drainScopedBanks();
 		} catch (error) {
 			logger.warn("Mnemopi: enqueue failed.", { error: String(error) });
 		}

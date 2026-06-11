@@ -17,6 +17,8 @@
 
 ### Fixed
 
+- Fixed Mnemopi `per-project-tagged` enqueue maintenance to flush and consolidate the shared global bank alongside the project bank ([#2321](https://github.com/can1357/oh-my-pi/issues/2321)).
+
 - Fixed CDP attach target selection for Chromium/Edge endpoints that expose page targets through discovery before `browser.pages()` is populated, and improved `ws://` `app.cdp_url` diagnostics ([#2246](https://github.com/can1357/oh-my-pi/issues/2246)).
 - Fixed local memory consolidation on Responses-style models that reject user-only requests by sending a dedicated stage-two system prompt.
 - Fixed extension, custom-tool, custom-command, and hook loaders injecting `pi` through bare `@oh-my-pi/pi-coding-agent` self-imports, which could pull a different cached package version into global installs during plugin load and trigger mixed-runtime stack overflows.
