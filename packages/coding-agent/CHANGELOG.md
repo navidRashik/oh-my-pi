@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `chat.transparent` appearance setting (default off): when enabled, the chat-panel surfaces — user messages, custom messages, and tool-state panels — skip the theme's `userMessageBg`/`customMessageBg`/`toolPendingBg`/`toolSuccessBg`/`toolErrorBg` fills so the bubbles inherit the terminal's default background. Mirrors the existing `statusLine.transparent` opt-in for terminals (e.g. Ghostty) whose background does not match the theme's hardcoded chat-panel colors ([#2394](https://github.com/can1357/oh-my-pi/issues/2394))
+
 ## [15.11.8] - 2026-06-12
 
 ### Added

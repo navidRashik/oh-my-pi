@@ -1440,6 +1440,7 @@ export class Theme {
 		private readonly symbolPreset: SymbolPreset,
 		symbolOverrides: Partial<Record<SymbolKey, string>>,
 		spinnerFramesOverrides: Partial<Record<SpinnerType, string[]>> = {},
+		transparentSurfaces: readonly ThemeBg[] = [],
 	) {
 		this.statusLineLuminance = colorLuma(bgColors.statusLineBg);
 		this.#statusLineContrastLuminance = relativeLuminance(bgColors.statusLineBg);
@@ -1456,6 +1457,14 @@ export class Theme {
 		for (const [key, value] of Object.entries(bgColors) as [ThemeBg, string | number][]) {
 			this.#bgColors[key] = bgAnsi(value, mode);
 			this.#hexBgColors[key] = resolveToHex(value, slIsLight);
+		}
+		// Drop fill ANSI on the requested surfaces so `theme.bg(key, …)` and
+		// `theme.getBgAnsi(key)` resolve to the terminal default (`\x1b[49m`),
+		// matching the empty-string sentinel themes can set per-key. Hex bgs
+		// keep their original values — HTML export and color-aggregation paths
+		// stay intact.
+		for (const key of transparentSurfaces) {
+			if (key in this.#bgColors) this.#bgColors[key] = "\x1b[49m";
 		}
 		// Build symbol map from preset + overrides
 		const baseSymbols = SYMBOL_PRESETS[symbolPreset];
@@ -1983,13 +1992,26 @@ interface CreateThemeOptions {
 	mode?: ColorMode;
 	symbolPresetOverride?: SymbolPreset;
 	colorBlindMode?: boolean;
+	/** When true, paint chat-surface backgrounds (user messages, custom
+	 * messages, tool-state panels) with the terminal default — same opt-in
+	 * shape as `statusLine.transparent` but for the chat scroll. */
+	chatTransparent?: boolean;
 }
+
+/** Chat-scroll surfaces dropped when `chat.transparent` is on. */
+const CHAT_TRANSPARENT_SURFACES: readonly ThemeBg[] = [
+	"userMessageBg",
+	"customMessageBg",
+	"toolPendingBg",
+	"toolSuccessBg",
+	"toolErrorBg",
+];
 
 /** HSV adjustment to shift green toward blue for colorblind mode (red-green colorblindness) */
 const COLORBLIND_ADJUSTMENT = { h: 60, s: 0.71 };
 
 function createTheme(themeJson: ThemeJson, options: CreateThemeOptions = {}): Theme {
-	const { mode, symbolPresetOverride, colorBlindMode } = options;
+	const { mode, symbolPresetOverride, colorBlindMode, chatTransparent } = options;
 	const colorMode = mode ?? detectColorMode();
 	const resolvedColors = resolveThemeColors(themeJson.colors, themeJson.vars);
 
@@ -2022,7 +2044,16 @@ function createTheme(themeJson: ThemeJson, options: CreateThemeOptions = {}): Th
 	const symbolPreset: SymbolPreset = symbolPresetOverride ?? themeJson.symbols?.preset ?? "unicode";
 	const symbolOverrides = themeJson.symbols?.overrides ?? {};
 	const spinnerFramesOverrides = normalizeSpinnerFramesOverride(themeJson.symbols?.spinnerFrames);
-	return new Theme(fgColors, bgColors, colorMode, symbolPreset, symbolOverrides, spinnerFramesOverrides);
+	const transparentSurfaces = chatTransparent ? CHAT_TRANSPARENT_SURFACES : [];
+	return new Theme(
+		fgColors,
+		bgColors,
+		colorMode,
+		symbolPreset,
+		symbolOverrides,
+		spinnerFramesOverrides,
+		transparentSurfaces,
+	);
 }
 
 async function loadTheme(name: string, options: CreateThemeOptions = {}): Promise<Theme> {
@@ -2094,6 +2125,7 @@ export function getCurrentThemeName(): string | undefined {
 }
 var currentSymbolPresetOverride: SymbolPreset | undefined;
 var currentColorBlindMode: boolean = false;
+var currentChatTransparent: boolean = false;
 var themeWatcher: fs.FSWatcher | undefined;
 var themeReloadTimer: NodeJS.Timeout | undefined;
 var sigwinchHandler: (() => void) | undefined;
@@ -2107,6 +2139,7 @@ function getCurrentThemeOptions(): CreateThemeOptions {
 	return {
 		symbolPresetOverride: currentSymbolPresetOverride,
 		colorBlindMode: currentColorBlindMode,
+		chatTransparent: currentChatTransparent,
 	};
 }
 
@@ -2116,6 +2149,7 @@ export async function initTheme(
 	colorBlindMode?: boolean,
 	darkTheme?: string,
 	lightTheme?: string,
+	chatTransparent?: boolean,
 ): Promise<void> {
 	autoDetectedTheme = true;
 	autoDarkTheme = darkTheme ?? "dark";
@@ -2124,6 +2158,7 @@ export async function initTheme(
 	currentThemeName = name;
 	currentSymbolPresetOverride = symbolPreset;
 	currentColorBlindMode = colorBlindMode ?? false;
+	currentChatTransparent = chatTransparent ?? false;
 	try {
 		theme = await loadTheme(name, getCurrentThemeOptions());
 		if (enableWatcher) {
@@ -2290,6 +2325,37 @@ export async function setColorBlindMode(enabled: boolean): Promise<void> {
  */
 export function getColorBlindMode(): boolean {
 	return currentColorBlindMode;
+}
+
+/**
+ * Set chat-surface transparency, reloading the theme so user / custom message
+ * bubbles and tool-state panels paint with the terminal default background
+ * (or restore the theme's own fill when toggled off). Mirrors the
+ * `statusLine.transparent` opt-in.
+ */
+export async function setChatTransparent(enabled: boolean): Promise<void> {
+	currentChatTransparent = enabled;
+	if (!currentThemeName) return;
+
+	const requestId = ++themeLoadRequestId;
+	try {
+		const loadedTheme = await loadTheme(currentThemeName, getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) return;
+		theme = loadedTheme;
+	} catch {
+		if (requestId !== themeLoadRequestId) return;
+		// Fall back to dark theme
+		theme = await loadTheme("dark", getCurrentThemeOptions());
+		if (requestId !== themeLoadRequestId) return;
+	}
+	onThemeChangeCallback?.();
+}
+
+/**
+ * Get the current chat-surface transparency setting.
+ */
+export function getChatTransparent(): boolean {
+	return currentChatTransparent;
 }
 
 export function onThemeChange(callback: () => void): void {

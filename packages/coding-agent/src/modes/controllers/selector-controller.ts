@@ -21,6 +21,7 @@ import {
 	getAvailableThemes,
 	getSymbolTheme,
 	previewTheme,
+	setChatTransparent,
 	setColorBlindMode,
 	setSymbolPreset,
 	setTheme,
@@ -341,6 +342,14 @@ export class SelectorController {
 			}
 			case "colorBlindMode": {
 				setColorBlindMode(value === "true" || value === true).then(() => {
+					this.ctx.ui.invalidate();
+				});
+				break;
+			}
+			case "chat.transparent": {
+				setChatTransparent(value === "true" || value === true).then(() => {
+					this.ctx.statusLine.invalidate();
+					this.ctx.updateEditorTopBorder();
 					this.ctx.ui.invalidate();
 				});
 				break;

@@ -508,6 +508,18 @@ export const SETTINGS_SCHEMA = {
 				"Use the terminal's default background for the status line instead of the theme's `statusLineBg`. Powerline end caps are dropped because they need a contrasting fill to bridge into the surrounding terminal.",
 		},
 	},
+
+	"chat.transparent": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			group: "Theme",
+			label: "Transparent Chat Surfaces",
+			description:
+				"Drop the theme's chat-panel backgrounds (user messages, custom messages, and tool-state panels) so they inherit the terminal's default background — useful in Ghostty and other terminals whose theme background does not match the theme's hardcoded chat colors.",
+		},
+	},
 	"tools.artifactSpillThreshold": {
 		type: "number",
 		default: 50,
