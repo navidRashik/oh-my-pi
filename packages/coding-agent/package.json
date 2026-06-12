@@ -93,6 +93,7 @@
 		"src",
 		"dist/cli.js",
 		"dist/*.node",
+		"bin",
 		"scripts",
 		"examples",
 		"README.md",
