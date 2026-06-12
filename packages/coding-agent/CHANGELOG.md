@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the npm bundled CLI package to ship fastembed's nested ONNX `napi-v3` native binding at the path Bun-bundled fastembed resolves, restoring local Mnemopi embeddings in bundled installs ([#2389](https://github.com/can1357/oh-my-pi/issues/2389)).
+
 ## [15.11.8] - 2026-06-12
 
 ### Added
@@ -24,7 +28,6 @@
 
 ### Fixed
 
-- Fixed the npm bundled CLI package to ship fastembed's nested ONNX `napi-v3` native binding at the path Bun-bundled fastembed resolves, restoring local Mnemopi embeddings in bundled installs ([#2389](https://github.com/can1357/oh-my-pi/issues/2389)).
 - Fixed remote (SSH) image attachment silently inserting the local-machine path as plain text: when omp runs over SSH and the terminal forwards a bracketed-paste image path, the path is unreachable from the remote host. The path-as-text fallback is gone for unreachable paths and the status now points the user at the clipboard image-paste shortcut so the bytes actually cross the connection ([#2375](https://github.com/can1357/oh-my-pi/issues/2375)).
 
 ### Security
