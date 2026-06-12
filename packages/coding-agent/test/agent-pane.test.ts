@@ -290,9 +290,9 @@ describe("pane protocol and client", () => {
 							generation: permission.generation,
 							childId: permission.childId,
 							commandId,
-							result: { ok: false, code: "unavailable", message: "send queue full" },
+							result: { ok: false, code: "invalid_prompt", message: "prompt too long" },
 						},
-						503,
+						413,
 					);
 				}
 				return json({ error: "not_found" }, 404);
@@ -301,9 +301,9 @@ describe("pane protocol and client", () => {
 
 		await client.start();
 		const result = await client.send("continue once");
-		expect(result?.result).toEqual({ ok: false, code: "unavailable", message: "send queue full" });
+		expect(result?.result).toEqual({ ok: false, code: "invalid_prompt", message: "prompt too long" });
 		expect(client.state.connection).toBe("connected");
-		expect(client.state.notice).toBe("send queue full");
+		expect(client.state.notice).toBe("prompt too long");
 		expect(client.canSend).toBe(true);
 		client.close();
 		stream.close();

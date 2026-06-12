@@ -106,6 +106,17 @@ describe("lazy authenticated agent control sidecar", () => {
 			}),
 		});
 		expect(oversizedPrompt.status).toBe(413);
+		expect(await oversizedPrompt.json()).toEqual({
+			version: 1,
+			generation: permissionA.generation,
+			childId: permissionA.childId,
+			commandId: `${permissionA.generation}:oversized`,
+			result: {
+				ok: false,
+				code: "invalid_prompt",
+				message: "Agent pane prompt must be 1-32768 characters.",
+			},
+		});
 		const snapshotA = (await fetch(`${host.endpoint}/v1/snapshot`, {
 			headers: { authorization: `Bearer ${permissionA.token}` },
 		}).then(response => response.json())) as { id: string };

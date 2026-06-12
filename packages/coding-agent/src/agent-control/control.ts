@@ -35,6 +35,7 @@ export type ChildControlErrorCode =
 	| "identity_mismatch"
 	| "terminal"
 	| "not_revivable"
+	| "invalid_prompt"
 	| "unavailable";
 
 export type ChildControlSendResult =

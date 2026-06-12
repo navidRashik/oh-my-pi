@@ -270,7 +270,17 @@ export class AgentControlServer implements AgentControlServerHandle {
 		if (!commandId.startsWith(`${permission.generation}:`) || commandId.length > MAX_COMMAND_ID_CHARS) {
 			return response(400, { error: "invalid_command_id" });
 		}
-		if (prompt.length === 0 || prompt.length > MAX_PROMPT_CHARS) return response(413, { error: "invalid_prompt" });
+		if (prompt.length === 0 || prompt.length > MAX_PROMPT_CHARS) {
+			return response(
+				413,
+				sendRejection(
+					permission,
+					commandId,
+					"invalid_prompt",
+					`Agent pane prompt must be 1-${MAX_PROMPT_CHARS} characters.`,
+				),
+			);
+		}
 
 		let result = permission.ledger.get(commandId);
 		if (!result) {
