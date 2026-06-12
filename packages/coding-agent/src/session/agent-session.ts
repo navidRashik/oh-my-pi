@@ -303,6 +303,7 @@ export type AgentSessionEvent =
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 export type CommandMetadataChangedListener = () => void | Promise<void>;
+export type SessionGenerationCommittedListener = () => void;
 export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime">;
 
 const EMPTY_STOP_MAX_RETRIES = 3;
@@ -895,6 +896,7 @@ export class AgentSession {
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
 	#commandMetadataChangedListeners: CommandMetadataChangedListener[] = [];
+	#sessionGenerationCommittedListeners: SessionGenerationCommittedListener[] = [];
 
 	/** Tracks pending steering messages for UI display. Removed when delivered.
 	 *  Entry shape: `{ text }` for plain-text steers (user-message dequeue
@@ -3055,6 +3057,25 @@ export class AgentSession {
 		};
 	}
 
+	/** Observe successful session identity/tree commits; cancellation and rollback never notify. */
+	onSessionGenerationCommitted(listener: SessionGenerationCommittedListener): () => void {
+		this.#sessionGenerationCommittedListeners.push(listener);
+		return () => {
+			const index = this.#sessionGenerationCommittedListeners.indexOf(listener);
+			if (index !== -1) this.#sessionGenerationCommittedListeners.splice(index, 1);
+		};
+	}
+
+	#notifySessionGenerationCommitted(): void {
+		for (const listener of [...this.#sessionGenerationCommittedListeners]) {
+			try {
+				listener();
+			} catch (error) {
+				logger.error("Session generation observer threw", { error });
+			}
+		}
+	}
+
 	#notifyCommandMetadataChanged(): void {
 		const listeners = [...this.#commandMetadataChangedListeners];
 		for (const listener of listeners) {
@@ -3228,6 +3249,7 @@ export class AgentSession {
 			this.#unsubscribeAppendOnly = undefined;
 		}
 		this.#eventListeners = [];
+		this.#sessionGenerationCommittedListeners = [];
 	}
 
 	#closeAllProviderSessions(reason: string): void {
@@ -5545,6 +5567,7 @@ export class AgentSession {
 			});
 		}
 
+		this.#notifySessionGenerationCommitted();
 		return true;
 	}
 
@@ -5620,6 +5643,7 @@ export class AgentSession {
 			});
 		}
 
+		this.#notifySessionGenerationCommitted();
 		return true;
 	}
 
@@ -9664,6 +9688,7 @@ export class AgentSession {
 					error: String(error),
 				});
 			}
+			this.#notifySessionGenerationCommitted();
 			return true;
 		} catch (error) {
 			this.sessionManager.restoreState(previousSessionState);
@@ -9788,6 +9813,7 @@ export class AgentSession {
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 		}
 
+		this.#notifySessionGenerationCommitted();
 		return { selectedText, cancelled: false };
 	}
 
@@ -9968,8 +9994,10 @@ export class AgentSession {
 				fromExtension: summaryText ? fromExtension : undefined,
 			});
 			const rawContext = this.sessionManager.buildSessionContext();
+			this.#notifySessionGenerationCommitted();
 			return { editorText, cancelled: false, summaryEntry, sessionContext: rawContext };
 		}
+		this.#notifySessionGenerationCommitted();
 		return { editorText, cancelled: false, summaryEntry, sessionContext: stateContext };
 	}
 
