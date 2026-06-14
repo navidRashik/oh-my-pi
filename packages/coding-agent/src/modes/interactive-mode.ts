@@ -87,10 +87,8 @@ import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, BUILTIN_SLASH_COMMANDS } from "..
 import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
-import { formatTaskId } from "../task/render";
 import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
-import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import { type ResolveToolDetails, runResolveInvocation } from "../tools/resolve";
 import { formatPhaseDisplayName, selectStickyTodoWindow, todoMatchesAnyDescription } from "../tools/todo";
@@ -136,7 +134,6 @@ import {
 	parseLoopLimitArgs,
 } from "./loop-limit";
 import { OAuthManualInputManager } from "./oauth-manual-input";
-import type { ObservableSession } from "./session-observer-registry";
 import { SessionObserverRegistry } from "./session-observer-registry";
 import { runProviderSetupWizard } from "./setup-wizard/lazy";
 import { interruptHint } from "./shared";
@@ -282,46 +279,6 @@ class StatusContainer extends Container implements NativeScrollbackLiveRegion {
 	}
 }
 
-/**
- * Build the anchored subagent HUD block: a bold accent "Subagents" header plus
- * one hooked row per running agent in the same `Id: description` shape the
- * inline task rows use (muted task preview when no description was given).
- * Only detached background spawns are listed: a sync task call blocks the
- * parent turn and its inline tool block already renders progress live, and
- * eval `agent()` spawns are rendered by their own eval cell tree.
- * Returns an empty array when nothing is running so the container can clear.
- */
-export function renderSubagentHudLines(sessions: ObservableSession[], columns: number): string[] {
-	const running = sessions.filter(
-		session => session.kind === "subagent" && session.status === "active" && session.detached === true,
-	);
-	if (running.length === 0) return [];
-
-	const indent = "  ";
-	const hook = theme.tree.hook;
-	const dot = theme.styledSymbol("status.done", "accent");
-	const lines = ["", indent + theme.bold(theme.fg("accent", "Subagents"))];
-	running.forEach((session, index) => {
-		const prefix = `${indent}${index === 0 ? hook : " "} `;
-		const displayId = formatTaskId(session.id);
-		let line = `${prefix}${dot} ${theme.fg("accent", theme.bold(displayId))}`;
-		const description = session.description?.trim() || session.progress?.description?.trim();
-		if (description) {
-			const budget = Math.max(TRUNCATE_LENGTHS.SHORT, columns - visibleWidth(prefix) - visibleWidth(displayId) - 6);
-			line += `${theme.fg("accent", ":")} ${theme.fg("accent", truncateToWidth(replaceTabs(description), budget))}`;
-		} else {
-			// No spawn description: fall back to a muted task preview, same as
-			// the inline task rows when a row has no label.
-			const taskPreview = session.progress?.task?.trim();
-			if (taskPreview) {
-				line += ` ${theme.fg("muted", truncateToWidth(replaceTabs(taskPreview), TRUNCATE_LENGTHS.SHORT))}`;
-			}
-		}
-		lines.push(line);
-	});
-	return lines;
-}
-
 export class InteractiveMode implements InteractiveModeContext {
 	session: AgentSession;
 	sessionManager: SessionManager;
@@ -432,6 +389,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #eventController: EventController;
 	get eventController(): EventController {
 		return this.#eventController;
+	}
+
+	describeSubagentJob(id: string): string | undefined {
+		const progress = this.#observerRegistry.getSessions().find(session => session.id === id)?.progress;
+		return progress?.lastIntent?.trim() || progress?.description?.trim() || progress?.task?.trim() || undefined;
 	}
 	get eventBus(): EventBus | undefined {
 		return this.#eventBus;
@@ -715,7 +677,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#reconcileTodosWithSubagents();
 			this.#syncTodoAutoClearTimer();
 			this.#renderTodoList();
-			this.#renderSubagentList();
+			this.#eventController.refreshBackgroundJobs();
 			this.ui.requestRender();
 		});
 
@@ -1410,19 +1372,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		});
 
 		this.todoContainer.addChild(new Text(lines.join("\n"), 1, 0));
-	}
-
-	/**
-	 * Anchored HUD of in-flight subagents, mirroring the Todos block above the
-	 * editor. Driven entirely by observer-registry change events, so rows appear
-	 * on spawn and the whole block clears itself once the last subagent leaves
-	 * the "active" state.
-	 */
-	#renderSubagentList(): void {
-		this.subagentContainer.clear();
-		const lines = renderSubagentHudLines(this.#observerRegistry.getSessions(), this.ui.terminal.columns);
-		if (lines.length === 0) return;
-		this.subagentContainer.addChild(new Text(lines.join("\n"), 1, 0));
 	}
 
 	async #loadTodoList(): Promise<void> {

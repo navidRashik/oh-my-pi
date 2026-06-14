@@ -108,5 +108,8 @@ export class SessionFocusController {
 		if (target.isStreaming) await this.ctx.eventController.handleEvent({ type: "agent_start" });
 		this.ctx.updateEditorBorderColor();
 		this.ctx.ui.requestRender();
+		// Refresh the main-session background-jobs panel for the new focus:
+		// hidden while observing a subagent, restored on return to main.
+		this.ctx.eventController.refreshBackgroundJobs();
 	}
 }

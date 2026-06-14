@@ -680,7 +680,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 		return manager.register(
 			"task",
-			agentId,
+			progress.description?.trim() || agentId,
 			async ({ jobId: ownJobId, signal: runSignal, reportProgress, markRunning }) => {
 				const startedAt = Date.now();
 				const semaphore = this.#getSpawnSemaphore();

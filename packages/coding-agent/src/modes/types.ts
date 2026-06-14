@@ -85,6 +85,7 @@ export interface InteractiveModeContext {
 	pendingMessagesContainer: Container;
 	statusContainer: Container;
 	todoContainer: Container;
+	/** Anchored panel above the editor listing the main session's background jobs. */
 	subagentContainer: Container;
 	btwContainer: Container;
 	omfgContainer: Container;
@@ -110,6 +111,12 @@ export interface InteractiveModeContext {
 	unfocusSession(): Promise<void>;
 	/** Clear loader, status/pending containers, streaming state, and pending tools. */
 	clearTransientSessionUi(): void;
+	/**
+	 * Live one-line summary of a detached subagent's current action (latest
+	 * intent, else spawn description, else assignment), for the background-jobs
+	 * panel. Undefined when no such subagent is tracked.
+	 */
+	describeSubagentJob(id: string): string | undefined;
 	settings: Settings;
 	keybindings: KeybindingsManager;
 	agent: AgentSession["agent"];

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced the detached subagent HUD with an anchored `Background Jobs` panel that lists running async task and shell jobs, hides while observing a subagent session, and blocks idle auto-compaction while background work is still in flight ([#2512](https://github.com/can1357/oh-my-pi/issues/2512)).
+
 ## [15.12.5] - 2026-06-13
 ### Changed
 

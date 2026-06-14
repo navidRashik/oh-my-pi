@@ -1504,6 +1504,21 @@ export class AgentSession {
 	}
 
 	/**
+	 * True while this session has any running async task/bash job, or any
+	 * completion delivery still queued/in flight. Used to gate work that would
+	 * race a follow-up turn triggered by a job completion — e.g. idle
+	 * compaction, goal/loop/autoresearch auto-continuation.
+	 */
+	hasPendingBackgroundJobs(): boolean {
+		const manager = this.#asyncJobManager;
+		if (!manager) return false;
+		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		if (manager.getRunningJobs(ownerFilter).length > 0) return true;
+		const delivery = manager.getDeliveryState(ownerFilter);
+		return delivery.queued > 0 || delivery.delivering || delivery.pendingJobIds.length > 0;
+	}
+
+	/**
 	 * Cancel async jobs registered by *this* agent only. Used by lifecycle
 	 * transitions (newSession, switchSession, handoff, dispose) so a subagent
 	 * cleans up its own background work without touching its parent's jobs.

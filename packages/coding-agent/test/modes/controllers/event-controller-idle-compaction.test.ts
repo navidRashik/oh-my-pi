@@ -44,8 +44,10 @@ describe("EventController idle compaction teardown", () => {
 		resetSettingsForTest();
 	});
 
-	it("cancels scheduled idle compaction when disposed", async () => {
-		const runIdleCompaction = vi.fn();
+	function makeContext(
+		runIdleCompaction: () => void,
+		hasPendingBackgroundJobs: () => boolean = () => false,
+	): InteractiveModeContext {
 		const context = {
 			isInitialized: true,
 			loadingAnimation: undefined,
@@ -63,7 +65,11 @@ describe("EventController idle compaction teardown", () => {
 			session: {
 				isCompacting: false,
 				isStreaming: false,
+				isGeneratingHandoff: false,
+				queuedMessageCount: 0,
 				runIdleCompaction,
+				hasPendingBackgroundJobs,
+				getAsyncJobSnapshot: () => null,
 				agent: { state: { messages: [createAssistantMessage()] } },
 			},
 			get viewSession() {
@@ -71,12 +77,36 @@ describe("EventController idle compaction teardown", () => {
 			},
 			clearTransientSessionUi: () => {},
 		} as unknown as InteractiveModeContext;
+		return context;
+	}
 
-		const controller = new EventController(context);
+	it("cancels scheduled idle compaction when disposed", async () => {
+		const runIdleCompaction = vi.fn();
+		const controller = new EventController(makeContext(runIdleCompaction));
 		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
 		controller.dispose();
 		vi.advanceTimersByTime(60_000);
 
 		expect(runIdleCompaction).not.toHaveBeenCalled();
+	});
+
+	it("fires idle compaction after the delay when idle with no background jobs", async () => {
+		const runIdleCompaction = vi.fn();
+		const controller = new EventController(makeContext(runIdleCompaction, () => false));
+		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(60_000);
+
+		expect(runIdleCompaction).toHaveBeenCalledTimes(1);
+		controller.dispose();
+	});
+
+	it("does not schedule idle compaction while background jobs are running", async () => {
+		const runIdleCompaction = vi.fn();
+		const controller = new EventController(makeContext(runIdleCompaction, () => true));
+		await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+		vi.advanceTimersByTime(60_000);
+
+		expect(runIdleCompaction).not.toHaveBeenCalled();
+		controller.dispose();
 	});
 });

@@ -12,6 +12,7 @@ function createContext() {
 	const session = {
 		getToolByName: () => undefined,
 		isAborting: false,
+		getAsyncJobSnapshot: () => null,
 	};
 	const ctx = {
 		isInitialized: true,

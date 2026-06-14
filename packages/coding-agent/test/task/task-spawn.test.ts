@@ -134,6 +134,7 @@ describe("task spawn routing", () => {
 		expect(text).toContain(`job \`${jobId}\``);
 		const job = manager.getJob(jobId!);
 		expect(job?.status).toBe("running");
+		expect(job?.label).toBe("background work");
 		expect(job?.resultText).toBeUndefined();
 
 		gate.resolve();
