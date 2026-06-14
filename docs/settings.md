@@ -43,7 +43,7 @@ disabledProviders:
   - groq
 modelRoles:
   default: anthropic/claude-sonnet-4-5
-  smol: openai/gpt-5.3-mini
+  smol: openai/gpt-5-mini
 ```
 
 Objects are deep-merged. Arrays are replaced wholesale by the higher-precedence layer.
