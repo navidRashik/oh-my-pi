@@ -213,6 +213,12 @@ function applyGeneratedModelPolicy(model: ModelSpec<Api>): void {
 		model.maxTokens = 131_072;
 	}
 
+	// MiniMax-M3: models.dev currently reports the 512K standard-tier
+	// boundary, but first-party MiniMax endpoints advertise a 1M context cap.
+	if ((model.provider === "minimax" || model.provider === "minimax-cn") && model.id === "MiniMax-M3") {
+		model.contextWindow = 1_000_000;
+	}
+
 	if (
 		model.api === "openai-completions" &&
 		(model.provider === "minimax-code" || model.provider === "minimax-code-cn")

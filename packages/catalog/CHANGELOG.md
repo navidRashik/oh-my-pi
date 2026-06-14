@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed MiniMax-M3 catalog metadata for `minimax` and `minimax-cn` so generated catalogs report the 1M context window instead of the 512K standard-tier boundary ([#2577](https://github.com/can1357/oh-my-pi/issues/2577)).
+
 ## [15.13.0] - 2026-06-14
 
 ### Added
