@@ -23,6 +23,9 @@ display(value) → None
     Render value in cell output, shows presentable values natively (figures, images, dataframes)
 print(value, ...) → None
     Print to text output.
+{{#if js}}nodeRepl.write(text) → None
+    JS only: append exact text to the cell output without a newline. Use this instead of `process.stdout.write(...)`, whose boolean return value becomes the cell result.
+{{/if}}
 read(path, offset?=1, limit?=None) → str
     Read file as text; offset/limit are 1-indexed lines. Accepts `local://…`.
 write(path, content) → str

@@ -26,6 +26,15 @@ describe("eval tool description", () => {
 		expect(text).not.toContain("agent(prompt");
 	});
 
+	it("documents nodeRepl.write() for JavaScript exact text output", () => {
+		const jsText = getEvalToolDescription({ py: false, js: true, spawns: false });
+		const pyText = getEvalToolDescription({ py: true, js: false, spawns: false });
+
+		expect(jsText).toContain("nodeRepl.write(text)");
+		expect(jsText).toContain("process.stdout.write");
+		expect(pyText).not.toContain("nodeRepl.write(text)");
+	});
+
 	it("EvalTool description reflects spawn policy from the session", () => {
 		const wildcard = new EvalTool(makeSession({ spawns: "*" })).description;
 		const denied = new EvalTool(makeSession({ spawns: "" })).description;

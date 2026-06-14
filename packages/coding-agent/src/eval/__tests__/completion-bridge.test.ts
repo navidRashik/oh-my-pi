@@ -371,6 +371,23 @@ describe("completion() through eval runtimes", () => {
 		expect(result.output.trim()).toBe("hello from smol");
 	});
 
+	it("exposes nodeRepl.write() for exact JavaScript eval text output", async () => {
+		using tempDir = TempDir.createSync("@omp-eval-completion-js-node-repl-");
+		const sessionFile = path.join(tempDir.path(), "session.jsonl");
+		const sessionId = `js-completion-node-repl:${crypto.randomUUID()}`;
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "hello from nodeRepl" }));
+
+		const result = await executeJs('const text = await completion("hi", { model: "smol" }); nodeRepl.write(text);', {
+			cwd: tempDir.path(),
+			sessionId,
+			session: makeSession(),
+			sessionFile,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toBe("hello from nodeRepl");
+	});
+
 	it("parses structured completion() output in the JavaScript runtime", async () => {
 		using tempDir = TempDir.createSync("@omp-eval-completion-js-struct-");
 		const sessionFile = path.join(tempDir.path(), "session.jsonl");

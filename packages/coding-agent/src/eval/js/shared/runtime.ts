@@ -306,6 +306,9 @@ export class JsRuntime {
 				const text = `${prefix}${formatConsoleArgs(args)}`;
 				this.#activeHooks("log")?.onText(text.endsWith("\n") ? text : `${text}\n`);
 			},
+			__omp_write_text__: (chunk: unknown) => {
+				this.#activeHooks("write")?.onText(String(chunk));
+			},
 			__omp_table__: (...args: unknown[]) => {
 				const hooks = this.#activeHooks("table");
 				if (!hooks) return;
