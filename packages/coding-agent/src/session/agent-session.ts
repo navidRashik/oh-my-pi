@@ -313,6 +313,11 @@ export type AgentSessionEvent =
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
+type EagerPreludeOptions = {
+	allowPriorUserMessages?: boolean;
+	suppressTodoToolChoice?: boolean;
+};
+
 const UNEXPECTED_STOP_MAX_RETRIES = 3;
 const UNEXPECTED_STOP_TIMEOUT_MS = 4000;
 const EMPTY_STOP_MAX_RETRIES = 3;
@@ -2147,6 +2152,20 @@ export class AgentSession {
 
 	#scheduleAutoContinuePrompt(generation: number): void {
 		const continuePrompt = async () => {
+			const eagerTodoPrelude = this.#createEagerTodoPrelude(autoContinuePrompt, {
+				allowPriorUserMessages: true,
+				suppressTodoToolChoice: true,
+			});
+			const eagerTaskPrelude = this.#createEagerTaskPrelude(autoContinuePrompt, {
+				allowPriorUserMessages: true,
+			});
+			const prependMessages: AgentMessage[] = [];
+			if (eagerTodoPrelude) {
+				prependMessages.push(eagerTodoPrelude.message);
+			}
+			if (eagerTaskPrelude) {
+				prependMessages.push(eagerTaskPrelude);
+			}
 			await this.#promptWithMessage(
 				{
 					role: "developer",
@@ -2155,7 +2174,10 @@ export class AgentSession {
 					timestamp: Date.now(),
 				},
 				autoContinuePrompt,
-				{ skipPostPromptRecoveryWait: true },
+				{
+					prependMessages: prependMessages.length > 0 ? prependMessages : undefined,
+					skipPostPromptRecoveryWait: true,
+				},
 			);
 		};
 		this.#schedulePostPromptTask(
@@ -7314,7 +7336,10 @@ export class AgentSession {
 		};
 	}
 
-	#createEagerTodoPrelude(promptText: string): { message: AgentMessage; toolChoice?: ToolChoice } | undefined {
+	#createEagerTodoPrelude(
+		promptText: string,
+		options: EagerPreludeOptions = {},
+	): { message: AgentMessage; toolChoice?: ToolChoice } | undefined {
 		const mode = this.settings.get("todo.eager");
 		const todosEnabled = this.settings.get("todo.enabled");
 		if (mode === "default" || !todosEnabled) {
@@ -7328,11 +7353,11 @@ export class AgentSession {
 			return undefined;
 		}
 
-		// Only inject on the first user message of the conversation. Subsequent user
-		// turns must not receive the eager todo reminder — they often correct, clarify,
-		// or redirect the prior task, and forcing a brand-new todo list there is wrong.
+		// Normally only inject on the first user message of the conversation. Auto
+		// compaction can summarize that oldest hidden reminder away, so the resume
+		// hook may re-assert it once on the synthetic continuation turn.
 		const hasPriorUserMessage = this.agent.state.messages.some(m => m.role === "user");
-		if (hasPriorUserMessage) {
+		if (hasPriorUserMessage && !options.allowPriorUserMessages) {
 			return undefined;
 		}
 
@@ -7361,8 +7386,9 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		// `preferred` suggests a todo list (reminder only); `always` also forces the
-		// `todo` tool on the first turn — the previous boolean-on behavior.
-		if (mode === "preferred") {
+		// `todo` tool on the first turn. Post-compaction auto-continuation suppresses
+		// that forced choice so it cannot override the in-flight action being resumed.
+		if (mode === "preferred" || options.suppressTodoToolChoice) {
 			return { message };
 		}
 		const todoToolChoice = buildNamedToolChoice("todo", this.model);
@@ -7380,7 +7406,7 @@ export class AgentSession {
 		return { message, toolChoice: todoToolChoice };
 	}
 
-	#createEagerTaskPrelude(promptText: string): AgentMessage | undefined {
+	#createEagerTaskPrelude(promptText: string, options: EagerPreludeOptions = {}): AgentMessage | undefined {
 		if (this.settings.get("task.eager") !== "always") return undefined;
 		// Main agent only: subagents keep `task` active (the parent only filters `todo`),
 		// so a salient delegate-reminder there would amplify nested fan-out. Gate on the
@@ -7388,7 +7414,7 @@ export class AgentSession {
 		// still gets the reminder.
 		if (this.#agentKind === "sub") return undefined;
 		if (this.#planModeState?.enabled) return undefined;
-		if (this.agent.state.messages.some(m => m.role === "user")) return undefined;
+		if (!options.allowPriorUserMessages && this.agent.state.messages.some(m => m.role === "user")) return undefined;
 		const trimmed = promptText.trimEnd();
 		if (trimmed.endsWith("?") || trimmed.endsWith("!")) return undefined;
 		if (!this.getActiveToolNames().includes("task")) return undefined;

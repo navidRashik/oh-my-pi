@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { TextContent } from "@oh-my-pi/pi-ai";
+import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
+import type { AssistantMessage, TextContent } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -11,7 +12,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { z } from "zod/v4";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
@@ -61,6 +62,40 @@ function getMessageText(message: AgentMessage): string {
 		.join("\n");
 }
 
+function createHighUsageAssistantMessage(): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: "Done." }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		stopReason: "stop",
+		usage: {
+			input: 190000,
+			output: 1000,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 191000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		timestamp: Date.now(),
+	};
+}
+
+async function triggerAutoCompaction(session: AgentSession): Promise<void> {
+	const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+	session.subscribe(event => {
+		if (event.type === "auto_compaction_end") onCompactionDone();
+	});
+
+	const assistantMessage = createHighUsageAssistantMessage();
+	session.agent.emitExternalEvent({ type: "message_end", message: assistantMessage });
+	session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMessage] });
+
+	await withTimeout(compactionDone, 1000, "Auto-compaction timed out");
+	await withTimeout(session.waitForIdle(), 1000, "Auto-continuation timed out");
+}
+
 describe("AgentSession eager task prelude", () => {
 	let tempDir: TempDir;
 	const harnesses: Harness[] = [];
@@ -77,6 +112,7 @@ describe("AgentSession eager task prelude", () => {
 		}
 		harnesses.length = 0;
 		tempDir.removeSync();
+		vi.restoreAllMocks();
 	});
 
 	async function createHarness(
@@ -298,6 +334,36 @@ describe("AgentSession eager task prelude", () => {
 		expect(texts.at(-1)).toBe("refactor the parser across modules");
 		// the task reminder is the second prelude (after the todo reminder)
 		expect(texts.findIndex(text => text.includes("delegation is enabled"))).toBe(1);
+	});
+
+	it("reasserts eager reminders once on post-compaction auto-continuation without forcing todo", async () => {
+		vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "compacted",
+			shortSummary: undefined,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+		const { session, observedCalls } = await createHarness({
+			"compaction.enabled": true,
+			"compaction.keepRecentTokens": 1,
+			"todo.enabled": true,
+			"todo.eager": "always",
+			"todo.reminders": false,
+		});
+
+		await session.prompt("refactor the parser across modules");
+		expect(observedCalls[0]?.toolChoice).toBe("todo");
+
+		observedCalls.length = 0;
+		await triggerAutoCompaction(session);
+
+		expect(observedCalls).toHaveLength(1);
+		expect(observedCalls[0]?.toolChoice).toBeUndefined();
+		const reminderTexts = observedCalls[0]?.messageTexts ?? [];
+		expect(reminderTexts.some(text => text.includes("You MUST call"))).toBe(true);
+		expect(reminderTexts.some(text => text.includes("delegation is enabled"))).toBe(true);
+		expect(reminderTexts.at(-1)).toContain("Resume work");
 	});
 
 	it("omits batch-call guidance from the eager task reminder when task.batch is disabled", async () => {

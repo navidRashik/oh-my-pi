@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed post-compaction auto-continuation to reassert eager task/todo reminders without forcing the todo tool choice on the resumed turn ([#2681](https://github.com/can1357/oh-my-pi/issues/2681)).
+
 ## [15.13.3] - 2026-06-15
 
 ### Added
