@@ -259,11 +259,11 @@ export class PluginManager {
 
 		const errors: string[] = [];
 		const loadable: string[] = [];
-		for (const { entry, resolvedPath } of declaredEntries) {
-			if (resolvedPath === null) {
+		for (const { entry, resolvedPaths } of declaredEntries) {
+			if (resolvedPaths.length === 0) {
 				errors.push(`${entry}: declared extension entry not found on disk`);
 			} else {
-				loadable.push(resolvedPath);
+				loadable.push(...resolvedPaths);
 			}
 		}
 

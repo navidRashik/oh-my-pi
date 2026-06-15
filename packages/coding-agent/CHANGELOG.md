@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed plugin `pi.extensions: ["./extensions"]` manifest entries to load one-level extension directory children such as `extensions/<name>/index.ts` instead of failing install validation or silently skipping them at runtime ([#2713](https://github.com/can1357/oh-my-pi/issues/2713)).
+
 ## [16.0.1] - 2026-06-15
 
 ### Breaking Changes

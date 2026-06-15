@@ -67,6 +67,55 @@ describe("PluginManager.install load validation", () => {
 		await fs.rm(tmpRoot, { recursive: true, force: true });
 	});
 
+	test("accepts an install whose pi extension entry is a directory of sub-extensions", async () => {
+		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
+			expect(cmd).toEqual(["bun", "install", "directory-plugin"]);
+
+			const prepare = (async () => {
+				await Bun.write(
+					pluginsPkgJson,
+					JSON.stringify(
+						{ name: "omp-plugins", private: true, dependencies: { "directory-plugin": "1.0.0" } },
+						null,
+						2,
+					),
+				);
+				const installedDir = path.join(pluginsNodeModules, "directory-plugin");
+				await fs.mkdir(path.join(installedDir, "extensions", "wiki"), { recursive: true });
+				await Bun.write(
+					path.join(installedDir, "package.json"),
+					JSON.stringify(
+						{
+							name: "directory-plugin",
+							version: "1.0.0",
+							pi: { extensions: ["./extensions"] },
+						},
+						null,
+						2,
+					),
+				);
+				await Bun.write(
+					path.join(installedDir, "extensions", "wiki", "index.ts"),
+					'export default function(pi) { pi.registerCommand("wiki-ext", { handler: async () => {} }); }\n',
+				);
+			})();
+
+			return {
+				pid: 1,
+				stdout: emptyStream(),
+				stderr: emptyStream(),
+				exited: prepare.then(() => 0),
+			} as Subprocess;
+		}) as typeof Bun.spawn);
+
+		await expect(new PluginManager(tmpRoot).install("directory-plugin")).resolves.toMatchObject({
+			name: "directory-plugin",
+			version: "1.0.0",
+		});
+		const lock = await Bun.file(path.join(tmpRoot, "omp-plugins.lock.json")).json();
+		expect(lock.plugins["directory-plugin"]).toEqual({ version: "1.0.0", enabledFeatures: null, enabled: true });
+	});
+
 	test("rejects an install whose extension entry cannot resolve its dependencies", async () => {
 		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[]) => {
 			expect(cmd).toEqual(["bun", "install", "broken-plugin"]);

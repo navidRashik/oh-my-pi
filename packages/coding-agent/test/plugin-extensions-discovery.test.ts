@@ -76,6 +76,48 @@ describe("plugin extension discovery", () => {
 		expect(extension?.commands.has("plugin-ext")).toBe(true);
 	});
 
+	it("loads installed pi plugin extension directories with one-level children", async () => {
+		const pluginsDir = getPluginsDir();
+		const pluginDir = path.join(pluginsDir, "node_modules", "@demo", "plugin");
+		const directExtensionPath = path.join(pluginDir, "extensions", "direct.ts");
+		const nestedExtensionPath = path.join(pluginDir, "extensions", "llm-wiki", "index.ts");
+		fs.mkdirSync(path.dirname(nestedExtensionPath), { recursive: true });
+		fs.writeFileSync(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({
+				name: "@demo/plugin",
+				version: "1.0.0",
+				pi: {
+					extensions: ["./extensions"],
+				},
+			}),
+		);
+		fs.writeFileSync(
+			directExtensionPath,
+			`
+				export default function(pi) {
+					pi.registerCommand("direct-pi-ext", { handler: async () => {} });
+				}
+			`,
+		);
+		fs.writeFileSync(
+			nestedExtensionPath,
+			`
+				export default function(pi) {
+					pi.registerCommand("nested-pi-ext", { handler: async () => {} });
+				}
+			`,
+		);
+
+		const result = await discoverAndLoadExtensions([], projectDir.path());
+		const directExtension = result.extensions.find(ext => ext.path === directExtensionPath);
+		const nestedExtension = result.extensions.find(ext => ext.path === nestedExtensionPath);
+
+		expect(result.errors).toHaveLength(0);
+		expect(directExtension?.commands.has("direct-pi-ext")).toBe(true);
+		expect(nestedExtension?.commands.has("nested-pi-ext")).toBe(true);
+	});
+
 	it("loads installed legacy Pi plugin extensions from Windows drive-letter paths", async () => {
 		const pluginsDir = getPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "legacy-pi-plugin");

@@ -145,27 +145,70 @@ export async function getEnabledPlugins(cwd: string, opts: { home?: string } = {
 
 const MANIFEST_ENTRY_INDEX_NAMES = ["index.ts", "index.js", "index.mjs", "index.cjs"];
 
+function isManifestEntryFile(name: string): boolean {
+	return name.endsWith(".ts") || name.endsWith(".js") || name.endsWith(".mjs") || name.endsWith(".cjs");
+}
+
+function resolveManifestEntryIndex(dir: string): string | null {
+	for (const name of MANIFEST_ENTRY_INDEX_NAMES) {
+		const candidate = path.join(dir, name);
+		if (fs.existsSync(candidate)) return candidate;
+	}
+	return null;
+}
+
+function resolveExtensionDirectoryEntries(dir: string): string[] {
+	const resolved: string[] = [];
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return resolved;
+	}
+
+	entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+	for (const entry of entries) {
+		const candidate = path.join(dir, entry.name);
+		let stats: fs.Stats | null = null;
+		try {
+			stats = entry.isSymbolicLink() ? fs.statSync(candidate) : null;
+		} catch {
+			continue;
+		}
+		const isFile = entry.isFile() || stats?.isFile() === true;
+		if (isFile && isManifestEntryFile(entry.name)) {
+			resolved.push(candidate);
+			continue;
+		}
+		const isDirectory = entry.isDirectory() || stats?.isDirectory() === true;
+		if (!isDirectory) continue;
+		const index = resolveManifestEntryIndex(candidate);
+		if (index) resolved.push(index);
+	}
+
+	return resolved;
+}
+
 /**
- * Resolve a plugin manifest entry to a concrete loadable file path. Returns the
+ * Resolve a plugin manifest entry to concrete loadable file paths. Returns the
  * file path itself when the entry points at a file, the matching index file when
- * the entry points at a directory containing index.{ts,js,mjs,cjs}, and null
- * when no entry exists at the joined path.
+ * the entry points at a directory containing index.{ts,js,mjs,cjs}, extension
+ * children when an extension-directory entry contains no direct index, and an
+ * empty array when no entry exists at the joined path.
  */
-function resolveManifestEntryFile(joined: string): string | null {
+function resolveManifestEntryFiles(joined: string, key: "tools" | "hooks" | "commands" | "extensions"): string[] {
 	let stats: fs.Stats;
 	try {
 		stats = fs.statSync(joined);
 	} catch {
-		return null;
+		return [];
 	}
 	if (stats.isDirectory()) {
-		for (const name of MANIFEST_ENTRY_INDEX_NAMES) {
-			const candidate = path.join(joined, name);
-			if (fs.existsSync(candidate)) return candidate;
-		}
-		return null;
+		const index = resolveManifestEntryIndex(joined);
+		if (index) return [index];
+		return key === "extensions" ? resolveExtensionDirectoryEntries(joined) : [];
 	}
-	return joined;
+	return [joined];
 }
 
 /**
@@ -175,15 +218,15 @@ function resolveManifestEntryFile(joined: string): string | null {
 function resolvePluginPaths(plugin: InstalledPlugin, key: "tools" | "hooks" | "commands" | "extensions"): string[] {
 	const resolved: string[] = [];
 	for (const entry of resolvePluginManifestEntries(plugin, key)) {
-		if (entry.resolvedPath) {
-			resolved.push(entry.resolvedPath);
+		if (entry.resolvedPaths.length > 0) {
+			resolved.push(...entry.resolvedPaths);
 		}
 	}
 	return resolved;
 }
 
 /**
- * Declared manifest entries paired with their resolved file path. Returns one
+ * Declared manifest entries paired with their resolved file paths. Returns one
  * record per declared entry — base entries first, then enabled-feature entries
  * — so callers (e.g. install-time validation) can detect manifest entries that
  * point at missing files instead of silently skipping them like
@@ -192,13 +235,13 @@ function resolvePluginPaths(plugin: InstalledPlugin, key: "tools" | "hooks" | "c
 export function resolvePluginManifestEntries(
 	plugin: InstalledPlugin,
 	key: "tools" | "hooks" | "commands" | "extensions",
-): Array<{ entry: string; resolvedPath: string | null }> {
-	const declared: Array<{ entry: string; resolvedPath: string | null }> = [];
+): Array<{ entry: string; resolvedPaths: string[] }> {
+	const declared: Array<{ entry: string; resolvedPaths: string[] }> = [];
 	const manifest = plugin.manifest;
 
-	const resolveEntry = (entry: string): { entry: string; resolvedPath: string | null } => ({
+	const resolveEntry = (entry: string): { entry: string; resolvedPaths: string[] } => ({
 		entry,
-		resolvedPath: resolveManifestEntryFile(path.join(plugin.path, entry)),
+		resolvedPaths: resolveManifestEntryFiles(path.join(plugin.path, entry), key),
 	});
 
 	const base = manifest[key];
