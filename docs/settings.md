@@ -345,6 +345,7 @@ A value of `-1` means "use the provider/model default" — `omp` does not send t
 | `presencePenalty` | number | `-1` | Presence penalty. |
 | `repetitionPenalty` | number | `-1` | Repetition penalty. |
 | `serviceTier` | enum | `none` | `none`, `auto`, `default`, `flex`, `scale`, `priority`, `openai-only`, `claude-only`. |
+| `fastModeScope` | enum | `both` | Which provider families `/fast on` and the fast-mode toggle affect: `both`, `openai`, or `claude`. |
 | `personality` | enum | `default` | `default`, `friendly`, `pragmatic`, `none`. |
 
 ### Retry and fallback
@@ -388,6 +389,8 @@ tools:
 | `tools.approval` | record | `{}` | Per-tool policy keyed by tool name; each value is `allow`, `deny`, or `prompt`. e.g. `omp config set tools.approval '{"bash":"prompt"}'`. |
 | `tools.discoveryMode` | enum | `auto` | `auto`, `off`, `mcp-only`, `all`. Controls dynamic tool discovery. |
 | `tools.essentialOverride` | array | `[]` | Tool names kept available even when tools are narrowed. |
+| `task.eager` | enum | `default` | `default`, `preferred`, `always`; controls how strongly the agent is pushed toward subagent delegation. |
+| `todo.eager` | enum | `default` | `default`, `preferred`, `always`; controls first-turn todo-list creation guidance. |
 | `tools.maxTimeout` | number | `0` | Max tool runtime in seconds; `0` = no cap. |
 | `tools.intentTracing` | boolean | `true` | Record per-call intent strings. |
 | `tools.outputMaxColumns` | number | `768` | Per-line byte cap for streaming output; `0` disables. |
@@ -608,7 +611,9 @@ searxng:
 | `exa.enableResearcher` | boolean | `false` | Exa researcher. |
 | `exa.enableWebsets` | boolean | `false` | Exa websets. |
 | `searxng.endpoint` | string | _(unset)_ | SearXNG instance URL. |
-| `searxng.token` | string | _(unset)_ | SearXNG token; also `searxng.basicUsername`/`searxng.basicPassword`/`searxng.categories`/`searxng.language`. |
+| `searxng.categories` | string | _(unset)_ | Optional categories passed to SearXNG when an endpoint is configured. |
+| `searxng.language` | string | _(unset)_ | Optional language code passed to SearXNG when an endpoint is configured. |
+| `searxng.token` | string | _(unset)_ | SearXNG token; also supports `searxng.basicUsername`/`searxng.basicPassword`. |
 | `auth.broker.url` | string | _(unset)_ | Auth-broker URL. Overridden by `OMP_AUTH_BROKER_URL`. |
 | `auth.broker.token` | string | _(unset)_ | Auth-broker token. Overridden by `OMP_AUTH_BROKER_TOKEN`. |
 

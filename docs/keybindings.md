@@ -47,3 +47,11 @@ On Windows Terminal, `Ctrl+V` may be handled by the terminal paste command befor
 Terminals that implement OSC 5522 enhanced paste can send clipboard MIME data directly to `omp`; image pastes are attached as `[Image #N]`, while text/plain paste events keep normal paste behavior. When OSC 5522 is unavailable, bracketed paste still handles text, and a pasted single image-file path is loaded as an image when the file is readable from the `omp` host.
 
 Older unqualified action names are migrated when `keybindings.yml` is loaded, but new docs and new configs should use the namespaced action IDs above. Existing `keybindings.json` files are still accepted and migrated to `keybindings.yml`; `keybindings.yaml` is also accepted.
+
+## Built-in editor chords
+
+| Key | Action |
+| --- | ------ |
+| `Enter` | Send message |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | Insert a newline |
+

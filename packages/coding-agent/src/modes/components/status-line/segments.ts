@@ -91,6 +91,12 @@ const modelSegment: StatusLineSegment = {
 		if (ctx.session.isFastModeActive() && theme.icon.fast) {
 			content += ` ${theme.icon.fast}`;
 		}
+		if (sessionSettingEnabled(ctx, "speech.enabled")) {
+			content = appendModelFlag(content, "speech");
+		}
+		if (sessionSettingEnabled(ctx, "autolearn.enabled")) {
+			content = appendModelFlag(content, "learn");
+		}
 
 		// Add thinking level with dot separator
 		if (opts.showThinkingLevel !== false && state.model?.thinking) {
@@ -114,6 +120,18 @@ const modelSegment: StatusLineSegment = {
 		return { content: theme.fg("statusLineModel", content), visible: true };
 	},
 };
+
+function appendModelFlag(content: string, label: string): string {
+	return `${content}${theme.sep.dot}${label}`;
+}
+
+function sessionSettingEnabled(ctx: SegmentContext, key: "autolearn.enabled" | "speech.enabled"): boolean {
+	try {
+		return ctx.session.settings?.get(key) === true;
+	} catch {
+		return false;
+	}
+}
 
 function formatGoalBudget(current: number, budget?: number): string {
 	const used = formatNumber(current);

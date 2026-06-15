@@ -74,7 +74,7 @@ export type SettingDef = BooleanSettingDef | EnumSettingDef | SubmenuSettingDef 
 // Condition Functions
 // ═══════════════════════════════════════════════════════════════════════════
 
-const CONDITIONS: Record<string, () => boolean> = {
+export const CONDITIONS: Record<string, () => boolean> = {
 	hasImageProtocol: () => !!TERMINAL.imageProtocol,
 	hindsightActive: () => {
 		try {
@@ -90,6 +90,26 @@ const CONDITIONS: Record<string, () => boolean> = {
 			return false;
 		}
 	},
+	mnemopiEmbeddingsActive: () => {
+		try {
+			return (
+				Settings.instance.get("memory.backend") === "mnemopi" &&
+				Settings.instance.get("mnemopi.noEmbeddings") !== true
+			);
+		} catch {
+			return false;
+		}
+	},
+	mnemopiRemoteLlmActive: () => {
+		try {
+			return (
+				Settings.instance.get("memory.backend") === "mnemopi" &&
+				Settings.instance.get("mnemopi.llmMode") === "remote"
+			);
+		} catch {
+			return false;
+		}
+	},
 	autolearnActive: () => {
 		try {
 			return Settings.instance.get("autolearn.enabled") === true;
@@ -100,6 +120,73 @@ const CONDITIONS: Record<string, () => boolean> = {
 	autoThinkingActive: () => {
 		try {
 			return Settings.instance.get("defaultThinkingLevel") === "auto";
+		} catch {
+			return false;
+		}
+	},
+	compactionActive: () => {
+		try {
+			return Settings.instance.get("compaction.enabled") === true;
+		} catch {
+			return false;
+		}
+	},
+	exaActive: () => {
+		try {
+			return Settings.instance.get("exa.enabled") === true;
+		} catch {
+			return false;
+		}
+	},
+	localTtsActive: () => {
+		try {
+			const provider = Settings.instance.get("providers.tts");
+			return provider === "auto" || provider === "local";
+		} catch {
+			return false;
+		}
+	},
+	remoteCompactionActive: () => {
+		try {
+			return (
+				Settings.instance.get("compaction.enabled") === true &&
+				Settings.instance.get("compaction.remoteEnabled") === true
+			);
+		} catch {
+			return false;
+		}
+	},
+	retryActive: () => {
+		try {
+			return Settings.instance.get("retry.enabled") === true;
+		} catch {
+			return false;
+		}
+	},
+	searxngActive: () => {
+		try {
+			return !!Settings.instance.get("searxng.endpoint");
+		} catch {
+			return false;
+		}
+	},
+	skillsActive: () => {
+		try {
+			return Settings.instance.get("skills.enabled") === true;
+		} catch {
+			return false;
+		}
+	},
+	speechActive: () => {
+		try {
+			return Settings.instance.get("speech.enabled") === true;
+		} catch {
+			return false;
+		}
+	},
+	sttActive: () => {
+		try {
+			return Settings.instance.get("stt.enabled") === true;
 		} catch {
 			return false;
 		}

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed settings, help, status-line, and docs surfaces drifting from v15.13 features: `/settings` now groups/gates speech, Mnemopi, Exa, retry, skills, compaction, SearXNG, and Hindsight controls correctly; `/fast`, `/guided-goal`, hotkeys, and tool docs mention the new controls and fields ([#2621](https://github.com/can1357/oh-my-pi/issues/2621)).
+
 ## [15.13.1] - 2026-06-15
 
 ### Added

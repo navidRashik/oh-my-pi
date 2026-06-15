@@ -286,7 +286,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "guided-goal",
-		description: "Interview and refine a goal before enabling goal mode",
+		description: "Start a guided interview that refines a rough objective before enabling goal mode",
 		inlineHint: "[rough objective]",
 		allowArgs: true,
 		handleTui: async (command, runtime) => {
@@ -355,8 +355,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "fast",
-		description: "Toggle priority service tier (OpenAI service_tier=priority, Anthropic speed=fast)",
-		acpDescription: "Toggle fast mode",
+		description:
+			"Toggle fast mode within the configured fastModeScope (OpenAI service_tier=priority, Anthropic speed=fast)",
+		acpDescription: "Toggle fast mode within fastModeScope",
 		acpInputHint: "[on|off|status]",
 		subcommands: [
 			{ name: "on", description: "Enable fast mode" },
@@ -385,7 +386,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				await runtime.output(`Fast mode is ${formatFastModeStatus(runtime.session)}.`);
 				return commandConsumed();
 			}
-			return usage("Usage: /fast [on|off|status]", runtime);
+			return usage("Usage: /fast [on|off|status] (scope controlled by fastModeScope)", runtime);
 		},
 		handleTui: (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
@@ -415,7 +416,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.editor.setText("");
 				return;
 			}
-			runtime.ctx.showStatus("Usage: /fast [on|off|status]");
+			runtime.ctx.showStatus("Usage: /fast [on|off|status] (scope controlled by fastModeScope)");
 			runtime.ctx.editor.setText("");
 		},
 	},
