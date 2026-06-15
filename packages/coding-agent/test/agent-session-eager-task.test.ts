@@ -96,6 +96,16 @@ async function triggerAutoCompaction(session: AgentSession): Promise<void> {
 	await withTimeout(session.waitForIdle(), 1000, "Auto-continuation timed out");
 }
 
+function stubCompaction(): void {
+	vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+		summary: "compacted",
+		shortSummary: undefined,
+		firstKeptEntryId: preparation.firstKeptEntryId,
+		tokensBefore: preparation.tokensBefore,
+		details: {},
+	}));
+}
+
 describe("AgentSession eager task prelude", () => {
 	let tempDir: TempDir;
 	const harnesses: Harness[] = [];
@@ -337,13 +347,7 @@ describe("AgentSession eager task prelude", () => {
 	});
 
 	it("reasserts eager reminders once on post-compaction auto-continuation without forcing todo", async () => {
-		vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
-			summary: "compacted",
-			shortSummary: undefined,
-			firstKeptEntryId: preparation.firstKeptEntryId,
-			tokensBefore: preparation.tokensBefore,
-			details: {},
-		}));
+		stubCompaction();
 		const { session, observedCalls } = await createHarness({
 			"compaction.enabled": true,
 			"compaction.keepRecentTokens": 1,
@@ -363,6 +367,30 @@ describe("AgentSession eager task prelude", () => {
 		const reminderTexts = observedCalls[0]?.messageTexts ?? [];
 		expect(reminderTexts.some(text => text.includes("You MUST call"))).toBe(true);
 		expect(reminderTexts.some(text => text.includes("delegation is enabled"))).toBe(true);
+		expect(reminderTexts.at(-1)).toContain("Resume work");
+	});
+
+	it("preserves the latest user prompt punctuation gate on post-compaction auto-continuation", async () => {
+		stubCompaction();
+		const { session, observedCalls } = await createHarness({
+			"compaction.enabled": true,
+			"compaction.keepRecentTokens": 1,
+			"todo.enabled": true,
+			"todo.eager": "always",
+			"todo.reminders": false,
+		});
+
+		await session.prompt("should I refactor the parser?");
+		expect(observedCalls[0]?.messageRoles).toEqual(["user"]);
+
+		observedCalls.length = 0;
+		await triggerAutoCompaction(session);
+
+		expect(observedCalls).toHaveLength(1);
+		expect(observedCalls[0]?.toolChoice).toBeUndefined();
+		const reminderTexts = observedCalls[0]?.messageTexts ?? [];
+		expect(reminderTexts.some(text => text.includes("You MUST call"))).toBe(false);
+		expect(reminderTexts.some(text => text.includes("delegation is enabled"))).toBe(false);
 		expect(reminderTexts.at(-1)).toContain("Resume work");
 	});
 

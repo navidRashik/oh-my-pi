@@ -2152,11 +2152,12 @@ export class AgentSession {
 
 	#scheduleAutoContinuePrompt(generation: number): void {
 		const continuePrompt = async () => {
-			const eagerTodoPrelude = this.#createEagerTodoPrelude(autoContinuePrompt, {
+			const eagerPreludePromptText = this.#getLatestUserPromptText() ?? autoContinuePrompt;
+			const eagerTodoPrelude = this.#createEagerTodoPrelude(eagerPreludePromptText, {
 				allowPriorUserMessages: true,
 				suppressTodoToolChoice: true,
 			});
-			const eagerTaskPrelude = this.#createEagerTaskPrelude(autoContinuePrompt, {
+			const eagerTaskPrelude = this.#createEagerTaskPrelude(eagerPreludePromptText, {
 				allowPriorUserMessages: true,
 			});
 			const prependMessages: AgentMessage[] = [];
@@ -7334,6 +7335,24 @@ export class AgentSession {
 			toolRefs: { task: wireName("task"), todo: wireName("todo") },
 			taskBatch: this.settings.get("task.batch"),
 		};
+	}
+
+	#getLatestUserPromptText(): string | undefined {
+		const branchEntries = this.sessionManager.getBranch();
+		for (let index = branchEntries.length - 1; index >= 0; index--) {
+			const entry = branchEntries[index];
+			if (entry?.type !== "message" || entry.message.role !== "user") continue;
+			const text = this.#extractUserMessageText(entry.message.content);
+			if (text) return text;
+		}
+
+		for (let index = this.agent.state.messages.length - 1; index >= 0; index--) {
+			const message = this.agent.state.messages[index];
+			if (message?.role !== "user") continue;
+			const text = this.#extractUserMessageText(message.content);
+			if (text) return text;
+		}
+		return undefined;
 	}
 
 	#createEagerTodoPrelude(
