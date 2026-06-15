@@ -1,7 +1,7 @@
 /**
  * Utilities for launching an external text editor ($VISUAL / $EDITOR).
  */
-import { spawn } from "node:child_process";
+import * as childProcess from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -34,6 +34,23 @@ export interface OpenInEditorOptions {
 	trimTrailingNewline?: boolean;
 }
 
+interface EditorInvocation {
+	editor: string;
+	args: string[];
+	shell: boolean;
+}
+
+function shouldUseWindowsShell(editor: string): boolean {
+	if (process.platform !== "win32") return false;
+	const normalized = editor.toLowerCase();
+	return normalized !== "notepad" && normalized !== "notepad.exe";
+}
+
+function getEditorInvocation(editorCmd: string, tmpFile: string): EditorInvocation {
+	const [editor, ...editorArgs] = editorCmd.split(" ");
+	return { editor, args: [...editorArgs, tmpFile], shell: shouldUseWindowsShell(editor) };
+}
+
 /**
  * Opens `content` in the user's external editor and returns the edited text.
  * Returns `null` if the editor exits with a non-zero code.
@@ -51,10 +68,10 @@ export async function openInEditor(
 	try {
 		await Bun.write(tmpFile, content);
 
-		const [editor, ...editorArgs] = editorCmd.split(" ");
+		const { args, editor, shell } = getEditorInvocation(editorCmd, tmpFile);
 		const stdio = options?.stdio ?? ["inherit", "inherit", "inherit"];
 
-		const child = spawn(editor, [...editorArgs, tmpFile], { stdio, shell: process.platform === "win32" });
+		const child = childProcess.spawn(editor, args, { stdio, shell });
 		const { promise, reject, resolve } = Promise.withResolvers<number>();
 		child.once("exit", (code, signal) => resolve(code ?? (signal ? -1 : 0)));
 		child.once("error", error => reject(error));
