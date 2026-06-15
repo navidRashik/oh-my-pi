@@ -280,12 +280,24 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 
 	applyCompatOverrides(compat, spec.compat);
 
+	const whenReasoningDisabledPolicy =
+		spec.compat?.whenReasoningDisabled ??
+		(compat.disableReasoningWhenToolsPresent ? { requiresReasoningContentForToolCalls: false } : undefined);
+	let whenReasoningDisabled: ResolvedOpenAICompat | undefined;
+	if (whenReasoningDisabledPolicy) {
+		whenReasoningDisabled = { ...compat };
+		applyCompatOverrides(whenReasoningDisabled, whenReasoningDisabledPolicy);
+	}
+
 	const whenThinkingPolicy =
 		spec.compat?.whenThinking ?? (isOpenCodeProvider && spec.reasoning ? OPENCODE_WHEN_THINKING : undefined);
 	if (whenThinkingPolicy) {
 		const variant: ResolvedOpenAICompat = { ...compat };
 		applyCompatOverrides(variant, whenThinkingPolicy);
 		compat.whenThinking = variant;
+	}
+	if (whenReasoningDisabled) {
+		compat.whenReasoningDisabled = whenReasoningDisabled;
 	}
 
 	return compat;

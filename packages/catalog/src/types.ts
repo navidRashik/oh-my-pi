@@ -254,7 +254,13 @@ export interface OpenAICompat {
 	 * alternate view as `compat.whenThinking`; handlers pointer-swap, never
 	 * spread. Default: auto-detected (OpenCode gateways, #1071/#1484).
 	 */
-	whenThinking?: Partial<Omit<OpenAICompat, "whenThinking">>;
+	whenThinking?: Partial<Omit<OpenAICompat, "whenThinking" | "whenReasoningDisabled">>;
+	/**
+	 * Compat deltas applied when a request explicitly suppresses reasoning.
+	 * Use this to disable thinking-mode history replay fields alongside
+	 * top-level reasoning params. Default: auto-detected (direct DeepSeek tools).
+	 */
+	whenReasoningDisabled?: Partial<Omit<OpenAICompat, "whenThinking" | "whenReasoningDisabled">>;
 }
 
 /**
@@ -366,6 +372,7 @@ export type ResolvedOpenAICompat = Required<
 		| "strictResponsesPairing"
 		| "requiresJuiceZeroHack"
 		| "whenThinking"
+		| "whenReasoningDisabled"
 	>
 > & {
 	openRouterRouting?: OpenAICompat["openRouterRouting"];
@@ -381,6 +388,8 @@ export type ResolvedOpenAICompat = Required<
 	isVercelGatewayHost: boolean;
 	/** Complete alternate view for thinking-engaged requests; swap pointers, never spread. */
 	whenThinking?: ResolvedOpenAICompat;
+	/** Complete alternate view for reasoning-disabled requests; swap pointers, never spread. */
+	whenReasoningDisabled?: ResolvedOpenAICompat;
 };
 
 /** Fully-resolved Responses-API compat view (same contract as `ResolvedOpenAICompat`). */
