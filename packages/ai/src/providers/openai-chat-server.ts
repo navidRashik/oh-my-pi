@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { resolvePromptCacheKey } from "../auth-gateway/http";
 /**
  * Parsed inbound OpenAI chat-completions request, ready to feed into pi-ai
@@ -32,8 +33,22 @@ export type { ParsedRequest };
 
 type ReasoningEffort = NonNullable<ParsedRequest["options"]["reasoning"]>;
 
-function isReasoningEffort(value: unknown): value is ReasoningEffort {
-	return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
+function normalizeReasoningEffort(value: unknown): ReasoningEffort | undefined {
+	switch (value) {
+		case "minimal":
+			return Effort.Minimal;
+		case "low":
+			return Effort.Low;
+		case "medium":
+			return Effort.Medium;
+		case "high":
+			return Effort.High;
+		case "xhigh":
+		case "max":
+			return Effort.XHigh;
+		default:
+			return undefined;
+	}
 }
 
 function isServiceTier(value: unknown): value is ResolvedServiceTier {
@@ -156,8 +171,9 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 	if (data.user !== undefined) options.user = data.user;
 	if (data.response_format !== undefined) options.responseFormat = data.response_format;
 	if (data.parallel_tool_calls !== undefined) options.parallelToolCalls = data.parallel_tool_calls;
-	if (data.reasoning_effort !== undefined && isReasoningEffort(data.reasoning_effort)) {
-		options.reasoning = data.reasoning_effort;
+	const reasoningEffort = normalizeReasoningEffort(data.reasoning_effort);
+	if (reasoningEffort !== undefined) {
+		options.reasoning = reasoningEffort;
 	}
 	if (data.service_tier !== undefined && isServiceTier(data.service_tier)) {
 		options.serviceTier = data.service_tier;

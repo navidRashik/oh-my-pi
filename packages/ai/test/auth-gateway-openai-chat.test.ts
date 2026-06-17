@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { encodeResponse, encodeStream, parseRequest } from "@oh-my-pi/pi-ai/providers/openai-chat-server";
 import type { AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream } from "@oh-my-pi/pi-ai/types";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 
 function makeEventStream(events: AssistantMessageEvent[], final: AssistantMessage): AssistantMessageEventStream {
 	async function* iter() {
@@ -151,6 +152,16 @@ describe("auth-gateway openai-chat: parseRequest", () => {
 		const parsed = parseRequest({ model: "m", messages: [], max_tokens: 256 });
 		expect(parsed.options.maxOutputTokens).toBe(256);
 		expect(parsed.stream).toBe(false);
+	});
+
+	it("normalizes provider-native max reasoning effort to internal xhigh", () => {
+		const parsed = parseRequest({
+			model: "glm-5.2",
+			messages: [{ role: "user", content: "hi" }],
+			reasoning_effort: "max",
+		});
+
+		expect(parsed.options.reasoning).toBe(Effort.XHigh);
 	});
 
 	it("honours an explicit wire `name` on a tool message over back-resolution", () => {
