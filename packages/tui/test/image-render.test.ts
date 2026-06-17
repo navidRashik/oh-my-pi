@@ -117,7 +117,7 @@ describe("terminal image rendering", () => {
 		expect((result?.sequence ?? "").startsWith("\x1bP")).toBe(true);
 	});
 
-	it("Image component forwards maxHeightCells to terminal rendering", () => {
+	it("Image component restores direct-placement cursor with save/restore", () => {
 		terminal.imageProtocol = ImageProtocol.Kitty;
 		const image = new Image(
 			BASE64_DUMMY,
@@ -131,11 +131,13 @@ describe("terminal image rendering", () => {
 
 		expect(lines[0]).toBe("\x1b[0m");
 		expect(lines).toHaveLength(2);
-		expect(lines[1]).toContain("\x1b[1A");
-		expect(lines[1]).toContain("C=1");
-		expect(lines[1]).toContain("c=2");
-		expect(lines[1]).toContain("r=2");
-		expect(lines[1]?.endsWith("\x1b[1B")).toBe(true);
+		const clippedTopLine = lines[1] ?? "";
+		expect(clippedTopLine.startsWith("\x1b7\x1b[1A")).toBe(true);
+		expect(clippedTopLine).toContain("C=1");
+		expect(clippedTopLine).toContain("c=2");
+		expect(clippedTopLine).toContain("r=2");
+		expect(clippedTopLine).not.toContain("\x1b[1B");
+		expect(clippedTopLine.endsWith("\x1b8")).toBe(true);
 	});
 });
 
