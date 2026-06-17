@@ -1003,6 +1003,21 @@ export class Editor implements Component, Focusable {
 		return result;
 	}
 
+	/** Consumes bracketed paste chunks before subclass shortcut handling can interpret paste bytes as keys. */
+	handleBracketedPasteInput(data: string): boolean {
+		const paste = this.#pasteHandler.process(data);
+		if (paste.handled) {
+			if (paste.pasteContent !== undefined) {
+				this.#handlePaste(paste.pasteContent);
+				if (paste.remaining.length > 0) {
+					this.handleInput(paste.remaining);
+				}
+			}
+			return true;
+		}
+		return false;
+	}
+
 	handleInput(data: string): void {
 		const kb = getKeybindings();
 
@@ -1027,16 +1042,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Handle bracketed paste mode
-		const paste = this.#pasteHandler.process(data);
-		if (paste.handled) {
-			if (paste.pasteContent !== undefined) {
-				this.#handlePaste(paste.pasteContent);
-				if (paste.remaining.length > 0) {
-					this.handleInput(paste.remaining);
-				}
-			}
-			return;
-		}
+		if (this.handleBracketedPasteInput(data)) return;
 
 		// Handle special key combinations first
 

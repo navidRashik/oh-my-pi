@@ -461,6 +461,8 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
+		if (this.handleBracketedPasteInput(data)) return;
+
 		const parsedKey = parseKey(data);
 
 		if (isRawModifiedEnter(data)) {

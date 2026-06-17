@@ -81,6 +81,19 @@ describe("CustomEditor custom key handlers", () => {
 		expect(events).toEqual(["follow-up"]);
 		expect(editor.getText()).toBe("draft");
 	});
+
+	it("preserves active bracketed paste chunks that start with newline bytes", () => {
+		const editor = new CustomEditor(getEditorTheme());
+		const events: string[] = [];
+		editor.setCustomKeyHandler("ctrl+enter", () => events.push("follow-up"));
+
+		editor.handleInput("draft");
+		editor.handleInput("\x1b[200~");
+		editor.handleInput("\nbody\x1b[201~");
+
+		expect(events).toEqual([]);
+		expect(editor.getText()).toBe("draft\nbody");
+	});
 });
 
 describe("CustomEditor space-hold push-to-talk", () => {
