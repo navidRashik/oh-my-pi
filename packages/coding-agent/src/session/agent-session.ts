@@ -96,6 +96,7 @@ import {
 	clearAnthropicFastModeFallback,
 	deriveClaudeDeviceId,
 	Effort,
+	isAuthRetryableError,
 	isContextOverflow,
 	isUsageLimitError,
 	parseRateLimitReason,
@@ -9658,7 +9659,7 @@ export class AgentSession {
 		if (this.#isStaleOpenAIResponsesReplayError(message)) return true;
 
 		const err = message.errorMessage;
-		return this.#isTransientErrorMessage(err) || isUsageLimitError(err);
+		return this.#isTransientErrorMessage(err) || isUsageLimitError(err) || isAuthRetryableError(err);
 	}
 	#streamInterruptedAfterObservableOutput(message: AssistantMessage): boolean {
 		if (message.stopDetails?.type === STREAM_INTERRUPTED_AFTER_CONTENT_STOP_DETAIL) return true;

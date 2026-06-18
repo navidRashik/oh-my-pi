@@ -70,6 +70,12 @@ export function seedApiKeyResolver(seed: string | undefined, resolver: ApiKeyRes
 	};
 }
 
+function isStringAuthStatusError(message: string): boolean {
+	return (
+		/\b401\b/.test(message) && /authentication_error|unauthorized|invalid.?x-api-key|invalid.?api.?key/i.test(message)
+	);
+}
+
 /**
  * Classifies whether an error should trigger a credential refresh/rotation
  * retry: a hard `401`, or a rotatable usage-limit ("usage_limit_reached",
@@ -79,7 +85,7 @@ export function isAuthRetryableError(error: unknown): boolean {
 	if (extractHttpStatusFromError(error) === 401) return true;
 	const message = error instanceof Error ? error.message : typeof error === "string" ? error : undefined;
 	if (!message) return false;
-	if (extractHttpStatusFromError({ message }) === 401) return true;
+	if (extractHttpStatusFromError({ message }) === 401 || isStringAuthStatusError(message)) return true;
 	return isUsageLimitError(message);
 }
 

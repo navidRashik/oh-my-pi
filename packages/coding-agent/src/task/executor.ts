@@ -41,6 +41,7 @@ import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
+import { parseThinkingLevel } from "../thinking";
 import type { ContextFileEntry } from "../tools";
 import { isIrcEnabled } from "../tools/irc";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
@@ -132,6 +133,46 @@ interface SubagentRetryFallbackCandidate {
 	selector: string;
 }
 
+function stripSelectorThinkingSuffix(selector: string): string {
+	const colonIndex = selector.lastIndexOf(":");
+	if (colonIndex < 0) return selector;
+	const suffix = selector.slice(colonIndex + 1);
+	return parseThinkingLevel(suffix) ? selector.slice(0, colonIndex) : selector;
+}
+
+function selectorDedupKeys(selector: string): string[] {
+	const baseSelector = stripSelectorThinkingSuffix(selector);
+	return baseSelector === selector ? [selector] : [selector, baseSelector];
+}
+
+function modelPatternRole(pattern: string): string | undefined {
+	const basePattern = stripSelectorThinkingSuffix(pattern.trim());
+	if (basePattern === "default") return "default";
+	if (!basePattern.startsWith("pi/")) return undefined;
+	const role = basePattern.slice("pi/".length).trim();
+	return role || undefined;
+}
+
+function pushSubagentRetryFallbackCandidate(
+	candidates: SubagentRetryFallbackCandidate[],
+	seen: Set<string>,
+	pattern: string,
+	modelRegistry: ModelRegistry,
+	settings: Settings,
+): void {
+	const resolved = resolveModelOverride([pattern], modelRegistry, settings);
+	if (!resolved.model) return;
+	const selector = resolved.explicitThinkingLevel
+		? formatModelSelectorValue(formatModelStringWithRouting(resolved.model), resolved.thinkingLevel)
+		: formatModelStringWithRouting(resolved.model);
+	const keys = selectorDedupKeys(selector);
+	if (keys.some(key => seen.has(key))) return;
+	for (const key of keys) {
+		seen.add(key);
+	}
+	candidates.push({ model: resolved.model, selector });
+}
+
 function resolveSubagentRetryFallbackCandidates(
 	modelPatterns: string[],
 	modelRegistry: ModelRegistry,
@@ -140,15 +181,19 @@ function resolveSubagentRetryFallbackCandidates(
 	const candidates: SubagentRetryFallbackCandidate[] = [];
 	const seen = new Set<string>();
 	for (const pattern of modelPatterns) {
-		const resolved = resolveModelOverride([pattern], modelRegistry, settings);
-		if (!resolved.model) continue;
-		const selector = resolved.explicitThinkingLevel
-			? formatModelSelectorValue(formatModelStringWithRouting(resolved.model), resolved.thinkingLevel)
-			: formatModelStringWithRouting(resolved.model);
-		if (seen.has(selector)) continue;
-		seen.add(selector);
-		candidates.push({ model: resolved.model, selector });
+		pushSubagentRetryFallbackCandidate(candidates, seen, pattern, modelRegistry, settings);
 	}
+
+	if (modelPatterns.length === 1) {
+		const fallbackChains = settings.get("retry.fallbackChains");
+		const role = modelPatternRole(modelPatterns[0]);
+		const configuredChain = role ? fallbackChains[role] : undefined;
+		const roleChain = configuredChain && configuredChain.length > 0 ? configuredChain : fallbackChains.default;
+		for (const pattern of roleChain ?? []) {
+			pushSubagentRetryFallbackCandidate(candidates, seen, pattern, modelRegistry, settings);
+		}
+	}
+
 	return candidates;
 }
 
@@ -166,7 +211,17 @@ function installSubagentRetryFallbackChain(args: {
 		candidate => candidate.model.provider === model.provider && candidate.model.id === model.id,
 	);
 	if (selectedIndex < 0) return undefined;
-	const fallbackSelectors = candidates.slice(selectedIndex + 1).map(candidate => candidate.selector);
+	const selectedCandidate = candidates[selectedIndex];
+	const fallbackSelectors: string[] = [];
+	const seenFallbackSelectors = new Set<string>(selectorDedupKeys(selectedCandidate.selector));
+	for (const candidate of candidates.slice(selectedIndex + 1)) {
+		const keys = selectorDedupKeys(candidate.selector);
+		if (keys.some(key => seenFallbackSelectors.has(key))) continue;
+		for (const key of keys) {
+			seenFallbackSelectors.add(key);
+		}
+		fallbackSelectors.push(candidate.selector);
+	}
 	if (fallbackSelectors.length === 0) return undefined;
 
 	const role = `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`;

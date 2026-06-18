@@ -43,7 +43,11 @@ function getLastAssistantMessage(session: AgentSession): AssistantMessage {
 	return lastMessage;
 }
 
-function createFallbackAgent(primaryModel: Model, requestedModels: string[]): Agent {
+function createFallbackAgent(
+	primaryModel: Model,
+	requestedModels: string[],
+	errorMessage = "rate limit exceeded retry-after-ms=200",
+): Agent {
 	const mock = createMockModel();
 	let primaryAttempts = 0;
 	return new Agent({
@@ -58,7 +62,7 @@ function createFallbackAgent(primaryModel: Model, requestedModels: string[]): Ag
 			requestedModels.push(`${model.provider}/${model.id}`);
 			if (model.provider === primaryModel.provider && model.id === primaryModel.id && primaryAttempts === 0) {
 				primaryAttempts += 1;
-				mock.push({ throw: "rate limit exceeded retry-after-ms=200" });
+				mock.push({ throw: errorMessage });
 			} else {
 				mock.push({ content: [`ok:${model.provider}/${model.id}`] });
 			}
@@ -213,6 +217,58 @@ describe("AgentSession retry fallback", () => {
 			{
 				type: "retry_fallback_succeeded",
 				model: `${secondFallback.provider}/${secondFallback.id}`,
+				role: "default",
+			},
+		]);
+	});
+	it("falls back on string-form provider authentication errors", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const agent = createFallbackAgent(
+			primaryModel,
+			requestedModels,
+			'401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}',
+		);
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") {
+				fallbackAppliedEvents.push(event);
+			}
+		});
+
+		await session.prompt("Recover from provider auth failure");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+		expect(fallbackAppliedEvents).toEqual([
+			{
+				type: "retry_fallback_applied",
+				from: `${primaryModel.provider}/${primaryModel.id}`,
+				to: `${fallbackModel.provider}/${fallbackModel.id}`,
 				role: "default",
 			},
 		]);
@@ -455,6 +511,7 @@ describe("AgentSession retry fallback", () => {
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 1,
+			"retry.modelFallback": false,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 
@@ -597,6 +654,7 @@ describe("AgentSession retry fallback", () => {
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 1,
+			"retry.modelFallback": false,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 
@@ -655,6 +713,7 @@ describe("AgentSession retry fallback", () => {
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 1,
+			"retry.modelFallback": false,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 
@@ -714,6 +773,7 @@ describe("AgentSession retry fallback", () => {
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 1,
+			"retry.modelFallback": false,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 
@@ -930,6 +990,7 @@ describe("AgentSession retry fallback", () => {
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 1,
+			"retry.modelFallback": false,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 

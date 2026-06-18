@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed built-in agent roles to install provider-failure fallback chains for single-model subagents, so provider auth/quota/rate-limit/timeout failures can fall back to another configured provider. ([#2912](https://github.com/can1357/oh-my-pi/issues/2912))
+
 ## [16.0.5] - 2026-06-17
 
 ### Added

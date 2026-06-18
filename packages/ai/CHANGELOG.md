@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed provider billing/quota and string-form authentication errors so they enter credential/model retry fallback instead of surfacing as non-retryable provider failures. ([#2912](https://github.com/can1357/oh-my-pi/issues/2912))
+
 ## [16.0.5] - 2026-06-17
 
 ### Added

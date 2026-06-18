@@ -18,6 +18,8 @@ const SERVER_ERROR_BACKOFF_MS = 20 * 1000; // 20s
 
 const ACCOUNT_RATE_LIMIT_PATTERN =
 	/\baccount(?:'s)?\b[^\n]{0,80}\brate.?limit\b|\brate.?limit\b[^\n]{0,80}\baccount\b/i;
+const BILLING_QUOTA_PATTERN =
+	/credit balance is too low|insufficient[_ -]?quota|quota.?exceeded|payment required|no credits?|billing quota/i;
 
 /**
  * Classify a rate-limit error message into a reason category.
@@ -35,7 +37,11 @@ export function parseRateLimitReason(errorMessage: string): RateLimitReason {
 	// The literal "capacity" used to pre-empt the QUOTA branch even though "quota
 	// will reset" is the long-wait signal — short-circuit here before the
 	// MODEL_CAPACITY fallthrough so credential rotation (not 60s backoff) kicks in.
-	if (lower.includes("quota will reset") || lower.includes("exhausted your capacity")) {
+	if (
+		BILLING_QUOTA_PATTERN.test(errorMessage) ||
+		lower.includes("quota will reset") ||
+		lower.includes("exhausted your capacity")
+	) {
 		return "QUOTA_EXHAUSTED";
 	}
 
@@ -94,8 +100,12 @@ export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
 
 /** Detect usage/quota limit errors in error messages (persistent, requires credential switch). */
 const USAGE_LIMIT_PATTERN =
-	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?exceeded|quota.?reached|resource.?exhausted|exhausted your capacity|quota will reset/i;
+	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?reached|resource.?exhausted|exhausted your capacity|quota will reset/i;
 
 export function isUsageLimitError(errorMessage: string): boolean {
-	return USAGE_LIMIT_PATTERN.test(errorMessage) || ACCOUNT_RATE_LIMIT_PATTERN.test(errorMessage);
+	return (
+		USAGE_LIMIT_PATTERN.test(errorMessage) ||
+		BILLING_QUOTA_PATTERN.test(errorMessage) ||
+		ACCOUNT_RATE_LIMIT_PATTERN.test(errorMessage)
+	);
 }

@@ -263,6 +263,26 @@ export interface ModelTagDef {
 	/** If true, the role is functional but not shown in the model selector UI. */
 	hidden?: boolean;
 }
+/** Default provider-availability fallback order shared by built-in model roles. */
+export const DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN: string[] = [
+	"openai-codex/gpt-5.5:high",
+	"anthropic/claude-opus-4-8:high",
+	"google-gemini-cli/gemini-3.1-pro-preview",
+];
+
+/** Role-keyed fallback chains installed for fresh settings. */
+export const DEFAULT_RETRY_FALLBACK_CHAINS: Record<string, string[]> = {
+	default: [...DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN],
+	smol: [...DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN],
+	slow: [...DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN],
+	vision: [...DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN],
+	plan: [...DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN],
+	designer: [...DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN],
+	commit: [...DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN],
+	title: [...DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN],
+	task: [...DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN],
+	advisor: [...DEFAULT_PROVIDER_FAILURE_FALLBACK_CHAIN],
+};
 
 export interface ModelTagsSettings {
 	[key: string]: ModelTagDef;
@@ -1164,7 +1184,7 @@ export const SETTINGS_SCHEMA = {
 			description: "Allow retry recovery to switch to configured fallback models",
 		},
 	},
-	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
+	"retry.fallbackChains": { type: "record", default: DEFAULT_RETRY_FALLBACK_CHAINS },
 	"retry.fallbackRevertPolicy": {
 		type: "enum",
 		values: ["cooldown-expiry", "never"] as const,
@@ -4543,6 +4563,8 @@ export interface RetrySettings {
 	baseDelayMs: number;
 	maxDelayMs: number;
 	modelFallback: boolean;
+	fallbackChains: Record<string, string[]>;
+	fallbackRevertPolicy: "cooldown-expiry" | "never";
 }
 
 export interface MemoriesSettings {

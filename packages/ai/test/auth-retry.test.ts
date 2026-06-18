@@ -57,6 +57,15 @@ describe("isAuthRetryableError", () => {
 		expect(isAuthRetryableError(new Error("network blip"))).toBe(false);
 		expect(isAuthRetryableError(undefined)).toBe(false);
 	});
+	it("treats string-form provider authentication errors as retryable", () => {
+		expect(
+			isAuthRetryableError(
+				'401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}',
+			),
+		).toBe(true);
+		expect(isAuthRetryableError("403 payment required")).toBe(true);
+		expect(isAuthRetryableError("403 invalid provider configuration")).toBe(false);
+	});
 });
 
 describe("withAuth", () => {

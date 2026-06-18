@@ -21,6 +21,24 @@ function model(provider: string, id: string): Model<Api> {
 		maxTokens: 8192,
 	});
 }
+const PROVIDER_FAILURE_CHAIN = [
+	"openai-codex/gpt-5.5:high",
+	"anthropic/claude-opus-4-8:high",
+	"google-gemini-cli/gemini-3.1-pro-preview",
+];
+
+const BUILT_IN_FALLBACK_ROLES = [
+	"default",
+	"smol",
+	"slow",
+	"vision",
+	"plan",
+	"designer",
+	"commit",
+	"title",
+	"task",
+	"advisor",
+];
 
 function createYieldingSession(): AgentSession {
 	const listeners: Array<(event: { type: string; [key: string]: unknown }) => void> = [];
@@ -60,9 +78,17 @@ function createYieldingSession(): AgentSession {
 	return session as unknown as AgentSession;
 }
 
-describe("issue #2750: subagent runtime model fallback", () => {
+describe("subagent runtime model fallback", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("defaults every built-in role to the provider-failure chain", () => {
+		const fallbackChains = Settings.isolated().get("retry.fallbackChains");
+
+		for (const role of BUILT_IN_FALLBACK_ROLES) {
+			expect(fallbackChains[role]).toEqual(PROVIDER_FAILURE_CHAIN);
+		}
 	});
 
 	it("passes ordered subagent candidates as a child retry fallback chain", async () => {
@@ -118,6 +144,120 @@ describe("issue #2750: subagent runtime model fallback", () => {
 		expect(inheritedFallbackChain).toEqual(["global/inherited-model"]);
 		expect(result.modelOverride).toEqual(["primary/bad-runtime-model", "fallback/working-model"]);
 		expect(result.resolvedModel).toBe("fallback/working-model");
+	});
+	it("inherits the single-role smol provider-failure chain and removes the selected primary", async () => {
+		const primary = model("openai-codex", "gpt-5.5");
+		const opus = model("anthropic", "claude-opus-4-8");
+		const gemini = model("google-gemini-cli", "gemini-3.1-pro-preview");
+		let childFallbackChains: Record<string, string[]> | undefined;
+		let childModelRoles: Record<string, string> | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("Expected createAgentSession options");
+			childFallbackChains = options.settings?.get("retry.fallbackChains") as Record<string, string[]> | undefined;
+			childModelRoles = options.settings?.getModelRoles() as Record<string, string> | undefined;
+			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+		});
+
+		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
+		const settings = Settings.isolated();
+		settings.setModelRole("smol", "openai-codex/gpt-5.5:high");
+
+		await runSubprocess({
+			cwd: "/tmp",
+			agent,
+			task: "work",
+			index: 0,
+			id: "issue-2912-smol",
+			modelOverride: ["pi/smol"],
+			settings,
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [primary, opus, gemini],
+				getApiKey: async () => "test-key",
+			} as never,
+			enableLsp: false,
+		});
+
+		expect(childModelRoles?.["subagent:issue-2912-smol"]).toBe("openai-codex/gpt-5.5:high");
+		expect(childFallbackChains?.["subagent:issue-2912-smol"]).toEqual([
+			"anthropic/claude-opus-4-8:high",
+			"google-gemini-cli/gemini-3.1-pro-preview",
+		]);
+	});
+
+	it("uses the default chain for a single concrete model without a role chain", async () => {
+		const primary = model("custom", "primary-model");
+		const fallback = model("fallback", "default-chain-model");
+		let childFallbackChains: Record<string, string[]> | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("Expected createAgentSession options");
+			childFallbackChains = options.settings?.get("retry.fallbackChains") as Record<string, string[]> | undefined;
+			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+		});
+
+		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
+		const settings = Settings.isolated({
+			"retry.fallbackChains": {
+				default: ["fallback/default-chain-model"],
+			},
+		});
+
+		await runSubprocess({
+			cwd: "/tmp",
+			agent,
+			task: "work",
+			index: 0,
+			id: "issue-2912-default",
+			modelOverride: ["custom/primary-model"],
+			settings,
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [primary, fallback],
+				getApiKey: async () => "test-key",
+			} as never,
+			enableLsp: false,
+		});
+
+		expect(childFallbackChains?.["subagent:issue-2912-default"]).toEqual(["fallback/default-chain-model"]);
+	});
+
+	it("keeps explicit multi-role candidates before default provider chains", async () => {
+		const plan = model("plan", "primary-model");
+		const slow = model("slow", "explicit-fallback");
+		const defaultFallback = model("fallback", "default-chain-model");
+		let childFallbackChains: Record<string, string[]> | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("Expected createAgentSession options");
+			childFallbackChains = options.settings?.get("retry.fallbackChains") as Record<string, string[]> | undefined;
+			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+		});
+
+		const agent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
+		const settings = Settings.isolated({
+			"retry.fallbackChains": {
+				default: ["fallback/default-chain-model"],
+			},
+		});
+		settings.setModelRole("plan", "plan/primary-model");
+		settings.setModelRole("slow", "slow/explicit-fallback");
+
+		await runSubprocess({
+			cwd: "/tmp",
+			agent,
+			task: "work",
+			index: 0,
+			id: "issue-2912-multi",
+			modelOverride: ["pi/plan", "pi/slow"],
+			settings,
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [plan, slow, defaultFallback],
+				getApiKey: async () => "test-key",
+			} as never,
+			enableLsp: false,
+		});
+
+		expect(childFallbackChains?.["subagent:issue-2912-multi"]).toEqual(["slow/explicit-fallback"]);
 	});
 
 	it("preserves upstream routing selectors in the child retry fallback chain", async () => {

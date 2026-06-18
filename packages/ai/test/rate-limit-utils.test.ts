@@ -66,6 +66,16 @@ describe("parseRateLimitReason", () => {
 			),
 		).toBe("QUOTA_EXHAUSTED");
 	});
+	it("classifies provider billing exhaustion as QUOTA_EXHAUSTED", () => {
+		const message = '400 {"message":"Your credit balance is too low to access the Anthropic API"}';
+
+		expect(parseRateLimitReason(message)).toBe("QUOTA_EXHAUSTED");
+		expect(parseRateLimitReason("insufficient_quota")).toBe("QUOTA_EXHAUSTED");
+		expect(parseRateLimitReason("quota exceeded")).toBe("QUOTA_EXHAUSTED");
+		expect(parseRateLimitReason("payment required")).toBe("QUOTA_EXHAUSTED");
+		expect(parseRateLimitReason("no credits")).toBe("QUOTA_EXHAUSTED");
+		expect(parseRateLimitReason("billing quota")).toBe("QUOTA_EXHAUSTED");
+	});
 });
 
 describe("isUsageLimitError", () => {
@@ -105,6 +115,14 @@ describe("isUsageLimitError", () => {
 	it("detects bare 'quota reached' phrasing", () => {
 		expect(isUsageLimitError("quota reached")).toBe(true);
 		expect(isUsageLimitError("quota_reached")).toBe(true);
+	});
+	it("detects provider billing exhaustion as credential-rotatable usage limits", () => {
+		expect(isUsageLimitError('400 {"message":"Your credit balance is too low to access the Anthropic API"}')).toBe(
+			true,
+		);
+		expect(isUsageLimitError("insufficient_quota")).toBe(true);
+		expect(isUsageLimitError("payment required")).toBe(true);
+		expect(isUsageLimitError("400 invalid_request_error: schema validation failed")).toBe(false);
 	});
 });
 
