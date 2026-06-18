@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/model` in the TUI to open the role and effort selector again while `/switch` remains the temporary active-session switcher ([#2976](https://github.com/can1357/oh-my-pi/issues/2976)).
+
 ## [16.0.6] - 2026-06-18
 
 ### Added
