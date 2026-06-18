@@ -31,6 +31,52 @@ function getHeader(headers: RequestInit["headers"], name: string): string | unde
 	return typeof value === "string" ? value : value?.[0];
 }
 
+function createSlowOllamaResponse(): Response {
+	const encoder = new TextEncoder();
+	const chunks = [
+		{ message: { content: "Long " } },
+		{ message: { content: "active " } },
+		{ message: { content: "stream " } },
+		{ message: { content: "completed" } },
+		{ message: {}, done: true, prompt_eval_count: 1, eval_count: 4 },
+	];
+	let timer: NodeJS.Timeout | undefined;
+	let closed = false;
+	const cleanup = () => {
+		closed = true;
+		if (timer) clearTimeout(timer);
+	};
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			let index = 0;
+			const enqueueNext = () => {
+				if (closed) return;
+				if (index >= chunks.length) {
+					cleanup();
+					controller.close();
+					return;
+				}
+				controller.enqueue(encoder.encode(`${JSON.stringify(chunks[index++])}\n`));
+				timer = setTimeout(enqueueNext, 3);
+			};
+			enqueueNext();
+		},
+		cancel() {
+			cleanup();
+		},
+	});
+	return new Response(stream, { status: 200 });
+}
+
+function createSilentOllamaResponse(): Response {
+	return new Response(
+		new ReadableStream<Uint8Array>({
+			start() {},
+		}),
+		{ status: 200 },
+	);
+}
+
 describe("Ollama chat thinking controls", () => {
 	it("sends think false when reasoning is explicitly disabled", async () => {
 		let payload: object | undefined;
@@ -77,5 +123,39 @@ describe("Ollama chat thinking controls", () => {
 
 		expect(getHeader(requestHeaders, "X-Proxy-Token")).toBe("proxy-token");
 		expect(getHeader(requestHeaders, "Authorization")).toBe("Bearer test-key");
+	});
+
+	it("does not let the first-event timeout abort active response bodies", async () => {
+		const fetchMock = async (): Promise<Response> => createSlowOllamaResponse();
+		const context: Context = {
+			messages: [{ role: "user", content: "Write a long answer", timestamp: 0 }],
+		};
+
+		const result = await streamOllama(createReasoningOllamaModel(), context, {
+			apiKey: "test-key",
+			streamFirstEventTimeoutMs: 5,
+			streamIdleTimeoutMs: 20,
+			fetch: fetchMock,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "Long active stream completed" }]);
+	});
+
+	it("times out direct streams when headers arrive but the body is silent", async () => {
+		const fetchMock = async (): Promise<Response> => createSilentOllamaResponse();
+		const context: Context = {
+			messages: [{ role: "user", content: "Ping", timestamp: 0 }],
+		};
+
+		const result = await streamOllama(createReasoningOllamaModel(), context, {
+			apiKey: "test-key",
+			streamFirstEventTimeoutMs: 5,
+			streamIdleTimeoutMs: 5,
+			fetch: fetchMock,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Ollama stream stalled while waiting for the first chunk");
 	});
 });

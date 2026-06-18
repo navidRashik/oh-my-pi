@@ -18,7 +18,11 @@ import type {
 import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { type CapturedHttpErrorResponse, finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
-import { getOpenAIStreamFirstEventTimeoutMs, getOpenAIStreamIdleTimeoutMs } from "../utils/idle-iterator";
+import {
+	getOpenAIStreamFirstEventTimeoutMs,
+	getOpenAIStreamIdleTimeoutMs,
+	iterateWithIdleTimeout,
+} from "../utils/idle-iterator";
 import { parseStreamingJson } from "../utils/json-parse";
 import { createPreResponseTimeoutSignal } from "../utils/pre-response-timeout";
 import { toolWireSchema } from "../utils/schema/wire";
@@ -310,33 +314,58 @@ async function captureHttpErrorResponse(response: Response): Promise<CapturedHtt
 	};
 }
 
-async function* iterateNdjson(stream: ReadableStream<Uint8Array>): AsyncGenerator<OllamaChatChunk> {
+function getAbortReason(signal: AbortSignal): Error {
+	const reason = signal.reason;
+	return reason instanceof Error ? reason : new Error("Request was aborted");
+}
+
+async function* iterateNdjson(
+	stream: ReadableStream<Uint8Array>,
+	abortSignal?: AbortSignal,
+): AsyncGenerator<OllamaChatChunk> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
 	let buffer = "";
-	while (true) {
-		const { done, value } = await reader.read();
-		if (done) {
-			break;
+	let abortListener: (() => void) | undefined;
+	try {
+		if (abortSignal) {
+			abortListener = () => {
+				void reader.cancel(abortSignal.reason).catch(() => {});
+			};
+			if (abortSignal.aborted) {
+				abortListener();
+			} else {
+				abortSignal.addEventListener("abort", abortListener, { once: true });
+			}
 		}
-		buffer += decoder.decode(value, { stream: true });
 		while (true) {
-			const newlineIndex = buffer.indexOf("\n");
-			if (newlineIndex < 0) {
+			const { done, value } = await reader.read();
+			if (abortSignal?.aborted) throw getAbortReason(abortSignal);
+			if (done) {
 				break;
 			}
-			const line = buffer.slice(0, newlineIndex).trim();
-			buffer = buffer.slice(newlineIndex + 1);
-			if (!line) {
-				continue;
+			buffer += decoder.decode(value, { stream: true });
+			while (true) {
+				const newlineIndex = buffer.indexOf("\n");
+				if (newlineIndex < 0) {
+					break;
+				}
+				const line = buffer.slice(0, newlineIndex).trim();
+				buffer = buffer.slice(newlineIndex + 1);
+				if (!line) {
+					continue;
+				}
+				yield JSON.parse(line) as OllamaChatChunk;
 			}
-			yield JSON.parse(line) as OllamaChatChunk;
 		}
-	}
-	buffer += decoder.decode();
-	const tail = buffer.trim();
-	if (tail) {
-		yield JSON.parse(tail) as OllamaChatChunk;
+		buffer += decoder.decode();
+		const tail = buffer.trim();
+		if (tail) {
+			yield JSON.parse(tail) as OllamaChatChunk;
+		}
+	} finally {
+		if (abortListener) abortSignal?.removeEventListener("abort", abortListener);
+		reader.releaseLock();
 	}
 }
 
@@ -566,7 +595,20 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 				throw new Error("Ollama returned an empty response body");
 			}
 			stream.push({ type: "start", partial: output });
-			for await (const chunk of iterateNdjson(response.body)) {
+			const bodyWatchdog = new AbortController();
+			const bodySignal = options.signal
+				? AbortSignal.any([options.signal, bodyWatchdog.signal])
+				: bodyWatchdog.signal;
+			const bodyChunks = iterateWithIdleTimeout(iterateNdjson(response.body, bodySignal), {
+				idleTimeoutMs,
+				firstItemTimeoutMs: firstEventTimeoutMs,
+				errorMessage: "Ollama stream stalled while waiting for the next chunk",
+				firstItemErrorMessage: "Ollama stream stalled while waiting for the first chunk",
+				abortSignal: options.signal,
+				onIdle: () => bodyWatchdog.abort(),
+				onFirstItemTimeout: () => bodyWatchdog.abort(),
+			});
+			for await (const chunk of bodyChunks) {
 				if (chunk.message?.thinking) {
 					endActiveTextBlock();
 					if (activeThinkingIndex === undefined) {
