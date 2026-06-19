@@ -52,6 +52,10 @@ export const REPLACE_PAIR_COALESCED_WARNING = `Two hunks targeted the same range
 export const BARE_BODY_AUTO_PIPED_WARNING =
 	"Auto-prefixed bare body row(s) with `+`. Body rows must be `+TEXT` literal lines.";
 
+/** Bare `DEL` after a replace header means delete the named range, not literal payload. */
+export const BARE_DEL_REPLACE_DELETE_WARNING =
+	"Interpreted bare `DEL` after `SWAP N.=M:` as an empty replacement delete. Use `DEL N.=M` for deletions or `+DEL` for literal text.";
+
 /** Unified-diff-style `-` row in a hunk body. */
 export const MINUS_ROW_REJECTED =
 	"`-` rows are not valid; the range already names the lines being changed. For a literal `-` line, write `+-…`.";

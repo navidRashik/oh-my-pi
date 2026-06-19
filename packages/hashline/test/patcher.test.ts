@@ -33,6 +33,22 @@ describe("Patcher snapshot tag integrity", () => {
 		expect(fs.get(PATH)).toBe("after\n");
 	});
 
+	it("accepts the fresh tag returned by the previous successful edit", async () => {
+		const fs = new InMemoryFilesystem([[PATH, "one\ntwo\nthree\n"]]);
+		const snapshots = new InMemorySnapshotStore();
+		const firstTag = snapshots.record(PATH, "one\ntwo\nthree\n");
+		const patcher = new Patcher({ fs, snapshots });
+
+		const first = await patcher.apply(Patch.parse(`[${PATH}#${firstTag}]\nSWAP 2.=2:\n+TWO`));
+		const nextHeader = first.sections[0]?.header;
+		expect(nextHeader).toMatch(/^\[a\.ts#[0-9A-F]{4}\]$/);
+
+		const second = await patcher.apply(Patch.parse(`${nextHeader}\nSWAP 3.=3:\n+THREE`));
+
+		expect(second.sections[0]?.op).toBe("update");
+		expect(fs.get(PATH)).toBe("one\nTWO\nTHREE\n");
+	});
+
 	it("validates any anchor purely from the content hash, even with no recorded snapshot", async () => {
 		// The core fix: the tag fingerprints the WHOLE file. An edit anchored at
 		// a line the model never saw recorded applies whenever the live file

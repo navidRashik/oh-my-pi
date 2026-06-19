@@ -151,7 +151,7 @@ describe("boundary-balance repair", () => {
 		expect(warnings).toHaveLength(0);
 	});
 
-	it("drops duplicated leading and trailing boundary lines around a range replacement", () => {
+	it("preserves duplicated leading and trailing boundary lines around a range replacement", () => {
 		const file = [
 			"func _cmd_travel_homeworld():",
 			"\tvar destination = get_homeworld()",
@@ -171,14 +171,16 @@ describe("boundary-balance repair", () => {
 		expect(text).toBe(
 			[
 				"func _cmd_travel_homeworld():",
+				"func _cmd_travel_homeworld():",
 				"\tvar destination = find_homeworld()",
 				"\ttravel_to(destination)",
 				"\tprint_status()",
+				"\tprint_status()",
 			].join("\n"),
 		);
-		expect(text.split("\n").filter(line => line === "func _cmd_travel_homeworld():")).toHaveLength(1);
-		expect(text.split("\n").filter(line => line === "\tprint_status()")).toHaveLength(1);
-		expect(warnings.some(warning => /boundary echo/.test(warning))).toBe(true);
+		expect(text.split("\n").filter(line => line === "func _cmd_travel_homeworld():")).toHaveLength(2);
+		expect(text.split("\n").filter(line => line === "\tprint_status()")).toHaveLength(2);
+		expect(warnings).toHaveLength(0);
 	});
 
 	it("preserves payloads where multi-line boundary echoes cover every line", () => {
@@ -217,16 +219,16 @@ describe("boundary-balance repair", () => {
 		expect(warnings).toHaveLength(0);
 	});
 
-	// The common wrapper-echo mistake stays repaired: balance-neutral edges
-	// (opener + closer) that duplicate the surviving neighbors are dropped.
-	it("still drops a balance-neutral wrapper echo", () => {
+	// Balance-neutral wrapper echoes are kept verbatim; a payload may
+	// intentionally duplicate the surrounding opener/closer.
+	it("preserves a balance-neutral wrapper echo", () => {
 		const file = ["function f() {", "old();", "}"].join("\n");
 		const diff = ["SWAP 2.=2:", "+function f() {", "+fresh();", "+}"].join("\n");
 
 		const { text, warnings } = apply(file, diff);
 
-		expect(text).toBe(["function f() {", "fresh();", "}"].join("\n"));
-		expect(warnings.some(warning => /boundary echo/.test(warning))).toBe(true);
+		expect(text).toBe(["function f() {", "function f() {", "fresh();", "}", "}"].join("\n"));
+		expect(warnings).toHaveLength(0);
 	});
 
 	// Balance-preserving edits are never touched, even when the payload's last
@@ -261,34 +263,39 @@ describe("boundary-balance repair", () => {
 	});
 
 	// A MULTI-line construct rewrite whose payload restates the keeper that
-	// survives just below the range — the att#1 `replace 639.=644` shape where
-	// the range was one line short of the `const changedFiles` it retyped.
-	it("drops a one-sided trailing keeper echo in a multi-line rewrite", () => {
+	// survives just below the range keeps the duplicate: payload fidelity wins.
+	it("preserves a one-sided trailing keeper echo in a multi-line rewrite", () => {
 		const file = ["function f() {", "  a();", "  b();", "  const out = [];", "  return out;", "}"].join("\n");
 		const diff = ["SWAP 2.=3:", "+  a2();", "+  b2();", "+  const out = [];"].join("\n");
 		const { text, warnings } = apply(file, diff);
-		expect(text).toBe(["function f() {", "  a2();", "  b2();", "  const out = [];", "  return out;", "}"].join("\n"));
-		expect(warnings.some(warning => /boundary echo/.test(warning))).toBe(true);
+		expect(text).toBe(
+			["function f() {", "  a2();", "  b2();", "  const out = [];", "  const out = [];", "  return out;", "}"].join(
+				"\n",
+			),
+		);
+		expect(warnings).toHaveLength(0);
 	});
 
-	it("drops a one-sided JSX closer echo in a single-line expansion", () => {
+	it("preserves a one-sided JSX closer echo in a single-line expansion", () => {
 		const file = ["const view = (", "  <section>", "    <Old />", "  </section>", ");"].join("\n");
 		const diff = ["SWAP 3.=3:", "+    <New />", "+  </section>"].join("\n");
 		const { text, warnings } = apply(file, diff);
 
-		expect(text).toBe(["const view = (", "  <section>", "    <New />", "  </section>", ");"].join("\n"));
-		expect(text.split("\n").filter(line => line === "  </section>")).toHaveLength(1);
-		expect(warnings.some(warning => /boundary echo/.test(warning))).toBe(true);
+		expect(text).toBe(
+			["const view = (", "  <section>", "    <New />", "  </section>", "  </section>", ");"].join("\n"),
+		);
+		expect(text.split("\n").filter(line => line === "  </section>")).toHaveLength(2);
+		expect(warnings).toHaveLength(0);
 	});
 
-	it("drops a JSX closer echo after a self-closing tag with a greater-than prop expression", () => {
+	it("preserves a JSX closer echo after a self-closing tag with a greater-than prop expression", () => {
 		const file = ["const view = (", "<Foo>", "old text", "</Foo>", ");"].join("\n");
 		const diff = ["SWAP 3.=3:", "+<Foo value={a > b} />", "+</Foo>"].join("\n");
 		const { text, warnings } = apply(file, diff);
 
-		expect(text).toBe(["const view = (", "<Foo>", "<Foo value={a > b} />", "</Foo>", ");"].join("\n"));
-		expect(text.split("\n").filter(line => line === "</Foo>")).toHaveLength(1);
-		expect(warnings.some(warning => /boundary echo/.test(warning))).toBe(true);
+		expect(text).toBe(["const view = (", "<Foo>", "<Foo value={a > b} />", "</Foo>", "</Foo>", ");"].join("\n"));
+		expect(text.split("\n").filter(line => line === "</Foo>")).toHaveLength(2);
+		expect(warnings).toHaveLength(0);
 	});
 
 	it("preserves a nested JSX closer that matches the surviving parent closer", () => {
@@ -335,12 +342,12 @@ describe("boundary-balance repair", () => {
 
 	// Mirror direction: the payload restates the keeper that survives just above
 	// the multi-line range (range one line low instead of one short).
-	it("drops a one-sided leading keeper echo in a multi-line rewrite", () => {
+	it("preserves a one-sided leading keeper echo in a multi-line rewrite", () => {
 		const file = ["setup();", "a();", "b();", "c();"].join("\n");
 		const diff = ["SWAP 3.=4:", "+a();", "+B();", "+C();"].join("\n");
 		const { text, warnings } = apply(file, diff);
-		expect(text).toBe(["setup();", "a();", "B();", "C();"].join("\n"));
-		expect(warnings.some(warning => /boundary echo/.test(warning))).toBe(true);
+		expect(text).toBe(["setup();", "a();", "a();", "B();", "C();"].join("\n"));
+		expect(warnings).toHaveLength(0);
 	});
 });
 

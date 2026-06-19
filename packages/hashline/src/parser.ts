@@ -6,6 +6,7 @@
 import { HL_PAYLOAD_REPLACE, HL_RANGE_SEP } from "./format";
 import {
 	BARE_BODY_AUTO_PIPED_WARNING,
+	BARE_DEL_REPLACE_DELETE_WARNING,
 	DELETE_BLOCK_TAKES_NO_BODY,
 	DELETE_TAKES_NO_BODY,
 	EMPTY_BLOCK,
@@ -234,6 +235,17 @@ export class Executor {
 		if (this.#pending) {
 			if (text.trim().length === 0) {
 				this.#handleBlank(text, lineNum);
+				return;
+			}
+			if (
+				this.#pending.target.kind === "replace" &&
+				this.#pending.payloads.length === 0 &&
+				this.#pending.deferredBlanks.length === 0 &&
+				text.trim() === "DEL"
+			) {
+				if (!this.#warnings.includes(BARE_DEL_REPLACE_DELETE_WARNING)) {
+					this.#warnings.push(BARE_DEL_REPLACE_DELETE_WARNING);
+				}
 				return;
 			}
 			if (this.#pending.target.kind === "delete") throw new Error(`line ${lineNum}: ${DELETE_TAKES_NO_BODY}`);

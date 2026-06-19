@@ -38,7 +38,7 @@ There is NO other body row kind. NEVER write `-old` or a bare/context line. To k
 - `SWAP.BLK N` resolves EXACTLY the node at N. Leading decorators/attributes/doc-comments are separate nodes: point N at the FIRST decorator to sweep both; standalone line-comments are never swept — use `SWAP N.=M`.
 - Block ops (`SWAP.BLK`/`DEL.BLK`/`INS.BLK.POST`) anchor the OPENING line of a MULTI-LINE construct — never its closer, its last line, or a bare statement inside it. Anchoring a single statement resolves to ONE line and is REJECTED: use the plain op (`SWAP N.=N` / `DEL N` / `INS.POST N`) for one line, or point N at the real opener. Saw the closer? Use plain `INS.POST M:`.
 - Non-adjacent changes = separate hunks; untouched lines stay out of every range.
-- Pure additions use `INS.PRE` / `INS.POST` / `INS.HEAD` / `INS.TAIL`, never a widened `SWAP` — retyped keepers are exactly what gets dropped. A multi-line `SWAP` whose body restates the line just outside the range is auto-dropped as an off-by-one keeper (with a warning), but issue the payload as the final content for the range only and never lean on the repair.
+- Pure additions use `INS.PRE` / `INS.POST` / `INS.HEAD` / `INS.TAIL`, never a widened `SWAP` — body rows are applied verbatim, so retyped keepers become duplicated keepers.
 - NEVER format/restyle code with this tool; run the project formatter instead.
 </rules>
 

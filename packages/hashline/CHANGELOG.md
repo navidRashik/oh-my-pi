@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+
+### Fixed
+
+- Preserved replacement payload boundary lines verbatim instead of auto-dropping balance-neutral echoes that match neighboring unchanged lines. ([#2885](https://github.com/can1357/oh-my-pi/issues/2885))
+- Fixed the exported provider grammar to accept documented single-line `DEL N` hunks. ([#2885](https://github.com/can1357/oh-my-pi/issues/2885))
+- Treated bare `DEL` under `SWAP N.=M:` as an empty replacement delete instead of literal inserted text. ([#2885](https://github.com/can1357/oh-my-pi/issues/2885))
 ## [16.0.2] - 2026-06-16
 
 ### Fixed

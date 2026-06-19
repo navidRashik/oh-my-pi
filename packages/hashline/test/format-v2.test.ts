@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { applyEdits, parsePatch, parsePatchStreaming } from "@oh-my-pi/hashline";
+import grammar from "../src/grammar.lark" with { type: "text" };
 
 function applyPatch(text: string, diff: string): string {
 	return applyEdits(text, parsePatch(diff).edits).text;
@@ -18,9 +19,21 @@ describe("hashline format v4", () => {
 		expect(applyPatch(text, "DEL 2")).toBe("a\nc");
 	});
 
+	it("documents single-line delete in the provider grammar", () => {
+		expect(grammar).toContain('delete_hunk: "DEL " (header_range | LID) LF');
+	});
+
 	it("deletes a concrete range", () => {
 		const text = "a\nb\nc\nd";
 		expect(applyPatch(text, "DEL 2.=3")).toBe("a\nd");
+	});
+
+	it("treats bare DEL under a replace header as deletion, not literal text", () => {
+		const text = "a\nb\nc\nd";
+		const result = parsePatch("SWAP 2.=3:\nDEL");
+
+		expect(applyEdits(text, result.edits).text).toBe("a\nd");
+		expect(result.warnings.some(warning => /bare `DEL`/.test(warning))).toBe(true);
 	});
 
 	it("inserts before and after concrete anchors", () => {
