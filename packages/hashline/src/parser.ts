@@ -246,6 +246,7 @@ export class Executor {
 				if (!this.#warnings.includes(BARE_DEL_REPLACE_DELETE_WARNING)) {
 					this.#warnings.push(BARE_DEL_REPLACE_DELETE_WARNING);
 				}
+				this.#pending.target = { kind: "delete", range: this.#pending.target.range };
 				return;
 			}
 			if (this.#pending.target.kind === "delete") throw new Error(`line ${lineNum}: ${DELETE_TAKES_NO_BODY}`);

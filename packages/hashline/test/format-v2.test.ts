@@ -115,4 +115,13 @@ describe("hashline format v4", () => {
 		const result = parsePatchStreaming("SWAP 2.=2:\nINS.TAIL:\n");
 		expect(result.edits).toEqual([{ kind: "delete", anchor: { line: 2 }, lineNum: 1, index: 0 }]);
 	});
+
+	it("flushes bare DEL under a replace hunk during streaming parse", () => {
+		const result = parsePatchStreaming("SWAP 2.=3:\nDEL");
+		expect(result.edits).toEqual([
+			{ kind: "delete", anchor: { line: 2 }, lineNum: 1, index: 0 },
+			{ kind: "delete", anchor: { line: 3 }, lineNum: 1, index: 1 },
+		]);
+		expect(result.warnings.some(warning => /bare `DEL`/.test(warning))).toBe(true);
+	});
 });
