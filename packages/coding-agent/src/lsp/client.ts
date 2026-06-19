@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { isEnoent, logger, ptree, untilAborted } from "@oh-my-pi/pi-utils";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
@@ -9,6 +10,7 @@ import type {
 	LspJsonRpcNotification,
 	LspJsonRpcRequest,
 	LspJsonRpcResponse,
+	LspWatchedFileMatcher,
 	PublishDiagnosticsParams,
 	ServerConfig,
 	WorkspaceEdit,
@@ -146,6 +148,9 @@ const CLIENT_CAPABILITIES = {
 		workDoneProgress: true,
 	},
 	workspace: {
+		didChangeWatchedFiles: {
+			dynamicRegistration: true,
+		},
 		applyEdit: true,
 		workspaceEdit: {
 			documentChanges: true,
@@ -400,6 +405,7 @@ async function startMessageReader(client: LspClient): Promise<void> {
 			}
 			client.pendingRequests.clear();
 			client.resolveProjectLoaded();
+			closeWatchedFileWatcher(client);
 			client.proc.kill();
 		}
 	}
@@ -456,6 +462,201 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 	}
 }
 
+const DID_CHANGE_WATCHED_FILES = "workspace/didChangeWatchedFiles";
+const WATCH_KIND_CREATED = 1;
+const WATCH_KIND_CHANGED = 2;
+const WATCH_KIND_DELETED = 4;
+const WATCH_KIND_ALL = WATCH_KIND_CREATED | WATCH_KIND_CHANGED | WATCH_KIND_DELETED;
+const JSON_RPC_INVALID_PARAMS = -32602;
+const JSON_RPC_INTERNAL_ERROR = -32603;
+
+interface ParsedWatchedFilesRegistration {
+	id: string;
+	watchers: LspWatchedFileMatcher[];
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+}
+
+function readArrayParam(params: unknown, key: string): unknown[] | undefined {
+	const record = recordValue(params);
+	const value = record?.[key];
+	return Array.isArray(value) ? value : undefined;
+}
+
+function parseWatchedFilesRegistration(value: unknown): ParsedWatchedFilesRegistration | string {
+	const registration = recordValue(value);
+	if (!registration || typeof registration.id !== "string") {
+		return "Registration id must be a string";
+	}
+	if (registration.method !== DID_CHANGE_WATCHED_FILES) {
+		return `Unsupported dynamic registration: ${String(registration.method)}`;
+	}
+
+	const options = recordValue(registration.registerOptions);
+	const rawWatchers = options ? options.watchers : undefined;
+	if (!Array.isArray(rawWatchers)) {
+		return "workspace/didChangeWatchedFiles registration requires watchers";
+	}
+
+	const watchers: LspWatchedFileMatcher[] = [];
+	for (const rawWatcher of rawWatchers) {
+		const watcher = recordValue(rawWatcher);
+		if (!watcher || typeof watcher.globPattern !== "string") {
+			return "workspace/didChangeWatchedFiles watcher globPattern must be a string";
+		}
+		watchers.push({
+			pattern: watcher.globPattern,
+			glob: new Bun.Glob(watcher.globPattern),
+			kind: typeof watcher.kind === "number" ? watcher.kind : WATCH_KIND_ALL,
+		});
+	}
+
+	return { id: registration.id, watchers };
+}
+
+function parseWatchedFilesUnregistration(value: unknown): string | undefined {
+	const registration = recordValue(value);
+	if (!registration || typeof registration.id !== "string") {
+		return undefined;
+	}
+	if (registration.method !== DID_CHANGE_WATCHED_FILES) {
+		return undefined;
+	}
+	return registration.id;
+}
+
+function normalizeWatchedPath(filePath: string): string {
+	return filePath.replaceAll("\\", "/");
+}
+
+function shouldNotifyWatchedFile(client: LspClient, relativePath: string, changeType: number): boolean {
+	for (const registration of client.watchedFiles.values()) {
+		for (const watcher of registration.watchers) {
+			if ((watcher.kind & changeType) !== 0 && watcher.glob.match(relativePath)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+async function detectWatchedFileChangeType(filePath: string, eventType: string): Promise<number> {
+	if (eventType === "change") {
+		return WATCH_KIND_CHANGED;
+	}
+	return (await Bun.file(filePath).exists()) ? WATCH_KIND_CREATED : WATCH_KIND_DELETED;
+}
+
+async function handleWatchedFileEvent(
+	client: LspClient,
+	eventType: string,
+	filename: string | Buffer | null,
+): Promise<void> {
+	if (!filename) return;
+	const eventPath = Buffer.isBuffer(filename) ? filename.toString() : filename;
+	const absolutePath = path.isAbsolute(eventPath) ? eventPath : path.join(client.cwd, eventPath);
+	const relativePath = normalizeWatchedPath(path.relative(client.cwd, absolutePath));
+	if (!relativePath || relativePath.startsWith("../") || relativePath === "..") return;
+
+	const changeType = await detectWatchedFileChangeType(absolutePath, eventType);
+	if (!shouldNotifyWatchedFile(client, relativePath, changeType)) return;
+
+	await sendNotification(client, DID_CHANGE_WATCHED_FILES, {
+		changes: [{ uri: fileToUri(absolutePath), type: changeType }],
+	});
+}
+
+function closeWatchedFileWatcher(client: LspClient): void {
+	client.fileWatcher?.close();
+	client.fileWatcher = undefined;
+}
+
+function ensureWatchedFileWatcher(client: LspClient): void {
+	if (client.fileWatcher) return;
+	client.fileWatcher = fs.watch(client.cwd, { recursive: true }, (eventType, filename) => {
+		void handleWatchedFileEvent(client, eventType, filename).catch(err => {
+			logger.warn("LSP watched-file notification failed", {
+				server: client.name,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+	});
+}
+
+async function handleRegisterCapabilityRequest(client: LspClient, message: LspJsonRpcRequest): Promise<void> {
+	const registrations = readArrayParam(message.params, "registrations");
+	if (!registrations) {
+		await sendResponse(client, message.id, null, message.method, {
+			code: JSON_RPC_INVALID_PARAMS,
+			message: "client/registerCapability requires registrations",
+		});
+		return;
+	}
+
+	const parsedRegistrations: ParsedWatchedFilesRegistration[] = [];
+	for (const registration of registrations) {
+		const parsed = parseWatchedFilesRegistration(registration);
+		if (typeof parsed === "string") {
+			await sendResponse(client, message.id, null, message.method, {
+				code: JSON_RPC_INVALID_PARAMS,
+				message: parsed,
+			});
+			return;
+		}
+		parsedRegistrations.push(parsed);
+	}
+
+	try {
+		if (parsedRegistrations.length > 0) {
+			ensureWatchedFileWatcher(client);
+		}
+	} catch (err) {
+		await sendResponse(client, message.id, null, message.method, {
+			code: JSON_RPC_INTERNAL_ERROR,
+			message: err instanceof Error ? err.message : String(err),
+		});
+		return;
+	}
+
+	for (const registration of parsedRegistrations) {
+		client.watchedFiles.set(registration.id, {
+			method: DID_CHANGE_WATCHED_FILES,
+			watchers: registration.watchers,
+		});
+	}
+	await sendResponse(client, message.id, null, message.method);
+}
+
+async function handleUnregisterCapabilityRequest(client: LspClient, message: LspJsonRpcRequest): Promise<void> {
+	const unregisterations = readArrayParam(message.params, "unregisterations");
+	if (!unregisterations) {
+		await sendResponse(client, message.id, null, message.method, {
+			code: JSON_RPC_INVALID_PARAMS,
+			message: "client/unregisterCapability requires unregisterations",
+		});
+		return;
+	}
+
+	for (const registration of unregisterations) {
+		const id = parseWatchedFilesUnregistration(registration);
+		if (!id) {
+			await sendResponse(client, message.id, null, message.method, {
+				code: JSON_RPC_INVALID_PARAMS,
+				message: "Unsupported dynamic unregistration",
+			});
+			return;
+		}
+		client.watchedFiles.delete(id);
+	}
+
+	if (client.watchedFiles.size === 0) {
+		closeWatchedFileWatcher(client);
+	}
+	await sendResponse(client, message.id, null, message.method);
+}
+
 /**
  * Respond to a server-initiated request.
  */
@@ -477,9 +678,12 @@ async function handleServerRequest(client: LspClient, message: LspJsonRpcRequest
 		await sendResponse(client, message.id, null, message.method);
 		return;
 	}
-	if (message.method === "client/registerCapability" || message.method === "client/unregisterCapability") {
-		// Some servers block semantic requests until dynamic registration succeeds.
-		await sendResponse(client, message.id, null, message.method);
+	if (message.method === "client/registerCapability") {
+		await handleRegisterCapabilityRequest(client, message);
+		return;
+	}
+	if (message.method === "client/unregisterCapability") {
+		await handleUnregisterCapabilityRequest(client, message);
 		return;
 	}
 	await sendResponse(client, message.id, null, message.method, {
@@ -654,6 +858,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			diagnosticsVersion: 0,
 			openFiles: new Map(),
 			pendingRequests: new Map(),
+			watchedFiles: new Map(),
 			messageBuffer: new Uint8Array(0),
 			isReading: false,
 			status: "connecting",
@@ -669,6 +874,7 @@ export async function getOrCreateClient(config: ServerConfig, cwd: string, initT
 			if (clients.get(key) === client) clients.delete(key);
 			if (clientLocks.get(key) === clientPromise) clientLocks.delete(key);
 			client.resolveProjectLoaded();
+			closeWatchedFileWatcher(client);
 
 			// Reject any pending requests — the server is gone, they will never complete.
 			if (client.pendingRequests.size > 0) {
@@ -984,6 +1190,7 @@ async function shutdownClientInstance(client: LspClient): Promise<void> {
 	}
 	client.pendingRequests.clear();
 
+	closeWatchedFileWatcher(client);
 	const shutdownCompleted = await sendRequest(client, "shutdown", null, undefined, SHUTDOWN_TIMEOUT_MS).then(
 		() => true,
 		() => false,

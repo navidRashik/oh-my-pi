@@ -1,3 +1,4 @@
+import type * as fs from "node:fs";
 import type { ptree } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 
@@ -400,6 +401,10 @@ export interface LspClient {
 	diagnosticsVersion: number;
 	openFiles: Map<string, OpenFile>;
 	pendingRequests: Map<number | string, PendingRequest>;
+	/** Dynamic `workspace/didChangeWatchedFiles` registrations accepted from the server. */
+	watchedFiles: Map<string, LspWatchedFilesRegistration>;
+	/** Recursive filesystem watcher backing dynamic `workspace/didChangeWatchedFiles` registrations. */
+	fileWatcher?: fs.FSWatcher;
 	messageBuffer: Uint8Array;
 	isReading: boolean;
 	/** Lifecycle state: "connecting" until initialize completes, then "ready"; "error" on init failure or reader death. */
@@ -419,6 +424,19 @@ export interface LspClient {
 // =============================================================================
 // JSON-RPC Protocol Types
 // =============================================================================
+
+/** Compiled matcher for one server-registered watched-file glob. */
+export interface LspWatchedFileMatcher {
+	pattern: string;
+	glob: Bun.Glob;
+	kind: number;
+}
+
+/** Accepted dynamic registration for `workspace/didChangeWatchedFiles`. */
+export interface LspWatchedFilesRegistration {
+	method: "workspace/didChangeWatchedFiles";
+	watchers: LspWatchedFileMatcher[];
+}
 
 /** JSON-RPC request/response identifier accepted by LSP peers. */
 export type LspJsonRpcId = number | string;

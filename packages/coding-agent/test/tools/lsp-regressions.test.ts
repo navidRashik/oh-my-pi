@@ -332,12 +332,6 @@ describe("lsp regressions", () => {
 							],
 						},
 					});
-					srv.send({
-						jsonrpc: "2.0",
-						id: "expert-unregister-1",
-						method: "client/unregisterCapability",
-						params: { unregisterations: [{ id: "-42", method: "workspace/didChangeWatchedFiles" }] },
-					});
 				} else if (message.id === 9002 && message.method === undefined) {
 					dynamicRegistrationAccepted = message.error === undefined;
 				} else if (message.method === "textDocument/hover" && dynamicRegistrationAccepted) {
@@ -355,13 +349,10 @@ describe("lsp regressions", () => {
 				rootMarkers: [],
 			};
 
+			fs.mkdirSync(path.join(tempDir.path(), "lib"), { recursive: true });
 			const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
 			const registerResponse = await server.waitFor(message => message.id === 9002 && message.method === undefined);
-			const unregisterResponse = await server.waitFor(
-				message => message.id === "expert-unregister-1" && message.method === undefined,
-			);
 			expect(registerResponse.error).toBeUndefined();
-			expect(unregisterResponse.error).toBeUndefined();
 			const result = await lspClient.sendRequest(
 				client,
 				"textDocument/hover",
@@ -374,6 +365,41 @@ describe("lsp regressions", () => {
 			);
 
 			expect(result).toEqual({ contents: "Atas.version()" });
+
+			const sourcePath = path.join(tempDir.path(), "lib", "atas.ex");
+			await Bun.write(sourcePath, 'defmodule Atas do\n  def version, do: "0.1.0"\nend\n');
+			const watchedFilesNotification = await server.waitFor(
+				message => message.method === "workspace/didChangeWatchedFiles",
+				2_000,
+			);
+			const watchedFilesParams = watchedFilesNotification.params as {
+				changes?: Array<{ uri?: string; type?: number }>;
+			};
+			expect(
+				watchedFilesParams.changes?.some(change => change.uri === fileToUri(sourcePath) && change.type !== 3),
+			).toBe(true);
+
+			server.send({
+				jsonrpc: "2.0",
+				id: "expert-unregister-1",
+				method: "client/unregisterCapability",
+				params: { unregisterations: [{ id: "-42", method: "workspace/didChangeWatchedFiles" }] },
+			});
+			const unregisterResponse = await server.waitFor(
+				message => message.id === "expert-unregister-1" && message.method === undefined,
+			);
+			expect(unregisterResponse.error).toBeUndefined();
+
+			server.send({
+				jsonrpc: "2.0",
+				id: "unsupported-register-1",
+				method: "client/registerCapability",
+				params: { registrations: [{ id: "unsupported", method: "workspace/executeCommand", registerOptions: {} }] },
+			});
+			const unsupportedRegisterResponse = await server.waitFor(
+				message => message.id === "unsupported-register-1" && message.method === undefined,
+			);
+			expect(unsupportedRegisterResponse.error?.code).toBe(-32602);
 		} finally {
 			await lspClient.shutdownAll();
 			tempDir.removeSync();
@@ -832,6 +858,7 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 1,
 				openFiles: new Map([[targetUri, { version: 1, languageId: "typescript" }]]),
 				pendingRequests: new Map(),
+				watchedFiles: new Map(),
 				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
@@ -1040,6 +1067,7 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
+				watchedFiles: new Map(),
 				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
@@ -1142,6 +1170,7 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
+				watchedFiles: new Map(),
 				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
@@ -1203,6 +1232,7 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
+				watchedFiles: new Map(),
 				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
@@ -1273,6 +1303,7 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
+				watchedFiles: new Map(),
 				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
@@ -1343,6 +1374,7 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
+				watchedFiles: new Map(),
 				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
@@ -1401,6 +1433,7 @@ describe("lsp regressions", () => {
 				diagnosticsVersion: 0,
 				openFiles: new Map(),
 				pendingRequests: new Map(),
+				watchedFiles: new Map(),
 				messageBuffer: new Uint8Array(),
 				isReading: false,
 				status: "ready",
@@ -1750,6 +1783,7 @@ describe("lsp regressions", () => {
 			diagnosticsVersion: 0,
 			openFiles: new Map(),
 			pendingRequests: new Map(),
+			watchedFiles: new Map(),
 			messageBuffer: new Uint8Array(),
 			isReading: false,
 			status: "ready",
@@ -1776,6 +1810,7 @@ describe("lsp regressions", () => {
 			diagnosticsVersion: 0,
 			openFiles: new Map(),
 			pendingRequests: new Map(),
+			watchedFiles: new Map(),
 			messageBuffer: new Uint8Array(),
 			isReading: false,
 			status: "ready",
