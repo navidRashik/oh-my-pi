@@ -419,6 +419,56 @@ describe("lsp regressions", () => {
 		}
 	});
 
+	it("notifies absolute-pattern watchers when files change", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-absolute-watcher-");
+		try {
+			const absolutePattern = `${tempDir.path().replaceAll("\\", "/")}/**/*.rb`;
+			const server = installFakeLsp((message, srv) => {
+				if (message.method === "initialize") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+				} else if (message.method === "initialized") {
+					srv.send({
+						jsonrpc: "2.0",
+						id: 9100,
+						method: "client/registerCapability",
+						params: {
+							registrations: [
+								{
+									id: "abs-watch",
+									method: "workspace/didChangeWatchedFiles",
+									registerOptions: { watchers: [{ globPattern: absolutePattern }] },
+								},
+							],
+						},
+					});
+				} else if (message.method === "shutdown") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					srv.exit(0);
+				}
+			});
+
+			const config: ServerConfig = { command: "fake-lsp", fileTypes: ["rb"], rootMarkers: [] };
+			fs.mkdirSync(path.join(tempDir.path(), "app"), { recursive: true });
+			await lspClient.getOrCreateClient(config, tempDir.path(), 1_000);
+			const registerResponse = await server.waitFor(message => message.id === 9100 && message.method === undefined);
+			expect(registerResponse.error).toBeUndefined();
+
+			const sourcePath = path.join(tempDir.path(), "app", "main.rb");
+			await Bun.write(sourcePath, "puts 'hi'\n");
+			const notification = await server.waitFor(message => {
+				if (message.method !== "workspace/didChangeWatchedFiles") return false;
+				const params = message.params as { changes?: Array<{ uri?: string }> };
+				return params.changes?.some(change => change.uri === fileToUri(sourcePath)) ?? false;
+			}, 2_000);
+			const params = notification.params as { changes?: Array<{ uri?: string }> };
+			expect(params.changes?.some(change => change.uri === fileToUri(sourcePath))).toBe(true);
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
 	it("opens rust-analyzer Cargo workspace files before polling workspace readiness", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rust-workspace-");
 		try {

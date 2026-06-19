@@ -430,6 +430,8 @@ export interface LspWatchedFileMatcher {
 	pattern: string;
 	glob: Bun.Glob;
 	kind: number;
+	/** True when `pattern` is an absolute path; match against the absolute event path instead of the cwd-relative one. */
+	absolute: boolean;
 }
 
 /** Accepted dynamic registration for `workspace/didChangeWatchedFiles`. */

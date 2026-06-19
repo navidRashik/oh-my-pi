@@ -507,10 +507,12 @@ function parseWatchedFilesRegistration(value: unknown): ParsedWatchedFilesRegist
 		if (!watcher || typeof watcher.globPattern !== "string") {
 			return "workspace/didChangeWatchedFiles watcher globPattern must be a string";
 		}
+		const isAbsolutePattern = /^([A-Za-z]:)?[\\/]/.test(watcher.globPattern);
 		watchers.push({
 			pattern: watcher.globPattern,
 			glob: new Bun.Glob(watcher.globPattern),
 			kind: typeof watcher.kind === "number" ? watcher.kind : WATCH_KIND_ALL,
+			absolute: isAbsolutePattern,
 		});
 	}
 
@@ -532,12 +534,18 @@ function normalizeWatchedPath(filePath: string): string {
 	return filePath.replaceAll("\\", "/");
 }
 
-function shouldNotifyWatchedFile(client: LspClient, relativePath: string, changeType: number): boolean {
+function shouldNotifyWatchedFile(
+	client: LspClient,
+	relativePath: string,
+	absolutePath: string,
+	changeType: number,
+): boolean {
+	const normalizedAbsolute = normalizeWatchedPath(absolutePath);
 	for (const registration of client.watchedFiles.values()) {
 		for (const watcher of registration.watchers) {
-			if ((watcher.kind & changeType) !== 0 && watcher.glob.match(relativePath)) {
-				return true;
-			}
+			if ((watcher.kind & changeType) === 0) continue;
+			const target = watcher.absolute ? normalizedAbsolute : relativePath;
+			if (watcher.glob.match(target)) return true;
 		}
 	}
 	return false;
@@ -566,7 +574,7 @@ async function handleWatchedFileEvent(
 	if (!relativePath || relativePath.startsWith("../") || relativePath === "..") return;
 
 	const changeType = await detectWatchedFileChangeType(absolutePath, eventType);
-	if (!shouldNotifyWatchedFile(client, relativePath, changeType)) return;
+	if (!shouldNotifyWatchedFile(client, relativePath, absolutePath, changeType)) return;
 
 	await sendNotification(client, DID_CHANGE_WATCHED_FILES, {
 		changes: [{ uri: fileToUri(absolutePath), type: fileChangeTypeForWatchKind(changeType) }],
