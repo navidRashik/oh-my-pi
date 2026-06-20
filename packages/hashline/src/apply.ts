@@ -625,14 +625,27 @@ function repairReplacementBoundaries(
 	edits: AppliedEdit[];
 	warnings: string[];
 } {
-	const out: AppliedEdit[] = [];
-	const warnings: string[] = [];
-	const patchDelta = computeEditBalanceDelta(edits, fileLines);
+	type RepairSlot =
+		| { kind: "edits"; edits: AppliedEdit[]; warning?: string }
+		| {
+				kind: "candidate";
+				group: ReplacementGroup;
+				inserts: AppliedEdit[];
+				deletes: AppliedEdit[];
+				delta: DelimiterBalance;
+		  };
+
+	// Pass 1: walk the edit stream once. Apply every repair whose correctness
+	// is local to its group (boundary echo, dup suffix/prefix, one-sided echo).
+	// Defer the dropped-closer repair: it must compare its group's imbalance
+	// against the whole patch's residual balance, which is only known once the
+	// local repairs above have settled.
+	const slots: RepairSlot[] = [];
 	let i = 0;
 	while (i < edits.length) {
 		const group = findReplacementGroup(edits, i);
 		if (!group) {
-			out.push(edits[i]);
+			slots.push({ kind: "edits", edits: [edits[i]] });
 			i++;
 			continue;
 		}
@@ -642,8 +655,11 @@ function repairReplacementBoundaries(
 
 		const boundaryEcho = findBoundaryEcho(group, fileLines);
 		if (boundaryEcho) {
-			warnings.push(describeBoundaryEchoRepair(group, boundaryEcho));
-			out.push(...inserts.slice(boundaryEcho.leading, inserts.length - boundaryEcho.trailing), ...deletes);
+			slots.push({
+				kind: "edits",
+				edits: [...inserts.slice(boundaryEcho.leading, inserts.length - boundaryEcho.trailing), ...deletes],
+				warning: describeBoundaryEchoRepair(group, boundaryEcho),
+			});
 			continue;
 		}
 
@@ -654,52 +670,83 @@ function repairReplacementBoundaries(
 		if (balanceIsZero(delta)) {
 			const oneSided = findOneSidedBoundaryEcho(group, fileLines);
 			if (oneSided) {
-				warnings.push(describeOneSidedEchoRepair(group, oneSided.side, oneSided.count));
 				const trimmed =
 					oneSided.side === "leading"
 						? inserts.slice(oneSided.count)
 						: inserts.slice(0, inserts.length - oneSided.count);
-				out.push(...trimmed, ...deletes);
+				slots.push({
+					kind: "edits",
+					edits: [...trimmed, ...deletes],
+					warning: describeOneSidedEchoRepair(group, oneSided.side, oneSided.count),
+				});
 				continue;
 			}
-			out.push(...inserts, ...deletes);
+			slots.push({ kind: "edits", edits: [...inserts, ...deletes] });
 			continue;
 		}
 
 		const dupSuffix = findDuplicateSuffix(group, fileLines, delta);
 		if (dupSuffix > 0) {
-			warnings.push(
-				describeBoundaryRepair(
+			slots.push({
+				kind: "edits",
+				edits: [...inserts.slice(0, inserts.length - dupSuffix), ...deletes],
+				warning: describeBoundaryRepair(
 					group,
 					`dropped ${dupSuffix} duplicated trailing payload line(s) already present below the range`,
 				),
-			);
-			out.push(...inserts.slice(0, inserts.length - dupSuffix), ...deletes);
+			});
 			continue;
 		}
 		const dupPrefix = findDuplicatePrefix(group, fileLines, delta);
 		if (dupPrefix > 0) {
-			warnings.push(
-				describeBoundaryRepair(
+			slots.push({
+				kind: "edits",
+				edits: [...inserts.slice(dupPrefix), ...deletes],
+				warning: describeBoundaryRepair(
 					group,
 					`dropped ${dupPrefix} duplicated leading payload line(s) already present above the range`,
 				),
-			);
-			out.push(...inserts.slice(dupPrefix), ...deletes);
+			});
 			continue;
 		}
-		const droppedClosers = balanceCovers(patchDelta, delta) ? findDroppedSuffixClosers(group, fileLines, delta) : 0;
+		slots.push({ kind: "candidate", group, inserts, deletes, delta });
+	}
+
+	// Pass 2: with local repairs already projected, compute the residual
+	// delimiter delta from the post-pass1 edit stream (candidate groups still
+	// in their raw form). A dropped-closer repair only fires when this
+	// patchDelta covers the candidate's delta in the same direction — sparing
+	// a closer in a patch already balanced by some other hunk (e.g. a DEL of
+	// the matching opener, #3142) would inject a stray closer.
+	const projected: AppliedEdit[] = [];
+	for (const slot of slots) {
+		if (slot.kind === "candidate") projected.push(...slot.inserts, ...slot.deletes);
+		else projected.push(...slot.edits);
+	}
+	const patchDelta = computeEditBalanceDelta(projected, fileLines);
+
+	const out: AppliedEdit[] = [];
+	const warnings: string[] = [];
+	for (const slot of slots) {
+		if (slot.kind !== "candidate") {
+			if (slot.warning !== undefined) warnings.push(slot.warning);
+			out.push(...slot.edits);
+			continue;
+		}
+		const droppedClosers = balanceCovers(patchDelta, slot.delta)
+			? findDroppedSuffixClosers(slot.group, fileLines, slot.delta)
+			: 0;
 		if (droppedClosers > 0) {
 			warnings.push(
 				describeBoundaryRepair(
-					group,
+					slot.group,
 					`kept ${droppedClosers} structural closing line(s) the range deleted without restating`,
 				),
 			);
-			out.push(...inserts, ...deletes.slice(0, deletes.length - droppedClosers));
+			out.push(...slot.inserts, ...slot.deletes.slice(0, slot.deletes.length - droppedClosers));
 			continue;
 		}
-		out.push(...inserts, ...deletes);
+		out.push(...slot.inserts, ...slot.deletes);
 	}
 	return { edits: out, warnings };
 }

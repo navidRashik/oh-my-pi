@@ -147,6 +147,45 @@ describe("boundary-balance repair", () => {
 		expect(warnings).toHaveLength(0);
 	});
 
+	// A separate hunk's dupSuffix repair leaves another hunk's missing-closer
+	// imbalance unmasked: pass 2 must recompute the patch delta from the
+	// post-pass1 edit stream so the genuine droppedClosers repair still fires.
+	it("still fires droppedClosers when another hunk's dupSuffix masks the raw patch delta", () => {
+		const file = [
+			'addEventListener("click", () => {', // 1
+			"\tfoo();", // 2
+			"\tbar();", // 3
+			"});", // 4
+			"", // 5
+			"const config = {", // 6
+			"\ta: 1,", // 7
+			"};", // 8
+		].join("\n");
+		// Hunk A duplicates the surviving `});` at line 4 (dupSuffix).
+		// Hunk B replaces `};` at line 8 without restating it (droppedClosers).
+		// Raw patch delta is `paren: -1, brace: 0` — opposite-direction parens
+		// hide hunk B's `brace: +1` until pass 1 cancels hunk A's contribution.
+		const diff = ["SWAP 2.=3:", "+\tsetup();", "+\tfoo();", "+\tbar();", "+});", "SWAP 8.=8:", "+\tb: 2,"].join("\n");
+		const { text, warnings } = apply(file, diff);
+
+		expect(text).toBe(
+			[
+				'addEventListener("click", () => {',
+				"\tsetup();",
+				"\tfoo();",
+				"\tbar();",
+				"});",
+				"",
+				"const config = {",
+				"\ta: 1,",
+				"\tb: 2,",
+				"};",
+			].join("\n"),
+		);
+		expect(warnings.some(w => /trailing payload line/.test(w))).toBe(true);
+		expect(warnings.some(w => /structural closing line/.test(w))).toBe(true);
+	});
+
 	// If the selected range is already imbalanced internally, a payload that
 	// restates the range's final closer must not trigger "missing closer" repair;
 	// keeping the deleted suffix would duplicate the closer outside the payload.
