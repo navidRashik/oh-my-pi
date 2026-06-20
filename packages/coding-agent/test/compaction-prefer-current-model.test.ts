@@ -97,4 +97,74 @@ describe("compaction prefers the current session model over modelRoles.default",
 		const [, firstCandidate] = compactSpy.mock.calls[0]!;
 		expect(`${firstCandidate.provider}/${firstCandidate.id}`).toBe(`${currentModel.provider}/${currentModel.id}`);
 	});
+
+	it("uses the configured compaction model without changing the active session model", async () => {
+		const modelsPath = path.join(tempDir.path(), "models.yml");
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					"custom-proxy": {
+						baseUrl: "https://proxy.example.com/v1",
+						apiKey: "CUSTOM_TOKEN",
+						api: "openai-responses",
+						compaction: { model: "compact-model" },
+						models: [{ id: "work-model" }, { id: "compact-model" }],
+					},
+				},
+			}),
+		);
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		modelRegistry = new ModelRegistry(authStorage, modelsPath);
+		const currentModel = modelRegistry.find("custom-proxy", "work-model");
+		const compactionModel = modelRegistry.find("custom-proxy", "compact-model");
+		if (!currentModel || !compactionModel) {
+			throw new Error("Expected custom compaction test models to exist");
+		}
+
+		const agent = new Agent({
+			initialState: {
+				model: currentModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.keepRecentTokens": 1 }),
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+
+		for (const [userText, assistantText] of [
+			["first question", "first answer"],
+			["second question", "second answer"],
+		] as const) {
+			const user = userMsg(userText);
+			const assistant = assistantMsg(assistantText);
+			session.agent.appendMessage(user);
+			session.sessionManager.appendMessage(user);
+			session.agent.appendMessage(assistant);
+			session.sessionManager.appendMessage(assistant);
+		}
+
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => ({
+			summary: "ok",
+			shortSummary: "ok short",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: 1,
+			details: { provider: model.provider },
+		}));
+
+		await session.compact();
+
+		expect(compactSpy).toHaveBeenCalled();
+		const [, firstCandidate] = compactSpy.mock.calls[0]!;
+		expect(`${firstCandidate.provider}/${firstCandidate.id}`).toBe(
+			`${compactionModel.provider}/${compactionModel.id}`,
+		);
+		expect(`${session.model?.provider}/${session.model?.id}`).toBe(`${currentModel.provider}/${currentModel.id}`);
+	});
 });

@@ -1,7 +1,15 @@
 import { execSync } from "node:child_process";
 import * as path from "node:path";
 import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import type { Api, Context, Model, ModelSpec, SimpleStreamOptions, ThinkingConfig } from "@oh-my-pi/pi-ai/types";
+import type {
+	Api,
+	Context,
+	Model,
+	ModelCompactionConfig,
+	ModelSpec,
+	SimpleStreamOptions,
+	ThinkingConfig,
+} from "@oh-my-pi/pi-ai/types";
 import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { isVertexExpressOpenAIUrl } from "@oh-my-pi/pi-catalog/hosts";
@@ -88,13 +96,14 @@ function isDiscoveryBearerApiKey(apiKey: string | undefined | null): apiKey is s
 	return isAuthenticated(apiKey) && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== DEFAULT_VLLM_LOCAL_TOKEN;
 }
 
-/** Provider override config (baseUrl, headers, apiKey, compat, transport) without custom models */
+/** Provider override config without custom models. */
 interface ProviderOverride {
 	baseUrl?: string;
 	headers?: Record<string, string>;
 	apiKey?: string;
 	authHeader?: boolean;
 	compat?: ModelSpec<Api>["compat"];
+	compaction?: ModelCompactionConfig;
 	transport?: Model<Api>["transport"];
 }
 
@@ -127,7 +136,7 @@ interface ProviderOverride {
 export function mergeDiscoveredModel<TApi extends Api>(
 	model: Model<TApi>,
 	existing: Model<Api> | undefined,
-	providerOverride?: Pick<ProviderOverride, "baseUrl" | "headers" | "transport">,
+	providerOverride?: Pick<ProviderOverride, "baseUrl" | "headers" | "transport" | "compaction">,
 ): Model<TApi> {
 	if (existing) {
 		const supportsTools = model.supportsTools ?? existing.supportsTools;
@@ -136,6 +145,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 			baseUrl: providerOverride?.baseUrl ?? model.baseUrl ?? existing.baseUrl,
 			headers: existing.headers ? { ...existing.headers, ...model.headers } : model.headers,
 			transport: providerOverride?.transport ?? existing.transport ?? model.transport,
+			compaction: mergeCompaction(existing.compaction, providerOverride?.compaction),
 			...(supportsTools !== undefined ? { supportsTools } : {}),
 			compat: model.compatConfig,
 		} as ModelSpec<TApi>);
@@ -146,6 +156,7 @@ export function mergeDiscoveredModel<TApi extends Api>(
 			baseUrl: providerOverride.baseUrl ?? model.baseUrl,
 			headers: providerOverride.headers ? { ...model.headers, ...providerOverride.headers } : model.headers,
 			...(providerOverride.transport !== undefined ? { transport: providerOverride.transport } : {}),
+			compaction: providerOverride.compaction,
 			compat: model.compatConfig,
 		} as ModelSpec<TApi>);
 	}
@@ -353,6 +364,15 @@ function mergeCompat<TBase extends object, TOverride extends object>(
 	return merged as TBase & TOverride;
 }
 
+function mergeCompaction(
+	baseCompaction: ModelCompactionConfig | undefined,
+	overrideCompaction: ModelCompactionConfig | undefined,
+): ModelCompactionConfig | undefined {
+	if (!baseCompaction) return overrideCompaction;
+	if (!overrideCompaction) return baseCompaction;
+	return { ...baseCompaction, ...overrideCompaction };
+}
+
 /**
  * Project a built model back to spec shape for the model-manager/cache
  * boundary: sparse compat comes from `compatConfig`, never from the resolved
@@ -379,6 +399,7 @@ interface ModelPatch {
 	omitMaxOutputTokens?: boolean;
 	headers?: Record<string, string>;
 	compat?: ModelSpec<Api>["compat"];
+	compaction?: ModelCompactionConfig;
 	contextPromotionTarget?: string;
 	premiumMultiplier?: number;
 }
@@ -403,6 +424,9 @@ function applyModelPatch(base: Model<Api>, patch: ModelPatch, transport: ModelTr
 	if (patch.maxTokens !== undefined) result.maxTokens = patch.maxTokens;
 	if (patch.omitMaxOutputTokens !== undefined) result.omitMaxOutputTokens = patch.omitMaxOutputTokens;
 	if (patch.contextPromotionTarget !== undefined) result.contextPromotionTarget = patch.contextPromotionTarget;
+	if (patch.compaction !== undefined) {
+		result.compaction = transport === "merge" ? mergeCompaction(base.compaction, patch.compaction) : patch.compaction;
+	}
 	if (patch.premiumMultiplier !== undefined) result.premiumMultiplier = patch.premiumMultiplier;
 	if (patch.cost) {
 		result.cost = {
@@ -496,6 +520,7 @@ function buildCustomModelOverlay(
 	providerApiKey: string | undefined,
 	authHeader: boolean | undefined,
 	providerCompat: ModelSpec<Api>["compat"] | undefined,
+	providerCompaction: ModelCompactionConfig | undefined,
 	providerAuth: ProviderAuthMode | undefined,
 	modelDef: CustomModelDefinitionLike,
 ): CustomModelOverlay | undefined {
@@ -517,6 +542,7 @@ function buildCustomModelOverlay(
 		omitMaxOutputTokens: modelDef.omitMaxOutputTokens,
 		headers: mergeCustomModelHeaders(providerHeaders, modelDef.headers, authHeader, providerApiKey),
 		compat: mergeCompat(providerCompat, modelDef.compat),
+		compaction: mergeCompaction(providerCompaction, modelDef.compaction),
 		contextPromotionTarget: modelDef.contextPromotionTarget,
 		premiumMultiplier: modelDef.premiumMultiplier,
 		isOAuth: resolveCustomModelIsOAuth(api, providerAuth),
@@ -558,6 +584,7 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 		omitMaxOutputTokens: resolvedModel.omitMaxOutputTokens ?? reference?.omitMaxOutputTokens,
 		compat: mergeCompat(reference?.compatConfig, resolvedModel.compat),
 		contextPromotionTarget: resolvedModel.contextPromotionTarget,
+		compaction: mergeCompaction(reference?.compaction, resolvedModel.compaction),
 		premiumMultiplier: resolvedModel.premiumMultiplier,
 		isOAuth: resolvedModel.isOAuth,
 	} as ModelSpec<Api>);
@@ -1033,12 +1060,22 @@ export class ModelRegistry {
 					)
 				: models;
 
+		const withProviderCompaction = providerConfig.compaction
+			? withDecoderMetadata.map(model =>
+					buildModel({
+						...model,
+						compaction: mergeCompaction(model.compaction, providerConfig.compaction),
+						compat: model.compatConfig,
+					} as ModelSpec<Api>),
+				)
+			: withDecoderMetadata;
+
 		if (providerConfig.provider !== "ollama" || providerConfig.api !== "openai-responses") {
-			return withDecoderMetadata;
+			return withProviderCompaction;
 		}
 
 		const contextLengthOverride = getOllamaContextLengthOverride();
-		return withDecoderMetadata.map(model => {
+		return withProviderCompaction.map(model => {
 			const normalized =
 				model.api === "openai-completions"
 					? buildModel({
@@ -1130,13 +1167,14 @@ export class ModelRegistry {
 
 		for (const [providerName, providerConfig] of providerEntries) {
 			const resolvedProviderHeaders = resolveConfigHeaders(providerConfig.headers);
-			// Always set overrides when baseUrl/headers/apiKey/authHeader/compat/disableStrictTools/transport are present
+			// Always set overrides when provider-level transport, compatibility, or compaction fields are present.
 			if (
 				providerConfig.baseUrl ||
 				resolvedProviderHeaders ||
 				providerConfig.apiKey ||
 				providerConfig.authHeader !== undefined ||
 				providerConfig.compat ||
+				providerConfig.compaction ||
 				providerConfig.disableStrictTools ||
 				providerConfig.transport
 			) {
@@ -1147,6 +1185,7 @@ export class ModelRegistry {
 					apiKey: providerConfig.apiKey,
 					authHeader: providerConfig.authHeader,
 					compat: mergeCompat(providerConfig.compat, disableStrictCompat),
+					compaction: providerConfig.compaction,
 					transport: providerConfig.transport,
 				});
 			}
@@ -1167,6 +1206,7 @@ export class ModelRegistry {
 					baseUrl: providerConfig.baseUrl,
 					headers: resolvedProviderHeaders,
 					compat: mergeCompat(providerConfig.compat, disableStrictCompat),
+					compaction: providerConfig.compaction,
 					discovery: providerConfig.discovery,
 					optional: false,
 				});
@@ -1538,12 +1578,17 @@ export class ModelRegistry {
 			authHeader: override.authHeader ?? baseOverride?.authHeader,
 			headers: override.headers ? { ...(baseOverride?.headers ?? {}), ...override.headers } : baseOverride?.headers,
 			compat: override.compat ? mergeCompat(baseOverride?.compat, override.compat) : baseOverride?.compat,
+			compaction: override.compaction
+				? mergeCompaction(baseOverride?.compaction, override.compaction)
+				: baseOverride?.compaction,
 			transport: override.transport ?? baseOverride?.transport,
 		};
 	}
-	#applyProviderTransportOverride<T extends { baseUrl?: string; headers?: Record<string, string> }>(
+	#applyProviderTransportOverride<
+		T extends { baseUrl?: string; headers?: Record<string, string>; compaction?: ModelCompactionConfig },
+	>(
 		entry: T,
-		override: Pick<ProviderOverride, "baseUrl" | "headers" | "authHeader" | "apiKey" | "transport">,
+		override: Pick<ProviderOverride, "baseUrl" | "headers" | "authHeader" | "apiKey" | "transport" | "compaction">,
 	): T {
 		const headers = mergeAuthHeader(
 			override.headers ? { ...entry.headers, ...override.headers } : entry.headers,
@@ -1554,6 +1599,7 @@ export class ModelRegistry {
 			...entry,
 			baseUrl: override.baseUrl ?? entry.baseUrl,
 			headers,
+			compaction: mergeCompaction(entry.compaction, override.compaction),
 			// Preserve the model's existing transport when the override omits one;
 			// providers without a `transport` field keep the default per-API dispatch.
 			...(override.transport !== undefined ? { transport: override.transport } : {}),
@@ -1661,6 +1707,7 @@ export class ModelRegistry {
 					providerConfig.apiKey,
 					providerConfig.authHeader,
 					providerCompat,
+					providerConfig.compaction,
 					(providerConfig.auth as ProviderAuthMode | undefined) ?? undefined,
 					modelDef as CustomModelDefinitionLike,
 				);
@@ -2007,6 +2054,7 @@ export class ModelRegistry {
 				apiKey: config.apiKey,
 				api: config.api,
 				oauthConfigured: Boolean(config.oauth),
+				compaction: config.compaction,
 				models: (config.models ?? []) as ProviderValidationModel[],
 			},
 			"runtime-register",
@@ -2068,6 +2116,7 @@ export class ModelRegistry {
 					config.apiKey,
 					config.authHeader,
 					config.compat,
+					config.compaction,
 					undefined,
 					modelDef as CustomModelDefinitionLike,
 				);
@@ -2115,6 +2164,7 @@ export class ModelRegistry {
 			const providerApiKey = config.apiKey;
 			const providerAuthHeader = config.authHeader;
 			const providerCompat = config.compat;
+			const providerCompaction = config.compaction;
 			const managerOptions: ModelManagerOptions<Api> = {
 				providerId: providerName as Parameters<typeof createModelManager>[0]["providerId"],
 				staticModels: [],
@@ -2135,6 +2185,7 @@ export class ModelRegistry {
 							providerApiKey,
 							providerAuthHeader,
 							providerCompat,
+							providerCompaction,
 							undefined,
 							modelDef as CustomModelDefinitionLike,
 						);
@@ -2153,6 +2204,7 @@ export class ModelRegistry {
 			config.headers ||
 			config.apiKey ||
 			config.authHeader !== undefined ||
+			config.compaction !== undefined ||
 			config.transport !== undefined
 		) {
 			const transportOverride = {
@@ -2160,6 +2212,7 @@ export class ModelRegistry {
 				headers: config.headers,
 				apiKey: config.apiKey,
 				authHeader: config.authHeader,
+				compaction: config.compaction,
 				transport: config.transport,
 			};
 			const nextRuntimeOverride = this.#mergeProviderOverride(
@@ -2221,6 +2274,7 @@ export interface ProviderConfigInput {
 	streamSimple?: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream;
 	headers?: Record<string, string>;
 	compat?: ModelSpec<Api>["compat"];
+	compaction?: ModelCompactionConfig;
 	authHeader?: boolean;
 	/** Streaming transport override — see {@link Model.transport}. */
 	transport?: Model<Api>["transport"];
@@ -2254,6 +2308,7 @@ export interface ProviderConfigInput {
 		maxTokens: number;
 		headers?: Record<string, string>;
 		compat?: ModelSpec<Api>["compat"];
+		compaction?: ModelCompactionConfig;
 		contextPromotionTarget?: string;
 		premiumMultiplier?: number;
 	}>;

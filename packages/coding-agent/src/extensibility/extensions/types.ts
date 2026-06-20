@@ -22,6 +22,7 @@ import type {
 	Context,
 	ImageContent,
 	Model,
+	ModelCompactionConfig,
 	ModelSpec,
 	ProviderResponseMetadata,
 	SimpleStreamOptions,
@@ -1195,6 +1196,8 @@ export interface ProviderConfig {
 	headers?: Record<string, string>;
 	/** If true, adds Authorization: Bearer header with the resolved API key. */
 	authHeader?: boolean;
+	/** Provider-level compaction endpoint/model used without changing the active session model. */
+	compaction?: ModelCompactionConfig;
 	/** Models to register. If provided, replaces all existing models for this provider. */
 	models?: ProviderModelConfig[];
 	/** OAuth provider for /login support. */
@@ -1245,6 +1248,8 @@ export interface ProviderModelConfig {
 	headers?: Record<string, string>;
 	/** OpenAI compatibility settings. */
 	compat?: ModelSpec<Api>["compat"];
+	/** Model-specific compaction endpoint/model override. */
+	compaction?: ModelCompactionConfig;
 }
 
 /** Extension factory function type. Supports both sync and async initialization. */

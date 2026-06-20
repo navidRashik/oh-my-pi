@@ -1095,6 +1095,47 @@ describe("ModelRegistry", () => {
 			expect(openaiGpt54Override.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
 		});
 
+		test("custom provider compaction config is inherited and model-overridable", () => {
+			const registry = readonlyRegistry({
+				providers: {
+					"custom-proxy": {
+						baseUrl: "https://proxy.example.com/v1",
+						apiKey: "TEST_KEY",
+						api: "openai-responses",
+						compaction: {
+							enabled: true,
+							endpoint: "https://proxy.example.com/v1/responses/compact",
+							model: "compact-model",
+							adapter: "openai-responses",
+						},
+						models: [
+							{ id: "work-model" },
+							{
+								id: "compact-model",
+								compaction: {
+									endpoint: "https://proxy.example.com/v1/custom-compact",
+									model: "tiny-compact-model",
+								},
+							},
+						],
+					},
+				},
+			});
+
+			expect(registry.find("custom-proxy", "work-model")?.compaction).toEqual({
+				enabled: true,
+				endpoint: "https://proxy.example.com/v1/responses/compact",
+				model: "compact-model",
+				adapter: "openai-responses",
+			});
+			expect(registry.find("custom-proxy", "compact-model")?.compaction).toEqual({
+				enabled: true,
+				endpoint: "https://proxy.example.com/v1/custom-compact",
+				model: "tiny-compact-model",
+				adapter: "openai-responses",
+			});
+		});
+
 		test("discoverable bundled replacement survives refresh", async () => {
 			writeModelsJson({
 				openai: providerConfig(

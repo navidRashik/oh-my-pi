@@ -560,6 +560,54 @@ describe("remote compaction setting", () => {
 		expect(fetchHandler.mock.calls[0]?.[0]).toBe("https://chatgpt.com/backend-api/codex/responses/compact");
 	});
 
+	it("uses configured OpenAI Responses compact endpoint for custom providers", async () => {
+		const baseModel = getBundledModel("openai", "gpt-5.1");
+		if (!baseModel) throw new Error("Expected openai/gpt-5.1 model to exist");
+
+		const model: Model = {
+			...baseModel,
+			api: "openai-responses",
+			provider: "custom-proxy",
+			baseUrl: "https://proxy.example.com/v1",
+			compaction: {
+				enabled: true,
+				endpoint: "https://proxy.example.com/v1/responses/compact",
+				adapter: "openai-responses",
+			},
+		};
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(createOpenAiAssistantMessage("Answer 1", model, createMockUsage(0, 100, 9000, 0))),
+		];
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1,
+			remoteEnabled: true,
+			remoteEndpoint: model.compaction?.endpoint,
+			remoteAdapter: "openai-responses",
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		const fetchHandler = vi.fn(
+			async (_input, _init) =>
+				new Response(JSON.stringify({ output: [{ type: "compaction", encrypted_content: "new_encrypted" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		const fetchSpy = mockFetch(fetchHandler);
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("Short summary"));
+
+		await compact(preparation, model, "test-api-key", undefined, undefined, { fetch: fetchSpy });
+
+		expect(fetchHandler).toHaveBeenCalledTimes(1);
+		expect(fetchHandler.mock.calls[0]?.[0]).toBe("https://proxy.example.com/v1/responses/compact");
+		const requestBody = JSON.parse(String(fetchHandler.mock.calls[0]?.[1]?.body)) as {
+			model: string;
+		};
+		expect(requestBody.model).toBe(model.id);
+	});
+
 	it("preserves codex assistant text signature metadata in remote compaction history", async () => {
 		const baseModel = getBundledModel("openai", "gpt-5.1");
 		if (!baseModel) throw new Error("Expected openai/gpt-5.1 model to exist");

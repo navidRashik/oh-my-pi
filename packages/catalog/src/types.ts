@@ -576,6 +576,21 @@ export type CompatOf<TApi extends Api> = TApi extends "openrouter"
 				? ResolvedAnthropicCompat
 				: undefined;
 
+/** Remote compaction protocol used for provider/model-specific context maintenance. */
+export type ModelCompactionAdapter = "generic" | "openai-responses";
+
+/** Provider/model compaction override carried by custom catalog entries. */
+export interface ModelCompactionConfig {
+	/** Whether this provider/model-specific compaction override participates in maintenance. */
+	enabled?: boolean;
+	/** Explicit compact endpoint; adapter decides the request/response shape. */
+	endpoint?: string;
+	/** Model selector used only for compaction calls; the active session model is preserved. */
+	model?: string;
+	/** Remote compaction protocol. Omitted endpoints default to provider-family inference. */
+	adapter?: ModelCompactionAdapter;
+}
+
 // Model interface for the unified model system
 export interface Model<TApi extends Api = Api> {
 	id: string;
@@ -648,6 +663,8 @@ export interface Model<TApi extends Api = Api> {
 	preferWebsockets?: boolean;
 	/** Preferred model to switch to when context promotion is triggered (model id or provider/id). */
 	contextPromotionTarget?: string;
+	/** Provider/model-specific compaction endpoint or one-shot model override. */
+	compaction?: ModelCompactionConfig;
 	/** Provider-assigned priority value (lower = higher priority). */
 	priority?: number;
 	/** Canonical thinking capability metadata for this model. */

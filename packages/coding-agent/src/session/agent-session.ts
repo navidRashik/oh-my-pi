@@ -44,6 +44,7 @@ import {
 	CompactionCancelledError,
 	type CompactionPreparation,
 	type CompactionResult,
+	type CompactionSettings,
 	calculateContextTokens,
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
@@ -79,6 +80,7 @@ import type {
 	Message,
 	MessageAttribution,
 	Model,
+	ModelCompactionAdapter,
 	ProviderResponseMetadata,
 	ProviderSessionState,
 	ResetCreditAccountStatus,
@@ -2000,11 +2002,11 @@ export class AgentSession {
 		const advisor = this.#advisorAgent;
 		if (!advisor) return false;
 
-		const compactionSettings = this.settings.getGroup("compaction");
+		const advisorModel = advisor.state.model;
+		const compactionSettings = this.#resolveCompactionSettings(advisorModel, this.settings.getGroup("compaction"));
 		if (compactionSettings.strategy === "off") return false;
 		if (!compactionSettings.enabled) return false;
 
-		const advisorModel = advisor.state.model;
 		const contextWindow = advisorModel.contextWindow ?? 0;
 		if (contextWindow <= 0) return false;
 
@@ -7602,7 +7604,7 @@ export class AgentSession {
 				throw new Error("No model selected");
 			}
 
-			const compactionSettings = this.settings.getGroup("compaction");
+			const compactionSettings = this.#resolveCompactionSettings(this.model, this.settings.getGroup("compaction"));
 			// The `/compact <mode>` override (resolved above) replaces the configured
 			// strategy/remote flags for this one invocation. Merged before
 			// prepareCompaction so the remote gating (preparation.settings.
@@ -7612,7 +7614,8 @@ export class AgentSession {
 				: compactionSettings;
 			if (compactMode?.requiresRemote) {
 				const remoteReady =
-					Boolean(effectiveSettings.remoteEndpoint) || shouldUseOpenAiRemoteCompaction(this.model);
+					Boolean(effectiveSettings.remoteEndpoint) ||
+					shouldUseOpenAiRemoteCompaction(this.model, effectiveSettings.remoteAdapter);
 				if (!remoteReady) {
 					this.emitNotice(
 						"warning",
@@ -9064,6 +9067,54 @@ export class AgentSession {
 		return availableModels.find(m => m.provider === currentModel.provider && m.id === configuredTarget);
 	}
 
+	#resolveConfiguredCompactionModel(
+		currentModel: Model | null | undefined,
+		availableModels: Model[],
+	): Model | undefined {
+		const configuredTarget =
+			currentModel?.compaction?.enabled === false ? undefined : currentModel?.compaction?.model?.trim();
+		if (!configuredTarget) return undefined;
+
+		const parsed = parseModelString(configuredTarget, {
+			allowMaxAlias: true,
+			isLiteralModelId: (provider, id) =>
+				availableModels.some(model => model.provider === provider && model.id === id),
+		});
+		if (parsed) {
+			const explicitModel = availableModels.find(m => m.provider === parsed.provider && m.id === parsed.id);
+			if (explicitModel) return explicitModel;
+		}
+
+		return currentModel
+			? availableModels.find(m => m.provider === currentModel.provider && m.id === configuredTarget)
+			: undefined;
+	}
+
+	#inferCompactionRemoteAdapter(model: Model, endpoint: string | undefined): ModelCompactionAdapter | undefined {
+		const configured = model.compaction?.adapter;
+		if (configured) return configured;
+		if (
+			model.api === "openai-responses" ||
+			model.api === "azure-openai-responses" ||
+			model.api === "openai-codex-responses"
+		) {
+			return endpoint || model.compaction?.enabled === true ? "openai-responses" : undefined;
+		}
+		if (!endpoint) return undefined;
+		return "generic";
+	}
+
+	#resolveCompactionSettings(model: Model, baseSettings: CompactionSettings): CompactionSettings {
+		const compaction = model.compaction;
+		if (!compaction || compaction.enabled === false) return baseSettings;
+		const endpoint = compaction.endpoint ?? baseSettings.remoteEndpoint;
+		return {
+			...baseSettings,
+			remoteEndpoint: endpoint,
+			remoteAdapter: this.#inferCompactionRemoteAdapter(model, endpoint) ?? baseSettings.remoteAdapter,
+		};
+	}
+
 	#resolveRoleModelFull(
 		role: string,
 		availableModels: Model[],
@@ -9102,6 +9153,7 @@ export class AgentSession {
 			candidates.push(model);
 		};
 
+		addCandidate(this.#resolveConfiguredCompactionModel(preferredModel, availableModels));
 		addCandidate(preferredModel ?? undefined);
 		for (const role of MODEL_ROLE_IDS) {
 			addCandidate(this.#resolveRoleModelFull(role, availableModels, preferredModel ?? undefined).model);
@@ -9429,7 +9481,8 @@ export class AgentSession {
 
 			const pathEntries = this.sessionManager.getBranch();
 
-			const preparation = prepareCompaction(pathEntries, compactionSettings);
+			const effectiveCompactionSettings = this.#resolveCompactionSettings(this.model, compactionSettings);
+			const preparation = prepareCompaction(pathEntries, effectiveCompactionSettings);
 			if (!preparation) {
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
@@ -9502,7 +9555,7 @@ export class AgentSession {
 				const ctxWindow = this.model?.contextWindow ?? 0;
 				const budget =
 					ctxWindow > 0
-						? ctxWindow - effectiveReserveTokens(ctxWindow, compactionSettings)
+						? ctxWindow - effectiveReserveTokens(ctxWindow, effectiveCompactionSettings)
 						: Number.POSITIVE_INFINITY;
 				const projected = this.#projectSnapcompactContextTokens(preparation, snapcompactResult);
 				if (projected > budget) {

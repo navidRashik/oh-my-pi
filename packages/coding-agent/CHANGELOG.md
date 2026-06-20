@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed custom provider compaction configuration so `models.yml` providers/models can route context maintenance through a configured compaction endpoint or compaction-only model while preserving the active session model. ([#3105](https://github.com/can1357/oh-my-pi/issues/3105))
+
 ## [16.1.7] - 2026-06-20
 
 ### Fixed

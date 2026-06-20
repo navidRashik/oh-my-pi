@@ -15,7 +15,7 @@
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/errors";
 import { parseTextSignature } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import type { AssistantMessage, FetchImpl, Message, Model } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, FetchImpl, Message, Model, ModelCompactionAdapter } from "@oh-my-pi/pi-ai/types";
 import {
 	getOpenAIResponsesHistoryItems,
 	getOpenAIResponsesHistoryPayload,
@@ -86,11 +86,21 @@ export interface RemoteCompactionResponse {
 // OpenAI provider gating + endpoint resolution
 // ============================================================================
 
-export function shouldUseOpenAiRemoteCompaction(model: Model): boolean {
+function isOpenAiResponsesCompactionApi(model: Model): boolean {
+	return (
+		model.api === "openai-responses" ||
+		model.api === "azure-openai-responses" ||
+		model.api === "openai-codex-responses"
+	);
+}
+
+export function shouldUseOpenAiRemoteCompaction(model: Model, adapter?: ModelCompactionAdapter): boolean {
+	if (adapter === "openai-responses") return isOpenAiResponsesCompactionApi(model);
 	return model.provider === "openai" || model.provider === "openai-codex";
 }
 
-function resolveOpenAiCompactEndpoint(model: Model): string {
+function resolveOpenAiCompactEndpoint(model: Model, endpoint?: string): string {
+	if (endpoint) return endpoint;
 	if (model.provider === "openai-codex") {
 		return resolveOpenAiCodexCompactEndpoint(model.baseUrl);
 	}
@@ -451,9 +461,9 @@ export async function requestOpenAiRemoteCompaction(
 	compactInput: Array<Record<string, unknown>>,
 	instructions: string,
 	signal?: AbortSignal,
-	opts?: { fetch?: FetchImpl; timeoutMs?: number },
+	opts?: { fetch?: FetchImpl; timeoutMs?: number; endpoint?: string },
 ): Promise<OpenAiRemoteCompactionResponse> {
-	const endpoint = resolveOpenAiCompactEndpoint(model);
+	const endpoint = resolveOpenAiCompactEndpoint(model, opts?.endpoint);
 	const request: OpenAiRemoteCompactionRequest = {
 		model: model.id,
 		input: trimOpenAiCompactInput(compactInput, model.contextWindow ?? Number.POSITIVE_INFINITY, instructions),

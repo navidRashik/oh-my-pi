@@ -2,7 +2,7 @@
  * models.json config file handle and provider configuration validation.
  */
 
-import type { Api, ModelSpec } from "@oh-my-pi/pi-ai/types";
+import type { Api, ModelCompactionConfig, ModelSpec } from "@oh-my-pi/pi-ai/types";
 import { ConfigFile } from "./config-file";
 import {
 	type ModelsConfig,
@@ -30,6 +30,7 @@ export interface ProviderValidationConfig {
 	oauthConfigured?: boolean;
 	discovery?: ProviderDiscovery;
 	compat?: ModelSpec<Api>["compat"];
+	compaction?: ModelCompactionConfig;
 	disableStrictTools?: boolean;
 	modelOverrides?: Record<string, unknown>;
 	models: ProviderValidationModel[];
@@ -53,11 +54,12 @@ export function validateProviderConfiguration(
 				!config.apiKey &&
 				config.auth !== "none" &&
 				!config.disableStrictTools &&
+				!config.compaction &&
 				!hasModelOverrides &&
 				!config.discovery
 			) {
 				throw new Error(
-					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "auth: none", "compat", "disableStrictTools", "modelOverrides", "discovery", or "models"`,
+					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "auth: none", "compat", "compaction", "disableStrictTools", "modelOverrides", "discovery", or "models"`,
 				);
 			}
 		}
@@ -120,6 +122,7 @@ export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsCon
 					auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
 					discovery: providerConfig.discovery as ProviderDiscovery | undefined,
 					compat: providerConfig.compat,
+					compaction: providerConfig.compaction,
 					disableStrictTools: providerConfig.disableStrictTools,
 					modelOverrides: providerConfig.modelOverrides,
 					models: (providerConfig.models ?? []) as ProviderValidationModel[],

@@ -6,7 +6,7 @@
  * discovery lives in pi-catalog's provider-models.
  */
 import { type ApiKey, type FetchImpl, withAuth } from "@oh-my-pi/pi-ai";
-import type { Api, Model } from "@oh-my-pi/pi-ai/types";
+import type { Api, Model, ModelCompactionConfig } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	getBundledModelReferenceIndex,
@@ -89,6 +89,7 @@ export interface DiscoveryProviderConfig {
 	baseUrl?: string;
 	headers?: Record<string, string>;
 	compat?: ModelSpec<Api>["compat"];
+	compaction?: ModelCompactionConfig;
 	discovery: ProviderDiscovery;
 	optional?: boolean;
 }

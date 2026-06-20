@@ -151,6 +151,7 @@ export interface CompactionSettings {
 	autoContinue?: boolean;
 	remoteEnabled?: boolean;
 	remoteEndpoint?: string;
+	remoteAdapter?: "generic" | "openai-responses";
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
@@ -1008,10 +1009,11 @@ export async function compact(
 		settings,
 	} = preparation;
 
+	const useOpenAiRemoteAdapter = settings.remoteAdapter === "openai-responses";
 	const summaryOptions: SummaryOptions = {
 		promptOverride: options?.promptOverride,
 		extraContext: options?.extraContext,
-		remoteEndpoint: settings.remoteEnabled === false ? undefined : settings.remoteEndpoint,
+		remoteEndpoint: settings.remoteEnabled === false || useOpenAiRemoteAdapter ? undefined : settings.remoteEndpoint,
 		remoteInstructions: options?.remoteInstructions,
 		initiatorOverride: options?.initiatorOverride,
 		metadata: options?.metadata,
@@ -1027,7 +1029,7 @@ export async function compact(
 	};
 
 	let preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, undefined);
-	if (settings.remoteEnabled !== false && shouldUseOpenAiRemoteCompaction(model)) {
+	if (settings.remoteEnabled !== false && shouldUseOpenAiRemoteCompaction(model, settings.remoteAdapter)) {
 		const previousRemoteCompaction = getPreservedOpenAiRemoteCompactionData(previousPreserveData);
 		const remoteMessages = [...messagesToSummarize, ...turnPrefixMessages, ...recentMessages];
 		const previousReplacementHistory =
@@ -1050,7 +1052,10 @@ export async function compact(
 							remoteHistory,
 							summaryOptions.remoteInstructions ?? SUMMARIZATION_SYSTEM_PROMPT,
 							signal,
-							{ fetch: summaryOptions.fetch },
+							{
+								fetch: summaryOptions.fetch,
+								endpoint: useOpenAiRemoteAdapter ? settings.remoteEndpoint : undefined,
+							},
 						),
 					{ signal },
 				);

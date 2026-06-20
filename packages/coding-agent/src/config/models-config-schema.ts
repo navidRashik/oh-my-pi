@@ -70,6 +70,21 @@ export const OpenAICompatSchema = type({
 	"whenThinking?": OpenAICompatFieldsSchema,
 });
 
+const CompactionConfigSchema = type({
+	"enabled?": "boolean",
+	"endpoint?": "string",
+	"model?": "string",
+	"adapter?": '"generic" | "openai-responses"',
+}).narrow((value, ctx) => {
+	if (value.endpoint !== undefined && typeof value.endpoint === "string" && value.endpoint.length === 0) {
+		return ctx.mustBe("endpoint a non-empty string");
+	}
+	if (value.model !== undefined && typeof value.model === "string" && value.model.length === 0) {
+		return ctx.mustBe("model a non-empty string");
+	}
+	return true;
+});
+
 const EffortSchema = type('"minimal" | "low" | "medium" | "high" | "xhigh"');
 
 const ThinkingControlModeSchema = type(
@@ -140,6 +155,7 @@ const ModelDefinitionSchema = type({
 	"omitMaxOutputTokens?": "boolean",
 	"headers?": { "[string]": "string" },
 	"compat?": OpenAICompatSchema,
+	"compaction?": CompactionConfigSchema,
 	"contextPromotionTarget?": "string",
 }).narrow((value, ctx) => {
 	// Enforce id non-empty
@@ -180,6 +196,7 @@ export const ModelOverrideSchema = type({
 	"omitMaxOutputTokens?": "boolean",
 	"headers?": { "[string]": "string" },
 	"compat?": OpenAICompatSchema,
+	"compaction?": CompactionConfigSchema,
 	"contextPromotionTarget?": "string",
 }).narrow((value, ctx) => {
 	if (value.name !== undefined && typeof value.name === "string" && value.name.length === 0) {
@@ -213,6 +230,7 @@ const ProviderConfigSchema = type({
 		'"openai-completions" | "openai-responses" | "openai-codex-responses" | "azure-openai-responses" | "anthropic-messages" | "google-generative-ai" | "google-gemini-cli" | "google-vertex"',
 	"headers?": { "[string]": "string" },
 	"compat?": OpenAICompatSchema,
+	"compaction?": CompactionConfigSchema,
 	"authHeader?": "boolean",
 	"auth?": ProviderAuthSchema,
 	"discovery?": ProviderDiscoverySchema,
