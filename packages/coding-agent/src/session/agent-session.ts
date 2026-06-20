@@ -1908,6 +1908,9 @@ export class AgentSession {
 			reset: () => {
 				advisorAgent.reset();
 				appendOnlyContext.log.clear();
+				// Forget the recent-advice ring so post-rewrite the advisor can re-state
+				// notes the primary no longer remembers (issue #3154).
+				adviseTool.reset();
 			},
 			state: advisorAgent.state,
 		};

@@ -139,6 +139,24 @@ export function deriveAdvisorTelemetry(
  */
 export const ADVISOR_READONLY_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "search", "find"]);
 
+/**
+ * How many previously delivered advice notes to remember for the duplicate
+ * filter. Sized to absorb the most common repeat patterns observed in the
+ * wild (issue #3154: an advisor model emitting the same `concern` every
+ * primary turn for a dozen turns) while still letting a long, distinct
+ * stream of advice through unimpeded.
+ */
+const ADVISE_DEDUP_WINDOW = 5;
+
+/**
+ * Collapse cosmetic whitespace and case so an advisor that retypes the same
+ * advice with trivial variation ("Run tests." vs "  Run tests.\n") is still
+ * detected as a repeat.
+ */
+function normalizeAdviceKey(note: string): string {
+	return note.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
 export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails> {
 	readonly name = "advise";
 	readonly label = "Advise";
@@ -146,7 +164,29 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	readonly parameters = adviseSchema;
 	readonly intent = "omit" as const;
 
+	/**
+	 * Sliding window of the last {@link ADVISE_DEDUP_WINDOW} normalized notes the
+	 * advisor delivered. The advisor system prompt forbids repeated advice
+	 * ("NEVER repeat advice you already gave"), but a misbehaving model can
+	 * still loop indefinitely with identical `concern`/`blocker` text — every
+	 * primary turn the advisor sees the new transcript delta, generates the
+	 * same advice, fires another interrupt, and the cycle repeats (issue #3154).
+	 * Cleared by {@link reset} when the advisor itself is re-primed.
+	 */
+	#recent: string[] = [];
+
 	constructor(private readonly onAdvice: (note: string, severity?: AdviseDetails["severity"]) => void) {}
+
+	/**
+	 * Forget the recently delivered advice. Called from the advisor agent facade
+	 * when {@link AdvisorRuntime.reset} re-primes the advisor — after a
+	 * conversation rewrite (compaction, `/new`, `/branch`, session switch) the
+	 * primary has lost the prior context, so the advisor is allowed to re-state
+	 * advice it had already given.
+	 */
+	reset(): void {
+		this.#recent.length = 0;
+	}
 
 	async execute(
 		_toolCallId: string,
@@ -155,6 +195,25 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 		_onUpdate?: AgentToolUpdateCallback<AdviseDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<AdviseDetails>> {
+		const key = normalizeAdviceKey(args.note);
+		if (key.length > 0 && this.#recent.includes(key)) {
+			// Tell the advisor model the note was a duplicate — silently dropping
+			// it would let a stuck advisor keep burning tokens with the same loop.
+			return {
+				content: [
+					{
+						type: "text",
+						text: "Duplicate of recent advice; not delivered. The agent already has this note — stay silent or offer a distinct angle.",
+					},
+				],
+				details: { note: args.note, severity: args.severity },
+				useless: true,
+			};
+		}
+		if (key.length > 0) {
+			this.#recent.push(key);
+			if (this.#recent.length > ADVISE_DEDUP_WINDOW) this.#recent.shift();
+		}
 		this.onAdvice(args.note, args.severity);
 		return {
 			content: [{ type: "text", text: "Recorded." }],

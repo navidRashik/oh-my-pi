@@ -198,6 +198,42 @@ describe("advisor", () => {
 			expect(result.useless).toBe(true);
 		});
 
+		it("drops repeated identical advice and surfaces the duplicate-ness to the advisor (issue #3154)", async () => {
+			const onAdvice = vi.fn();
+			const tool = new AdviseTool(onAdvice);
+			const first = await tool.execute("tc-1", { note: "Run the verification commands now.", severity: "concern" });
+			const second = await tool.execute("tc-2", { note: "Run the verification commands now.", severity: "concern" });
+			const thirdDifferentWhitespace = await tool.execute("tc-3", {
+				note: "  Run the verification commands now.\n",
+				severity: "concern",
+			});
+			expect(onAdvice).toHaveBeenCalledTimes(1);
+			expect(onAdvice).toHaveBeenCalledWith("Run the verification commands now.", "concern");
+			// First call delivers; subsequent identical (or whitespace-equivalent) calls do not.
+			expect((first.content[0] as { text: string }).text).toBe("Recorded.");
+			expect((second.content[0] as { text: string }).text).toMatch(/duplicate/i);
+			expect((thirdDifferentWhitespace.content[0] as { text: string }).text).toMatch(/duplicate/i);
+		});
+
+		it("does not dedup advice with a distinct body even at the same severity", async () => {
+			const onAdvice = vi.fn();
+			const tool = new AdviseTool(onAdvice);
+			await tool.execute("tc-1", { note: "Check the null branch.", severity: "concern" });
+			await tool.execute("tc-2", { note: "Verify the retry budget.", severity: "concern" });
+			expect(onAdvice).toHaveBeenCalledTimes(2);
+		});
+
+		it("re-allows previously delivered advice after reset()", async () => {
+			const onAdvice = vi.fn();
+			const tool = new AdviseTool(onAdvice);
+			await tool.execute("tc-1", { note: "Run tests.", severity: "concern" });
+			await tool.execute("tc-2", { note: "Run tests.", severity: "concern" });
+			expect(onAdvice).toHaveBeenCalledTimes(1);
+			tool.reset();
+			await tool.execute("tc-3", { note: "Run tests.", severity: "concern" });
+			expect(onAdvice).toHaveBeenCalledTimes(2);
+		});
+
 		it("validates parameters using ArkType", () => {
 			const onAdvice = vi.fn();
 			const tool = new AdviseTool(onAdvice);

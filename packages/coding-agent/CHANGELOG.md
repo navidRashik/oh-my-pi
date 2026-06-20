@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- Fixed an advisor loop where a misbehaving advisor model emitted the same `concern`/`blocker` note every primary turn, flooding the transcript even after the user interrupted (the advisor's pending batches kept draining identical advice). `AdviseTool` now drops a note whose normalized text matches one of the last five delivered notes and tells the advisor it was a duplicate so it can stop repeating itself. The ring resets on `AdvisorRuntime.reset()` (compaction, `/new`, `/branch`, session switch) so re-stating advice after a conversation rewrite still goes through. ([#3154](https://github.com/can1357/oh-my-pi/issues/3154))
 - Fixed side-channel turns failing to correctly obfuscate secrets and tools when inheriting prompt cache layout
 - Fixed MCP startup status to live-update from "Connecting…" to connected, still-connecting, or failed server states so completed connections do not leave a stale banner. ([#3150](https://github.com/can1357/oh-my-pi/issues/3150))
 - Fixed session history becoming desynchronized when using the `rewind` tool
