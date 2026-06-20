@@ -489,6 +489,8 @@ export class ModelSelectorComponent extends Container {
 			candidates,
 		});
 		const canonicalModels = canonicalSelections.map(({ record, model: selectedModel }): CanonicalModelItem => {
+			const selectedVariant = record.variants.find(variant => modelsAreEqual(variant.model, selectedModel));
+			const selectionSelector = selectedVariant?.selector ?? `${selectedModel.provider}/${selectedModel.id}`;
 			const searchText = [
 				record.id,
 				record.name,
@@ -501,7 +503,7 @@ export class ModelSelectorComponent extends Container {
 				kind: "canonical",
 				id: record.id,
 				model: selectedModel,
-				selector: record.id,
+				selector: selectionSelector,
 				variantCount: record.variants.length,
 				searchText,
 				normalizedSearchText: normalizeSearchText(searchText),

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed canonical model selection persisting bare custom model ids instead of concrete `provider/id` selectors, so custom `models.yml` models remain resolvable from settings. ([#3112](https://github.com/can1357/oh-my-pi/issues/3112))
+
 ## [16.1.7] - 2026-06-20
 
 ### Fixed

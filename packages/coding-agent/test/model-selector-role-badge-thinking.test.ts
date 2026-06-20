@@ -232,6 +232,68 @@ describe("ModelSelector role badge thinking display", () => {
 		refreshGate.resolve();
 	});
 
+	test("passes concrete selector when selecting a canonical custom model", () => {
+		installTestTheme();
+		const settings = Settings.isolated({});
+		const customModel = buildModel({
+			id: "mimo-v2.5-pro",
+			name: "MiMo-V2.5-Pro",
+			api: "openai-completions",
+			provider: "xiaomi-token-plan-cn",
+			baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8192,
+		});
+		const modelRegistry = {
+			getAll: () => [customModel],
+			refresh: vi.fn(async () => {}),
+			refreshProvider: vi.fn(async () => {}),
+			getError: () => undefined,
+			getAvailable: () => [customModel],
+			getDiscoverableProviders: () => [],
+			getCanonicalModelSelections: () => [
+				{
+					record: {
+						id: "mimo-v2.5-pro",
+						name: "MiMo-V2.5-Pro",
+						variants: [
+							{
+								canonicalId: "mimo-v2.5-pro",
+								selector: "xiaomi-token-plan-cn/mimo-v2.5-pro",
+								model: customModel,
+								source: "heuristic",
+							},
+						],
+					},
+					model: customModel,
+				},
+			],
+		} as unknown as ModelRegistry;
+		const selected: Array<string | undefined> = [];
+		const ui = {
+			requestRender: vi.fn(),
+		} as unknown as TUI;
+
+		const selector = new ModelSelectorComponent(
+			ui,
+			undefined,
+			settings,
+			modelRegistry,
+			[],
+			(_model, _role, _thinkingLevel, modelSelector) => selected.push(modelSelector),
+			() => {},
+			{ temporaryOnly: true, initialSearchInput: "mimo-v2.5-pro" },
+		);
+
+		selector.handleInput("\t");
+		selector.handleInput("\n");
+
+		expect(selected).toEqual(["xiaomi-token-plan-cn/mimo-v2.5-pro"]);
+	});
+
 	test("keeps the highlighted model when a background refresh reorders the list", async () => {
 		installTestTheme();
 		const settings = Settings.isolated({});
