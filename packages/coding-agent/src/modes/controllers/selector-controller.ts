@@ -17,7 +17,6 @@ import {
 	getPluginsCacheDir,
 	MarketplaceManager,
 } from "../../extensibility/plugins/marketplace";
-import { getEditorSurfaceFocusTarget } from "./editor-surface-focus";
 import {
 	getAvailableThemes,
 	getSymbolTheme,
@@ -69,6 +68,7 @@ import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
 import type { SessionObserverRegistry } from "../session-observer-registry";
 import { buildCopyTargets } from "../utils/copy-targets";
+import { getEditorSurfaceFocusTarget } from "./editor-surface-focus";
 
 const MANUAL_LOGIN_TIP = "Tip: You can complete pairing with /login <redirect URL>.";
 

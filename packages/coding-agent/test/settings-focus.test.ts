@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { Text, TUI, type Terminal, type TerminalAppearance } from "@oh-my-pi/pi-tui";
 import { getEditorSurfaceFocusTarget } from "@oh-my-pi/pi-coding-agent/modes/controllers/editor-surface-focus";
+import { type Terminal, type TerminalAppearance, Text, TUI } from "@oh-my-pi/pi-tui";
 
 class MemoryTerminal implements Terminal {
 	readonly columns = 80;
