@@ -567,8 +567,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.pr": "\uea64",
 	// pick:  | alt: ⊛ ◍ 
 	"icon.tokens": "\ue26b",
-	// pick:  | alt: ◫ ▦
-	"icon.context": "\ue70f",
+	// pick:  (nf-cod-window) | alt:  (nf-md-gauge)  (nf-md-memory) ◫ ▦
+	"icon.context": "\ueb7f",
 	// pick:  | alt: $ ¢
 	"icon.cost": "\uf155",
 	// pick:  | alt: ◷ ◴
@@ -599,8 +599,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.warning": "\uf071",
 	// pick:  | alt:  ↺
 	"icon.rewind": "\uf0e2",
-	// pick: 󰁨 | alt:   
-	"icon.auto": "\u{f0068}",
+	// pick: 󰁪 (nf-md-autorenew) | alt: 󰁨 (nf-md-auto_fix)  
+	"icon.auto": "\u{f006a}",
 	"icon.fast": "\uf0e7",
 	"icon.extensionSkill": "\uf0eb",
 	// pick:  | alt:  

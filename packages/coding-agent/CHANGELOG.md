@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the `nerd` symbol preset rendering the Microsoft Windows brand logo for `icon.context` and a magic wand for `icon.auto` on the status line's `context_pct` segment. `NERD_SYMBOLS` in `packages/coding-agent/src/modes/theme/theme.ts` mapped `icon.context` to `U+E70F` (`nf-dev-windows`) instead of a generic context window, and `icon.auto` to `U+F0068` (`nf-md-auto_fix`) — off-by-two from `U+F006A` (`nf-md-autorenew`), the refresh-loop glyph that matches the `unicode` preset's `⟲` for the same icon. The preset now uses `nf-cod-window` (`U+EB7F`) and `nf-md-autorenew` (`U+F006A`). ([#3481](https://github.com/can1357/oh-my-pi/issues/3481))
+
 ## [16.1.19] - 2026-06-25
 
 ### Fixed
