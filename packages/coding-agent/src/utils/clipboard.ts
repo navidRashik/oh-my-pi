@@ -88,10 +88,11 @@ const POWERSHELL_TIMEOUT_MS = 8000;
  * Read an image through the Windows host's PowerShell.
  *
  * Native Windows uses this as a fallback when arboard reports no image or
- * cannot access the clipboard. WSLg exposes a Wayland socket but no native
- * clipboard image transport, so arboard returns `ContentNotAvailable` there;
- * PowerShell, reached via WSL interop, can read the Windows clipboard directly
- * and round-trip the bitmap as PNG.
+ * cannot convert screenshot-tool bitmaps such as `BI_BITFIELDS` CF_DIB
+ * payloads. WSLg exposes a Wayland socket but no native clipboard image
+ * transport, so arboard returns `ContentNotAvailable` there; PowerShell,
+ * reached via WSL interop, can read the Windows clipboard directly and
+ * round-trip the bitmap as PNG.
  *
  * Returns null when no image is on the clipboard, the host PowerShell is
  * missing, or the bridge times out.
