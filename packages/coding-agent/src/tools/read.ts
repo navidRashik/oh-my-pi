@@ -2092,7 +2092,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					skills: this.session.skills,
 				});
 				if (localFile) {
-					return this.execute(_toolCallId, { path: `${localFile.path}:${internalTarget.sel}` }, signal, _onUpdate, _toolContext);
+					return this.execute(
+						_toolCallId,
+						{ path: `${localFile.path}:${internalTarget.sel}` },
+						signal,
+						_onUpdate,
+						_toolContext,
+					);
 				}
 			}
 			return this.#handleInternalUrl(internalTarget.path, parsed, signal);
