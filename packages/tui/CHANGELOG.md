@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `truncateToWidth` crashing when plugins pass legacy string ellipsis arguments such as `"..."` or `"…"`; the wrapper now maps them before calling the native enum API ([#3492](https://github.com/can1357/oh-my-pi/issues/3492)).
+
 ## [16.1.19] - 2026-06-25
 
 ### Fixed
