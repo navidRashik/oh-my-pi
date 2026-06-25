@@ -393,6 +393,7 @@ export class InputController {
 		this.ctx.editor.onPasteImage = () => this.handleImagePaste();
 		this.ctx.editor.onPasteImagePath = path => this.handleImagePathPaste(path);
 		this.ctx.editor.onPasteFilePath = path => this.handleFilePathPaste(path);
+		this.ctx.editor.shouldInterceptPathPaste = () => this.ctx.settings.get("paste.autoAttachFilePaths");
 		this.ctx.editor.setActionKeys(
 			"app.clipboard.pasteTextRaw",
 			this.ctx.keybindings.getKeys("app.clipboard.pasteTextRaw"),
@@ -1262,6 +1263,12 @@ export class InputController {
 	}
 
 	async handleFilePathPaste(filePath: string): Promise<void> {
+		if (!this.ctx.settings.get("paste.autoAttachFilePaths")) {
+			this.ctx.editor.pasteText(filePath);
+			this.ctx.ui.requestRender();
+			return;
+		}
+
 		try {
 			const resolvedPath = resolvePastedFilePath(filePath, this.ctx.sessionManager.getCwd());
 			const stat = await Bun.file(resolvedPath).stat();
@@ -1293,6 +1300,12 @@ export class InputController {
 	}
 
 	async handleImagePathPaste(path: string): Promise<void> {
+		if (!this.ctx.settings.get("paste.autoAttachFilePaths")) {
+			this.ctx.editor.pasteText(path);
+			this.ctx.ui.requestRender();
+			return;
+		}
+
 		try {
 			const image = await loadImageInput({
 				path,

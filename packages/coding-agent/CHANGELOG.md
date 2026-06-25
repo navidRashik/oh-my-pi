@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed `skill://` tool resolution losing loaded session skills when a tool runs outside the session-initialization module state. Internal URL resolution now prefers the caller's `session.skills` snapshot before falling back to the process-global skill list, so `read skill://<name>` works across tool execution boundaries. ([#3436](https://github.com/can1357/oh-my-pi/issues/3436))
+- Fixed bracketed pasted file paths always being auto-attached; they now stay as source paths by default, with `paste.autoAttachFilePaths` restoring image attachment and non-image `local://attachment-*` copies for users who want them. The gate lives in `CustomEditor.shouldInterceptPathPaste` so pastes fall through to the editor's normal text handling — original separators and shell escaping (e.g. `src/a.ts src/b.ts`, `/tmp/my\ file.txt`) are preserved instead of being replayed as normalized single tokens. ([#3452](https://github.com/can1357/oh-my-pi/issues/3452))
 
 ## [16.1.18] - 2026-06-25
 

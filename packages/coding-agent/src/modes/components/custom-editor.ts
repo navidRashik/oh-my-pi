@@ -320,6 +320,15 @@ export class CustomEditor extends Editor {
 	onPasteImagePath?: (path: string) => void | Promise<void>;
 	/** Called when a bracketed paste contains one or more non-image file paths. */
 	onPasteFilePath?: (path: string) => void | Promise<void>;
+	/**
+	 * Gate for the bracketed pasted-path interception above. Returning `false`
+	 * skips path parsing entirely and lets the raw paste flow through to the
+	 * editor's normal text-paste handling — original separators and shell
+	 * escaping are preserved, and `onPasteImagePath`/`onPasteFilePath` are not
+	 * invoked. Left undefined = intercept whenever a hook is set (the
+	 * historical default that #3384 introduced).
+	 */
+	shouldInterceptPathPaste?: () => boolean;
 	/** Called when the configured raw text-paste shortcut is pressed. */
 	onPasteTextRaw?: () => void;
 	/** Called when the configured dequeue shortcut is pressed. */
@@ -505,19 +514,21 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
-		const pastedPaths = extractBracketedPastePaths(data);
-		if (pastedPaths) {
-			const canHandlePaths = pastedPaths.every(path =>
-				isImagePath(path) ? this.onPasteImagePath !== undefined : this.onPasteFilePath !== undefined,
-			);
-			if (canHandlePaths) {
-				void (async () => {
-					for (const path of pastedPaths) {
-						if (isImagePath(path)) await this.onPasteImagePath?.(path);
-						else await this.onPasteFilePath?.(path);
-					}
-				})();
-				return;
+		if (this.shouldInterceptPathPaste?.() !== false) {
+			const pastedPaths = extractBracketedPastePaths(data);
+			if (pastedPaths) {
+				const canHandlePaths = pastedPaths.every(path =>
+					isImagePath(path) ? this.onPasteImagePath !== undefined : this.onPasteFilePath !== undefined,
+				);
+				if (canHandlePaths) {
+					void (async () => {
+						for (const path of pastedPaths) {
+							if (isImagePath(path)) await this.onPasteImagePath?.(path);
+							else await this.onPasteFilePath?.(path);
+						}
+					})();
+					return;
+				}
 			}
 		}
 

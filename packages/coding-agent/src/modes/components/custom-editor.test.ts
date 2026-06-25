@@ -103,6 +103,26 @@ describe("CustomEditor bracketed path paste", () => {
 		expect(await pasted.promise).toBe("/tmp/report.csv");
 		expect(editor.getText()).toBe("");
 	});
+
+	it("skips path hooks and preserves raw paste bytes when interception is disabled", () => {
+		const { editor } = makeEditor();
+		const fileHook = vi.fn();
+		const imageHook = vi.fn();
+		editor.onPasteFilePath = fileHook;
+		editor.onPasteImagePath = imageHook;
+		editor.shouldInterceptPathPaste = () => false;
+
+		// Multi-path + shell-escaped-space payloads that the parser would otherwise
+		// normalize into segments — the regressions Codex flagged in #3453.
+		editor.handleInput(bracketedPaste("src/a.ts src/b.ts"));
+		editor.handleInput(bracketedPaste("/tmp/my\\ file.txt"));
+
+		expect(fileHook).not.toHaveBeenCalled();
+		expect(imageHook).not.toHaveBeenCalled();
+		const text = editor.getText();
+		expect(text).toContain("src/a.ts src/b.ts");
+		expect(text).toContain("/tmp/my\\ file.txt");
+	});
 });
 
 describe("CustomEditor space-hold push-to-talk", () => {
