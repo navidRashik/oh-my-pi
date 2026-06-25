@@ -194,4 +194,74 @@ describe("LocalProtocolHandler", () => {
 			).rejects.toThrow("Local file not found: local://PLAN.md");
 		});
 	});
+
+	it("returns a notice instead of decoding a binary local file (issue #3449)", async () => {
+		await withTempDir(async tempDir => {
+			const artifactsDir = path.join(tempDir, "artifacts");
+			const localFile = path.join(artifactsDir, "local", "attachment-1.mp4");
+			await fs.mkdir(path.dirname(localFile), { recursive: true });
+			// 1 MiB of structured non-text bytes (NUL in the head triggers the sniff).
+			const buf = Buffer.alloc(1024 * 1024);
+			for (let i = 0; i < buf.length; i += 4) {
+				buf[i] = 0xff;
+				buf[i + 1] = 0xfe;
+				buf[i + 2] = 0x00;
+				buf[i + 3] = i & 0xff;
+			}
+			await Bun.write(localFile, buf);
+
+			LocalProtocolHandler.setOverride({
+				getArtifactsDir: () => artifactsDir,
+				getSessionId: () => "session-binary",
+			});
+			const router = InternalUrlRouter.instance();
+			const resource = await router.resolve("local://attachment-1.mp4");
+
+			// Notice replaces the file content; size matches the notice, not the
+			// 1 MiB source — proves the binary was never decoded into mojibake.
+			expect(resource.content).toContain("Cannot read binary local:// file");
+			expect(resource.content).toContain("local://attachment-1.mp4");
+			expect(resource.content).toContain("NUL bytes");
+			expect(resource.size).toBe(Buffer.byteLength(resource.content, "utf-8"));
+			expect(resource.size).toBeLessThan(1024);
+			// `sourcePath` stays populated so find/search/path-utils still resolve.
+			expect(resource.sourcePath).toBe(await fs.realpath(localFile));
+			expect(resource.contentType).toBe("text/plain");
+		});
+	});
+
+	it("returns a notice instead of materializing an oversized text local file (issue #3449)", async () => {
+		await withTempDir(async tempDir => {
+			const artifactsDir = path.join(tempDir, "artifacts");
+			const localFile = path.join(artifactsDir, "local", "huge.log");
+			await fs.mkdir(path.dirname(localFile), { recursive: true });
+			// 11 MiB of plain ASCII — passes the binary sniff but trips the size cap.
+			const chunk = "a".repeat(1024);
+			const handle = await fs.open(localFile, "w");
+			try {
+				const lineBytes = Buffer.from(`${chunk}\n`, "utf-8");
+				for (let i = 0; i < 11 * 1024; i++) {
+					await handle.write(lineBytes);
+				}
+			} finally {
+				await handle.close();
+			}
+
+			LocalProtocolHandler.setOverride({
+				getArtifactsDir: () => artifactsDir,
+				getSessionId: () => "session-large",
+			});
+			const router = InternalUrlRouter.instance();
+			const resource = await router.resolve("local://huge.log");
+
+			expect(resource.content).toContain("Cannot inline local:// file");
+			expect(resource.content).toContain("local://huge.log");
+			expect(resource.content).toContain("exceeds");
+			expect(resource.content).toContain("inline limit");
+			// Notice mentions a range-selector workaround so the agent knows what to try next.
+			expect(resource.content).toMatch(/local:\/\/huge\.log:1-200/);
+			expect(resource.size).toBeLessThan(1024);
+			expect(resource.sourcePath).toBe(await fs.realpath(localFile));
+		});
+	});
 });

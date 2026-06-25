@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed `local://` reads decoding binary attachments (videos, archives, images) via `Bun.file().text()`, causing OMP to hang and grow memory by 100+ MiB per read. `LocalProtocolHandler.resolve` now sniffs the first 8 KiB for NUL bytes and rejects binary content with a clear notice, and caps inline text resources at 10 MiB so a single oversized log can't allocate the whole file twice. `sourcePath` stays populated so callers like `find`, `search`, and bash `local://` expansion keep working. ([#3449](https://github.com/can1357/oh-my-pi/issues/3449))
 - Fixed `skill://` tool resolution losing loaded session skills when a tool runs outside the session-initialization module state. Internal URL resolution now prefers the caller's `session.skills` snapshot before falling back to the process-global skill list, so `read skill://<name>` works across tool execution boundaries. ([#3436](https://github.com/can1357/oh-my-pi/issues/3436))
 
 ## [16.1.18] - 2026-06-25

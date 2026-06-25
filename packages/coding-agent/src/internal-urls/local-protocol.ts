@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isEnoent } from "@oh-my-pi/pi-utils";
+import { formatBytes, isEnoent } from "@oh-my-pi/pi-utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { buildDirectoryResource } from "./filesystem-resource";
 import { parseInternalUrl } from "./parse";
@@ -27,6 +27,24 @@ function toLocalValidationError(error: unknown): Error {
 	const message = error instanceof Error ? error.message : String(error);
 	return new Error(message.replace("skill://", "local://"));
 }
+
+/**
+ * Inline cap for `local://` text reads. `LocalProtocolHandler.resolve` returns
+ * a single in-memory string, so a 100 MB attachment would allocate 100+ MB
+ * (more for non-ASCII bytes, which UTF-8-re-encode as the 3-byte U+FFFD
+ * replacement). 10 MiB comfortably covers planning artifacts, subagent
+ * handoffs, and large generated text while keeping accidental video/archive
+ * reads from sliding the box into paging — see issue #3449.
+ */
+const LOCAL_MAX_TEXT_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Window inspected for NUL bytes before decoding. 8 KiB catches every
+ * mainstream binary container (mp4/mkv/zip/exe/png/...) and UTF-16 text
+ * (which has NULs in the ASCII range). Mirrors the same NUL sniff the plain
+ * file path applies after streaming.
+ */
+const LOCAL_BINARY_SNIFF_BYTES = 8 * 1024;
 const WINDOWS_LOCAL_ROOT_MAX_CHARS = 180;
 
 function safeSessionId(options: LocalProtocolOptions): string {
@@ -175,6 +193,24 @@ type ResolvedLocalTarget =
 	| { kind: "listing"; root: string }
 	| { kind: "directory"; path: string }
 	| { kind: "file"; path: string; size: number };
+
+/**
+ * Wrap a small notice (e.g. "binary file, refusing to decode" or "too large
+ * for inline read") in the same `InternalResource` shape `LocalProtocolHandler.resolve`
+ * returns for normal file reads. `sourcePath` is preserved so callers like
+ * `find` / `path-utils` / `bash-skill-urls` — which only need the on-disk path
+ * — keep functioning even when the file content cannot safely be inlined.
+ */
+function localNoticeResource(url: InternalUrl, sourcePath: string, content: string): InternalResource {
+	return {
+		url: url.href,
+		content,
+		contentType: "text/plain",
+		size: Buffer.byteLength(content, "utf-8"),
+		sourcePath,
+		notes: [LOCAL_WRITE_NOTE],
+	};
+}
 
 /**
  * Resolve a local:// URL to its on-disk target with realpath + containment
@@ -336,7 +372,37 @@ export class LocalProtocolHandler implements ProtocolHandler {
 			return buildDirectoryResource(url.href, resolved.path, [LOCAL_WRITE_NOTE]);
 		}
 
-		const content = await Bun.file(resolved.path).text();
+		const file = Bun.file(resolved.path);
+
+		// Size guard. A single-string `InternalResource` cannot stream, so any
+		// caller that text-decodes the result would otherwise pay O(size) memory
+		// twice (raw bytes + UTF-8 mojibake). Cap before allocation; the read
+		// tool's range/streaming path on the resolved disk path remains the
+		// escape hatch for genuinely large text artifacts.
+		if (resolved.size > LOCAL_MAX_TEXT_BYTES) {
+			return localNoticeResource(
+				url,
+				resolved.path,
+				`[Cannot inline local:// file '${url.href}' (${formatBytes(resolved.size)}); exceeds ${formatBytes(LOCAL_MAX_TEXT_BYTES)} inline limit. Use the read tool with a range selector (e.g. '${url.href}:1-200') or process the file directly via its on-disk path.]`,
+			);
+		}
+
+		// Binary sniff. A NUL byte in the head window means the file is not
+		// displayable text; decoding it as UTF-8 would produce mojibake and
+		// allocate up to 3x the input size (every lone byte becomes U+FFFD).
+		const sniffEnd = Math.min(resolved.size, LOCAL_BINARY_SNIFF_BYTES);
+		if (sniffEnd > 0) {
+			const head = new Uint8Array(await file.slice(0, sniffEnd).arrayBuffer());
+			if (head.includes(0)) {
+				return localNoticeResource(
+					url,
+					resolved.path,
+					`[Cannot read binary local:// file '${url.href}' (${formatBytes(resolved.size)}); content contains NUL bytes (binary or UTF-16 encoded). This resource is not text — process the file via its on-disk path with a binary-aware workflow.]`,
+				);
+			}
+		}
+
+		const content = await file.text();
 		return {
 			url: url.href,
 			content,
