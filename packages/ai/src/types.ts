@@ -538,6 +538,14 @@ export interface AssistantMessage {
 	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
 	errorStatus?: number;
 	/**
+	 * Categorical identifier for the failure (e.g. `"auth"`, `"rate_limit"`,
+	 * `"timeout"`). Populated alongside `errorStatus`/`errorMessage` so
+	 * consumers can route on a structured error class without scraping the
+	 * human-readable message. Producer is `errorIdFromError` in
+	 * `utils/error-id.ts`. Undefined when no taxonomy entry applies.
+	 */
+	errorId?: string;
+	/**
 	 * Stable identifiers for request features the provider silently dropped
 	 * during this turn (e.g. `"priority"`). Set when a server-side rejection
 	 * triggered an in-provider fallback retry that succeeded without the
