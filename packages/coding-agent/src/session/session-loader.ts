@@ -20,6 +20,24 @@ import {
 	titleUpdateFromSlot,
 } from "./session-title-slot";
 
+// Stay below Bun/JSC's maximum JS string size before calling Bun.file().text().
+const MAX_SESSION_JSONL_FULL_READ_BYTES = 1024 * 1024 * 1024;
+
+function formatBytes(bytes: number): string {
+	const mib = bytes / (1024 * 1024);
+	return `${mib.toFixed(mib >= 10 ? 0 : 1)} MiB`;
+}
+
+function assertSessionFileSafeToRead(filePath: string, storage: SessionStorage): void {
+	const { size } = storage.statSync(filePath);
+	if (size <= MAX_SESSION_JSONL_FULL_READ_BYTES) return;
+	throw new Error(
+		`Session file is too large to load safely (${formatBytes(size)} > ${formatBytes(
+			MAX_SESSION_JSONL_FULL_READ_BYTES,
+		)}): ${filePath}. Move the oversized session out of the sessions directory or trim persisted compaction payloads.`,
+	);
+}
+
 function splitTitleSlot(content: string): { body: string; slot: SessionTitleUpdate | undefined } {
 	const slot = titleUpdateFromSlot(parseTitleSlotFromContent(content));
 	if (!slot) return { body: content, slot: undefined };
@@ -82,6 +100,7 @@ export async function loadEntriesFromFile(
 ): Promise<FileEntry[]> {
 	let content: string;
 	try {
+		assertSessionFileSafeToRead(filePath, storage);
 		content = await storage.readText(filePath);
 	} catch (err) {
 		if (isEnoent(err)) return [];
