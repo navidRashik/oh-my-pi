@@ -14,6 +14,7 @@ repository = "https://github.com/can1357/oh-my-pi"
 [patch.crates-io]
 brush-core = { path = "crates/vendor/brush-core" }
 brush-builtins = { path = "crates/vendor/brush-builtins" }
+uucore = { path = "crates/vendor/uucore" }
 
 [profile.release]
 opt-level = 3
