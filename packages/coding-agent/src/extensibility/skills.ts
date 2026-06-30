@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
-import { getProjectDir } from "@oh-my-pi/pi-utils";
+import { getProjectDir, prompt } from "@oh-my-pi/pi-utils";
 import {
 	isValidManagedSkillName,
 	MANAGED_SKILLS_PROVIDER_ID,
@@ -11,6 +11,8 @@ import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
 import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
+import skillAutoloadTemplate from "../prompts/system/skill-autoload.md" with { type: "text" };
+import skillUserInvocationTemplate from "../prompts/system/skill-user-invocation.md" with { type: "text" };
 import type { SkillPromptDetails } from "../session/messages";
 import { expandTilde } from "../tools/path-utils";
 export interface Skill {
@@ -380,22 +382,30 @@ export interface BuiltSkillPromptMessage {
 	details: SkillPromptDetails;
 }
 
+export type SkillPromptInvocation = "user" | "autoload";
+
 export function getSkillSlashCommandName(skill: Pick<Skill, "name">): string {
 	return `skill:${skill.name}`;
 }
 
 export async function buildSkillPromptMessage(
-	skill: Pick<Skill, "name" | "filePath">,
+	skill: Pick<Skill, "name" | "filePath"> & Partial<Pick<Skill, "baseDir">>,
 	args: string,
+	invocation: SkillPromptInvocation = "user",
 ): Promise<BuiltSkillPromptMessage> {
 	const content = await Bun.file(skill.filePath).text();
 	const body = content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
-	const metaLines = [`Skill: ${skill.filePath}`];
 	const trimmedArgs = args.trim();
-	if (trimmedArgs) {
-		metaLines.push(`User: ${trimmedArgs}`);
-	}
-	const message = `${body}\n\n---\n\n${metaLines.join("\n")}`;
+	const template = invocation === "autoload" ? skillAutoloadTemplate : skillUserInvocationTemplate;
+	const message = prompt
+		.render(template, {
+			name: skill.name,
+			body,
+			filePath: skill.filePath,
+			baseDir: skill.baseDir ?? skill.filePath.replace(/[\\/]SKILL\.md$/, ""),
+			userArgs: trimmedArgs || undefined,
+		})
+		.trim();
 	return {
 		message,
 		details: {

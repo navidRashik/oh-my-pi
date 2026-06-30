@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed user-invoked skill prompts to identify the requested skill and include the skill directory for relative path resolution. ([#3902](https://github.com/can1357/oh-my-pi/issues/3902))
+
 ## [16.2.8] - 2026-06-30
 
 ### Added

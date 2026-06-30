@@ -16,6 +16,7 @@ import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
 import { shareSession } from "../../export/share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
+import { buildSkillPromptMessage } from "../../extensibility/skills";
 import {
 	diffMentalModelContent,
 	type HindsightApi,
@@ -1162,13 +1163,15 @@ export class CommandController {
 
 	async handleSkillCommand(skillPath: string, args: string): Promise<void> {
 		try {
-			const content = await Bun.file(skillPath).text();
-			const body = content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
-			const metaLines = [`Skill: ${skillPath}`];
-			if (args) {
-				metaLines.push(`User: ${args}`);
-			}
-			const message = `${body}\n\n---\n\n${metaLines.join("\n")}`;
+			const baseDir = path.dirname(skillPath);
+			const { message } = await buildSkillPromptMessage(
+				{
+					name: path.basename(baseDir) || "skill",
+					filePath: skillPath,
+					baseDir,
+				},
+				args,
+			);
 			await this.ctx.session.prompt(message);
 		} catch (err) {
 			this.ctx.showError(`Failed to load skill: ${err instanceof Error ? err.message : String(err)}`);
