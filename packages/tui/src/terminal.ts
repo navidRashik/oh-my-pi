@@ -4,6 +4,7 @@ import { $env, isBunTestRuntime, isTerminalHeadless, logger } from "@oh-my-pi/pi
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 import {
+	detectTerminalId,
 	isInsideTmux,
 	NotifyProtocol,
 	setCellDimensions,
@@ -11,7 +12,11 @@ import {
 	TERMINAL,
 	wrapTmuxPassthrough,
 } from "./terminal-capabilities";
-import { type HangulCompatibilityJamoWidth, setHangulCompatibilityJamoWidth } from "./utils";
+import {
+	type HangulCompatibilityJamoWidth,
+	setHangulCompatibilityJamoWidth,
+	setWarpNarrowStatusGlyphsActive,
+} from "./utils";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
@@ -33,6 +38,16 @@ export function resolveHangulCompatibilityJamoWidthFromTerminalIdentity(
 		return 2;
 	}
 	return "platform";
+}
+
+/**
+ * Warp renders a handful of status-line glyphs at 1 cell that `Bun.stringWidth`
+ * (and UAX#11) report wider, so the editor's top-border math underfills by the
+ * delta and the renderer truncates the over-Bun-wide line — dropping the right
+ * corner. See {@link setWarpNarrowStatusGlyphsActive} and issue #3885.
+ */
+export function resolveWarpNarrowStatusGlyphsActiveFromTerminalIdentity(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	return detectTerminalId(env) === "warp";
 }
 
 /**
@@ -559,6 +574,7 @@ export class ProcessTerminal implements Terminal {
 		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 		this.#queryAndEnableKittyProtocol();
 		setHangulCompatibilityJamoWidth(resolveHangulCompatibilityJamoWidthFromTerminalIdentity());
+		setWarpNarrowStatusGlyphsActive(resolveWarpNarrowStatusGlyphsActiveFromTerminalIdentity());
 
 		// Query terminal background color via OSC 11 for dark/light detection.
 		// Uses DA1 (Primary Device Attributes) as a sentinel: terminals process
