@@ -2300,19 +2300,15 @@ export class AgentSession {
 		const content = formatAdvisorBatchContent(notes);
 		const details = { notes } satisfies AdvisorMessageDetails;
 		if (this.#planModeState?.enabled) {
-			if (this.agent.state.isStreaming) {
-				this.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
-			} else {
-				this.#preserveAdvisorCard({
-					role: "custom",
-					customType: "advisor",
-					content,
-					display: true,
-					attribution: "agent",
-					details,
-					timestamp: Date.now(),
-				});
-			}
+			this.#preserveAdvisorCard({
+				role: "custom",
+				customType: "advisor",
+				content,
+				display: true,
+				attribution: "agent",
+				details,
+				timestamp: Date.now(),
+			});
 			return;
 		}
 		const interrupting = isInterruptingSeverity(severity);

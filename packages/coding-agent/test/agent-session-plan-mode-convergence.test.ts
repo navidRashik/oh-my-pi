@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { ToolChoice } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -36,6 +36,7 @@ type Harness = {
 
 type HarnessOptions = {
 	complyWithRequired?: boolean;
+	advisorAdvice?: boolean;
 };
 
 function textOf(message: AgentMessage): string {
@@ -97,6 +98,7 @@ describe("AgentSession plan-mode convergence", () => {
 
 		const observedCalls: ObservedPromptCall[] = [];
 		const resolveRuns = { count: 0 };
+		const advisorCalls = { count: 0 };
 		let session: AgentSession;
 		const resolveApplied = Promise.withResolvers<void>();
 		const resolveTool: AgentTool<typeof resolveToolSchema> = {
@@ -160,15 +162,58 @@ describe("AgentSession plan-mode convergence", () => {
 			},
 		});
 
+		const advisorStreamFn: StreamFn | undefined = harnessOptions.advisorAdvice
+			? (_model, _context, _options) => {
+					advisorCalls.count++;
+					const response = createAssistantMessage(`advisor response ${advisorCalls.count}`);
+					if (advisorCalls.count === 1) {
+						response.content = [
+							{
+								type: "toolCall",
+								id: "call-advise-plan",
+								name: "advise",
+								arguments: { note: "advisor says stop", severity: "concern" },
+							},
+						];
+						response.stopReason = "toolUse";
+					}
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: response });
+						if (response.content[0]?.type === "toolCall") {
+							stream.push({ type: "toolcall_start", contentIndex: 0, partial: response });
+							stream.push({
+								type: "toolcall_end",
+								contentIndex: 0,
+								toolCall: response.content[0],
+								partial: response,
+							});
+						}
+						stream.push({
+							type: "done",
+							reason: response.stopReason === "toolUse" ? "toolUse" : "stop",
+							message: response,
+						});
+					});
+					return stream;
+				}
+			: undefined;
 		const authStorage = await AuthStorage.create(tempDir.join(`auth-${Snowflake.next()}.db`));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const settings = Settings.isolated({ "compaction.enabled": false });
+		const settings = Settings.isolated({
+			"advisor.enabled": harnessOptions.advisorAdvice === true,
+			"compaction.enabled": false,
+		});
+		if (harnessOptions.advisorAdvice) {
+			settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		}
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
+			advisorStreamFn,
 		});
 		session.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
 		const harness = { session, authStorage, observedCalls, resolveRuns, resolveApplied: resolveApplied.promise };
@@ -212,6 +257,19 @@ describe("AgentSession plan-mode convergence", () => {
 		expect(observedCalls.map(call => call.toolChoice)).toEqual([undefined, "required", "required"]);
 		expect(resolveRuns.count).toBe(0);
 		expect(session.getPlanModeState()?.enabled).toBe(true);
+	});
+
+	it("preserves streaming advisor notes in plan mode without an aside continuation", async () => {
+		const { session, observedCalls } = await createHarness({ advisorAdvice: true, complyWithRequired: false });
+
+		await session.prompt("draft a plan");
+
+		expect(observedCalls.map(call => call.toolChoice)).toEqual([undefined, "required", "required"]);
+		expect(
+			session.agent.state.messages.some(
+				message => message.role === "custom" && textOf(message).includes("advisor says stop"),
+			),
+		).toBe(true);
 	});
 
 	it("records idle IRC in plan mode without waking an autonomous turn", async () => {
