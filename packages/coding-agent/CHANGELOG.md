@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Warp editor border alignment by measuring reported one-cell status glyphs with Warp-compatible widths ([#3885](https://github.com/can1357/oh-my-pi/issues/3885)).
+
 ## [16.2.7] - 2026-06-30
 
 ### Breaking Changes

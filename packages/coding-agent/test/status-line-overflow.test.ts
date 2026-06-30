@@ -25,6 +25,24 @@ afterAll(() => {
 	setProjectDir(originalProjectDir);
 });
 
+function withTermProgram(value: string | undefined, run: () => void): void {
+	const previous = Bun.env.TERM_PROGRAM;
+	if (value === undefined) {
+		delete Bun.env.TERM_PROGRAM;
+	} else {
+		Bun.env.TERM_PROGRAM = value;
+	}
+	try {
+		run();
+	} finally {
+		if (previous === undefined) {
+			delete Bun.env.TERM_PROGRAM;
+		} else {
+			Bun.env.TERM_PROGRAM = previous;
+		}
+	}
+}
+
 /** Minimal SegmentContext factory — only path/git fields matter for these tests. */
 function createCtx(overrides?: { pathMaxLength?: number; branch?: string | null }): SegmentContext {
 	return {
@@ -130,6 +148,22 @@ describe("status line session accent", () => {
 		// glyph) must not appear. The session_name segment may still emit the accent ANSI
 		// for its own text — we only care that the gap is not accent-painted.
 		expect(border).not.toContain(`${ansi}${theme.boxRound.horizontal}`);
+	});
+	it("uses Warp's one-cell status glyph width for the editor border budget", () => {
+		withTermProgram("WarpTerminal", () => {
+			const component = new StatusLineComponent(createStatusLineSession("cache 💾"));
+			component.updateSettings({
+				preset: "custom",
+				leftSegments: ["session_name"],
+				rightSegments: [],
+				separator: "ascii",
+			});
+
+			const border = component.getTopBorder(80);
+
+			expect(border.content).toContain("💾");
+			expect(border.width).toBe(visibleWidth(border.content) - 1);
+		});
 	});
 });
 
