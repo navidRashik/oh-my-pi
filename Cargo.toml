@@ -20,11 +20,11 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-# Unwind (not abort) so panics in vendored uutils code and napi-rs functions
-# are catchable: the uutils boundary (pi-shell coreutils) and napi-rs's per-call
-# catch_unwind turn a panic into a failed command / JS error instead of killing
-# the host process. Recoverable uutils panics are kept out of the crash report
-# by the crash hook (see crates/pi-natives/src/crash_handler.rs).
+# Unwind (not abort) so panics are catchable at explicit recovery boundaries:
+# the uutils boundary (pi-shell coreutils), guarded pi-natives blocking tasks,
+# and napi-rs's guarded async/future paths turn a panic into a failed command
+# or JS error instead of killing the host process. Recoverable uutils panics are
+# kept out of the crash report by the crash hook (see crates/pi-natives/src/crash_handler.rs).
 panic = "unwind"
 
 [profile.ci]

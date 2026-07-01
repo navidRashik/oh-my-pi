@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed native blocking task panics crossing the napi-rs async-work C callback boundary by converting them into `GenericFailure` Promise rejections ([#4006](https://github.com/can1357/oh-my-pi/issues/4006)).
+
 ## [16.2.11] - 2026-07-01
 
 ### Fixed

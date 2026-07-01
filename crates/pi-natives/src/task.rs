@@ -27,9 +27,13 @@
 //! }
 //! ```
 
-use std::future::Future;
+use std::{
+	any::Any,
+	future::Future,
+	panic::{AssertUnwindSafe, catch_unwind},
+};
 
-use napi::{Env, Error, Result, Task, bindgen_prelude::*};
+use napi::{Env, Error, Result, Status, Task, bindgen_prelude::*};
 use pi_shell::cancel as core_cancel;
 
 use crate::prof::profile_region;
@@ -159,6 +163,23 @@ where
 	work:         Option<Box<dyn FnOnce(CancelToken) -> Result<T> + Send>>,
 }
 
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+	if let Some(message) = payload.downcast_ref::<&str>() {
+		(*message).to_string()
+	} else if let Some(message) = payload.downcast_ref::<String>() {
+		message.clone()
+	} else {
+		"unknown panic payload".to_string()
+	}
+}
+
+fn panic_error(tag: &str, payload: Box<dyn Any + Send>) -> Error {
+	Error::new(
+		Status::GenericFailure,
+		format!("Blocking task {tag:?} panicked: {}", panic_payload_message(payload.as_ref())),
+	)
+}
+
 impl<T> Task for Blocking<T>
 where
 	T: ToNapiValue + Send + 'static + TypeName,
@@ -172,7 +193,10 @@ where
 			.work
 			.take()
 			.ok_or_else(|| Error::from_reason("BlockingTask: work already consumed"))?;
-		work(self.cancel_token.clone())
+		match catch_unwind(AssertUnwindSafe(|| work(self.cancel_token.clone()))) {
+			Ok(result) => result,
+			Err(payload) => Err(panic_error(self.tag, payload)),
+		}
 	}
 
 	fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
@@ -255,4 +279,26 @@ where
 		let _guard = profile_region(tag);
 		work.await
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use napi::Status;
+
+	use super::*;
+
+	#[test]
+	fn blocking_compute_maps_panic_to_generic_failure() {
+		let mut task = Blocking::<String> {
+			tag:          "panic_test",
+			cancel_token: CancelToken::default(),
+			work:         Some(Box::new(|_| -> Result<String> { panic!("native boom") })),
+		};
+
+		let err = Task::compute(&mut task).expect_err("panic should become a napi error");
+
+		assert_eq!(err.status, Status::GenericFailure);
+		assert!(err.reason.contains("panic_test"));
+		assert!(err.reason.contains("native boom"));
+	}
 }
