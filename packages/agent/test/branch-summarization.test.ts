@@ -6,11 +6,7 @@
  * `serializeConversation()` truncates each and drops `useless` entries.
  */
 import { describe, expect, test } from "bun:test";
-import {
-	generateBranchSummary,
-	prepareBranchEntries,
-	type SessionEntry,
-} from "@oh-my-pi/pi-agent-core/compaction";
+import { generateBranchSummary, prepareBranchEntries, type SessionEntry } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core/types";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -71,7 +67,7 @@ function branchEntries(): SessionEntry[] {
 					{ type: "text", text: "Reading the theme file." },
 					{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "theme.json" } },
 				],
-				"tool_use",
+				"toolUse",
 			),
 		),
 		messageEntry("e3", "e2", {
@@ -91,7 +87,7 @@ describe("prepareBranchEntries — tool result preservation", () => {
 		const { messages } = prepareBranchEntries(branchEntries());
 		const toolResult = messages.find(m => m.role === "toolResult");
 		expect(toolResult).toBeDefined();
-		if (!toolResult || toolResult.role !== "toolResult") throw new Error("unreachable");
+		if (toolResult?.role !== "toolResult") throw new Error("unreachable");
 		expect(Array.isArray(toolResult.content)).toBe(true);
 		const text = toolResult.content
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
@@ -104,7 +100,7 @@ describe("prepareBranchEntries — tool result preservation", () => {
 		const { messages } = prepareBranchEntries(branchEntries());
 		const assistant = messages.find(m => m.role === "assistant");
 		expect(assistant).toBeDefined();
-		if (!assistant || assistant.role !== "assistant") throw new Error("unreachable");
+		if (assistant?.role !== "assistant") throw new Error("unreachable");
 		const toolCall = assistant.content.find(block => block.type === "toolCall");
 		expect(toolCall).toBeDefined();
 	});
@@ -160,7 +156,7 @@ describe("generateBranchSummary — tool observation content reaches the summari
 						{ type: "toolCall", id: "call-keep", name: "search", arguments: { pattern: "alpha" } },
 						{ type: "toolCall", id: "call-drop", name: "search", arguments: { pattern: "zzz_nothing" } },
 					],
-					"tool_use",
+					"toolUse",
 				),
 			),
 			messageEntry("e3", "e2", {
