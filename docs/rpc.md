@@ -127,6 +127,10 @@ Important edge behavior from runtime:
 - `{ id?, type: "bash", command: string }`
 - `{ id?, type: "abort_bash" }`
 
+`abort_bash` is processed out-of-band from the regular command queue so it can
+cancel an in-flight `bash` command. Hosts must correlate responses by `id`;
+the `abort_bash` response can arrive before the earlier `bash` response.
+
 ### Session
 
 - `{ id?, type: "get_session_stats" }`

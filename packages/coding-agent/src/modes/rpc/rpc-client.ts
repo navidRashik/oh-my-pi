@@ -230,6 +230,7 @@ export class RpcClient {
 		if (this.#process) {
 			throw new Error("Client already started");
 		}
+		this.#abortController = new AbortController();
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -304,6 +305,9 @@ export class RpcClient {
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
 			}
+		} catch (error) {
+			this.stop();
+			throw error;
 		} finally {
 			clearTimeout(readyTimeout);
 		}

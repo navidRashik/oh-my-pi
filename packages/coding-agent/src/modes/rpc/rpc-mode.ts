@@ -1110,6 +1110,19 @@ export async function runRpcMode(
 		process.exit(0);
 	}
 
+	const sendCommandResponse = async (command: RpcCommand): Promise<void> => {
+		try {
+			const response = await handleCommand(command);
+			output(response);
+			await checkShutdownRequested();
+		} catch (e: unknown) {
+			const message = e instanceof Error ? e.message : String(e);
+			output(error(command.id, command.type, `Failed to handle command: ${message}`));
+		}
+	};
+
+	let regularCommandQueue: Promise<void> = Promise.resolve();
+
 	// Listen for JSON input using Bun's stdin
 	for await (const parsed of readJsonl(Bun.stdin.stream())) {
 		try {
@@ -1138,13 +1151,14 @@ export async function runRpcMode(
 				continue;
 			}
 
-			// Handle regular commands
+			// Keep normal commands serialized while letting abort_bash bypass the
+			// queue so it can cancel an in-flight bash command.
 			const command = parsed as RpcCommand;
-			const response = await handleCommand(command);
-			output(response);
-
-			// Check for deferred shutdown request (idle between commands)
-			await checkShutdownRequested();
+			if (command.type === "abort_bash") {
+				await sendCommandResponse(command);
+				continue;
+			}
+			regularCommandQueue = regularCommandQueue.then(() => sendCommandResponse(command));
 		} catch (e: unknown) {
 			const message = e instanceof Error ? e.message : String(e);
 			output(error(undefined, "parse", `Failed to parse command: ${message}`));

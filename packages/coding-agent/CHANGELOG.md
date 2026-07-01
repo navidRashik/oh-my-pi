@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed RPC bash cancellation so `abort_bash` bypasses the regular command queue, and fixed `RpcClient` cleanup so a client can restart after `stop()`. ([#4027](https://github.com/can1357/oh-my-pi/issues/4027))
+
 ## [16.2.12] - 2026-07-01
 
 ### Breaking Changes
