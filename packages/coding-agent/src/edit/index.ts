@@ -182,9 +182,7 @@ async function executeApplyPatchPerFile(
 			const skippedPaths = fileEntries.slice(i + 1).map(e => e.path);
 			if (appliedPaths.length > 0) {
 				contentTexts.push(
-					appliedPaths.length === 1
-						? `Applied: ${appliedPaths[0]}.`
-						: `Applied: ${appliedPaths.join(", ")}.`,
+					appliedPaths.length === 1 ? `Applied: ${appliedPaths[0]}.` : `Applied: ${appliedPaths.join(", ")}.`,
 				);
 			}
 			if (skippedPaths.length > 0) {
