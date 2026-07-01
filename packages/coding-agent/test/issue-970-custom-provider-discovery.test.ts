@@ -178,20 +178,33 @@ describe("issue #970 custom provider discovery", () => {
 		expect(rendered).toContain("baseUrl");
 	});
 
-	test("hides optional idle and unavailable discoverable providers that have no models", async () => {
+	test("hides optional idle discoverable providers that have no models", async () => {
 		installTestTheme();
-		for (const status of ["idle", "unavailable"] as const) {
-			const selector = await createSelector({
-				provider: "ollama",
-				status,
-				optional: true,
-				stale: false,
-				models: [],
-			});
+		const selector = await createSelector({
+			provider: "ollama",
+			status: "idle",
+			optional: true,
+			stale: false,
+			models: [],
+		});
 
-			const rendered = normalizeRenderedText(selector.render(200).join("\n"));
-			expect(rendered).not.toContain("OLLAMA");
-		}
+		const rendered = normalizeRenderedText(selector.render(200).join("\n"));
+		expect(rendered).not.toContain("OLLAMA");
+	});
+
+	test("keeps optional unavailable providers visible so the user can retry after starting the server", async () => {
+		installTestTheme();
+		const selector = await createSelector({
+			provider: "ollama",
+			status: "unavailable",
+			optional: true,
+			stale: false,
+			models: [],
+			error: "connect ECONNREFUSED 127.0.0.1:11434",
+		});
+
+		const rendered = normalizeRenderedText(selector.render(200).join("\n"));
+		expect(rendered).toContain("OLLAMA");
 	});
 
 	test("discovers multiple configurable vllm instances and preserves advertised context metadata", async () => {

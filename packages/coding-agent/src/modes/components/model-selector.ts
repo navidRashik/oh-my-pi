@@ -546,6 +546,16 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 
+	/**
+	 * A discoverable provider tab is shown when it has models to offer or when
+	 * hiding it would strand the user without a retry path. Optional local
+	 * providers (`ollama`, `llama.cpp`, `lm-studio`) start in `idle` state on a
+	 * fresh install with no cache — hide those so the menu isn't three dead
+	 * tabs. Once a probe runs and lands in `unavailable`/`empty`/`cached`/etc.,
+	 * keep the tab visible: selecting it schedules an online re-probe through
+	 * {@link #scheduleSelectedProviderRefresh}, which is the only in-session way
+	 * to rediscover a server that came up after the first attempt failed.
+	 */
 	#shouldShowDiscoverableProvider(providerId: string, providersWithModels: ReadonlySet<string>): boolean {
 		if (providersWithModels.has(providerId)) {
 			return true;
@@ -554,7 +564,7 @@ export class ModelSelectorComponent extends Container {
 		if (!discoveryState?.optional) {
 			return true;
 		}
-		return discoveryState.status !== "idle" && discoveryState.status !== "unavailable";
+		return discoveryState.status !== "idle";
 	}
 
 	#buildProviderTabs(): void {
