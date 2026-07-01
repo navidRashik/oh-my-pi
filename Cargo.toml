@@ -20,11 +20,22 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-# Unwind (not abort) so panics in vendored uutils code and napi-rs functions
-# are catchable: the uutils boundary (pi-shell coreutils) and napi-rs's per-call
-# catch_unwind turn a panic into a failed command / JS error instead of killing
-# the host process. Recoverable uutils panics are kept out of the crash report
-# by the crash hook (see crates/pi-natives/src/crash_handler.rs).
+# Unwind (not abort) so panics inside the native module have somewhere to be
+# caught. Two boundaries do that catching explicitly — napi-rs itself does
+# NOT wrap the `Task`/`AsyncTask` async-work path (its `execute`/`complete`
+# are plain `extern "C" fn`, so an unwind escaping them would abort under
+# stabilized C-unwind rules, RFC 2945 / rust-lang/rust#115285):
+#
+#   - `pi-shell` `run_uutil`: catches panics from vendored uutils code and
+#     surfaces them as a failed command.
+#   - `pi-natives` `task::Blocking::compute`: wraps the user closure in
+#     `catch_unwind` and turns a panic into a rejected JS promise (see issue
+#     #4020).
+#
+# The crash hook (crates/pi-natives/src/crash_handler.rs) suppresses the
+# stderr echo for panics inside either scope so recoverable errors don't
+# spam the user; they are still written to the on-disk crash log for
+# diagnosis.
 panic = "unwind"
 
 [profile.ci]
