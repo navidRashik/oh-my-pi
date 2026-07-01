@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Hide idle/unavailable optional local providers (`ollama`, `llama.cpp`, `lm-studio`) from the model selector's provider tabs when they contribute no discovered models, so the menu no longer shows dead tabs for services the user isn't running ([#2761](https://github.com/can1357/oh-my-pi/issues/2761)).
+
 ## [16.0.1] - 2026-06-15
 
 ### Breaking Changes

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import type { ModelRegistry, ProviderDiscoveryState } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -27,16 +28,19 @@ function installTestTheme(): void {
 	setThemeInstance(testTheme);
 }
 
-async function createSelector(state: ProviderDiscoveryState): Promise<ModelSelectorComponent> {
+async function createSelector(
+	state: ProviderDiscoveryState,
+	models: ReadonlyArray<Model> = [],
+): Promise<ModelSelectorComponent> {
 	const modelRegistry = {
 		refresh: async () => {},
 		refreshProvider: async () => {},
 		getError: () => undefined,
-		getAvailable: () => [],
-		getAll: () => [],
+		getAvailable: () => models,
+		getAll: () => models,
 		getDiscoverableProviders: () => [state.provider],
 		getCanonicalModelSelections: () => [],
-		getProviderDiscoveryState: () => state,
+		getProviderDiscoveryState: (provider: string) => (provider === state.provider ? state : undefined),
 	} as unknown as ModelRegistry;
 	const ui = { requestRender: vi.fn() } as unknown as TUI;
 	const selector = new ModelSelectorComponent(
@@ -172,6 +176,22 @@ describe("issue #970 custom provider discovery", () => {
 		const rendered = normalizeRenderedText(selector.render(200).join("\n"));
 		expect(rendered).toContain("http://192.168.5.3:8085/v1/models returned 404");
 		expect(rendered).toContain("baseUrl");
+	});
+
+	test("hides optional idle and unavailable discoverable providers that have no models", async () => {
+		installTestTheme();
+		for (const status of ["idle", "unavailable"] as const) {
+			const selector = await createSelector({
+				provider: "ollama",
+				status,
+				optional: true,
+				stale: false,
+				models: [],
+			});
+
+			const rendered = normalizeRenderedText(selector.render(200).join("\n"));
+			expect(rendered).not.toContain("OLLAMA");
+		}
 	});
 
 	test("discovers multiple configurable vllm instances and preserves advertised context metadata", async () => {

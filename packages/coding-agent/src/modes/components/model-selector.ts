@@ -546,6 +546,17 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 
+	#shouldShowDiscoverableProvider(providerId: string, providersWithModels: ReadonlySet<string>): boolean {
+		if (providersWithModels.has(providerId)) {
+			return true;
+		}
+		const discoveryState = this.#modelRegistry.getProviderDiscoveryState(providerId);
+		if (!discoveryState?.optional) {
+			return true;
+		}
+		return discoveryState.status !== "idle" && discoveryState.status !== "unavailable";
+	}
+
 	#buildProviderTabs(): void {
 		const activeTabId = this.#getActiveTab().id;
 		const providerSet = new Set<string>();
@@ -553,7 +564,9 @@ export class ModelSelectorComponent extends Container {
 			providerSet.add(item.provider);
 		}
 		for (const provider of this.#modelRegistry.getDiscoverableProviders()) {
-			providerSet.add(provider);
+			if (this.#shouldShowDiscoverableProvider(provider, providerSet)) {
+				providerSet.add(provider);
+			}
 		}
 		const sortedProviderIds = Array.from(providerSet).sort((left, right) =>
 			formatProviderTabLabel(left).localeCompare(formatProviderTabLabel(right)),
