@@ -2035,7 +2035,15 @@ function normalizeZenMuxOpenAiBaseUrl(baseUrl?: string): string {
 	if (!value) {
 		return ZENMUX_OPENAI_BASE_URL;
 	}
-	return value.endsWith("/") ? value.slice(0, -1) : value;
+	const trimmed = value.endsWith("/") ? value.slice(0, -1) : value;
+	// The bundled Anthropic-routed baseUrl (.../api/anthropic) is what
+	// getProviderBaseUrl() surfaces for zenmux at runtime, but the
+	// OpenAI-style /models catalog only lives on the /api/v1 route — remap
+	// so discovery hits the real endpoint regardless of which route the
+	// resolver picked.
+	return trimmed.endsWith("/api/anthropic")
+		? `${trimmed.slice(0, -"/api/anthropic".length)}/api/v1`
+		: trimmed;
 }
 
 function toZenMuxAnthropicBaseUrl(openAiBaseUrl: string): string {
@@ -2103,37 +2111,38 @@ export function zenmuxModelManagerOptions(config?: ZenMuxModelManagerConfig): Mo
 	const anthropicBaseUrl = toZenMuxAnthropicBaseUrl(openAiBaseUrl);
 	return {
 		providerId: "zenmux",
-		...(apiKey && {
-			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels<Api>({
-					api: "openai-completions",
-					provider: "zenmux",
-					baseUrl: openAiBaseUrl,
-					apiKey,
-					mapModel: (entry, defaults) => {
-						const pricings = isRecord(entry.pricings) ? entry.pricings : undefined;
-						const capabilities = isRecord(entry.capabilities) ? entry.capabilities : undefined;
-						const isAnthropicModel = isZenMuxAnthropicModel(entry, defaults.id);
-						return {
-							...defaults,
-							name: toModelName(entry.display_name, defaults.name),
-							api: isAnthropicModel ? "anthropic-messages" : "openai-completions",
-							baseUrl: isAnthropicModel ? anthropicBaseUrl : openAiBaseUrl,
-							reasoning: capabilities?.reasoning === true || defaults.reasoning,
-							input: toInputCapabilities(entry.input_modalities),
-							cost: {
-								input: getZenMuxPricingValue(pricings, "prompt"),
-								output: getZenMuxPricingValue(pricings, "completion"),
-								cacheRead: getZenMuxPricingValue(pricings, "input_cache_read"),
-								cacheWrite: getZenMuxCacheWritePrice(pricings),
-							},
-							contextWindow: toPositiveNumber(entry.context_length, defaults.contextWindow),
-							maxTokens: toPositiveNumber(entry.max_completion_tokens, defaults.maxTokens),
-						};
-					},
-					fetch: config?.fetch,
-				}),
-		}),
+		fetchDynamicModels: () =>
+			fetchOpenAICompatibleModels<Api>({
+				api: "openai-completions",
+				provider: "zenmux",
+				baseUrl: openAiBaseUrl,
+				// Public /api/v1/models does not require credentials — pass the
+				// key when present, omit otherwise so keyless discovery still
+				// runs (see #4213).
+				apiKey,
+				mapModel: (entry, defaults) => {
+					const pricings = isRecord(entry.pricings) ? entry.pricings : undefined;
+					const capabilities = isRecord(entry.capabilities) ? entry.capabilities : undefined;
+					const isAnthropicModel = isZenMuxAnthropicModel(entry, defaults.id);
+					return {
+						...defaults,
+						name: toModelName(entry.display_name, defaults.name),
+						api: isAnthropicModel ? "anthropic-messages" : "openai-completions",
+						baseUrl: isAnthropicModel ? anthropicBaseUrl : openAiBaseUrl,
+						reasoning: capabilities?.reasoning === true || defaults.reasoning,
+						input: toInputCapabilities(entry.input_modalities),
+						cost: {
+							input: getZenMuxPricingValue(pricings, "prompt"),
+							output: getZenMuxPricingValue(pricings, "completion"),
+							cacheRead: getZenMuxPricingValue(pricings, "input_cache_read"),
+							cacheWrite: getZenMuxCacheWritePrice(pricings),
+						},
+						contextWindow: toPositiveNumber(entry.context_length, defaults.contextWindow),
+						maxTokens: toPositiveNumber(entry.max_completion_tokens, defaults.maxTokens),
+					};
+				},
+				fetch: config?.fetch,
+			}),
 	};
 }
 

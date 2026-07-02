@@ -95,4 +95,50 @@ describe("zenmux provider support", () => {
 		expect(openai?.baseUrl).toBe("https://zenmux.ai/api/v1");
 		expect(openai?.cost.output).toBe(10);
 	});
+
+	test("keyless discovery hits /api/v1/models without an Authorization header (#4213)", async () => {
+		const calls: { url: string; auth: string | null }[] = [];
+		const fetchMock: FetchImpl = vi.fn(async (url, init) => {
+			const headers = (init?.headers ?? {}) as Record<string, string>;
+			calls.push({ url: url.toString(), auth: headers.Authorization ?? null });
+			return new Response(JSON.stringify({ data: [] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		}) as unknown as FetchImpl;
+
+		const options = zenmuxModelManagerOptions({ fetch: fetchMock });
+		expect(options.fetchDynamicModels).toBeDefined();
+		await options.fetchDynamicModels?.();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].url).toBe("https://zenmux.ai/api/v1/models");
+		expect(calls[0].auth).toBeNull();
+	});
+
+	test("remaps the bundled /api/anthropic baseUrl to /api/v1 for discovery (#4213)", async () => {
+		const calls: string[] = [];
+		const fetchMock: FetchImpl = vi.fn(async url => {
+			calls.push(url.toString());
+			return new Response(JSON.stringify({ data: [] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		}) as unknown as FetchImpl;
+
+		// getProviderBaseUrl("zenmux") returns the first bundled model's baseUrl,
+		// which is anthropic-routed (.../api/anthropic). Discovery must still
+		// target the OpenAI-style /api/v1 catalog route.
+		const options = zenmuxModelManagerOptions({
+			apiKey: "zenmux-test-key",
+			baseUrl: "https://zenmux.ai/api/anthropic",
+			fetch: fetchMock,
+		});
+		await options.fetchDynamicModels?.();
+		expect(calls).toEqual(["https://zenmux.ai/api/v1/models"]);
+	});
+
+	test("descriptor allows unauthenticated runtime discovery (#4213)", () => {
+		const descriptor = PROVIDER_DESCRIPTORS.find(item => item.providerId === "zenmux");
+		expect(descriptor?.allowUnauthenticated).toBe(true);
+	});
 });

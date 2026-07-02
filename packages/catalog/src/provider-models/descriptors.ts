@@ -453,6 +453,10 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "anthropic/claude-opus-4.8",
 		envVars: ["ZENMUX_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => zenmuxModelManagerOptions(config),
+		// ZenMux's `/api/v1/models` endpoint is public — enable runtime discovery
+		// without a key so newly published models refresh into `models.db`
+		// without waiting for a `models.json` regen (#4213).
+		allowUnauthenticated: true,
 		catalogDiscovery: { label: "ZenMux" },
 	},
 	{

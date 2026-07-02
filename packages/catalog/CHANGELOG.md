@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed ZenMux runtime model discovery: without a `ZENMUX_API_KEY` no manager was constructed so new models never reached the `models.db` cache, and with a key discovery derived the wrong base URL (`.../api/anthropic/models`, which does not exist) from the bundled Anthropic-routed default model. The runtime now discovers keylessly against the public `/api/v1/models` endpoint and always normalizes the discovery URL to `/api/v1` regardless of the bundled model's route. ([#4213](https://github.com/can1357/oh-my-pi/issues/4213))
+
 ### Removed
 
 - Removed reasoning suppression prompt logic for GPT-5 models
