@@ -1368,6 +1368,188 @@ describe("advisor", () => {
 			expect(promptInputs[1]).toContain("new-conversation");
 			expect(promptInputs[1]).not.toContain("old-conversation");
 		});
+
+		it("on refusal, latches thinking off and re-renders without _thinking:_ instead of blind-retrying", async () => {
+			// Anthropic's Fable 5 `reasoning_extraction` classifier returns HTTP 200 +
+			// stop_reason:"refusal", which pi-ai flattens into `Refusal (<category>):
+			// ...`. The runtime historically re-sent the identical rendered batch on
+			// the same model — the docs' "usually earns another refusal" case,
+			// guaranteed during a strict-classifier window. It now strips thinking
+			// once and latches off for the rest of the session.
+			const promptInputs: string[] = [];
+			const failures: unknown[] = [];
+			let strippedNotices = 0;
+			const shouldRefuse = true;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					if (shouldRefuse && input.includes("_thinking:_")) {
+						throw new Error(
+							"Refusal (reasoning_extraction): This request was blocked as it seems to violate Anthropic's Terms of Service.",
+						);
+					}
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const thinkingContent = "Considering the edge case for empty input first.";
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "review this", timestamp: 1 } as AgentMessage,
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: thinkingContent },
+						{ type: "text", text: "Response body." },
+					],
+					timestamp: 2,
+				} as unknown as AgentMessage,
+			];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				notifyFailure: error => failures.push(error),
+				notifyThinkingStripped: () => {
+					strippedNotices++;
+				},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			// One refusal, then a stripped re-render — bounded even without turning
+			// off shouldRefuse, because the stripped batch no longer carries thinking.
+			await Bun.sleep(0);
+			await Bun.sleep(0);
+			await Bun.sleep(0);
+
+			expect(promptInputs).toHaveLength(2);
+			expect(promptInputs[0]).toContain("_thinking:_");
+			expect(promptInputs[0]).toContain(thinkingContent);
+			expect(promptInputs[1]).not.toContain("_thinking:_");
+			expect(promptInputs[1]).not.toContain(thinkingContent);
+			// Body of the assistant turn is still delivered.
+			expect(promptInputs[1]).toContain("Response body.");
+			expect(strippedNotices).toBe(1);
+			// The single stripped success cleared the backlog; no watchdog notice fired.
+			expect(failures).toHaveLength(0);
+			expect(runtime.backlog).toBe(0);
+
+			// A subsequent turn with new thinking still ships stripped (latched).
+			messages.push({
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "Latched off means this never leaks." },
+					{ type: "text", text: "Second reply." },
+				],
+				timestamp: 3,
+			} as unknown as AgentMessage);
+			runtime.onTurnEnd(messages);
+			await Bun.sleep(0);
+			await Bun.sleep(0);
+
+			expect(promptInputs).toHaveLength(3);
+			expect(promptInputs[2]).not.toContain("_thinking:_");
+			expect(promptInputs[2]).not.toContain("Latched off means this never leaks.");
+			expect(promptInputs[2]).toContain("Second reply.");
+			expect(strippedNotices).toBe(1); // fired exactly once, not per turn
+		});
+
+		it("respects an explicit includeThinking:false at construction time", async () => {
+			// The `advisor.includeThinking` escape hatch: user opts out proactively,
+			// so no thinking ever renders and no auto-degrade path runs.
+			const promptInputs: string[] = [];
+			let strippedNotices = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const thinkingContent = "Never rendered when opt-out is on.";
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "hi", timestamp: 1 } as AgentMessage,
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: thinkingContent },
+						{ type: "text", text: "visible." },
+					],
+					timestamp: 2,
+				} as unknown as AgentMessage,
+			];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				notifyThinkingStripped: () => {
+					strippedNotices++;
+				},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0, false);
+			runtime.onTurnEnd(messages);
+			await Bun.sleep(0);
+
+			expect(promptInputs).toHaveLength(1);
+			expect(promptInputs[0]).not.toContain("_thinking:_");
+			expect(promptInputs[0]).not.toContain(thinkingContent);
+			expect(promptInputs[0]).toContain("visible.");
+			expect(strippedNotices).toBe(0);
+		});
+
+		it("falls through to the watchdog if refusals keep coming after the strip", async () => {
+			// If the classifier keeps refusing even without thinking blocks, the
+			// degrade path fires once and the second refusal falls through to the
+			// normal consecutive-failure counter — no infinite auto-recovery loop.
+			const promptInputs: string[] = [];
+			const failures: unknown[] = [];
+			let strippedNotices = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					throw new Error("Refusal (reasoning_extraction): still refusing.");
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "review this", timestamp: 1 } as AgentMessage,
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "reasoning here" },
+						{ type: "text", text: "Body." },
+					],
+					timestamp: 2,
+				} as unknown as AgentMessage,
+			];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				notifyFailure: error => failures.push(error),
+				notifyThinkingStripped: () => {
+					strippedNotices++;
+				},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			await Bun.sleep(0);
+			await Bun.sleep(0);
+			await Bun.sleep(0);
+			await Bun.sleep(0);
+
+			// 1 with thinking → refusal → strip → 3 without → watchdog fires.
+			expect(strippedNotices).toBe(1);
+			expect(promptInputs).toHaveLength(4);
+			expect(promptInputs[0]).toContain("_thinking:_");
+			for (const p of promptInputs.slice(1)) {
+				expect(p).not.toContain("_thinking:_");
+			}
+			expect(failures).toHaveLength(1);
+			expect(runtime.backlog).toBe(0);
+		});
 	});
 
 	describe("advisor default tools", () => {

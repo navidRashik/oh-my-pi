@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `advisor.includeThinking` setting (default `true`) to control whether the primary agent's thinking blocks are rendered in the transcript delta shipped to the advisor. Turn off if the advisor model's provider refuses requests that echo reasoning content (e.g. Anthropic's `reasoning_extraction` classifier). ([#4210](https://github.com/can1357/oh-my-pi/issues/4210))
+
+### Fixed
+
+- Fixed the advisor blind-retrying provider refusals (e.g. Anthropic Fable's `reasoning_extraction` classifier) with the identical rendered batch. After the first refusal-shaped failure the runtime now latches `_thinking:_` rendering off for the rest of the session, re-primes the advisor transcript without thinking, and surfaces an info notice so the user can flip `advisor.includeThinking: false` to skip them from the start. ([#4210](https://github.com/can1357/oh-my-pi/issues/4210))
+
 ## [16.3.0] - 2026-07-02
 
 ### Added

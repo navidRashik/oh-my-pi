@@ -2408,21 +2408,34 @@ export class AgentSession {
 				// so two SessionManagers never hold the same file at once.
 				this.#advisorRecorderClosed,
 			);
-			const runtime = new AdvisorRuntime(advisorAgentFacade, {
-				snapshotMessages: () => this.agent.state.messages,
-				enqueueAdvice: (note, severity) => this.#routeAdvice(advisorRef, note, severity),
-				maintainContext: incomingTokens => this.#maintainAdvisorContext(advisorRef, incomingTokens),
-				obfuscator: this.#obfuscator,
-				beginAdvisorUpdate: () => advisorRef.emissionGuard.beginUpdate(),
-				notifyFailure: error => {
-					const message = error instanceof Error ? error.message : String(error);
-					this.emitNotice(
-						"warning",
-						`Advisor${slug ? ` "${advisorName}"` : ""} unavailable for ${formatModelString(advisorModel)}: ${message}`,
-						"advisor",
-					);
+			const includeThinking = this.settings.get("advisor.includeThinking") as boolean;
+			const runtime = new AdvisorRuntime(
+				advisorAgentFacade,
+				{
+					snapshotMessages: () => this.agent.state.messages,
+					enqueueAdvice: (note, severity) => this.#routeAdvice(advisorRef, note, severity),
+					maintainContext: incomingTokens => this.#maintainAdvisorContext(advisorRef, incomingTokens),
+					obfuscator: this.#obfuscator,
+					beginAdvisorUpdate: () => advisorRef.emissionGuard.beginUpdate(),
+					notifyFailure: error => {
+						const message = error instanceof Error ? error.message : String(error);
+						this.emitNotice(
+							"warning",
+							`Advisor${slug ? ` "${advisorName}"` : ""} unavailable for ${formatModelString(advisorModel)}: ${message}`,
+							"advisor",
+						);
+					},
+					notifyThinkingStripped: () => {
+						this.emitNotice(
+							"info",
+							`Advisor${slug ? ` "${advisorName}"` : ""} (${formatModelString(advisorModel)}) refused a delta carrying thinking blocks. Latching \`_thinking:_\` off for the rest of this session; set \`advisor.includeThinking: false\` to skip them from the start.`,
+							"advisor",
+						);
+					},
 				},
-			});
+				undefined,
+				includeThinking,
+			);
 
 			const advisorRef: ActiveAdvisor = {
 				name: advisorName,

@@ -41,15 +41,16 @@ export interface AdvisorRuntimeHost {
 	 * the primary's next compaction triggers {@link AdvisorRuntime.reset}).
 	 */
 	maintainContext?(incomingTokens: number): Promise<boolean>;
-	/**
-	 * Called immediately before each `agent.prompt(batch)` cycle. Lets the host
-	 * clear per-update advisor state — currently the one-advise-per-update gate
-	 * in {@link AdvisorEmissionGuard}, which the host owns because it is the
-	 * one that routes `advise()` results back to the primary.
-	 */
 	beginAdvisorUpdate?(): void;
 	/** Surface a non-recovering advisor failure to the host UI without adding model-visible context. */
 	notifyFailure?(error: unknown): void;
+	/**
+	 * Fired once, the first time a provider refusal triggers the runtime to
+	 * latch thinking-block rendering off for the rest of the session. Hosts
+	 * surface a notice so the user understands the automatic degradation.
+	 * See {@link AdvisorRuntime} refusal handling in `#drain`.
+	 */
+	notifyThinkingStripped?(): void;
 }
 
 interface PendingDelta {
@@ -90,7 +91,20 @@ export class AdvisorRuntime {
 		private readonly agent: AdvisorAgent,
 		private readonly host: AdvisorRuntimeHost,
 		private readonly retryDelayMs = 1000,
-	) {}
+		includeThinking = true,
+	) {
+		this.#includeThinking = includeThinking;
+	}
+
+	/** Whether the advisor's rendered transcript deltas include assistant
+	 *  thinking blocks. Starts at the constructor-provided value (mirroring
+	 *  `advisor.includeThinking`) and latches off when a provider refusal
+	 *  triggers the auto-degrade path in {@link #drain}. */
+	#includeThinking: boolean;
+	/** Guards the refusal auto-degrade from firing more than once per runtime.
+	 *  A second refusal after strip already applied falls through to the normal
+	 *  failure counter instead of looping. */
+	#refusalStripApplied = false;
 
 	get backlog(): number {
 		return this.#backlog;
@@ -205,7 +219,7 @@ export class AdvisorRuntime {
 		const obfuscator = this.host.obfuscator;
 		const formattedDelta = obfuscator?.hasSecrets() ? obfuscateAdvisorDelta(obfuscator, delta) : delta;
 		const md = formatSessionHistoryMarkdown(formattedDelta, {
-			includeThinking: true,
+			includeThinking: this.#includeThinking,
 			includeToolIntent: true,
 			watchedRoles: true,
 			expandPrimaryContext: true,
@@ -351,6 +365,33 @@ export class AdvisorRuntime {
 					// requeuing it into the post-reset conversation.
 					if (this.#epoch !== epoch) continue;
 					this.#rollbackFailedTurn(messageSnapshot);
+					// Provider refusal (e.g. Anthropic Fable's `reasoning_extraction`
+					// classifier flagging thinking-block passthrough): retrying the
+					// identical rendered batch on the same model "usually earns another
+					// refusal" per Anthropic's refusals-and-fallback docs. Latch thinking
+					// off for the rest of the session, drop dedupe state so the re-primed
+					// transcript replays primary-context in full, and re-render the
+					// current transcript without thinking so the failed batch's coverage
+					// is restored on the next drain iteration.
+					if (isRefusalError(err) && this.#includeThinking && !this.#refusalStripApplied) {
+						this.#includeThinking = false;
+						this.#refusalStripApplied = true;
+						this.#resetAdvisorContext(false, false);
+						const restripped = this.#renderDelta(this.#latestMessages);
+						if (restripped) {
+							this.#pending.unshift({ text: restripped, turns: finalTurns });
+						} else {
+							this.#backlog = Math.max(0, this.#backlog - finalTurns);
+							this.#notifyWaiters();
+						}
+						try {
+							this.host.notifyThinkingStripped?.();
+						} catch (notifyErr) {
+							logger.warn("advisor notifyThinkingStripped failed", { err: String(notifyErr) });
+						}
+						logger.debug("advisor refusal: latching thinking off and re-priming", { err: String(err) });
+						continue;
+					}
 					logger.debug("advisor turn failed", { err: String(err) });
 					this.#consecutiveFailures++;
 					if (this.#consecutiveFailures >= 3) {
@@ -384,6 +425,21 @@ export class AdvisorRuntime {
 			this.#busy = false;
 		}
 	}
+}
+
+/**
+ * Match the stable prefix `pi-ai` emits for provider refusal `stop_reason`s
+ * (`Refusal`, optionally `Refusal (<category>)`), independent of whether the
+ * refusal reached the runtime as a rejection or via `state.error` re-thrown
+ * inside `#drain`. See `anthropic.ts` refusal branch: category-tagged messages
+ * take the form `Refusal (reasoning_extraction): ...`; missing-details
+ * fallbacks surface as `Refusal (no details provided)`. Kept as a text match
+ * because `Agent.state.error` collapses the structured `stopDetails` down to
+ * `errorMessage`; the prefix is the last stable signal we have.
+ */
+function isRefusalError(err: unknown): boolean {
+	const msg = err instanceof Error ? err.message : String(err);
+	return msg.startsWith("Refusal (") || msg === "Refusal";
 }
 
 type TextualContent = string | readonly (TextContent | ImageContent)[];

@@ -447,6 +447,18 @@ export const SETTINGS_SCHEMA = {
 			condition: "advisorEnabled",
 		},
 	},
+	"advisor.includeThinking": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			group: "Advisor",
+			label: "Include Thinking in Advisor Transcript",
+			description:
+				"Render the primary agent's `_thinking:_` blocks in the incremental transcript delivered to the advisor. Turn off if the advisor model's provider refuses requests that echo reasoning content (Anthropic's `reasoning_extraction` classifier). The runtime also auto-latches this off for the rest of the session after the first refusal-shaped failure.",
+			condition: "advisorEnabled",
+		},
+	},
 	shellPath: { type: "string", default: undefined },
 	"git.enabled": {
 		type: "boolean",
