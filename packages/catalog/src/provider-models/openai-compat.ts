@@ -2041,9 +2041,7 @@ function normalizeZenMuxOpenAiBaseUrl(baseUrl?: string): string {
 	// OpenAI-style /models catalog only lives on the /api/v1 route — remap
 	// so discovery hits the real endpoint regardless of which route the
 	// resolver picked.
-	return trimmed.endsWith("/api/anthropic")
-		? `${trimmed.slice(0, -"/api/anthropic".length)}/api/v1`
-		: trimmed;
+	return trimmed.endsWith("/api/anthropic") ? `${trimmed.slice(0, -"/api/anthropic".length)}/api/v1` : trimmed;
 }
 
 function toZenMuxAnthropicBaseUrl(openAiBaseUrl: string): string {
