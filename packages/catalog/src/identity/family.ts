@@ -41,9 +41,9 @@ export const isKimiK26ModelId = memo((modelId: string): boolean => {
 	return /(^|\/)kimi-k2(?:\.6|p6)(?:[-:]|$)/i.test(modelId);
 });
 
-/** Claude ids in any namespace form (`claude-*`, `vendor/claude.x`). */
+/** Claude ids in plain, slash-namespaced, or dotted provider forms (`claude-*`, `vendor/claude.x`, `anthropic.claude-*`). */
 export const isClaudeModelId = memo((modelId: string): boolean => {
-	return /(^|\/)claude[-.]/i.test(modelId);
+	return /(^|[/.])claude[-.]/i.test(modelId);
 });
 
 /** `anthropic/`-namespaced ids (aggregator catalogs like OpenRouter). */
