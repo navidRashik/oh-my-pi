@@ -316,13 +316,14 @@ export interface InteractiveModeOptions {
 }
 
 /**
- * Anchored live-region container for the HUD/status rows between the transcript
- * and the editor (working loader, todo + subagent HUDs, transient notification
- * panels). While it has content every row is live: it reports a seam at 0 so the
- * engine never commits these anchored, rebuilt-in-place rows to native
- * scrollback — otherwise stale duplicates pile up above the live copy on short
- * terminals once the loader sits below a tall HUD. The transcript's own seam,
- * when present, sits higher and wins (topmost-seam merge in TUI.render).
+ * Anchored live-region container for transient rows between the transcript and
+ * the editor (queued follow-up rows, working loader, todo + subagent HUDs,
+ * transient notification panels). While it has content every row is live: it
+ * reports a seam at 0 so the engine never commits these anchored,
+ * rebuilt-in-place rows to native scrollback — otherwise stale duplicates pile
+ * up above the live copy on short terminals.
+ * The transcript's own seam, when present, sits higher and wins
+ * (topmost-seam merge in TUI.render).
  */
 class AnchoredLiveContainer extends Container implements NativeScrollbackLiveRegion {
 	getNativeScrollbackLiveRegionStart(): number | undefined {
@@ -635,7 +636,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// unless the user opts in, and never emits raw escapes on other terminals.
 		setTerminalTextSizing(settings.get("tui.textSizing") && TERMINAL.textSizing);
 		this.chatContainer = new TranscriptContainer();
-		this.pendingMessagesContainer = new Container();
+		this.pendingMessagesContainer = new AnchoredLiveContainer();
 		this.statusContainer = new AnchoredLiveContainer();
 		this.todoContainer = new AnchoredLiveContainer();
 		this.subagentContainer = new AnchoredLiveContainer();

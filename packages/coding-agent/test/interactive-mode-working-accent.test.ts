@@ -5,7 +5,7 @@ import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as sessionColor from "@oh-my-pi/pi-coding-agent/utils/session-color";
-import type { Container, NativeScrollbackLiveRegion } from "@oh-my-pi/pi-tui";
+import { type Container, type NativeScrollbackLiveRegion, Text } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 type Harness = {
@@ -89,6 +89,15 @@ describe("InteractiveMode working-message session accent cache", () => {
 		// the animating loader out of immutable native scrollback.
 		startStableLoader(mode);
 		expect(statusContainer.getNativeScrollbackLiveRegionStart()).toBe(0);
+	});
+
+	it("reports pending follow-up rows as a live seam while mounted", async () => {
+		const { mode } = await createHarness("Queued follow-up");
+		const pendingContainer = mode.pendingMessagesContainer as Container & Partial<NativeScrollbackLiveRegion>;
+
+		expect(pendingContainer.getNativeScrollbackLiveRegionStart?.()).toBeUndefined();
+		pendingContainer.addChild(new Text("Follow-up: queued", 1, 0));
+		expect(pendingContainer.getNativeScrollbackLiveRegionStart?.()).toBe(0);
 	});
 
 	it("reuses one computed accent across loader spinner and message colorizers", async () => {
