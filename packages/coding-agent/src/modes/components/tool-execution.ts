@@ -38,7 +38,7 @@ import {
 	resolveImageOptions,
 	truncateToWidth,
 } from "../../tools/render-utils";
-import { toolRenderers, type ToolRenderSnapshot } from "../../tools/renderers";
+import { type ToolRenderSnapshot, toolRenderers } from "../../tools/renderers";
 import { TODO_STRIKE_TOTAL_FRAMES, type TodoToolDetails } from "../../tools/todo";
 import { isFramedBlockComponent, renderStatusLine, WidthAwareText } from "../../tui";
 import { sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";

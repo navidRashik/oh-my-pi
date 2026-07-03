@@ -65,7 +65,7 @@ function taskNeedsTimedRepaint(progress: AgentProgress): boolean {
 		totalDurationMs: 1,
 		progress: [progress],
 	};
-	return taskToolRenderer.timeBasedPartialResult({}, { content: [], details });
+	return taskToolRenderer.timeBasedPartialResult({}, { details });
 }
 
 describe("task live progress rendering", () => {
