@@ -1382,6 +1382,20 @@ function dropOpenRouterKimiForcedToolReasoning(
 	}
 }
 
+/** Flattens assistant text blocks for Chat Completions without merging internal block boundaries. */
+export function flattenOpenAICompletionsAssistantTextBlocks(blocks: readonly TextContent[]): string | null {
+	const nonEmptyTextBlocks = blocks
+		.map(block => block.text.toWellFormed())
+		.filter(text => text.trim().length > 0);
+	if (nonEmptyTextBlocks.length === 0) return null;
+	let text = nonEmptyTextBlocks[0]!;
+	for (const blockText of nonEmptyTextBlocks.slice(1)) {
+		const alreadySeparated = /\s$/u.test(text) || /^\s/u.test(blockText);
+		text += `${alreadySeparated ? "" : "\n\n"}${blockText}`;
+	}
+	return text;
+}
+
 function buildParams(
 	model: Model<"openai-completions">,
 	context: Context,
@@ -1771,14 +1785,18 @@ export function convertMessages(
 				content: null,
 			};
 
-			const textBlocks = msg.content.filter(b => b.type === "text") as TextContent[];
-			// Filter out empty text blocks to avoid API validation errors
-			const nonEmptyTextBlocks = textBlocks.filter(b => b.text && b.text.trim().length > 0);
-			if (nonEmptyTextBlocks.length > 0) {
+			const flattenedText = flattenOpenAICompletionsAssistantTextBlocks(
+				msg.content.filter((b): b is TextContent => b.type === "text"),
+			);
+			if (flattenedText !== null) {
 				// Always send assistant content as a plain string. Some OpenAI-compatible
 				// backends mirror array-of-text-block payloads back to the model literally,
-				// causing recursive nested content in subsequent turns.
-				assistantMsg.content = nonEmptyTextBlocks.map(b => b.text.toWellFormed()).join("");
+				// causing recursive nested content in subsequent turns. Preserve a hard
+				// boundary between adjacent internal text blocks: cross-provider demotion
+				// can place bare Anthropic reasoning immediately before the assistant's
+				// original visible answer, and concatenating with `""` produces
+				// `reasoningFinal answer`.
+				assistantMsg.content = flattenedText;
 			}
 
 			// Handle thinking blocks

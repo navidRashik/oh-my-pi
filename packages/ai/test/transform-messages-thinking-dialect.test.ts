@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { getDialectDefinition, renderDemotedThinking } from "@oh-my-pi/pi-ai/dialect";
+import { flattenOpenAICompletionsAssistantTextBlocks } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import type { Api, AssistantMessage, Message, Model, ModelSpec, UserMessage } from "@oh-my-pi/pi-ai/types";
+import type { Api, AssistantMessage, Message, Model, ModelSpec, TextContent, UserMessage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 /**
@@ -84,6 +85,7 @@ function transformedAssistant(messages: Message[], target: Model<Api>): Assistan
 	return assistant;
 }
 
+
 describe("transformMessages cross-provider thinking demotion → canonical dialect", () => {
 	it("renders Anthropic reasoning as a Gemini ```thinking fence when switching to a Gemini target", () => {
 		const gemini = makeModel("google-generative-ai", "google", "gemini-3-pro-preview");
@@ -160,6 +162,18 @@ describe("transformMessages cross-provider thinking demotion → canonical diale
 			expect(reply?.type).toBe("text");
 			expect(reply && reply.type === "text" ? reply.text : "").toBe("Checking the forecast.");
 		}
+	});
+
+	it("preserves a boundary when OpenAI-compatible Claude targets flatten bare demotions", () => {
+		const model = makeModel("openai-completions", "openrouter", "anthropic/claude-sonnet-4-6");
+		const assistant = transformedAssistant(
+			[user("weather in Paris?"), anthropicThinkingTurn(), user("Summarize the result.")],
+			model,
+		);
+		const textBlocks = assistant.content.filter((block): block is TextContent => block.type === "text");
+
+		expect(flattenOpenAICompletionsAssistantTextBlocks(textBlocks)).toBe(`${REASONING}\n\nChecking the forecast.`);
+		expect(flattenOpenAICompletionsAssistantTextBlocks(textBlocks)).not.toBe(`${REASONING}Checking the forecast.`);
 	});
 
 	it("keeps the native thinking block for a same-provider/same-model continuation", () => {
