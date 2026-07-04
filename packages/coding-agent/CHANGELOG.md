@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Decoupled the `/extensions` provider toggle from the model/login provider filter. The capability registry (skills, rules, MCP servers, hooks, tools, prompts, context files, slash commands) now reads from a dedicated `disabledExtensionProviders` list, so toggling `cursor` off in `/extensions` hides its rules/MCP/context files without also removing `cursor/*` chat models from the model picker or `/login`. The model side keeps its existing `disabledProviders` semantics. Legacy configs that only set `disabledProviders` are read as the seed for the extension list on first init so users who previously wrote `disabledProviders: [cursor]` intending "hide everything from cursor" keep the joint behavior until they explicitly toggle a provider from the `/extensions` UI, which now writes to `disabledExtensionProviders` only. The new key supports the same path-scoped array shape (`{ path/pathPrefix, providers | values | items }`) as `disabledProviders` ([#4507](https://github.com/can1357/oh-my-pi/issues/4507)).
+
 ## [16.3.5] - 2026-07-04
 
 ### Fixed

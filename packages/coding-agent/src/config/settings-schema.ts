@@ -479,6 +479,8 @@ export const SETTINGS_SCHEMA = {
 
 	disabledExtensions: { type: "array", default: EMPTY_STRING_ARRAY },
 
+	disabledExtensionProviders: { type: "array", default: EMPTY_STRING_ARRAY },
+
 	modelRoles: { type: "record", default: EMPTY_STRING_RECORD },
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
