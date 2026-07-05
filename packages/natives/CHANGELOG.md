@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Disabled the OverlayFS isolation backend so task isolation cannot use a live parent worktree as an overlay lowerdir ([#4627](https://github.com/can1357/oh-my-pi/issues/4627)).
+
 ## [16.3.6] - 2026-07-04
 
 ### Changed

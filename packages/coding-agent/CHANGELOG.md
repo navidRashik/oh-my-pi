@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Removed OverlayFS from task isolation auto-selection and the isolation-mode picker because it cannot safely isolate live parent worktrees ([#4627](https://github.com/can1357/oh-my-pi/issues/4627)).
+
 ## [16.3.8] - 2026-07-05
 
 ### Fixed

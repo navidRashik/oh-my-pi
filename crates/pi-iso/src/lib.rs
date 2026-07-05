@@ -3,9 +3,8 @@
 //! A backend gives the caller a writable "merged" view of a read-only
 //! "lower" tree without paying for a deep copy:
 //!
-//! - **macOS** uses `clonefile(2)` to seed an APFS copy-on-write clone.
-//! - **Linux** mounts a kernel `overlay` filesystem, falling back to
-//!   `fuse-overlayfs` when the syscall is denied.
+//! - **Linux** tries filesystem-native snapshot/reflink backends, then falls
+//!   back to `Rcopy`.
 //! - **Windows** projects an existing tree through `ProjFS`.
 //! - **`Rcopy`** is the cross-platform fallback: `git worktree` if `lower` is a
 //!   git repo, plain recursive copy otherwise.
@@ -53,8 +52,8 @@ pub enum BackendKind {
 	Zfs,
 	/// Linux `FICLONE` per-file reflink tree (btrfs, XFS+reflink, bcachefs, …).
 	LinuxReflink,
-	/// Kernel `overlay` filesystem (Linux), with optional `fuse-overlayfs`
-	/// fallback.
+	/// Deprecated `OverlayFS` backend. Retained for settings/API compatibility,
+	/// but unavailable because a live lowerdir is not a safe task snapshot.
 	Overlayfs,
 	/// Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block clone tree (NTFS/ReFS).
 	WindowsBlockClone,
@@ -101,8 +100,9 @@ impl BackendKind {
 	}
 
 	/// Backend chosen for the current build target when the caller doesn't
-	/// specify one. Platform-native `CoW` first, [`Rcopy`](Self::Rcopy) as the
-	/// last resort.
+	/// specify one. The default must be safe without host/path probing; callers
+	/// that want faster platform backends should use
+	/// [`resolve`](crate::resolve).
 	pub const fn native() -> Self {
 		#[cfg(target_os = "macos")]
 		{
@@ -110,7 +110,7 @@ impl BackendKind {
 		}
 		#[cfg(target_os = "linux")]
 		{
-			Self::Overlayfs
+			Self::Rcopy
 		}
 		#[cfg(windows)]
 		{
@@ -126,13 +126,8 @@ impl BackendKind {
 #[cfg(target_os = "macos")]
 const MACOS_AUTO_ORDER: &[BackendKind] = &[BackendKind::Apfs, BackendKind::Zfs, BackendKind::Rcopy];
 #[cfg(target_os = "linux")]
-const LINUX_AUTO_ORDER: &[BackendKind] = &[
-	BackendKind::Btrfs,
-	BackendKind::Zfs,
-	BackendKind::LinuxReflink,
-	BackendKind::Overlayfs,
-	BackendKind::Rcopy,
-];
+const LINUX_AUTO_ORDER: &[BackendKind] =
+	&[BackendKind::Btrfs, BackendKind::Zfs, BackendKind::LinuxReflink, BackendKind::Rcopy];
 #[cfg(windows)]
 const WINDOWS_AUTO_ORDER: &[BackendKind] =
 	&[BackendKind::WindowsBlockClone, BackendKind::Projfs, BackendKind::Rcopy];
@@ -251,9 +246,8 @@ pub trait IsolationBackend: Send + Sync {
 	/// `(size, mtime)` to skip equal files before falling back to a
 	/// content comparison.
 	///
-	/// Backends are free to override when they know a cheaper path —
-	/// overlayfs can scan the upper dir, `ProjFS` can query the placeholder
-	/// set — but the default is correct everywhere.
+	/// Backends are free to override when they know a cheaper path, but the
+	/// default is correct everywhere.
 	async fn diff(&self, lower: &Path, merged: &Path) -> IsoResult<Diff> {
 		diff::default_diff(lower, merged).await
 	}
@@ -297,9 +291,8 @@ pub fn backend_kind() -> BackendKind {
 
 /// Backend preference order for automatic isolation on this build target.
 ///
-/// The order is intentionally broader than [`BackendKind::native`]: it tries
-/// filesystem-native snapshot/reflink mechanisms first, then mount/projection
-/// overlays, and keeps [`BackendKind::Rcopy`] as the universal final fallback.
+/// Tries filesystem-native snapshot/reflink mechanisms first and keeps
+/// [`BackendKind::Rcopy`] as the universal final fallback.
 pub const fn auto_order() -> &'static [BackendKind] {
 	#[cfg(target_os = "macos")]
 	{
@@ -384,4 +377,24 @@ pub fn resolve(preferred: Option<BackendKind>) -> Resolution {
 	};
 
 	Resolution { kind, candidates, fell_back, reason }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{BackendKind, auto_order, resolve};
+
+	#[test]
+	fn automatic_resolution_never_considers_overlayfs() {
+		assert!(!auto_order().contains(&BackendKind::Overlayfs));
+	}
+
+	#[test]
+	fn explicit_overlayfs_preference_falls_back_without_overlay_candidate() {
+		let resolution = resolve(Some(BackendKind::Overlayfs));
+
+		assert_ne!(resolution.kind, BackendKind::Overlayfs);
+		assert!(!resolution.candidates.contains(&BackendKind::Overlayfs));
+		assert!(resolution.fell_back);
+		assert!(resolution.candidates.contains(&BackendKind::Rcopy));
+	}
 }

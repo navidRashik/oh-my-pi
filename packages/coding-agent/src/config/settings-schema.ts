@@ -3947,7 +3947,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Isolation",
 			label: "Isolation Mode",
 			description:
-				'Isolation backend for subagents. "auto" lets the native PAL pick the best available backend (CoW-aware filesystems, then overlayfs/ProjFS, then a git worktree / recursive-copy fallback).',
+				'Isolation backend for subagents. "auto" lets the native PAL pick the best available backend (CoW-aware filesystems, then a git worktree / recursive-copy fallback).',
 			options: [
 				{ value: "none", label: "None", description: "No isolation" },
 				{ value: "auto", label: "Auto", description: "Let the PAL pick the best available backend" },
@@ -3955,11 +3955,6 @@ export const SETTINGS_SCHEMA = {
 				{ value: "btrfs", label: "btrfs", description: "btrfs subvolume snapshot" },
 				{ value: "zfs", label: "ZFS", description: "ZFS snapshot + clone" },
 				{ value: "reflink", label: "Reflink", description: "Linux FICLONE per-file reflink" },
-				{
-					value: "overlayfs",
-					label: "Overlayfs",
-					description: "Linux kernel overlay (or fuse-overlayfs fallback)",
-				},
 				{ value: "projfs", label: "ProjFS", description: "Windows Projected File System" },
 				{
 					value: "block-clone",

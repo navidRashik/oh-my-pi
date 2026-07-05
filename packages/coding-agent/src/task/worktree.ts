@@ -367,8 +367,9 @@ export function parseIsolationMode(mode: TaskIsolationMode): IsoBackendKind | un
 		case "reflink":
 			return IsoBackendKind.LinuxReflink;
 		case "overlayfs":
-		case "fuse-overlay":
 			return IsoBackendKind.Overlayfs;
+		case "fuse-overlay":
+			return IsoBackendKind.Rcopy;
 		case "projfs":
 		case "fuse-projfs":
 			return IsoBackendKind.Projfs;
