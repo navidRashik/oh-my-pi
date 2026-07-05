@@ -1339,7 +1339,7 @@ async function handleExecServerMessage(
 					_reason => buildMcpToolNotFoundResult(mcpCall),
 					error => buildMcpErrorResult(error),
 				),
-				{ output, stream, toolCallId: state.currentToolCall?.id, intervalMs: execKeepaliveIntervalMs },
+				{ output, stream, toolCallId: mcpCall.toolCallId, intervalMs: execKeepaliveIntervalMs },
 			);
 			sendExecClientMessage(h2Request, execMsg, "mcpResult", execResult);
 			return;

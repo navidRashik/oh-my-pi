@@ -166,6 +166,39 @@ describe("Cursor exec stream keepalive", () => {
 		}
 	});
 
+	it("keeps emitting mcp keepalives after the tool-call block was finalized", () => {
+		// Cursor emits `toolCallCompleted` for MCP tool calls, so by the time
+		// `execServerMessage.mcpArgs` arrives, `state.currentToolCall` is null.
+		// The keepalive helper must still resolve the finalized block by id so
+		// the local MCP handler wait keeps producing progress events.
+		const output: AssistantMessage = {
+			...cursorExecPartialMessage,
+			content: [
+				...cursorExecPartialMessage.content.map(content =>
+					content.type === "toolCall" && content.id === "call-1" ? { ...content, name: "mcp:query" } : content,
+				),
+				{ type: "text", text: "thinking..." },
+			],
+		};
+		const events: AssistantMessageEvent[] = [];
+		const stream = {
+			push(event: AssistantMessageEvent) {
+				events.push(event);
+			},
+		} as unknown as AssistantMessageEventStream;
+
+		pushCursorExecStreamKeepalive(output, stream, "call-1");
+
+		expect(events).toEqual([
+			{
+				type: "toolcall_delta",
+				contentIndex: 0,
+				delta: "",
+				partial: output,
+			},
+		]);
+	});
+
 	it("clamps the keepalive cadence below the effective idle budget", () => {
 		// 30s default is fine for the 120s watchdog but misses a caller who
 		// tunes streamIdleTimeoutMs down to 20_000 or PI_STREAM_IDLE_TIMEOUT_MS
