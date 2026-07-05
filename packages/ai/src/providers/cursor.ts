@@ -141,6 +141,7 @@ import {
 } from "../utils/block-symbols";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { getStreamIdleTimeoutMs } from "../utils/idle-iterator";
 import { connectProxiedSocket, getProxyForProvider, shouldBypassProxy } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { toolWireSchema } from "../utils/schema/wire";
@@ -149,7 +150,24 @@ export const CURSOR_API_URL = "https://api2.cursor.sh";
 export const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
 
 const CURSOR_PROXY_TUNNEL_TIMEOUT_MS = 30_000;
-const CURSOR_EXEC_KEEPALIVE_INTERVAL_MS = 30_000;
+const CURSOR_EXEC_KEEPALIVE_MAX_INTERVAL_MS = 30_000;
+const CURSOR_EXEC_KEEPALIVE_MIN_INTERVAL_MS = 1_000;
+
+/**
+ * Pick a keepalive cadence that always fires at least once before an idle
+ * budget expires. Callers can shorten `PI_STREAM_IDLE_TIMEOUT_MS` /
+ * `streamIdleTimeoutMs` below the default 120s; a fixed 30s cadence would then
+ * miss the deadline for the very case the exec keepalives are meant to cover.
+ * `undefined` (watchdog disabled) skips the derivation and uses the max cadence
+ * so we still surface progress on the transcript.
+ */
+export function resolveCursorExecKeepaliveIntervalMs(idleTimeoutMs: number | undefined): number {
+	if (idleTimeoutMs === undefined || idleTimeoutMs <= 0) {
+		return CURSOR_EXEC_KEEPALIVE_MAX_INTERVAL_MS;
+	}
+	const half = Math.floor(idleTimeoutMs / 2);
+	return Math.max(CURSOR_EXEC_KEEPALIVE_MIN_INTERVAL_MS, Math.min(CURSOR_EXEC_KEEPALIVE_MAX_INTERVAL_MS, half));
+}
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
@@ -368,6 +386,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				conversationState: cachedState,
 			});
 			conversationStateCache.set(conversationId, conversationState);
+			const effectiveIdleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+			const execKeepaliveIntervalMs = resolveCursorExecKeepaliveIntervalMs(effectiveIdleTimeoutMs);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
@@ -499,6 +519,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							options?.onToolResult,
 							usageState,
 							requestContextTools,
+							execKeepaliveIntervalMs,
 							onConversationCheckpoint,
 						).catch(error => {
 							log("error", "handleServerMessage", { error: String(error) });
@@ -665,6 +686,7 @@ async function handleServerMessage(
 	onToolResult: CursorToolResultHandler | undefined,
 	usageState: UsageState,
 	requestContextTools: McpToolDefinition[],
+	execKeepaliveIntervalMs: number,
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
 ): Promise<void> {
 	const msgCase = msg.message.case;
@@ -685,6 +707,7 @@ async function handleServerMessage(
 			output,
 			stream,
 			state,
+			execKeepaliveIntervalMs,
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
@@ -1044,6 +1067,7 @@ async function handleExecServerMessage(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	state: BlockState,
+	execKeepaliveIntervalMs: number,
 ): Promise<void> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
@@ -1089,7 +1113,7 @@ async function handleExecServerMessage(
 					reason => buildReadRejectedResult(args.path, reason),
 					error => buildReadErrorResult(args.path, error),
 				),
-				{ output, stream, toolCallId: args.toolCallId },
+				{ output, stream, toolCallId: args.toolCallId, intervalMs: execKeepaliveIntervalMs },
 			);
 			sendExecClientMessage(h2Request, execMsg, "readResult", execResult);
 			return;
@@ -1110,7 +1134,7 @@ async function handleExecServerMessage(
 					reason => buildLsRejectedResult(args.path, reason),
 					error => buildLsErrorResult(args.path, error),
 				),
-				{ output, stream, toolCallId: args.toolCallId },
+				{ output, stream, toolCallId: args.toolCallId, intervalMs: execKeepaliveIntervalMs },
 			);
 			sendExecClientMessage(h2Request, execMsg, "lsResult", execResult);
 			return;
@@ -1136,7 +1160,7 @@ async function handleExecServerMessage(
 					reason => buildGrepErrorResult(reason),
 					error => buildGrepErrorResult(error),
 				),
-				{ output, stream, toolCallId: args.toolCallId },
+				{ output, stream, toolCallId: args.toolCallId, intervalMs: execKeepaliveIntervalMs },
 			);
 			sendExecClientMessage(h2Request, execMsg, "grepResult", execResult);
 			return;
@@ -1168,7 +1192,7 @@ async function handleExecServerMessage(
 					reason => buildWriteRejectedResult(args.path, reason),
 					error => buildWriteErrorResult(args.path, error),
 				),
-				{ output, stream, toolCallId: args.toolCallId },
+				{ output, stream, toolCallId: args.toolCallId, intervalMs: execKeepaliveIntervalMs },
 			);
 			sendExecClientMessage(h2Request, execMsg, "writeResult", execResult);
 			return;
@@ -1186,7 +1210,7 @@ async function handleExecServerMessage(
 					reason => buildDeleteRejectedResult(args.path, reason),
 					error => buildDeleteErrorResult(args.path, error),
 				),
-				{ output, stream, toolCallId: args.toolCallId },
+				{ output, stream, toolCallId: args.toolCallId, intervalMs: execKeepaliveIntervalMs },
 			);
 			sendExecClientMessage(h2Request, execMsg, "deleteResult", execResult);
 			return;
@@ -1212,7 +1236,7 @@ async function handleExecServerMessage(
 					reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
 					error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
 				),
-				{ output, stream, toolCallId: args.toolCallId },
+				{ output, stream, toolCallId: args.toolCallId, intervalMs: execKeepaliveIntervalMs },
 			);
 			const sanitizedExecResult = sanitizeShellExecResult(execResult);
 			sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
@@ -1233,6 +1257,7 @@ async function handleExecServerMessage(
 					output,
 					stream,
 					toolCallId: args.toolCallId,
+					intervalMs: execKeepaliveIntervalMs,
 				},
 			);
 			return;
@@ -1297,7 +1322,7 @@ async function handleExecServerMessage(
 					reason => buildDiagnosticsRejectedResult(args.path, reason),
 					error => buildDiagnosticsErrorResult(args.path, error),
 				),
-				{ output, stream, toolCallId: args.toolCallId },
+				{ output, stream, toolCallId: args.toolCallId, intervalMs: execKeepaliveIntervalMs },
 			);
 			sendExecClientMessage(h2Request, execMsg, "diagnosticsResult", execResult);
 			return;
@@ -1314,7 +1339,7 @@ async function handleExecServerMessage(
 					_reason => buildMcpToolNotFoundResult(mcpCall),
 					error => buildMcpErrorResult(error),
 				),
-				{ output, stream, toolCallId: state.currentToolCall?.id },
+				{ output, stream, toolCallId: state.currentToolCall?.id, intervalMs: execKeepaliveIntervalMs },
 			);
 			sendExecClientMessage(h2Request, execMsg, "mcpResult", execResult);
 			return;
@@ -2180,7 +2205,7 @@ export async function awaitWithCursorExecKeepalive<TResult>(
 		intervalMs?: number;
 	},
 ): Promise<TResult> {
-	const intervalMs = options.intervalMs ?? CURSOR_EXEC_KEEPALIVE_INTERVAL_MS;
+	const intervalMs = options.intervalMs ?? CURSOR_EXEC_KEEPALIVE_MAX_INTERVAL_MS;
 	if (intervalMs <= 0 || !options.toolCallId) {
 		return await promise;
 	}

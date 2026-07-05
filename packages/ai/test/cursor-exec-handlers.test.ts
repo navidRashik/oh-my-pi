@@ -4,6 +4,7 @@ import {
 	buildCursorHistoryForTest,
 	buildCursorSystemPromptJsons,
 	pushCursorExecStreamKeepalive,
+	resolveCursorExecKeepaliveIntervalMs,
 	resolveExecHandler,
 	streamCursor,
 } from "@oh-my-pi/pi-ai/providers/cursor";
@@ -163,6 +164,22 @@ describe("Cursor exec stream keepalive", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("clamps the keepalive cadence below the effective idle budget", () => {
+		// 30s default is fine for the 120s watchdog but misses a caller who
+		// tunes streamIdleTimeoutMs down to 20_000 or PI_STREAM_IDLE_TIMEOUT_MS
+		// to 8_000 — the exec handler would abort before the first keepalive.
+		expect(resolveCursorExecKeepaliveIntervalMs(120_000)).toBe(30_000);
+		expect(resolveCursorExecKeepaliveIntervalMs(20_000)).toBe(10_000);
+		expect(resolveCursorExecKeepaliveIntervalMs(8_000)).toBe(4_000);
+		// Never drop below a 1s floor — a super-tight budget still gets a
+		// visible progress event before the deadline.
+		expect(resolveCursorExecKeepaliveIntervalMs(500)).toBe(1_000);
+		// Watchdog disabled or unset: fall back to the max cadence so the
+		// transcript still shows periodic progress.
+		expect(resolveCursorExecKeepaliveIntervalMs(undefined)).toBe(30_000);
+		expect(resolveCursorExecKeepaliveIntervalMs(0)).toBe(30_000);
 	});
 });
 describe("Cursor resolveExecHandler execHandlers binding", () => {

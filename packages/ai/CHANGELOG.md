@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed Cursor (`cursor-agent`) streams aborting mid-turn with `Provider stream stalled while waiting for the next event` when a local tool ran during the exec-channel round-trip: Cursor exec handlers now emit empty `toolcall_delta` keepalives while OMP is awaiting the local tool result, so the generic lazy stream watchdog still catches truly silent streams but no longer fires during legitimate long-running Cursor-driven tools ([#4593](https://github.com/can1357/oh-my-pi/issues/4593)).
+- Fixed Cursor (`cursor-agent`) streams aborting mid-turn with `Provider stream stalled while waiting for the next event` when a local tool ran during the exec-channel round-trip: Cursor exec handlers now emit empty `toolcall_delta` keepalives while OMP is awaiting the local tool result. The keepalive cadence is derived from the caller's effective `streamIdleTimeoutMs` / `PI_STREAM_IDLE_TIMEOUT_MS` (max 30s, min 1s, otherwise half the idle budget) so tuned deployments still fire a keepalive before the idle watchdog trips, while truly silent streams remain retryable through the generic lazy watchdog ([#4593](https://github.com/can1357/oh-my-pi/issues/4593)).
 
 ## [16.3.6] - 2026-07-04
 
