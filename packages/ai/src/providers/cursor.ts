@@ -149,6 +149,7 @@ export const CURSOR_API_URL = "https://api2.cursor.sh";
 export const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
 
 const CURSOR_PROXY_TUNNEL_TIMEOUT_MS = 30_000;
+const CURSOR_EXEC_KEEPALIVE_INTERVAL_MS = 30_000;
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
@@ -1079,13 +1080,16 @@ async function handleExecServerMessage(
 			const args = execMsg.message.value;
 			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
 			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "read", { path: args.path });
-			const { execResult } = await resolveExecHandler(
-				args,
-				execHandlers?.read?.bind(execHandlers),
-				onToolResult,
-				toolResult => buildReadResultFromToolResult(args.path, toolResult),
-				reason => buildReadRejectedResult(args.path, reason),
-				error => buildReadErrorResult(args.path, error),
+			const { execResult } = await awaitWithCursorExecKeepalive(
+				resolveExecHandler(
+					args,
+					execHandlers?.read?.bind(execHandlers),
+					onToolResult,
+					toolResult => buildReadResultFromToolResult(args.path, toolResult),
+					reason => buildReadRejectedResult(args.path, reason),
+					error => buildReadErrorResult(args.path, error),
+				),
+				{ output, stream, toolCallId: args.toolCallId },
 			);
 			sendExecClientMessage(h2Request, execMsg, "readResult", execResult);
 			return;
@@ -1097,13 +1101,16 @@ async function handleExecServerMessage(
 			// `CursorExecHandlers.ls` in `pi-coding-agent/src/cursor.ts`); mirror
 			// that here so the synthesized block matches the toolResult's `toolName`.
 			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "read", { path: args.path });
-			const { execResult } = await resolveExecHandler(
-				args,
-				execHandlers?.ls?.bind(execHandlers),
-				onToolResult,
-				toolResult => buildLsResultFromToolResult(args.path, toolResult),
-				reason => buildLsRejectedResult(args.path, reason),
-				error => buildLsErrorResult(args.path, error),
+			const { execResult } = await awaitWithCursorExecKeepalive(
+				resolveExecHandler(
+					args,
+					execHandlers?.ls?.bind(execHandlers),
+					onToolResult,
+					toolResult => buildLsResultFromToolResult(args.path, toolResult),
+					reason => buildLsRejectedResult(args.path, reason),
+					error => buildLsErrorResult(args.path, error),
+				),
+				{ output, stream, toolCallId: args.toolCallId },
 			);
 			sendExecClientMessage(h2Request, execMsg, "lsResult", execResult);
 			return;
@@ -1120,13 +1127,16 @@ async function handleExecServerMessage(
 				path: searchPath,
 				case: args.caseInsensitive === true ? false : undefined,
 			});
-			const { execResult } = await resolveExecHandler(
-				args,
-				execHandlers?.grep?.bind(execHandlers),
-				onToolResult,
-				toolResult => buildGrepResultFromToolResult(args, toolResult),
-				reason => buildGrepErrorResult(reason),
-				error => buildGrepErrorResult(error),
+			const { execResult } = await awaitWithCursorExecKeepalive(
+				resolveExecHandler(
+					args,
+					execHandlers?.grep?.bind(execHandlers),
+					onToolResult,
+					toolResult => buildGrepResultFromToolResult(args, toolResult),
+					reason => buildGrepErrorResult(reason),
+					error => buildGrepErrorResult(error),
+				),
+				{ output, stream, toolCallId: args.toolCallId },
 			);
 			sendExecClientMessage(h2Request, execMsg, "grepResult", execResult);
 			return;
@@ -1140,22 +1150,25 @@ async function handleExecServerMessage(
 				path: args.path,
 				content,
 			});
-			const { execResult } = await resolveExecHandler(
-				args,
-				execHandlers?.write?.bind(execHandlers),
-				onToolResult,
-				toolResult =>
-					buildWriteResultFromToolResult(
-						{
-							path: args.path,
-							fileText: args.fileText,
-							fileBytes: args.fileBytes,
-							returnFileContentAfterWrite: args.returnFileContentAfterWrite,
-						},
-						toolResult,
-					),
-				reason => buildWriteRejectedResult(args.path, reason),
-				error => buildWriteErrorResult(args.path, error),
+			const { execResult } = await awaitWithCursorExecKeepalive(
+				resolveExecHandler(
+					args,
+					execHandlers?.write?.bind(execHandlers),
+					onToolResult,
+					toolResult =>
+						buildWriteResultFromToolResult(
+							{
+								path: args.path,
+								fileText: args.fileText,
+								fileBytes: args.fileBytes,
+								returnFileContentAfterWrite: args.returnFileContentAfterWrite,
+							},
+							toolResult,
+						),
+					reason => buildWriteRejectedResult(args.path, reason),
+					error => buildWriteErrorResult(args.path, error),
+				),
+				{ output, stream, toolCallId: args.toolCallId },
 			);
 			sendExecClientMessage(h2Request, execMsg, "writeResult", execResult);
 			return;
@@ -1164,13 +1177,16 @@ async function handleExecServerMessage(
 			const args = execMsg.message.value;
 			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
 			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "delete", { path: args.path });
-			const { execResult } = await resolveExecHandler(
-				args,
-				execHandlers?.delete?.bind(execHandlers),
-				onToolResult,
-				toolResult => buildDeleteResultFromToolResult(args.path, toolResult),
-				reason => buildDeleteRejectedResult(args.path, reason),
-				error => buildDeleteErrorResult(args.path, error),
+			const { execResult } = await awaitWithCursorExecKeepalive(
+				resolveExecHandler(
+					args,
+					execHandlers?.delete?.bind(execHandlers),
+					onToolResult,
+					toolResult => buildDeleteResultFromToolResult(args.path, toolResult),
+					reason => buildDeleteRejectedResult(args.path, reason),
+					error => buildDeleteErrorResult(args.path, error),
+				),
+				{ output, stream, toolCallId: args.toolCallId },
 			);
 			sendExecClientMessage(h2Request, execMsg, "deleteResult", execResult);
 			return;
@@ -1187,13 +1203,16 @@ async function handleExecServerMessage(
 				cwd: args.workingDirectory || undefined,
 				timeout: shellTimeout,
 			});
-			const { execResult } = await resolveExecHandler(
-				args,
-				execHandlers?.shell?.bind(execHandlers),
-				onToolResult,
-				toolResult => buildShellResultFromToolResult(normalizedArgs, toolResult),
-				reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
-				error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
+			const { execResult } = await awaitWithCursorExecKeepalive(
+				resolveExecHandler(
+					args,
+					execHandlers?.shell?.bind(execHandlers),
+					onToolResult,
+					toolResult => buildShellResultFromToolResult(normalizedArgs, toolResult),
+					reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
+					error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
+				),
+				{ output, stream, toolCallId: args.toolCallId },
 			);
 			const sanitizedExecResult = sanitizeShellExecResult(execResult);
 			sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
@@ -1208,7 +1227,14 @@ async function handleExecServerMessage(
 				cwd: args.workingDirectory || undefined,
 				timeout: shellStreamTimeout,
 			});
-			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult);
+			await awaitWithCursorExecKeepalive(
+				handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult),
+				{
+					output,
+					stream,
+					toolCallId: args.toolCallId,
+				},
+			);
 			return;
 		}
 		case "backgroundShellSpawnArgs": {
@@ -1262,13 +1288,16 @@ async function handleExecServerMessage(
 				action: "diagnostics",
 				file: args.path,
 			});
-			const { execResult } = await resolveExecHandler(
-				args,
-				execHandlers?.diagnostics?.bind(execHandlers),
-				onToolResult,
-				toolResult => buildDiagnosticsResultFromToolResult(args.path, toolResult),
-				reason => buildDiagnosticsRejectedResult(args.path, reason),
-				error => buildDiagnosticsErrorResult(args.path, error),
+			const { execResult } = await awaitWithCursorExecKeepalive(
+				resolveExecHandler(
+					args,
+					execHandlers?.diagnostics?.bind(execHandlers),
+					onToolResult,
+					toolResult => buildDiagnosticsResultFromToolResult(args.path, toolResult),
+					reason => buildDiagnosticsRejectedResult(args.path, reason),
+					error => buildDiagnosticsErrorResult(args.path, error),
+				),
+				{ output, stream, toolCallId: args.toolCallId },
 			);
 			sendExecClientMessage(h2Request, execMsg, "diagnosticsResult", execResult);
 			return;
@@ -1276,13 +1305,16 @@ async function handleExecServerMessage(
 		case "mcpArgs": {
 			const args = execMsg.message.value;
 			const mcpCall = decodeMcpCall(args);
-			const { execResult } = await resolveExecHandler(
-				mcpCall,
-				execHandlers?.mcp?.bind(execHandlers),
-				onToolResult,
-				toolResult => buildMcpResultFromToolResult(mcpCall, toolResult),
-				_reason => buildMcpToolNotFoundResult(mcpCall),
-				error => buildMcpErrorResult(error),
+			const { execResult } = await awaitWithCursorExecKeepalive(
+				resolveExecHandler(
+					mcpCall,
+					execHandlers?.mcp?.bind(execHandlers),
+					onToolResult,
+					toolResult => buildMcpResultFromToolResult(mcpCall, toolResult),
+					_reason => buildMcpToolNotFoundResult(mcpCall),
+					error => buildMcpErrorResult(error),
+				),
+				{ output, stream, toolCallId: state.currentToolCall?.id },
 			);
 			sendExecClientMessage(h2Request, execMsg, "mcpResult", execResult);
 			return;
@@ -2120,6 +2152,47 @@ export function synthesizeCursorExecToolCall(
 	const idx = output.content.length - 1;
 	stream.push({ type: "toolcall_start", contentIndex: idx, partial: output });
 	stream.push({ type: "toolcall_end", contentIndex: idx, toolCall: block, partial: output });
+}
+
+/** Exported for tests: emits a no-op delta so the lazy stream watchdog observes exec progress. */
+export function pushCursorExecStreamKeepalive(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	toolCallId: string | undefined,
+): void {
+	if (!toolCallId) {
+		return;
+	}
+	const contentIndex = output.content.findIndex(content => content.type === "toolCall" && content.id === toolCallId);
+	if (contentIndex < 0) {
+		return;
+	}
+	stream.push({ type: "toolcall_delta", contentIndex, delta: "", partial: output });
+}
+
+/** Exported for tests: keeps Cursor exec-channel local tool waits visible to the lazy watchdog. */
+export async function awaitWithCursorExecKeepalive<TResult>(
+	promise: Promise<TResult>,
+	options: {
+		output: AssistantMessage;
+		stream: AssistantMessageEventStream;
+		toolCallId: string | undefined;
+		intervalMs?: number;
+	},
+): Promise<TResult> {
+	const intervalMs = options.intervalMs ?? CURSOR_EXEC_KEEPALIVE_INTERVAL_MS;
+	if (intervalMs <= 0 || !options.toolCallId) {
+		return await promise;
+	}
+	const timer = setInterval(() => {
+		pushCursorExecStreamKeepalive(options.output, options.stream, options.toolCallId);
+	}, intervalMs);
+	timer.unref?.();
+	try {
+		return await promise;
+	} finally {
+		clearInterval(timer);
+	}
 }
 
 /** Exported for tests: drives one Cursor interaction update through the streaming state machine. */

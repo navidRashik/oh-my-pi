@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed Cursor (`cursor-agent`) streams aborting mid-turn with `Provider stream stalled while waiting for the next event` when a local tool ran during the exec-channel round-trip: `streamCursor` in `register-builtins.ts` now sets `PROVIDER_HANDLED_STREAM_TIMEOUTS` so the lazy wrapper stops racing `iterateWithIdleTimeout` (default 120s) against the provider's own HTTP/2 heartbeat + trailers + caller-signal transport, matching Anthropic and every other transport-owning provider ([#4593](https://github.com/can1357/oh-my-pi/issues/4593)).
+- Fixed Cursor (`cursor-agent`) streams aborting mid-turn with `Provider stream stalled while waiting for the next event` when a local tool ran during the exec-channel round-trip: Cursor exec handlers now emit empty `toolcall_delta` keepalives while OMP is awaiting the local tool result, so the generic lazy stream watchdog still catches truly silent streams but no longer fires during legitimate long-running Cursor-driven tools ([#4593](https://github.com/can1357/oh-my-pi/issues/4593)).
 
 ## [16.3.6] - 2026-07-04
 

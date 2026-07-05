@@ -1,11 +1,14 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import {
+	awaitWithCursorExecKeepalive,
 	buildCursorHistoryForTest,
 	buildCursorSystemPromptJsons,
+	pushCursorExecStreamKeepalive,
 	resolveExecHandler,
 	streamCursor,
 } from "@oh-my-pi/pi-ai/providers/cursor";
-import type { Context, Model } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { AgentRunRequest } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
 
@@ -82,6 +85,86 @@ function toolResultContext(): Context {
 	};
 }
 
+const cursorExecPartialMessage: AssistantMessage = {
+	role: "assistant",
+	content: [
+		{
+			type: "toolCall",
+			id: "call-1",
+			name: "grep",
+			arguments: { pattern: "foo", path: "." },
+		},
+	],
+	api: "cursor-agent",
+	provider: "cursor",
+	model: "composer-2.5-fast",
+	usage: {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	},
+	stopReason: "toolUse",
+	timestamp: 1,
+};
+
+describe("Cursor exec stream keepalive", () => {
+	it("pushes an empty toolcall_delta for synthesized exec tool-call blocks", () => {
+		const output: AssistantMessage = { ...cursorExecPartialMessage, content: [...cursorExecPartialMessage.content] };
+		const events: AssistantMessageEvent[] = [];
+		const stream = {
+			push(event: AssistantMessageEvent) {
+				events.push(event);
+			},
+		} as unknown as AssistantMessageEventStream;
+
+		pushCursorExecStreamKeepalive(output, stream, "call-1");
+
+		expect(events).toEqual([
+			{
+				type: "toolcall_delta",
+				contentIndex: 0,
+				delta: "",
+				partial: output,
+			},
+		]);
+		expect(output.content).toEqual(cursorExecPartialMessage.content);
+	});
+
+	it("emits keepalive deltas while awaiting a long exec handler", async () => {
+		const output: AssistantMessage = { ...cursorExecPartialMessage, content: [...cursorExecPartialMessage.content] };
+		const events: AssistantMessageEvent[] = [];
+		const stream = {
+			push(event: AssistantMessageEvent) {
+				events.push(event);
+			},
+		} as unknown as AssistantMessageEventStream;
+		const pending = Promise.withResolvers<"done">();
+
+		vi.useFakeTimers();
+		try {
+			const resultPromise = awaitWithCursorExecKeepalive(pending.promise, {
+				output,
+				stream,
+				toolCallId: "call-1",
+				intervalMs: 10,
+			});
+			vi.advanceTimersByTime(30);
+			expect(events).toHaveLength(3);
+			expect(events.every(event => event.type === "toolcall_delta" && event.delta === "")).toBe(true);
+
+			pending.resolve("done");
+			expect(await resultPromise).toBe("done");
+
+			vi.advanceTimersByTime(30);
+			expect(events).toHaveLength(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
 describe("Cursor resolveExecHandler execHandlers binding", () => {
 	it("invokes handler with correct this when passed as bound method", async () => {
 		const sentinel = { tag: "bound-correctly" };
