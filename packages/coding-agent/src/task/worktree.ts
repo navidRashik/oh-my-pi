@@ -338,12 +338,16 @@ export type TaskIsolationMode =
 	| "btrfs"
 	| "zfs"
 	| "reflink"
-	| "overlayfs"
 	| "projfs"
 	| "block-clone"
 	| "rcopy"
 	// Legacy values, accepted for back-compat with pre-PAL settings files.
+	// `worktree`, `overlayfs`, `fuse-overlay`, and `fuse-projfs` are silently
+	// steered to safe backends; `overlayfs`/`fuse-overlay` never mount an
+	// overlay because a live parent worktree is not a safe lower layer
+	// (#4627).
 	| "worktree"
+	| "overlayfs"
 	| "fuse-overlay"
 	| "fuse-projfs";
 
@@ -367,7 +371,6 @@ export function parseIsolationMode(mode: TaskIsolationMode): IsoBackendKind | un
 		case "reflink":
 			return IsoBackendKind.LinuxReflink;
 		case "overlayfs":
-			return IsoBackendKind.Overlayfs;
 		case "fuse-overlay":
 			return IsoBackendKind.Rcopy;
 		case "projfs":

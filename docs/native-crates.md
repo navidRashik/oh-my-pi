@@ -16,7 +16,7 @@ covering when a crate should be promoted to user-facing docs, see
 | `pi-natives` | [`crates/pi-natives`](../crates/pi-natives) | Top-level N-API `cdylib`; aggregates the other crates and exposes the JS-visible API. |
 | `pi-shell` | [`crates/pi-shell`](../crates/pi-shell) | Embedded shell / PTY / process management split out of `pi-natives` (wraps `brush-*`). |
 | `pi-ast` | [`crates/pi-ast`](../crates/pi-ast) | tree-sitter-based code summarizer and AST utilities; 50+ language grammars. |
-| `pi-iso` | [`crates/pi-iso`](../crates/pi-iso) | Task isolation backend resolver: APFS clones, btrfs/zfs reflinks, overlayfs, projfs, rcopy. |
+| `pi-iso` | [`crates/pi-iso`](../crates/pi-iso) | Task isolation backend resolver: APFS clones, btrfs/zfs reflinks, projfs, rcopy. |
 | `pi-walker` | [`crates/pi-walker`](../crates/pi-walker) | Parallel filesystem walker (ignore + globset) shared by grep, glob, and fs-scan cache. |
 | `pi_uu_grep` | [`crates/pi-uu-grep`](../crates/pi-uu-grep) | `grep` re-implemented on `grep-regex` / `grep-searcher`; runs in-process as a shell builtin. Entry: `pi_uu_grep::run`. |
 | `pi-uutils-ctx` | [`crates/pi-uutils-ctx`](../crates/pi-uutils-ctx) | Thread-local stdio + cwd context shim for embedding vendored uutils as in-process shell builtins. |

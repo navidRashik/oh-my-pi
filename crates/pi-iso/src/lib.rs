@@ -30,7 +30,6 @@ mod apfs;
 mod btrfs;
 mod diff;
 mod linux_reflink;
-mod overlayfs;
 mod projfs;
 mod rcopy;
 mod windows_block_clone;
@@ -52,9 +51,6 @@ pub enum BackendKind {
 	Zfs,
 	/// Linux `FICLONE` per-file reflink tree (btrfs, XFS+reflink, bcachefs, …).
 	LinuxReflink,
-	/// Deprecated `OverlayFS` backend. Retained for settings/API compatibility,
-	/// but unavailable because a live lowerdir is not a safe task snapshot.
-	Overlayfs,
 	/// Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block clone tree (NTFS/ReFS).
 	WindowsBlockClone,
 	/// Windows Projected File System.
@@ -72,7 +68,6 @@ impl BackendKind {
 			Self::Btrfs => "btrfs",
 			Self::Zfs => "zfs",
 			Self::LinuxReflink => "linux-reflink",
-			Self::Overlayfs => "overlayfs",
 			Self::WindowsBlockClone => "windows-block-clone",
 			Self::Projfs => "projfs",
 			Self::Rcopy => "rcopy",
@@ -91,7 +86,6 @@ impl BackendKind {
 			"btrfs" => Self::Btrfs,
 			"zfs" => Self::Zfs,
 			"linux-reflink" | "reflink" => Self::LinuxReflink,
-			"overlayfs" => Self::Overlayfs,
 			"windows-block-clone" | "block-clone" => Self::WindowsBlockClone,
 			"projfs" => Self::Projfs,
 			"rcopy" => Self::Rcopy,
@@ -221,8 +215,8 @@ pub(crate) fn command_failed(
 ///
 /// `lower` is the read-only source tree; `merged` is the destination where
 /// the writable view is materialised. Implementations are responsible for
-/// creating any auxiliary directories (e.g. overlayfs upper/work dirs) and
-/// for tearing them down in [`stop`](Self::stop).
+/// creating any auxiliary directories and for tearing them down in
+/// [`stop`](Self::stop).
 ///
 /// `start` / `stop` are synchronous because the platform primitives they
 /// wrap (`mount`, `clonefile`, `PrjStartVirtualizing`) are blocking
@@ -277,7 +271,6 @@ pub fn backend(kind: BackendKind) -> &'static dyn IsolationBackend {
 		BackendKind::Btrfs => btrfs::backend(),
 		BackendKind::Zfs => zfs::backend(),
 		BackendKind::LinuxReflink => linux_reflink::backend(),
-		BackendKind::Overlayfs => overlayfs::backend(),
 		BackendKind::WindowsBlockClone => windows_block_clone::backend(),
 		BackendKind::Projfs => projfs::backend(),
 		BackendKind::Rcopy => &rcopy::RcopyBackend,
@@ -384,17 +377,25 @@ mod tests {
 	use super::{BackendKind, auto_order, resolve};
 
 	#[test]
-	fn automatic_resolution_never_considers_overlayfs() {
-		assert!(!auto_order().contains(&BackendKind::Overlayfs));
+	fn linux_auto_order_stays_on_snapshotting_backends() {
+		#[cfg(target_os = "linux")]
+		{
+			assert_eq!(auto_order(), &[
+				BackendKind::Btrfs,
+				BackendKind::Zfs,
+				BackendKind::LinuxReflink,
+				BackendKind::Rcopy,
+			]);
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			let _ = BackendKind::Rcopy;
+		}
 	}
 
 	#[test]
-	fn explicit_overlayfs_preference_falls_back_without_overlay_candidate() {
-		let resolution = resolve(Some(BackendKind::Overlayfs));
-
-		assert_ne!(resolution.kind, BackendKind::Overlayfs);
-		assert!(!resolution.candidates.contains(&BackendKind::Overlayfs));
-		assert!(resolution.fell_back);
+	fn resolve_unhinted_never_recommends_a_live_lowerdir_backend() {
+		let resolution = resolve(None);
 		assert!(resolution.candidates.contains(&BackendKind::Rcopy));
 	}
 }

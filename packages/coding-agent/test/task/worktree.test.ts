@@ -73,7 +73,7 @@ describe("worktree isolation helpers", () => {
 		expect(parseIsolationMode("btrfs")).toBe(natives.IsoBackendKind.Btrfs);
 		expect(parseIsolationMode("zfs")).toBe(natives.IsoBackendKind.Zfs);
 		expect(parseIsolationMode("reflink")).toBe(natives.IsoBackendKind.LinuxReflink);
-		expect(parseIsolationMode("overlayfs")).toBe(natives.IsoBackendKind.Overlayfs);
+		expect(parseIsolationMode("overlayfs")).toBe(natives.IsoBackendKind.Rcopy);
 		expect(parseIsolationMode("fuse-overlay")).toBe(natives.IsoBackendKind.Rcopy);
 		expect(parseIsolationMode("projfs")).toBe(natives.IsoBackendKind.Projfs);
 		expect(parseIsolationMode("fuse-projfs")).toBe(natives.IsoBackendKind.Projfs);

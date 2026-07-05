@@ -104,10 +104,9 @@ export const IsoBackendKind = {
 	Btrfs: 1,
 	Zfs: 2,
 	LinuxReflink: 3,
-	Overlayfs: 4,
-	WindowsBlockClone: 5,
-	Projfs: 6,
-	Rcopy: 7,
+	WindowsBlockClone: 4,
+	Projfs: 5,
+	Rcopy: 6,
 };
 export const IsoChangeKind = {
 	Added: 0,

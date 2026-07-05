@@ -104,19 +104,19 @@ Artifacts and side channels:
 - Batch mode (`task.batch`, default on)
   - on — `{ agent, context, tasks[] }`: one independent spawn per item, required `context` shared across the call's spawns, `isolated` per item. Lifecycle, revival, and concurrency semantics match N parallel single calls.
   - off — single spawn per call; `tasks`/`context` are rejected and removed from the schema.
-- Isolation mode (`task.isolation.mode`): `none`, `auto`, `apfs`, `btrfs`, `zfs`, `reflink`, `overlayfs`, `projfs`, `block-clone`, `rcopy` (legacy `worktree`, `fuse-overlay`, `fuse-projfs` accepted for back-compat); the PAL resolves the actual backend with fallback.
+- Isolation mode (`task.isolation.mode`): `none`, `auto`, `apfs`, `btrfs`, `zfs`, `reflink`, `projfs`, `block-clone`, `rcopy` (legacy `worktree`, `overlayfs`, `fuse-overlay`, `fuse-projfs` accepted for back-compat and normalized to safe backends); the PAL resolves the actual backend with fallback.
 - Isolation merge strategy: patch mode (capture/apply root patches) or branch mode (commit to `omp/task/<id>`, cherry-pick into parent).
 - Agent source precedence: project custom agents, then user custom agents, then bundled agents (`explore`, `plan`, `designer`, `reviewer`, `task`, `sonic`, `librarian`, `oracle`).
 
 ## Side Effects
 - Filesystem
   - Writes `<id>.jsonl` and `<id>.md` under the session artifacts dir or a temp task dir; isolated patch mode writes `<id>.patch`.
-  - Creates/removes worktrees or overlay mount directories; branch mode creates temporary worktrees and task branches.
+  - Creates/removes worktrees or backend mount directories; branch mode creates temporary worktrees and task branches.
 - Network
   - Child sessions may use whichever networked tools/models their active tool set permits.
   - MCP proxy tools can call existing parent MCP connections with a 60_000 ms timeout.
 - Subprocesses / native bindings
-  - Isolation backends run through the `pi-natives` PAL (`crates/pi-iso`): kernel `overlay` with `fuse-overlayfs`/`fusermount[3]` fallback on Linux, APFS/Btrfs/ZFS/reflink clones, ProjFS on Windows, recursive copy as last resort.
+  - Isolation backends run through the `pi-natives` PAL (`crates/pi-iso`): APFS/Btrfs/ZFS/reflink clones on macOS and Linux, ProjFS on Windows, recursive copy as last resort.
   - Git operations for baseline capture, patch apply, worktrees, branches, stash, cherry-pick, commits.
 - Session state (transcript, memory, jobs, checkpoints, registries)
   - Creates child `AgentSession` instances with isolated settings snapshots; finished sessions stay registered in the process-global `AgentRegistry` as `idle`/`parked` until process teardown or explicit release.

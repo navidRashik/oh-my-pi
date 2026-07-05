@@ -3929,18 +3929,7 @@ export const SETTINGS_SCHEMA = {
 	// Delegation
 	"task.isolation.mode": {
 		type: "enum",
-		values: [
-			"none",
-			"auto",
-			"apfs",
-			"btrfs",
-			"zfs",
-			"reflink",
-			"overlayfs",
-			"projfs",
-			"block-clone",
-			"rcopy",
-		] as const,
+		values: ["none", "auto", "apfs", "btrfs", "zfs", "reflink", "projfs", "block-clone", "rcopy"] as const,
 		default: "none",
 		ui: {
 			tab: "tasks",

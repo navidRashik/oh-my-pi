@@ -2,9 +2,9 @@
 
 ## [Unreleased]
 
-### Fixed
+### Removed
 
-- Removed OverlayFS from task isolation auto-selection and the isolation-mode picker because it cannot safely isolate live parent worktrees ([#4627](https://github.com/can1357/oh-my-pi/issues/4627)).
+- Removed the `overlayfs` value from `task.isolation.mode` and dropped the OverlayFS isolation backend. Legacy `overlayfs` and `fuse-overlay` configuration values are now migrated to `rcopy` because OverlayFS cannot safely isolate a live parent worktree ([#4627](https://github.com/can1357/oh-my-pi/issues/4627)).
 
 ## [16.3.8] - 2026-07-05
 

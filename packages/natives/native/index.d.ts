@@ -917,10 +917,9 @@ export declare enum IsoBackendKind {
   Btrfs = 1,
   Zfs = 2,
   LinuxReflink = 3,
-  Overlayfs = 4,
-  WindowsBlockClone = 5,
-  Projfs = 6,
-  Rcopy = 7
+  WindowsBlockClone = 4,
+  Projfs = 5,
+  Rcopy = 6
 }
 
 /** How a single file changed between `lower` and `merged`. */

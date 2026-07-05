@@ -520,6 +520,21 @@ describe("Settings", () => {
 			expect(settings.get("mnemopi.dbPath")).toBe("/tmp/new.db");
 		});
 
+		it("migrates the disabled overlayfs and legacy fuse-overlay isolation modes to rcopy", async () => {
+			await writeSettings({
+				task: { isolation: { mode: "overlayfs" } },
+			});
+
+			let settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("task.isolation.mode")).toBe("rcopy");
+
+			await writeSettings({
+				task: { isolation: { mode: "fuse-overlay" } },
+			});
+			settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("task.isolation.mode")).toBe("rcopy");
+		});
+
 		it("migrates boolean task.eager/todo.eager true to always", async () => {
 			await writeSettings({
 				task: { eager: true },

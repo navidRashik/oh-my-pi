@@ -884,13 +884,15 @@ export class Settings {
 			todoObj.eager = todoObj.eager ? "always" : "default";
 		}
 
-		// task.isolation.mode: legacy values from before the pi-iso PAL refactor.
-		// `worktree` was git worktree → now lives under `rcopy`. `fuse-overlay`
-		// now maps to the safe `rcopy` backend because OverlayFS cannot isolate a
-		// live parent worktree; `fuse-projfs` is now the platform-named `projfs`.
+		// task.isolation.mode: legacy values migrate to safe backends before
+		// schema validation. `worktree` was git worktree → now lives under
+		// `rcopy`. `overlayfs`/`fuse-overlay` map to `rcopy` because
+		// OverlayFS cannot isolate a live parent worktree (#4627).
+		// `fuse-projfs` is now the platform-named `projfs`.
 		if (isolationObj && typeof isolationObj.mode === "string") {
 			const legacy: Record<string, string> = {
 				worktree: "rcopy",
+				overlayfs: "rcopy",
 				"fuse-overlay": "rcopy",
 				"fuse-projfs": "projfs",
 			};

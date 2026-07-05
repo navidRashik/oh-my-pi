@@ -2,9 +2,9 @@
 
 ## [Unreleased]
 
-### Fixed
+### Breaking Changes
 
-- Disabled the OverlayFS isolation backend so task isolation cannot use a live parent worktree as an overlay lowerdir ([#4627](https://github.com/can1357/oh-my-pi/issues/4627)).
+- Removed the `Overlayfs` variant from `IsoBackendKind` and the OverlayFS isolation backend from `pi-iso`. Live-lower OverlayFS mounts could observe concurrent parent-worktree writes and produce torn copy-up state ([#4627](https://github.com/can1357/oh-my-pi/issues/4627)). Remaining `IsoBackendKind` numeric IDs shift: `WindowsBlockClone` is now `4`, `Projfs` is `5`, `Rcopy` is `6`.
 
 ## [16.3.6] - 2026-07-04
 

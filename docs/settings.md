@@ -671,7 +671,7 @@ Applied whenever raw settings are loaded (global, project, overlays, and runtime
 | flat `theme: "<name>"` string | `theme.dark` / `theme.light` (slot chosen by luminance; built-in `light`/`dark` are dropped to use defaults) |
 | `task.isolation.enabled: true/false` | `task.isolation.mode: auto/none` |
 | `task.simple` | removed |
-| legacy `task.isolation.mode` (`worktree`, `fuse-overlay`, `fuse-projfs`) | `rcopy`, `overlayfs`, `projfs` |
+| legacy `task.isolation.mode` (`worktree`, `overlayfs`, `fuse-overlay`, `fuse-projfs`) | `rcopy`, `rcopy`, `rcopy`, `projfs` (OverlayFS removed — [#4627](https://github.com/can1357/oh-my-pi/issues/4627)) |
 | `lastChangelogVersion` | moved to a marker file and stripped from `config.yml` |
 
 ## Troubleshooting
