@@ -6,11 +6,13 @@ import {
 	applyNestedPatches,
 	captureBaseline,
 	captureDeltaPatch,
+	cleanupIsolation,
 	cleanupTaskBranches,
 	commitToBranch,
 	ensureIsolation,
 	getGitNoIndexNullPath,
 	getRepoRoot,
+	type IsolationHandle,
 	mergeTaskBranches,
 	parseIsolationMode,
 } from "@oh-my-pi/pi-coding-agent/task/worktree";
@@ -37,6 +39,24 @@ async function runGit(repo: string, args: string[]): Promise<string> {
 		throw new Error(stderr.trim() || stdout.trim() || `git ${args.join(" ")} failed with exit code ${exitCode ?? 0}`);
 	}
 	return stdout.trim();
+}
+
+async function runGitOutput(repo: string, args: string[]): Promise<string> {
+	const proc = Bun.spawn(["git", ...args], {
+		cwd: repo,
+		stderr: "pipe",
+		stdout: "pipe",
+		windowsHide: true,
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	if ((exitCode ?? 0) !== 0) {
+		throw new Error(stderr.trim() || stdout.trim() || `git ${args.join(" ")} failed with exit code ${exitCode ?? 0}`);
+	}
+	return stdout;
 }
 
 async function createGitRepo(): Promise<{ baseBranch: string; repo: string }> {
@@ -80,6 +100,133 @@ describe("worktree isolation helpers", () => {
 		expect(parseIsolationMode("block-clone")).toBe(natives.IsoBackendKind.WindowsBlockClone);
 		expect(parseIsolationMode("rcopy")).toBe(natives.IsoBackendKind.Rcopy);
 		expect(parseIsolationMode("worktree")).toBe(natives.IsoBackendKind.Rcopy);
+	});
+
+	describe("Overlayfs isolation", () => {
+		it("passes a detached dirty-state worktree snapshot as the Overlayfs lower", async () => {
+			const { repo } = await createGitRepo();
+			const worktreeBase = await fs.mkdtemp(path.join(os.tmpdir(), "omp-overlayfs-worktree-"));
+			tempDirs.push(worktreeBase);
+			const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+			delete process.env.OMP_WORKTREE_DIR;
+			setWorktreesDir(worktreeBase);
+			vi.spyOn(natives, "isoResolve").mockReturnValue({
+				kind: natives.IsoBackendKind.Overlayfs,
+				candidates: [natives.IsoBackendKind.Overlayfs],
+				fellBack: false,
+				reason: undefined,
+			});
+			const isoStart = vi.spyOn(natives, "isoStart").mockResolvedValue(undefined);
+			vi.spyOn(natives, "isoStop").mockResolvedValue(undefined);
+			let handle: IsolationHandle | undefined;
+
+			try {
+				await fs.writeFile(path.join(repo, "staged.txt"), "staged snapshot\n");
+				await runGit(repo, ["add", "staged.txt"]);
+				await fs.writeFile(path.join(repo, "merged.txt"), "unstaged snapshot\n");
+				await fs.writeFile(path.join(repo, "untracked.txt"), "untracked snapshot\n");
+				const parentHead = await runGit(repo, ["rev-parse", "HEAD"]);
+
+				handle = await ensureIsolation(repo, "overlayfs-dirty-snapshot", natives.IsoBackendKind.Overlayfs);
+				const lowerDir = isoStart.mock.calls[0]?.[1];
+				if (lowerDir === undefined) {
+					throw new Error("Overlayfs isoStart was not called with a lower directory.");
+				}
+				if (path.resolve(lowerDir) === path.resolve(repo)) {
+					throw new Error("Overlayfs isoStart lower must be a frozen snapshot, not the live repo root.");
+				}
+
+				const worktreeList = await runGit(repo, ["worktree", "list", "--porcelain"]);
+				expect(worktreeList).toContain(`worktree ${lowerDir}\nHEAD ${parentHead}\ndetached`);
+				expect(await runGitOutput(lowerDir, ["status", "--porcelain=v1"])).toBe(
+					[" M merged.txt", "M  staged.txt", "?? untracked.txt", ""].join("\n"),
+				);
+				await expect(fs.readFile(path.join(lowerDir, "merged.txt"), "utf8")).resolves.toBe("unstaged snapshot\n");
+				await expect(fs.readFile(path.join(lowerDir, "staged.txt"), "utf8")).resolves.toBe("staged snapshot\n");
+				await expect(fs.readFile(path.join(lowerDir, "untracked.txt"), "utf8")).resolves.toBe(
+					"untracked snapshot\n",
+				);
+
+				await fs.writeFile(path.join(repo, "merged.txt"), "parent edit after ensure\n");
+				await fs.writeFile(path.join(repo, "untracked.txt"), "parent untracked after ensure\n");
+				await fs.writeFile(path.join(repo, "late-parent.txt"), "late parent file\n");
+
+				await expect(fs.readFile(path.join(lowerDir, "merged.txt"), "utf8")).resolves.toBe("unstaged snapshot\n");
+				await expect(fs.readFile(path.join(lowerDir, "untracked.txt"), "utf8")).resolves.toBe(
+					"untracked snapshot\n",
+				);
+				expect(await Bun.file(path.join(lowerDir, "late-parent.txt")).exists()).toBe(false);
+			} finally {
+				if (handle !== undefined) {
+					await cleanupIsolation(handle);
+				}
+				if (originalWorktreeDir === undefined) {
+					delete process.env.OMP_WORKTREE_DIR;
+				} else {
+					process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+				}
+				setWorktreesDir(undefined);
+			}
+		});
+
+		it("stops the backend before removing the registered Overlayfs snapshot worktree", async () => {
+			const { repo } = await createGitRepo();
+			const worktreeBase = await fs.mkdtemp(path.join(os.tmpdir(), "omp-overlayfs-cleanup-"));
+			tempDirs.push(worktreeBase);
+			const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
+			delete process.env.OMP_WORKTREE_DIR;
+			setWorktreesDir(worktreeBase);
+			vi.spyOn(natives, "isoResolve").mockReturnValue({
+				kind: natives.IsoBackendKind.Overlayfs,
+				candidates: [natives.IsoBackendKind.Overlayfs],
+				fellBack: false,
+				reason: undefined,
+			});
+			const isoStart = vi.spyOn(natives, "isoStart").mockResolvedValue(undefined);
+			let lowerDir: string | undefined;
+			let snapshotExistedDuringStop = false;
+			const isoStop = vi.spyOn(natives, "isoStop").mockImplementation(async () => {
+				snapshotExistedDuringStop =
+					lowerDir !== undefined &&
+					(await fs.stat(lowerDir).then(
+						stat => stat.isDirectory(),
+						() => false,
+					));
+			});
+
+			try {
+				const handle = await ensureIsolation(repo, "overlayfs-cleanup", natives.IsoBackendKind.Overlayfs);
+				lowerDir = isoStart.mock.calls[0]?.[1];
+				if (lowerDir === undefined) {
+					throw new Error("Overlayfs isoStart was not called with a lower directory.");
+				}
+				if (path.resolve(lowerDir) === path.resolve(repo)) {
+					throw new Error(
+						"Overlayfs isoStart lower must be a registered snapshot worktree, not the live repo root.",
+					);
+				}
+				expect(await runGit(repo, ["worktree", "list", "--porcelain"])).toContain(`worktree ${lowerDir}\n`);
+
+				await cleanupIsolation(handle);
+
+				expect(isoStop).toHaveBeenCalledWith(natives.IsoBackendKind.Overlayfs, handle.mergedDir);
+				expect(snapshotExistedDuringStop).toBe(true);
+				expect(
+					await fs.stat(lowerDir).then(
+						() => true,
+						() => false,
+					),
+				).toBe(false);
+				expect(await runGit(repo, ["worktree", "list", "--porcelain"])).not.toContain(`worktree ${lowerDir}\n`);
+			} finally {
+				if (originalWorktreeDir === undefined) {
+					delete process.env.OMP_WORKTREE_DIR;
+				} else {
+					process.env.OMP_WORKTREE_DIR = originalWorktreeDir;
+				}
+				setWorktreesDir(undefined);
+			}
+		});
 	});
 
 	// Real git worktree/stash/merge I/O is the contract under test and cannot be

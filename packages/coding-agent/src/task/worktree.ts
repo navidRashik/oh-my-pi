@@ -13,6 +13,7 @@ const { IsoBackendKind } = natives;
 const TASK_ISOLATION_DIR_PREFIX = "t";
 const TASK_ISOLATION_DIR_DIGEST_CHARS = 9;
 const TASK_ISOLATION_MOUNT_DIR = "m";
+const TASK_ISOLATION_SNAPSHOT_DIR = "s";
 type IsoBackendKind = natives.IsoBackendKind;
 
 /** Baseline state for a single git repository. */
@@ -389,6 +390,15 @@ export interface IsolationHandle {
 	fellBack: boolean;
 	/** Optional reason associated with `fellBack`. */
 	fallbackReason: string | null;
+	/** Detached worktree lowerdir used only by OverlayFS. */
+	overlaySnapshot?: OverlaySnapshotLower;
+}
+
+interface OverlaySnapshotLower {
+	/** Repository that owns the temporary detached worktree. */
+	repoRoot: string;
+	/** Frozen lowerdir passed to the OverlayFS backend. */
+	snapshotDir: string;
 }
 
 /**
@@ -397,7 +407,6 @@ export interface IsolationHandle {
  * caller learns about that through `IsolationHandle.fellBack` +
  * `fallbackReason`.
  */
-
 function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
@@ -406,6 +415,73 @@ function getTaskIsolationSegment(repoRoot: string, id: string): string {
 	const key = `${path.resolve(repoRoot)}\0${id}`;
 	const digest = Bun.hash(key).toString(16).padStart(16, "0").slice(-TASK_ISOLATION_DIR_DIGEST_CHARS);
 	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
+}
+
+async function copyUntrackedEntries(
+	repoRoot: string,
+	snapshotDir: string,
+	untracked: readonly string[],
+): Promise<void> {
+	for (const entry of untracked) {
+		const source = path.join(repoRoot, entry);
+		const destination = path.join(snapshotDir, entry);
+		await fs.mkdir(path.dirname(destination), { recursive: true });
+		await fs.cp(source, destination, {
+			force: true,
+			recursive: true,
+			verbatimSymlinks: true,
+		});
+	}
+}
+
+async function seedOverlaySnapshotDirtyState(repoRoot: string, snapshotDir: string): Promise<void> {
+	const [staged, unstaged, untracked] = await Promise.all([
+		git.diff(repoRoot, { binary: true, cached: true }),
+		git.diff(repoRoot, { binary: true }),
+		git.ls.untracked(repoRoot),
+	]);
+
+	if (staged.trim()) {
+		await git.patch.applyText(snapshotDir, staged, { cached: true });
+		await git.patch.applyText(snapshotDir, staged);
+	}
+	if (unstaged.trim()) {
+		await git.patch.applyText(snapshotDir, unstaged);
+	}
+	await copyUntrackedEntries(repoRoot, snapshotDir, untracked);
+}
+
+async function removeOverlaySnapshot(
+	snapshot: OverlaySnapshotLower,
+	options: { repoLockHeld?: boolean } = {},
+): Promise<void> {
+	const remove = async () => {
+		if (!(await git.worktree.tryRemove(snapshot.repoRoot, snapshot.snapshotDir))) {
+			await fs.rm(snapshot.snapshotDir, { recursive: true, force: true });
+		}
+	};
+
+	if (options.repoLockHeld) {
+		await remove();
+	} else {
+		await git.withRepoLock(snapshot.repoRoot, remove);
+	}
+}
+
+async function createOverlaySnapshotLower(repoRoot: string, baseDir: string): Promise<OverlaySnapshotLower> {
+	const snapshotDir = path.join(baseDir, TASK_ISOLATION_SNAPSHOT_DIR);
+	const snapshot = { repoRoot, snapshotDir };
+	await fs.mkdir(baseDir, { recursive: true });
+	await git.withRepoLock(repoRoot, async () => {
+		await git.worktree.add(repoRoot, snapshotDir, "HEAD", { detach: true });
+		try {
+			await seedOverlaySnapshotDirtyState(repoRoot, snapshotDir);
+		} catch (err) {
+			await removeOverlaySnapshot(snapshot, { repoLockHeld: true });
+			throw err;
+		}
+	});
+	return snapshot;
 }
 
 export async function ensureIsolation(
@@ -422,15 +498,20 @@ export async function ensureIsolation(
 
 	for (const candidate of candidates) {
 		await fs.rm(baseDir, { recursive: true, force: true });
+		let overlaySnapshot: OverlaySnapshotLower | undefined;
 		try {
-			await natives.isoStart(candidate, repoRoot, mergedDir);
+			overlaySnapshot =
+				candidate === IsoBackendKind.Overlayfs ? await createOverlaySnapshotLower(repoRoot, baseDir) : undefined;
+			await natives.isoStart(candidate, overlaySnapshot?.snapshotDir ?? repoRoot, mergedDir);
 			return {
 				mergedDir,
 				backend: candidate,
 				fellBack: candidate !== resolution.kind || resolution.fellBack,
 				fallbackReason,
+				overlaySnapshot,
 			};
 		} catch (err) {
+			if (overlaySnapshot) await removeOverlaySnapshot(overlaySnapshot);
 			await fs.rm(baseDir, { recursive: true, force: true });
 			const message = errorMessage(err);
 			if (!natives.isoIsUnavailableError(message)) {
@@ -456,8 +537,17 @@ export async function cleanupIsolation(handle: IsolationHandle): Promise<void> {
 			});
 		}
 	} finally {
-		// baseDir is the parent of the merged directory
 		const baseDir = path.dirname(handle.mergedDir);
+		if (handle.overlaySnapshot) {
+			try {
+				await removeOverlaySnapshot(handle.overlaySnapshot);
+			} catch (err) {
+				logger.warn("overlayfs snapshot worktree removal failed during cleanup", {
+					snapshotDir: handle.overlaySnapshot.snapshotDir,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
 		await fs.rm(baseDir, { recursive: true, force: true });
 	}
 }
