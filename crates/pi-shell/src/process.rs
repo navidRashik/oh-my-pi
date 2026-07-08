@@ -1561,9 +1561,10 @@ impl TerminationTargets {
 		Self::default()
 	}
 
-	/// Record a process group id. Duplicates are ignored.
+	/// Record a process group id. Duplicates and the host process group are
+	/// ignored.
 	pub fn add_pgid(&mut self, pgid: i32) {
-		if pgid > 0 && !self.pgids.contains(&pgid) {
+		if pgid > 0 && !is_self_process_group(pgid) && !self.pgids.contains(&pgid) {
 			self.pgids.push(pgid);
 		}
 	}
@@ -1973,6 +1974,24 @@ mod tests {
 		targets.add_process(pinned);
 		targets.add_pid(self_pid);
 		assert_eq!(targets.processes.len(), 1, "duplicate pids must be deduped");
+	}
+
+	/// A cancellation wave must never signal the harness' own process group.
+	/// If a child reports that pgid (for example when process-group isolation
+	/// failed under WSL), per-process signalling still reaches the child while
+	/// the group target is discarded.
+	#[cfg(unix)]
+	#[test]
+	fn add_pgid_ignores_own_process_group() {
+		// SAFETY: `getpgid(0)` queries the calling process and does not access
+		// caller-owned memory.
+		let own_pgid = unsafe { libc::getpgid(0) };
+		assert!(own_pgid > 0, "test process must have an observable pgid");
+
+		let mut targets = TerminationTargets::new();
+		targets.add_pgid(own_pgid);
+
+		assert!(targets.pgids.is_empty(), "own pgid must not enter the kill set");
 	}
 
 	/// Regression test for the review on PR #4606: a long-running shell

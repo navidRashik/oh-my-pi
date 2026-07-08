@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed shell timeout cleanup on POSIX hosts so a child process that reports OMP's own process group cannot cause cancellation to signal and terminate the OMP process itself ([#4866](https://github.com/can1357/oh-my-pi/issues/4866)).
+
 ## [16.3.12] - 2026-07-08
 
 ### Fixed
