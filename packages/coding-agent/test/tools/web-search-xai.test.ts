@@ -124,7 +124,7 @@ describe("xAI web search provider", () => {
 	});
 
 	it("POSTs the Responses API with bearer auth and xAI web_search tool payload", async () => {
-		const capture = captureFetch({ id: "resp_request", model: "grok-4.3", output_text: "xAI answer" });
+		const capture = captureFetch({ id: "resp_request", model: "grok-4.5", output_text: "xAI answer" });
 
 		await searchXAI({
 			...makeParams(capture.fetchMock),
@@ -140,7 +140,7 @@ describe("xAI web search provider", () => {
 			Authorization: "Bearer test-xai-key",
 		});
 		expect(capture.capturedRequest?.body).toMatchObject({
-			model: "grok-4.3",
+			model: "grok-4.5",
 			input: [
 				{ role: "system", content: "Use web search for current xAI facts." },
 				{ role: "user", content: "latest xAI web search" },

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed xAI `web_search` requests to use Grok 4.5 for search-backed answers instead of Grok 4.3. ([#4891](https://github.com/can1357/oh-my-pi/issues/4891))
+
 ## [16.3.12] - 2026-07-08
 
 ### Added
