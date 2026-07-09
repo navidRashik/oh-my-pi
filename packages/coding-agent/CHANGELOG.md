@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Codex 5.6 Sol thinking summaries rendering standalone `<!-- -->` separator comments as visible thinking text. ([#4958](https://github.com/can1357/oh-my-pi/issues/4958))
+
 ## [16.3.13] - 2026-07-09
 
 ### Fixed

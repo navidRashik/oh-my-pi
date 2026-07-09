@@ -33,6 +33,17 @@ export function formatThinkingForDisplay(text: string, proseOnly: boolean): stri
 	let fenceLen = 0;
 
 	const FENCE = /^( {0,3})([`~]{3,})/;
+	const EMPTY_HTML_COMMENT = /^\s*<!--\s*-->\s*$/;
+	const hasRenderableLineAfter = (index: number): boolean => {
+		for (let j = index + 1; j < lines.length; j++) {
+			const next = lines[j]!;
+			if (next.trim() === "" || EMPTY_HTML_COMMENT.test(next)) continue;
+			return true;
+		}
+		return false;
+	};
+
+	let suppressBlankAfterComment = false;
 	const appendEllipsis = () => {
 		let lastLineIdx = resultLines.length - 1;
 		while (lastLineIdx >= 0 && resultLines[lastLineIdx]!.trim() === "") {
@@ -70,8 +81,17 @@ export function formatThinkingForDisplay(text: string, proseOnly: boolean): stri
 				fenceChar = "";
 				fenceLen = 0;
 			}
+			suppressBlankAfterComment = false;
 			// We skip all internal lines of a code fence.
+		} else if (EMPTY_HTML_COMMENT.test(line)) {
+			if (hasRenderableLineAfter(i)) {
+				const last = resultLines[resultLines.length - 1];
+				if (last !== undefined && last.trim() !== "") resultLines.push("");
+			}
+			suppressBlankAfterComment = true;
+		} else if (suppressBlankAfterComment && line.trim() === "") {
 		} else if (open) {
+			suppressBlankAfterComment = false;
 			const marker = open[2]!;
 			const ch = marker[0]!;
 			// A backtick fence's info string may not contain a backtick.
@@ -84,6 +104,7 @@ export function formatThinkingForDisplay(text: string, proseOnly: boolean): stri
 				resultLines.push(line);
 			}
 		} else {
+			suppressBlankAfterComment = false;
 			resultLines.push(line);
 		}
 	}
@@ -101,7 +122,7 @@ export function hasDisplayableThinking(
 ): boolean {
 	if (!text) return false;
 	if (!formattedText) return false;
-	return formattedText.length > 0 && canonicalizeMessage(text).length > 0;
+	return canonicalizeMessage(formattedText).length > 0 && canonicalizeMessage(text).length > 0;
 }
 
 /** Whether an assistant message contains thinking content the TUI can reveal. */
