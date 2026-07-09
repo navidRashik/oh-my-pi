@@ -191,7 +191,14 @@ install_via_bun() {
         if [ -d "$SOURCE_DIR" ]; then
             mv "$SOURCE_DIR" "$BACKUP_DIR"
         fi
-        mv "$STAGED_SOURCE_DIR" "$SOURCE_DIR"
+        if ! mv "$STAGED_SOURCE_DIR" "$SOURCE_DIR"; then
+            echo "Failed to activate source install"
+            rm -rf "$SOURCE_DIR"
+            if [ -d "$BACKUP_DIR" ]; then
+                mv "$BACKUP_DIR" "$SOURCE_DIR"
+            fi
+            exit 1
+        fi
         if ! (cd "$SOURCE_DIR/packages/coding-agent" && bun link); then
             echo "Failed to link source install"
             rm -rf "$SOURCE_DIR"

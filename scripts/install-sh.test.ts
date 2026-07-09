@@ -18,6 +18,34 @@ function writeExecutable(file: string, content: string) {
 	fs.chmodSync(file, 0o755);
 }
 
+function writeFinalMoveFailureShim(shimDir: string) {
+	const realMv = Bun.which("mv");
+	if (!realMv) {
+		throw new Error("mv not found");
+	}
+
+	const quotedMv = `'${realMv.replaceAll("'", "'\\''")}'`;
+
+	writeExecutable(
+		path.join(shimDir, "mv"),
+		`#!/bin/sh
+set -eu
+printf 'mv' >> "$OMP_INSTALL_TEST_LOG"
+for arg do printf ' <%s>' "$arg" >> "$OMP_INSTALL_TEST_LOG"; done
+printf '\n' >> "$OMP_INSTALL_TEST_LOG"
+if [ "\${OMP_INSTALL_TEST_FAIL_FINAL_SOURCE_MOVE_TO:-}" != "" ] && [ "$#" -eq 2 ] && [ "$2" = "$OMP_INSTALL_TEST_FAIL_FINAL_SOURCE_MOVE_TO" ]; then
+  case "$1" in
+    */source|*/source/)
+      echo "simulated final source activation failure" >&2
+      exit 44
+      ;;
+  esac
+fi
+exec ${quotedMv} "$@"
+`,
+	);
+}
+
 function writeFixtureRepo(dir: string) {
 	const packageDir = path.join(dir, "packages", "coding-agent");
 	const nativesDir = path.join(dir, "packages", "natives");
@@ -262,5 +290,54 @@ describe("scripts/install.sh", () => {
 		expect(fs.existsSync(sentinel)).toBe(true);
 		expect(fs.readFileSync(sentinel, "utf8")).toBe("existing checkout");
 		expect(fs.existsSync(path.join(existingSourceDir, replacementMarker))).toBe(false);
+	});
+
+	it("restores the existing source checkout when activating the staged checkout fails", () => {
+		const dir = makeTempDir();
+		const fixtureRepo = path.join(dir, "fixture-repo");
+		const bunInstall = path.join(dir, "bun-install");
+		const commandLog = path.join(dir, "commands.log");
+		const sourceInstallRoot = path.join(dir, "source-installs");
+		const ref = "feature/source-install";
+		const existingSourceDir = path.join(sourceInstallRoot, "feature_source-install");
+		const sentinel = path.join(existingSourceDir, "existing-sentinel.txt");
+		const replacementMarker = "replacement-checkout-marker.txt";
+		const existingLink = path.join(bunInstall, "bin", "omp");
+		writeFixtureRepo(fixtureRepo);
+		fs.writeFileSync(path.join(fixtureRepo, replacementMarker), "new checkout");
+		fs.mkdirSync(existingSourceDir, { recursive: true });
+		fs.writeFileSync(sentinel, "existing checkout");
+		fs.mkdirSync(path.dirname(existingLink), { recursive: true });
+		fs.writeFileSync(existingLink, "#!/bin/sh\necho existing-source-link\n");
+		fs.chmodSync(existingLink, 0o755);
+		const { shimDir, stateDir } = writeShims(dir);
+		writeFinalMoveFailureShim(shimDir);
+
+		const result = Bun.spawnSync(["sh", installScript, "--source", "--ref", ref], {
+			cwd: dir,
+			env: {
+				...process.env,
+				HOME: path.join(dir, "home"),
+				BUN_INSTALL: bunInstall,
+				PI_SOURCE_INSTALL_DIR: sourceInstallRoot,
+				OMP_INSTALL_TEST_FAIL_FINAL_SOURCE_MOVE_TO: existingSourceDir,
+				OMP_INSTALL_TEST_LOG: commandLog,
+				OMP_INSTALL_TEST_REPO_FIXTURE: fixtureRepo,
+				OMP_INSTALL_TEST_STATE: stateDir,
+				PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdout = result.stdout.toString();
+		const stderr = result.stderr.toString();
+
+		expect(result.exitCode, `${stdout}\n${stderr}`).toBe(1);
+		expect(stdout).toContain("Failed to activate source install");
+		expect(stderr).toContain("simulated final source activation failure");
+		expect(fs.existsSync(sentinel)).toBe(true);
+		expect(fs.readFileSync(sentinel, "utf8")).toBe("existing checkout");
+		expect(fs.existsSync(path.join(existingSourceDir, replacementMarker))).toBe(false);
+		expect(fs.readFileSync(existingLink, "utf8")).toBe("#!/bin/sh\necho existing-source-link\n");
 	});
 });
