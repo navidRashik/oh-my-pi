@@ -345,7 +345,9 @@ export class ReadToolGroupComponent extends Container implements ToolExecutionHa
 	updateArgs(args: ReadRenderArgs, toolCallId?: string): void {
 		if (!toolCallId) return;
 		const basePath = args.file_path || args.path || "";
-		const selector = (args.selector ?? args.sel)?.trim().replace(/^:+/, "");
+		const rawSelector =
+			typeof args.selector === "string" ? args.selector : typeof args.sel === "string" ? args.sel : undefined;
+		const selector = rawSelector?.trim().replace(/^:+/, "");
 		const rawPath = selector && selector.length > 0 ? `${basePath}:${selector}` : basePath;
 		const entry: ReadEntry = this.#entries.get(toolCallId) ?? {
 			toolCallId,

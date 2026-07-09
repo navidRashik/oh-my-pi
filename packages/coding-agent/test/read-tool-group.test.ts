@@ -274,6 +274,21 @@ describe("ReadToolGroupComponent", () => {
 		expect(extractLinkTexts(rendered)).not.toContain("src/grouped.ts:2-3");
 	});
 
+	it("ignores non-string selectors from malformed runtime args", () => {
+		const component = new ReadToolGroupComponent();
+		const malformedArgs = { path: "src/example.ts", selector: 10 } as unknown as {
+			path: string;
+			selector: string;
+		};
+
+		expect(() => component.updateArgs(malformedArgs, "read-malformed-selector")).not.toThrow();
+
+		const plain = Bun.stripANSI(component.render(120).join("\n"));
+
+		expect(plain).toContain("Read src/example.ts");
+		expect(plain).not.toContain("src/example.ts:10");
+	});
+
 	it("links inline preview titles when the summary row is suppressed", () => {
 		settings.override("tui.hyperlinks", "always");
 		const component = new ReadToolGroupComponent({ showContentPreview: true });
