@@ -149,27 +149,45 @@ install_via_bun() {
         fi
 
         TMP_DIR="$(mktemp -d)"
+        CLONE_DIR="$TMP_DIR/repo"
         trap 'rm -rf "$TMP_DIR"' EXIT
 
-        if git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$TMP_DIR" >/dev/null 2>&1; then
+        if git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$CLONE_DIR" >/dev/null 2>&1; then
             :
         else
-            git clone "https://github.com/${REPO}.git" "$TMP_DIR"
-            (cd "$TMP_DIR" && git checkout "$REF")
+            git clone "https://github.com/${REPO}.git" "$CLONE_DIR"
+            (cd "$CLONE_DIR" && git checkout "$REF")
         fi
 
         # Pull LFS files
         if has_git_lfs; then
-            (cd "$TMP_DIR" && git lfs pull)
+            (cd "$CLONE_DIR" && git lfs pull)
         fi
 
-        if [ ! -d "$TMP_DIR/packages/coding-agent" ]; then
-            echo "Expected package at ${TMP_DIR}/packages/coding-agent"
+        if [ ! -d "$CLONE_DIR/packages/coding-agent" ]; then
+            echo "Expected package at ${CLONE_DIR}/packages/coding-agent"
             exit 1
         fi
 
-        bun install -g "$TMP_DIR/packages/coding-agent" || {
-            echo "Failed to install from source"
+        INSTALL_ROOT="${PI_SOURCE_INSTALL_DIR:-$HOME/.omp/source-installs}"
+        SAFE_REF="$(printf '%s' "$REF" | tr -c 'A-Za-z0-9._-' '_')"
+        SOURCE_DIR="$INSTALL_ROOT/$SAFE_REF"
+        mkdir -p "$INSTALL_ROOT"
+        rm -rf "$SOURCE_DIR"
+        mv "$CLONE_DIR" "$SOURCE_DIR"
+
+        (cd "$SOURCE_DIR" && bun install --frozen-lockfile) || {
+            echo "Failed to install source dependencies"
+            exit 1
+        }
+        if [ -d "$SOURCE_DIR/packages/natives" ]; then
+            (cd "$SOURCE_DIR/packages/natives" && bun run build) || {
+                echo "Failed to build native addon"
+                exit 1
+            }
+        fi
+        (cd "$SOURCE_DIR/packages/coding-agent" && bun link) || {
+            echo "Failed to link source install"
             exit 1
         }
     else
