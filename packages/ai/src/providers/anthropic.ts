@@ -60,7 +60,6 @@ import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTi
 import { notifyProviderResponse } from "../utils/provider-response";
 import { COMBINATOR_KEYS, NO_STRICT, toolWireSchema } from "../utils/schema";
 import { spillToDescription } from "../utils/schema/spill";
-import { createSdkStreamRequestOptions } from "../utils/sdk-stream-timeout";
 import { notifyRawSseEvent } from "../utils/sse-debug";
 import {
 	AnthropicApiError,
@@ -1952,7 +1951,11 @@ const streamAnthropicOnce = (
 				// pins it alongside a timeout; a client retry budget of 5 would otherwise
 				// multiply with PROVIDER_MAX_RETRIES into up to 66 wire attempts).
 				const requestOptions = {
-					...createSdkStreamRequestOptions(requestSignal, requestTimeoutMs),
+					signal: requestSignal,
+					// The provider loop owns retries and the clearable pre-response timer
+					// above owns time-to-first-event. Do not pass the first-event budget to
+					// the Anthropic SDK `timeout`: Stainless treats it as an absolute stream
+					// deadline, so active long tool-call streams can be aborted mid-body.
 					maxRetries: 0,
 					...(umansGatewayWebSearchHeader ? { headers: umansGatewayWebSearchHeader } : {}),
 				};

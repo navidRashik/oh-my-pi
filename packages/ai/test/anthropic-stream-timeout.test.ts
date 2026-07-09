@@ -234,7 +234,7 @@ describe("anthropic first-event timeout retries", () => {
 		}
 		expect(retryDelayMs).toBeGreaterThanOrEqual(375);
 		expect(retryDelayMs).toBeLessThanOrEqual(500);
-		expect(requestTimeouts).toEqual([1, 1]);
+		expect(requestTimeouts).toEqual([undefined, undefined]);
 		expect(requestMaxRetries).toEqual([0, 0]);
 		expect(result.stopReason).toBe("stop");
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "retry recovered" }]);
@@ -289,7 +289,7 @@ describe("anthropic first-event timeout retries", () => {
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "retry recovered" }]);
 	});
 
-	it("does not arm the Anthropic first-event watchdog before the stream connects", async () => {
+	it("does not pass the first-event budget to the SDK when the stream connects in time", async () => {
 		let seenRequestTimeout: number | undefined;
 		let seenRequestMaxRetries: number | undefined;
 		const create = ((
@@ -312,12 +312,116 @@ describe("anthropic first-event timeout retries", () => {
 		}).result();
 
 		expect(result.stopReason).toBe("stop");
-		expect(seenRequestTimeout).toBe(20);
+		expect(seenRequestTimeout).toBeUndefined();
 		expect(seenRequestMaxRetries).toBe(0);
 		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "delayed connect" }]);
 	});
 
-	it("times out before the Anthropic stream connects and forwards the budget to the SDK request", async () => {
+	it("does not let the SDK request timeout kill an active tool-call stream after response start", async () => {
+		let attempt = 0;
+		let seenRequestTimeout: number | undefined;
+		let seenRequestMaxRetries: number | undefined;
+		const create = ((
+			_body: unknown,
+			requestOptions?: { signal?: AbortSignal; timeout?: number; maxRetries?: number },
+		) => {
+			seenRequestTimeout = requestOptions?.timeout;
+			seenRequestMaxRetries = requestOptions?.maxRetries;
+			attempt += 1;
+			const response = new Response(null, {
+				status: 200,
+				headers: { "request-id": "req_active_write" },
+			});
+			const stream: MockAnthropicStream = {
+				async *[Symbol.asyncIterator]() {
+					const events: MockAnthropicEvent[] = [
+						{
+							type: "message_start",
+							message: {
+								id: "msg_active_write",
+								usage: {
+									input_tokens: 12,
+									output_tokens: 0,
+									cache_read_input_tokens: 0,
+									cache_creation_input_tokens: 0,
+								},
+							},
+						},
+						{
+							type: "content_block_start",
+							index: 0,
+							content_block: {
+								type: "tool_use",
+								id: "toolu_active_write",
+								name: "write",
+								input: {},
+							},
+						},
+						{
+							type: "content_block_delta",
+							index: 0,
+							delta: {
+								type: "input_json_delta",
+								partial_json: '{"path":"notes.md","content":"hello"}',
+							},
+						},
+						{ type: "content_block_stop", index: 0 },
+						{
+							type: "message_delta",
+							delta: { stop_reason: "tool_use" },
+							usage: {
+								input_tokens: 12,
+								output_tokens: 6,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+						{ type: "message_stop" },
+					];
+					for (const event of events) {
+						yield event;
+						if (event.type === "content_block_delta" && requestOptions?.timeout !== undefined) {
+							throw new Error("SDK stream timeout fired after response start");
+						}
+					}
+				},
+			};
+			return {
+				async withResponse() {
+					return {
+						data: stream,
+						response,
+						request_id: response.headers.get("request-id"),
+					};
+				},
+			} as never;
+		}) as unknown as AnthropicMessagesClientLike["messages"]["create"];
+		const client = { messages: { create } } as AnthropicMessagesClientLike;
+		const providerRetryWait = vi.fn(async () => {});
+
+		const result = await streamAnthropic(model, context, {
+			client,
+			streamFirstEventTimeoutMs: 1,
+			providerRetryWait,
+		}).result();
+
+		expect(attempt).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
+		expect(seenRequestTimeout).toBeUndefined();
+		expect(seenRequestMaxRetries).toBe(0);
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.errorMessage).toBeUndefined();
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([
+			{
+				type: "toolCall",
+				id: "toolu_active_write",
+				name: "write",
+				arguments: { path: "notes.md", content: "hello" },
+			},
+		]);
+	});
+
+	it("times out before the Anthropic stream connects without arming the SDK stream timeout", async () => {
 		let attempt = 0;
 		const requestTimeouts: Array<number | undefined> = [];
 		const requestMaxRetries: Array<number | undefined> = [];
@@ -345,7 +449,7 @@ describe("anthropic first-event timeout retries", () => {
 
 		expect(attempt).toBe(11);
 		expect(providerRetryWait).toHaveBeenCalledTimes(10);
-		expect(requestTimeouts).toEqual(new Array(11).fill(1));
+		expect(requestTimeouts).toEqual(new Array(11).fill(undefined));
 		expect(requestMaxRetries).toEqual(new Array(11).fill(0));
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Anthropic stream timed out while waiting for the first event");
