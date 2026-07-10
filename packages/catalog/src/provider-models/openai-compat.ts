@@ -1078,6 +1078,7 @@ function withXaiOAuthCompatDefaults(model: ModelSpec<"openai-responses">): Model
 		...(model.compat ?? {}),
 		includeEncryptedReasoning: model.compat?.includeEncryptedReasoning ?? false,
 		filterReasoningHistory: model.compat?.filterReasoningHistory ?? true,
+		supportsImageDetailOriginal: model.compat?.supportsImageDetailOriginal ?? false,
 		omitReasoningEffort: model.compat?.omitReasoningEffort ?? !isGrokReasoningEffortCapable(model.id),
 	};
 	return { ...model, compat };
