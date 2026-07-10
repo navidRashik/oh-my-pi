@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/switch` and `/model` showing empty tabs for implicit local providers (`ollama`, `llama.cpp`, `lm-studio`) before local discovery returns any models. ([#5026](https://github.com/can1357/oh-my-pi/issues/5026))
+
 ## [16.3.15] - 2026-07-09
 
 ### Changed

@@ -496,6 +496,9 @@ export class ModelSelectorComponent extends Container {
 			providerSet.add(item.provider);
 		}
 		for (const provider of this.#modelRegistry.getDiscoverableProviders()) {
+			if (this.#modelRegistry.getProviderDiscoveryState(provider)?.optional) {
+				continue;
+			}
 			providerSet.add(provider);
 		}
 		const sortedProviderIds = Array.from(providerSet).sort((left, right) =>

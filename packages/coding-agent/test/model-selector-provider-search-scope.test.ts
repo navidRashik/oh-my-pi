@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import type { ModelRegistry, ProviderDiscoveryState } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ModelSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/model-selector";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
@@ -41,7 +41,18 @@ interface SelectorHarness {
 	backgroundRefresh: Promise<void>;
 }
 
-function createSelector(models: Model[], onSelect: (model: Model) => void): SelectorHarness {
+type DiscoveryStatesByProvider = Partial<Record<string, ProviderDiscoveryState>>;
+
+interface SelectorOptions {
+	discoverableProviders?: string[];
+	discoveryStates?: DiscoveryStatesByProvider;
+}
+
+function createSelector(
+	models: Model[],
+	onSelect: (model: Model) => void,
+	options: SelectorOptions = {},
+): SelectorHarness {
 	const settings = Settings.isolated({});
 	// The constructor kicks off an offline refresh in the background. Drive it
 	// through an explicit gate so tests can await drain instead of sleeping.
@@ -52,7 +63,8 @@ function createSelector(models: Model[], onSelect: (model: Model) => void): Sele
 		refreshProvider: vi.fn(async () => {}),
 		getError: () => undefined,
 		getAvailable: () => models,
-		getDiscoverableProviders: () => [],
+		getDiscoverableProviders: () => options.discoverableProviders ?? [],
+		getProviderDiscoveryState: (provider: string) => options.discoveryStates?.[provider],
 	} as unknown as ModelRegistry;
 	const ui = {
 		requestRender: vi.fn(),
@@ -164,5 +176,77 @@ describe("ModelSelector search stays inside the active provider tab (#4522)", ()
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("No matching models in OPENROUTER");
 		expect(rendered).toContain("Switch to ALL");
+	});
+});
+
+describe("ModelSelector provider tabs hide optional empty local discovery providers (#5026)", () => {
+	beforeAll(async () => {
+		testTheme = await getThemeByName("dark");
+		if (!testTheme) {
+			throw new Error("Failed to load dark theme for ModelSelector tests");
+		}
+	});
+
+	test("omits optional implicit local providers when discovery returned no models", async () => {
+		installTestTheme();
+		const providers = ["ollama", "llama.cpp", "lm-studio"];
+		const discoveryStates: DiscoveryStatesByProvider = {
+			ollama: {
+				provider: "ollama",
+				status: "empty",
+				optional: true,
+				stale: false,
+				models: [],
+			},
+			"llama.cpp": {
+				provider: "llama.cpp",
+				status: "empty",
+				optional: true,
+				stale: false,
+				models: [],
+			},
+			"lm-studio": {
+				provider: "lm-studio",
+				status: "empty",
+				optional: true,
+				stale: false,
+				models: [],
+			},
+		};
+
+		const { selector, backgroundRefresh } = createSelector([], () => {}, {
+			discoverableProviders: providers,
+			discoveryStates,
+		});
+		await backgroundRefresh;
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("ALL");
+		expect(rendered).not.toContain("OLLAMA");
+		expect(rendered).not.toContain("LLAMA.CPP");
+		expect(rendered).not.toContain("LM STUDIO");
+	});
+
+	test("keeps non-optional discoverable providers visible even without models", async () => {
+		installTestTheme();
+		const provider = "vllm";
+		const { selector, backgroundRefresh } = createSelector([], () => {}, {
+			discoverableProviders: [provider],
+			discoveryStates: {
+				[provider]: {
+					provider,
+					status: "empty",
+					optional: false,
+					stale: false,
+					models: [],
+				},
+			},
+		});
+		await backgroundRefresh;
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("VLLM");
 	});
 });
