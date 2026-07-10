@@ -600,7 +600,7 @@ export const SETTINGS_SCHEMA = {
 
 	"statusLine.transparent": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "appearance",
 			group: "Status Line",
