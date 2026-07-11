@@ -2875,12 +2875,12 @@ export class Editor implements Component, Focusable {
 	 * - Exact match → always safe.
 	 * - Path branch is safe when the prefix is still a live suffix of the text; the
 	 *   provider's default slice at `cursorCol - prefix.length` then hits the right span.
-	 * - Slash branch re-anchors when both the prefix and the current text carry a
-	 *   leading or mid-prompt slash command and the current slash token is clean
-	 *   (no whitespace or inner slash), matching `applyCompletion`'s slash guards.
-	 *   It only engages for command-shaped selections: absolute-path completions (`/tmp/fo`
-	 *   via the no-command-match fall-through) share the leading-slash prefix shape
-	 *   but must use the live-suffix path rule so the apply slice stays anchored.
+	 * - Slash branch re-anchors leading slash popups only against the current
+	 *   leading slash token. It re-anchors a trailing mid-prompt slash token only
+	 *   for `skill:` selections, matching the provider branch that can preserve
+	 *   prompt prose while replacing the live token. Absolute-path completions
+	 *   (`/tmp/fo` via the no-command-match fall-through) share the slash prefix
+	 *   shape but must use the live-suffix path rule so the apply slice stays anchored.
 	 * - `@`-file branch re-anchors via `#extractAtPrefix`; safe when the current text
 	 *   still ends in a whitespace-anchored `@<token>`.
 	 * - Everything else is stale — accepting it would corrupt the buffer (issue #4295).
@@ -2892,13 +2892,21 @@ export class Editor implements Component, Focusable {
 			findLeadingSlashCommandStart(this.#autocompletePrefix) !== null ||
 			findTrailingSlashCommandStart(this.#autocompletePrefix) !== null;
 		if (prefixHasSlashCommand && !this.#selectedCompletionIsPath()) {
-			const currentSlashStart =
-				findLeadingSlashCommandStart(currentTextBeforeCursor) ??
-				findTrailingSlashCommandStart(currentTextBeforeCursor);
-			if (currentSlashStart !== null) {
-				const token = currentTextBeforeCursor.slice(currentSlashStart);
+			const currentLeadingStart = findLeadingSlashCommandStart(currentTextBeforeCursor);
+			if (currentLeadingStart !== null) {
+				const token = currentTextBeforeCursor.slice(currentLeadingStart);
 				if (!token.includes(" ") && !token.slice(1).includes("/")) return true;
 			}
+
+			const selected = this.#autocompleteList?.getSelectedItem();
+			if (selected?.value.startsWith("skill:")) {
+				const currentTrailingStart = findTrailingSlashCommandStart(currentTextBeforeCursor);
+				if (currentTrailingStart !== null) {
+					const token = currentTextBeforeCursor.slice(currentTrailingStart);
+					if (!token.includes(" ") && !token.slice(1).includes("/")) return true;
+				}
+			}
+
 			return false;
 		}
 

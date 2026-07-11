@@ -94,6 +94,26 @@ describe("Editor slash autocomplete acceptance", () => {
 		expect(editor.getText()).toBe("/skills:fix-bug ");
 	});
 
+	it("cancels a stale leading slash popup that moved to a mid-prompt non-skill token", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(
+			new CombinedAutocompleteProvider([{ name: "model", description: "Switch model" }], "/tmp"),
+		);
+
+		const opened = onceAutocompleteUpdate(editor);
+		editor.handleInput("/");
+		await opened;
+		expect(editor.isShowingAutocomplete()).toBe(true);
+
+		editor.handleInput("\x01"); // Ctrl+A: cursor to line start
+		editor.handleInput("ask ");
+		editor.handleInput("\x06"); // Ctrl+F: cursor after the slash
+		editor.handleInput("\t");
+
+		expect(editor.getText()).toBe("ask /");
+		expect(editor.isShowingAutocomplete()).toBe(false);
+	});
+
 	it("replaces mid-prompt skill characters typed after the rendered prefix with Tab", async () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setAutocompleteProvider(
