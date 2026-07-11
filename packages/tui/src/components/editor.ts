@@ -2877,10 +2877,11 @@ export class Editor implements Component, Focusable {
 	 *   provider's default slice at `cursorCol - prefix.length` then hits the right span.
 	 * - Slash branch re-anchors leading slash popups only against the current
 	 *   leading slash token. It re-anchors a trailing mid-prompt slash token only
-	 *   for `skill:` selections, matching the provider branch that can preserve
-	 *   prompt prose while replacing the live token. Absolute-path completions
-	 *   (`/tmp/fo` via the no-command-match fall-through) share the slash prefix
-	 *   shape but must use the live-suffix path rule so the apply slice stays anchored.
+	 *   for `skill:` selections whose selected item still matches the live token,
+	 *   matching the provider branch that can preserve prompt prose while replacing
+	 *   the live token. Absolute-path completions (`/tmp/fo` via the
+	 *   no-command-match fall-through) share the slash prefix shape but must use
+	 *   the live-suffix path rule so the apply slice stays anchored.
 	 * - `@`-file branch re-anchors via `#extractAtPrefix`; safe when the current text
 	 *   still ends in a whitespace-anchored `@<token>`.
 	 * - Everything else is stale — accepting it would corrupt the buffer (issue #4295).
@@ -2903,7 +2904,19 @@ export class Editor implements Component, Focusable {
 				const currentTrailingStart = findTrailingSlashCommandStart(currentTextBeforeCursor);
 				if (currentTrailingStart !== null) {
 					const token = currentTextBeforeCursor.slice(currentTrailingStart);
-					if (!token.includes(" ") && !token.slice(1).includes("/")) return true;
+					const query = token.slice(1).toLowerCase();
+					if (
+						!token.includes(" ") &&
+						!token.slice(1).includes("/") &&
+						(query.length === 0 ||
+							this.#slashCompletionTextMatchesQuery(query, selected.value) ||
+							this.#slashCompletionTextMatchesQuery(query, selected.label) ||
+							(selected.description
+								? this.#slashCompletionTextMatchesQuery(query, selected.description)
+								: false))
+					) {
+						return true;
+					}
 				}
 			}
 
@@ -2928,6 +2941,17 @@ export class Editor implements Component, Focusable {
 		const selected = this.#autocompleteList?.getSelectedItem();
 		if (!selected) return false;
 		return selected.value.startsWith("/") || selected.value.startsWith('"');
+	}
+
+	#slashCompletionTextMatchesQuery(query: string, text: string): boolean {
+		const target = text.toLowerCase();
+		if (target === query || target.startsWith(query) || target.includes(query)) return true;
+
+		let queryIndex = 0;
+		for (let targetIndex = 0; targetIndex < target.length && queryIndex < query.length; targetIndex += 1) {
+			if (query[queryIndex] === target[targetIndex]) queryIndex += 1;
+		}
+		return queryIndex === query.length;
 	}
 
 	#isSlashCommandNameAutocompleteSelection(): boolean {

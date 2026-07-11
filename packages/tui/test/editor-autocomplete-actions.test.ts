@@ -136,6 +136,27 @@ describe("Editor slash autocomplete acceptance", () => {
 		expect(editor.getText()).toBe("how do I /skill:semantic-compression ");
 	});
 
+	it("cancels a stale mid-prompt skill popup when the live token stops matching the selected skill", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(
+			new CombinedAutocompleteProvider([{ name: "skill:alpha", description: "Alpha skill" }], "/tmp"),
+		);
+
+		editor.setText("ask ");
+		const opened = onceAutocompleteUpdate(editor);
+		editor.handleInput("/");
+		await opened;
+		expect(editor.isShowingAutocomplete()).toBe(true);
+
+		editor.handleInput("t");
+		editor.handleInput("m");
+		editor.handleInput("p");
+		editor.handleInput("\t");
+
+		expect(editor.getText()).toBe("ask /tmp");
+		expect(editor.isShowingAutocomplete()).toBe(false);
+	});
+
 	it("accepts an absolute path completion with Tab when the line has leading whitespace", async () => {
 		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "editor-absolute-tab-"));
 		try {
