@@ -7,9 +7,14 @@
  * SQLite store, never POSTs the broker sentinel to an OpenAI token endpoint.
  */
 import * as os from "node:os";
-import { type AuthStorage, type FetchImpl, type OAuthAccess, withOAuthAccess } from "@oh-my-pi/pi-ai";
+import { type AuthStorage, type FetchImpl, type Model, type OAuthAccess, withOAuthAccess } from "@oh-my-pi/pi-ai";
 import { decodeJwt } from "@oh-my-pi/pi-ai/oauth/openai-codex";
+import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
+import { createOpenAICodexCompatibilityMetadata } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import { CODEX_CLIENT_VERSION, OPENAI_HEADER_VALUES, OPENAI_HEADERS } from "@oh-my-pi/pi-catalog/wire/codex";
 import { $env, readSseJson } from "@oh-my-pi/pi-utils";
 import packageJson from "../../../../package.json" with { type: "json" };
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
@@ -22,6 +27,9 @@ const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const CODEX_RESPONSES_PATH = "/codex/responses";
 const FALLBACK_MODEL = "gpt-5.5";
 const DEFAULT_MODEL_PREFERENCES = [
+	"gpt-5.6-luna",
+	"gpt-5.6-terra",
+	"gpt-5.6-sol",
 	"gpt-5.5",
 	"gpt-5.4",
 	"gpt-5-codex",
@@ -35,15 +43,83 @@ const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const DEFAULT_INSTRUCTIONS =
 	"You are a helpful assistant with web search capabilities. Search the web to answer the user's question accurately and cite your sources.";
 
-function getConfiguredModel(): string | undefined {
-	const configuredModel = $env.PI_CODEX_WEB_SEARCH_MODEL?.trim();
-	return configuredModel ? configuredModel : undefined;
+type CodexSearchModel = Model<"openai-codex-responses">;
+type CodexWebSearchEffort = Effort.Minimal | Effort.Low | Effort.Medium | Effort.High | Effort.XHigh | Effort.Max;
+
+interface ConfiguredCodexModel {
+	modelId: string;
+	reasoningEffort?: CodexWebSearchEffort;
 }
 
-function getDefaultModelCandidates(): string[] {
-	const bundledModels = getBundledModels("openai-codex");
-	const bundledIds = new Set(bundledModels.map(model => model.id));
-	const candidates = DEFAULT_MODEL_PREFERENCES.filter(modelId => bundledIds.has(modelId));
+interface CodexModelCandidate {
+	modelId: string;
+	catalogModel?: CodexSearchModel;
+	reasoningEffort?: CodexWebSearchEffort;
+}
+
+const CODEX_WEB_SEARCH_EFFORTS: Record<string, CodexWebSearchEffort> = {
+	minimal: Effort.Minimal,
+	low: Effort.Low,
+	medium: Effort.Medium,
+	high: Effort.High,
+	xhigh: Effort.XHigh,
+	max: Effort.Max,
+};
+const CODEX_WEB_SEARCH_EFFORT_LIST = "minimal, low, medium, high, xhigh, max";
+
+function parseConfiguredModel(): ConfiguredCodexModel | undefined {
+	const configuredModel = $env.PI_CODEX_WEB_SEARCH_MODEL?.trim();
+	if (!configuredModel) return undefined;
+
+	const effortSeparator = configuredModel.lastIndexOf(":");
+	if (effortSeparator === -1) return { modelId: configuredModel };
+
+	const modelId = configuredModel.slice(0, effortSeparator).trim();
+	const effortName = configuredModel
+		.slice(effortSeparator + 1)
+		.trim()
+		.toLowerCase();
+	const reasoningEffort = CODEX_WEB_SEARCH_EFFORTS[effortName];
+	if (!modelId || !reasoningEffort) {
+		throw new Error(
+			`Invalid PI_CODEX_WEB_SEARCH_MODEL value "${configuredModel}". Use "<model>" or "<model>:<effort>" where effort is one of: ${CODEX_WEB_SEARCH_EFFORT_LIST}.`,
+		);
+	}
+
+	return { modelId, reasoningEffort };
+}
+
+function getBundledCodexModels(): CodexSearchModel[] {
+	const models: CodexSearchModel[] = [];
+	for (const model of getBundledModels("openai-codex")) {
+		if (model.api === "openai-codex-responses") {
+			models.push(model as CodexSearchModel);
+		}
+	}
+	return models;
+}
+
+function resolveConfiguredCandidate(configured: ConfiguredCodexModel): CodexModelCandidate {
+	const bundledModels = getBundledCodexModels();
+	const catalogModel = bundledModels.find(model => model.id === configured.modelId);
+	if (configured.reasoningEffort && !catalogModel) {
+		throw new Error(
+			`PI_CODEX_WEB_SEARCH_MODEL requested reasoning effort "${configured.reasoningEffort}" for unknown Codex model "${configured.modelId}". Use a bundled Codex model so the effort can be validated.`,
+		);
+	}
+	if (configured.reasoningEffort && catalogModel) {
+		requireSupportedEffort(catalogModel, configured.reasoningEffort);
+	}
+	return { ...(catalogModel ? { catalogModel } : {}), ...configured };
+}
+
+function getDefaultModelCandidates(): CodexModelCandidate[] {
+	const bundledModels = getBundledCodexModels();
+	const candidates: CodexModelCandidate[] = [];
+	for (const modelId of DEFAULT_MODEL_PREFERENCES) {
+		const catalogModel = bundledModels.find(model => model.id === modelId);
+		if (catalogModel) candidates.push({ modelId, catalogModel });
+	}
 
 	if (candidates.length > 0) {
 		return candidates;
@@ -51,10 +127,11 @@ function getDefaultModelCandidates(): string[] {
 
 	const nonMini = bundledModels.find(model => !model.id.includes("mini") && !model.id.includes("spark"));
 	if (nonMini) {
-		return [nonMini.id];
+		return [{ modelId: nonMini.id, catalogModel: nonMini }];
 	}
 
-	return bundledModels[0]?.id ? [bundledModels[0].id] : [FALLBACK_MODEL];
+	const fallbackModel = bundledModels[0];
+	return fallbackModel ? [{ modelId: fallbackModel.id, catalogModel: fallbackModel }] : [{ modelId: FALLBACK_MODEL }];
 }
 
 function shouldRetryWithNextDefaultModel(error: unknown): boolean {
@@ -296,21 +373,6 @@ async function findCodexAuth(
 }
 
 /**
- * Builds HTTP headers for Codex API requests.
- */
-function buildCodexHeaders(accessToken: string, accountId: string): Record<string, string> {
-	return {
-		Authorization: `Bearer ${accessToken}`,
-		"chatgpt-account-id": accountId,
-		"OpenAI-Beta": "responses=experimental",
-		originator: "pi",
-		"User-Agent": `pi/${packageJson.version} (${os.platform()} ${os.release()}; ${os.arch()})`,
-		Accept: "text/event-stream",
-		"Content-Type": "application/json",
-	};
-}
-
-/**
  * Calls the Codex Responses API with web search tool enabled.
  * The caller provides the exact model id to send; retry / fallback policy
  * lives one layer up in `searchCodex()` so we can distinguish explicit user
@@ -323,7 +385,8 @@ async function callCodexSearch(
 		signal?: AbortSignal;
 		systemPrompt?: string;
 		searchContextSize?: "low" | "medium" | "high";
-		modelId: string;
+		model: CodexModelCandidate;
+		sessionId?: string;
 		fetch?: FetchImpl;
 	},
 ): Promise<{
@@ -334,9 +397,19 @@ async function callCodexSearch(
 	usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
 }> {
 	const url = `${CODEX_BASE_URL}${CODEX_RESPONSES_PATH}`;
-	const headers = buildCodexHeaders(auth.accessToken, auth.accountId);
+	const headers: Record<string, string> = {
+		Authorization: `Bearer ${auth.accessToken}`,
+		[OPENAI_HEADERS.ACCOUNT_ID]: auth.accountId,
+		[OPENAI_HEADERS.BETA]: OPENAI_HEADER_VALUES.BETA_RESPONSES,
+		[OPENAI_HEADERS.ORIGINATOR]: OPENAI_HEADER_VALUES.ORIGINATOR_CODEX,
+		[OPENAI_HEADERS.VERSION]: CODEX_CLIENT_VERSION,
+		"User-Agent": `pi/${packageJson.version} (${os.platform()} ${os.release()}; ${os.arch()})`,
+		Accept: "text/event-stream",
+		"Content-Type": "application/json",
+	};
 
-	const requestedModel = options.modelId;
+	const requestedModel = options.model.modelId;
+	const usesResponsesLite = options.model.catalogModel?.useResponsesLite === true;
 
 	const body: Record<string, unknown> = {
 		model: requestedModel,
@@ -358,6 +431,24 @@ async function callCodexSearch(
 		tool_choice: { type: "web_search" },
 		instructions: options.systemPrompt ?? DEFAULT_INSTRUCTIONS,
 	};
+	if (options.model.reasoningEffort || usesResponsesLite) {
+		body.reasoning = {
+			...(options.model.reasoningEffort ? { effort: options.model.reasoningEffort } : {}),
+			...(usesResponsesLite ? { context: "all_turns" } : {}),
+		};
+	}
+	if (usesResponsesLite) {
+		const metadata = createOpenAICodexCompatibilityMetadata({
+			sessionId: options.sessionId,
+			requestKind: "turn",
+			startNewTurn: true,
+		});
+		Object.assign(headers, metadata.headers);
+		headers[OPENAI_HEADERS.RESPONSES_LITE] = "true";
+		body.client_metadata = metadata.clientMetadata;
+		applyCodexResponsesLiteShape(body);
+		delete body.tool_choice;
+	}
 
 	const fetchImpl = options.fetch ?? fetch;
 	const response = await fetchImpl(url, {
@@ -501,9 +592,10 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 			"No Codex OAuth credentials found. Login with 'omp /login openai-codex' to enable Codex web search.",
 		);
 	}
-
-	const configuredModel = getConfiguredModel();
-	const modelCandidates = configuredModel ? [configuredModel] : getDefaultModelCandidates();
+	const configuredModel = parseConfiguredModel();
+	const modelCandidates = configuredModel
+		? [resolveConfiguredCandidate(configuredModel)]
+		: getDefaultModelCandidates();
 
 	const result = await withOAuthAccess(
 		params.authStorage,
@@ -528,7 +620,8 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 						signal: params.signal,
 						systemPrompt: params.systemPrompt,
 						searchContextSize: "high",
-						modelId,
+						model: modelId,
+						sessionId: params.sessionId,
 						fetch: params.fetch,
 					});
 				} catch (error) {
