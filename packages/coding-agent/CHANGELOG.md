@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the advisor treating a deliberate silent review from a reasoning model (empty `stop` completion that still spent output/reasoning tokens) as an empty-response failure, which surfaced `Advisor unavailable for … Advisor turn returned an empty stop response without advice` and disabled advice with models such as `openai-codex/gpt-5.6-sol` ([#5521](https://github.com/can1357/oh-my-pi/issues/5521)).
+
 ## [16.5.1] - 2026-07-14
 
 ### Changed

@@ -1960,6 +1960,67 @@ describe("advisor", () => {
 			expect(runtime.backlog).toBe(0);
 		});
 
+		it("accepts a silent empty stop that spent output tokens as a successful review", async () => {
+			const promptInputs: string[] = [];
+			const turnErrors: unknown[] = [];
+			const failures: unknown[] = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			let promptCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptCalls++;
+					promptInputs.push(input);
+					state.messages.push({ role: "user", content: input, timestamp: promptCalls * 2 - 1 } as AgentMessage);
+					state.messages.push({
+						role: "assistant",
+						content: [],
+						api: "mock",
+						provider: "mock",
+						model: "mock-advisor",
+						usage: {
+							input: 120,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							reasoningTokens: 640,
+							totalTokens: 760,
+						},
+						stopReason: "stop",
+						timestamp: promptCalls * 2,
+					} as unknown as AgentMessage);
+					state.error = undefined;
+				},
+				abort: () => {},
+				reset: () => {
+					state.messages.length = 0;
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "aaa", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				onTurnError: error => {
+					turnErrors.push(error);
+				},
+				notifyFailure: error => {
+					failures.push(error);
+				},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			await runtime.waitForCatchup(1000, 1);
+
+			// A reasoning model that thought (reasoningTokens > 0) then chose to stay
+			// silent is a valid review, not a failed turn — no retry, no failure.
+			expect(promptInputs).toHaveLength(1);
+			expect(turnErrors).toEqual([]);
+			expect(failures).toEqual([]);
+			expect(runtime.backlog).toBe(0);
+		});
+
 		it("calls onTurnError with state.error before retrying the batch", async () => {
 			const promptInputs: string[] = [];
 			const turnErrors: unknown[] = [];
