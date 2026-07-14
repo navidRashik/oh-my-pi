@@ -160,6 +160,7 @@ import {
 	BashTool,
 	BUILTIN_TOOLS,
 	computeEssentialBuiltinNames,
+	createReportToolIssueTool,
 	createTools,
 	createVibeTools,
 	type DeferredDiagnosticsEntry,
@@ -171,6 +172,7 @@ import {
 	GrepTool,
 	getSearchTools,
 	HIDDEN_TOOLS,
+	isAutoQaEnabled,
 	isImageProviderPreference,
 	isSearchProviderId,
 	isSearchProviderPreference,
@@ -1704,6 +1706,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const enableMCP = options.enableMCP ?? true;
 		const deferMCPDiscoveryForUI = enableMCP && !mcpManager && options.hasUI === true;
 		const customTools: CustomTool[] = [];
+		const reportableCustomToolNames = new Set<string>();
 		let startDeferredMCPDiscovery:
 			| ((liveSession: AgentSession, activation: DeferredMCPActivation) => void)
 			| undefined;
@@ -1815,16 +1818,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Add image tools when the active model or configured image providers can generate images.
 		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
 		if (imageGenTools.length > 0) {
+			for (const tool of imageGenTools) {
+				reportableCustomToolNames.add(tool.name);
+			}
 			customTools.push(...(imageGenTools as unknown as CustomTool[]));
 		}
 
 		if (settings.get("speechgen.enabled")) {
+			reportableCustomToolNames.add(ttsTool.name);
 			customTools.push(ttsTool as unknown as CustomTool);
 		}
 
 		// Add web search tools
 		if (options.toolNames?.includes("web_search")) {
-			customTools.push(...getSearchTools());
+			const searchTools = getSearchTools();
+			for (const tool of searchTools) {
+				reportableCustomToolNames.add(tool.name);
+			}
+			customTools.push(...searchTools);
 		}
 
 		// Discover custom tools from `.omp/tools/`, `.claude/tools/`, plugins, etc.
@@ -1844,8 +1855,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		for (const { path, error } of customToolsLoadResult.errors) {
 			logger.error("Custom tool load failed", { path, error });
 		}
-		if (customToolsLoadResult.tools.length > 0) {
-			customTools.push(...customToolsLoadResult.tools.map(loaded => loaded.tool));
+		for (const { tool } of customToolsLoadResult.tools) {
+			reportableCustomToolNames.delete(tool.name);
+			customTools.push(tool);
 		}
 		// Forward the path list (NOT the loaded tools) to subagents so they
 		// re-bind under their own `CustomToolAPI` while skipping the FS scan.
@@ -2211,6 +2223,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const registeredTools = extensionRunner.getAllRegisteredTools();
 		const sdkCustomTools = options.customTools?.filter(tool => !isLegacyBuiltinToolDefinition(tool)) ?? [];
+		for (const tool of sdkCustomTools) {
+			reportableCustomToolNames.delete(tool.name);
+		}
 		const allCustomTools = [
 			...registeredTools,
 			...sdkCustomTools.map(tool => {
@@ -2584,6 +2599,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				restored: new Set(existingSession.selectedMCPToolNames.map(normalizeRenamedBuiltinToolName)),
 				forceActive,
 			});
+		}
+
+		if (isAutoQaEnabled(settings) && toolRegistry.has("report_tool_issue")) {
+			const reportableToolNames = initialToolNames.filter(
+				name => builtInRegistryToolNames.has(name) || reportableCustomToolNames.has(name),
+			);
+			const qaTool = createReportToolIssueTool(toolSession, reportableToolNames);
+			toolRegistry.set(
+				qaTool.name,
+				new ExtensionToolWrapper(wrapToolWithMetaNotice(qaTool), extensionRunner) as Tool,
+			);
 		}
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,

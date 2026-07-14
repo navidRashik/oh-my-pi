@@ -27,11 +27,11 @@ import { type } from "arktype";
 import type { Settings } from "..";
 import type { ToolSession } from "./index";
 
-function buildReportToolIssueParams(activeBuiltinNames: readonly string[]) {
+function buildReportToolIssueParams(reportableToolNames: readonly string[]) {
 	// Enum gives the model a tight schema; the runtime check in `execute` is the
 	// source of truth (handles models that ignore the enum and the empty-list
 	// fallback used by call sites that don't know the active set yet).
-	const toolSchema = activeBuiltinNames.length > 0 ? type.enumerated(...activeBuiltinNames) : type("string");
+	const toolSchema = reportableToolNames.length > 0 ? type.enumerated(...reportableToolNames) : type("string");
 	return type({
 		tool: toolSchema.describe("tool name"),
 		report: type("string").describe(
@@ -184,6 +184,12 @@ export async function resolveAutoQaConsent(settings: Settings | undefined): Prom
 }
 
 let cachedDb: Database | null = null;
+
+/** Test-only: close and forget the cached auto-QA database handle. */
+export function __resetAutoQaDbForTests(): void {
+	cachedDb?.close();
+	cachedDb = null;
+}
 
 /**
  * Open (or return the cached handle for) the auto-QA SQLite database at
@@ -457,12 +463,15 @@ export async function flushGrievances(
 	}
 }
 
-export function createReportToolIssueTool(session: ToolSession, activeBuiltinNames: readonly string[] = []): AgentTool {
+export function createReportToolIssueTool(
+	session: ToolSession,
+	reportableToolNames: readonly string[] = [],
+): AgentTool {
 	const getModel = () => session.getActiveModelString?.() ?? "unknown";
 	// Snapshotted at construction time. The model's enum is built from the same
 	// snapshot; mid-session drift (extensions registering later, etc.) is caught
 	// by the silent-drop guard below.
-	const allowedToolNames = new Set(activeBuiltinNames);
+	const allowedToolNames = new Set(reportableToolNames);
 
 	return {
 		name: "report_tool_issue",
@@ -470,7 +479,7 @@ export function createReportToolIssueTool(session: ToolSession, activeBuiltinNam
 		strict: false,
 		approval: "write",
 		description: "Report unexpected tool behavior for automated QA tracking.",
-		parameters: buildReportToolIssueParams(activeBuiltinNames),
+		parameters: buildReportToolIssueParams(reportableToolNames),
 		intent: "omit",
 		async execute(_toolCallId, rawParams) {
 			// Save is unconditional: the row lives in the user's own SQLite
@@ -485,8 +494,8 @@ export function createReportToolIssueTool(session: ToolSession, activeBuiltinNam
 				// passthrough wrapper. Strip the prefix before allowlist check so
 				// `proxy_read` lands as a report against `read`, not a silent drop.
 				const canonicalTool = params.tool.startsWith("proxy_") ? params.tool.slice("proxy_".length) : params.tool;
-				// Silently drop reports targeting tools that aren't shipped built-ins
-				// (MCP servers, extensions that overrode a built-in name, typos).
+				// Silently drop reports targeting tools that aren't OMP-shipped
+				// reportable tools (MCP servers, extensions, typos).
 				// Not the model's fault — no error, no DB row, just acknowledge.
 				// Empty allowlist means the factory was called without a known active
 				// set, so behave as before and record everything.

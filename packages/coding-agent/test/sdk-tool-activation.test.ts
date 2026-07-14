@@ -278,4 +278,44 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			await session.dispose();
 		}
 	});
+
+	it("includes reportable built-in custom tools in the Auto QA schema", async () => {
+		const tempDir = makeTempDir();
+		const settings = Settings.isolated({ "dev.autoqa": true });
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings,
+			extensions: [toolActivationExtension],
+		});
+
+		try {
+			expect(session.getActiveToolNames()).toContain("generate_image");
+			expect(session.getActiveToolNames()).toContain("default_active_tool");
+
+			const reportTool = session.agent.state.tools.find(tool => tool.name === "report_tool_issue");
+			if (!reportTool) throw new Error("expected report_tool_issue");
+			const parameters = type(reportTool.parameters);
+			expect(
+				parameters({
+					tool: "generate_image",
+					report: "A schema-valid image generation request failed before reaching the provider.",
+				}) instanceof type.errors,
+			).toBe(false);
+			expect(
+				parameters({
+					tool: "report_tool_issue",
+					report: "The reporting tool itself rejected a valid report.",
+				}) instanceof type.errors,
+			).toBe(false);
+			expect(
+				parameters({
+					tool: "default_active_tool",
+					report: "Extension tool names must not be collected by Auto QA.",
+				}) instanceof type.errors,
+			).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	});
 });

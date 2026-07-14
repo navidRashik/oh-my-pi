@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `report_tool_issue` rejecting reports for active OMP-shipped custom tools such as `generate_image`. ([#5175](https://github.com/can1357/oh-my-pi/issues/5175))
+
 ## [16.4.3] - 2026-07-11
 
 ### Added

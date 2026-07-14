@@ -677,10 +677,10 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	// Injected unconditionally into every agent, regardless of requested tool list.
 	const autoQA = isAutoQaEnabled(session.settings);
 	if (autoQA && !tools.some(t => t.name === "report_tool_issue")) {
-		// Build the enum from tools we just constructed via BUILTIN_TOOLS / HIDDEN_TOOLS.
-		// Extension overrides (e.g. a user's custom `bash`) get added later by
-		// other code paths, so they're absent here — exactly what we want; MCP /
-		// extension tools never end up in the report enum.
+		// Build the provisional enum from tools constructed via BUILTIN_TOOLS /
+		// HIDDEN_TOOLS. `createAgentSession` rebuilds this tool after the complete
+		// registry exists so active OMP-shipped custom tools join the allowlist
+		// without admitting MCP or user-extension tools.
 		const activeBuiltinNames = tools
 			.map(t => t.name)
 			.filter(name => (name in BUILTIN_TOOLS || name in HIDDEN_TOOLS) && name !== "report_tool_issue");
