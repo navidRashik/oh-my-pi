@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed eval `log()`/`phase()` progress showing only the first few status lines: the transcript now tails the most recent events (with a `… N earlier` marker) so long workflows surface their latest progress, and ctrl+o widens the tail window instead of jumping back to the start. ([#5231](https://github.com/can1357/oh-my-pi/issues/5231))
+
 ## [16.4.5] - 2026-07-11
 
 ### Breaking Changes

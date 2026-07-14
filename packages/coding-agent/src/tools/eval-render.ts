@@ -414,17 +414,32 @@ function formatStatusEventExpanded(event: EvalStatusEvent, theme: Theme): string
 	return lines;
 }
 
-/** Render status events as tree lines. */
+/**
+ * Render status events as tree lines, keeping the MOST RECENT events.
+ *
+ * `log()`/`phase()` calls stream in as status events; a long orchestration
+ * accumulates many. We show the tail (latest progress) with a `… N earlier`
+ * marker on top — mirroring how streamed stdout and the code cell tail their
+ * windows — so the newest lines stay visible instead of freezing on the first
+ * few. Expanding (ctrl+o) widens the tail window rather than jumping to the head.
+ */
 function renderStatusEvents(events: EvalStatusEvent[], theme: Theme, expanded: boolean): string[] {
 	if (events.length === 0) return [];
 
 	const maxCollapsed = 3;
 	const maxExpanded = 10;
-	const displayCount = expanded ? Math.min(events.length, maxExpanded) : Math.min(events.length, maxCollapsed);
+	const cap = expanded ? maxExpanded : maxCollapsed;
+	const displayCount = Math.min(events.length, cap);
+	const startIndex = events.length - displayCount;
+	const hiddenCount = startIndex;
 
 	const lines: string[] = [];
-	for (let i = 0; i < displayCount; i++) {
-		const isLast = i === displayCount - 1 && (expanded || events.length <= maxCollapsed);
+	if (hiddenCount > 0) {
+		lines.push(`${theme.fg("dim", theme.tree.branch)} ${theme.fg("dim", `… ${hiddenCount} earlier`)}`);
+	}
+
+	for (let i = startIndex; i < events.length; i++) {
+		const isLast = i === events.length - 1;
 		const branch = isLast ? theme.tree.last : theme.tree.branch;
 
 		if (expanded) {
@@ -437,12 +452,6 @@ function renderStatusEvents(events: EvalStatusEvent[], theme: Theme, expanded: b
 		} else {
 			lines.push(`${theme.fg("dim", branch)} ${formatStatusEvent(events[i], theme)}`);
 		}
-	}
-
-	if (!expanded && events.length > maxCollapsed) {
-		lines.push(`${theme.fg("dim", theme.tree.last)} ${theme.fg("dim", `… ${events.length - maxCollapsed} more`)}`);
-	} else if (expanded && events.length > maxExpanded) {
-		lines.push(`${theme.fg("dim", theme.tree.last)} ${theme.fg("dim", `… ${events.length - maxExpanded} more`)}`);
 	}
 
 	return lines;
