@@ -32,6 +32,7 @@
 
 ### Fixed
 
+- Fixed `/q` + Enter running `/queue` instead of `/quit`: the newer `/queue` command is registered before `/quit`, and the editor's sync slash-completion applies the first same-prefix match on Enter, so `/q` shadowed to `/queue`. Added an explicit `q` alias to `/quit` (exact matches outrank prefix matches) so `/q` deterministically quits ([#5335](https://github.com/can1357/oh-my-pi/issues/5335))
 - Fixed `/tan` and `/fork` clones cold-missing the provider prompt cache: the per-turn supersede/useless-result prune rewrote the live context without persisting it, so file-based forks and resume rebuilt a divergent (un-pruned) prefix and re-wrote the entire cache
 - Fixed `/tan` pinning the clone's prompt-cache key to the parent's session id instead of the parent's effective cache key, dropping shard affinity when the parent was itself a fork or tan
 - Fixed inconsistent history rendering when toggling the display setting for compacted items
