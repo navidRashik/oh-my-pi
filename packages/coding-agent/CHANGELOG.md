@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- Fixed late advisor concerns after a terminal primary answer starting a duplicate primary turn when no queued work remains ([#4840](https://github.com/can1357/oh-my-pi/issues/4840)).
+- Fixed agent-authored maintenance turns repeating a completed answer ([#4840](https://github.com/can1357/oh-my-pi/issues/4840)): auto-learn capture now runs in a detached, abortable private agent with only `manage_skill` plus optional `learn` and leaves the primary transcript, queues, and provider anchors untouched (its blocked capture also drains on session dispose); late advisor `concern`/`blocker` notes after a terminal text answer are preserved as advisor cards instead of waking a new primary turn (and are deferred until capture teardown); and post-compaction auto-continue is skipped when the compacted tail is already a terminal text answer — including Cursor-resolved exec tails — while queued work and active goals still continue.
 
 ## [16.3.11] - 2026-07-06
 

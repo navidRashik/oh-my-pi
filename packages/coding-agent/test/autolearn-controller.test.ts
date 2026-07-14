@@ -11,12 +11,9 @@ interface CapturedNudge {
 class FakeSession {
 	readonly listeners: Array<(event: AgentSessionEvent) => void> = [];
 	readonly sent: CapturedNudge[] = [];
+	readonly captures: string[] = [];
 	planEnabled = false;
 	goalEnabled = false;
-	/** Whether a triggerTurn dispatch actually starts a synthetic turn. */
-	turnStarts = true;
-	/** Force the dispatch to reject (models a failed send). */
-	failSend = false;
 
 	subscribe(listener: (event: AgentSessionEvent) => void): () => void {
 		this.listeners.push(listener);
@@ -24,10 +21,8 @@ class FakeSession {
 	}
 
 	async sendCustomMessage(message: CapturedNudge["message"], options?: CapturedNudge["options"]): Promise<boolean> {
-		if (this.failSend) throw new Error("send failed");
 		this.sent.push({ message, options });
-		// Mirror AgentSession: a turn starts only when triggerTurn is honored.
-		return options?.triggerTurn === true && this.turnStarts;
+		return options?.triggerTurn === true;
 	}
 
 	getPlanModeState(): { enabled: boolean } | undefined {
@@ -57,10 +52,21 @@ class FakeSession {
 	}
 }
 
-function install(session: FakeSession, overrides: Record<string, unknown> = {}): Settings {
+function install(
+	session: FakeSession,
+	overrides: Record<string, unknown> = {},
+	capture: (content: string) => Promise<void> = async content => {
+		session.captures.push(content);
+	},
+): Settings {
 	const settings = Settings.isolated({ "autolearn.enabled": true, ...overrides });
-	new AutoLearnController({ session: session as unknown as AgentSession, settings });
+	new AutoLearnController({ session: session as unknown as AgentSession, settings, capture });
 	return settings;
+}
+
+async function flushMicrotasks(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
 }
 
 describe("AutoLearnController", () => {
@@ -70,20 +76,18 @@ describe("AutoLearnController", () => {
 		session.toolCalls(5);
 		session.agentEnd();
 
+		expect(session.captures).toHaveLength(0);
 		expect(session.sent).toHaveLength(0);
 	});
 
-	it("the auto-continue nudge is terminal — capture then stop, never assume approval (#3504)", () => {
-		// Regression: with autoContinue on, the synthetic capture turn carries
-		// the nudge as its only user-role payload. Without an explicit "stop /
-		// not a user reply / do not assume approval" contract, the agent reads
-		// its own unanswered prior question (e.g. "Want me to commit and
-		// push?") as accepted and continues — exactly the scenario in #3504.
+	it("auto-continue captures privately instead of mutating the primary transcript", () => {
 		const session = new FakeSession();
 		install(session, { "autolearn.autoContinue": true });
 		session.toolCalls(5);
 		session.agentEnd();
-		const body = String(session.sent[0]?.message.content);
+		expect(session.captures).toHaveLength(1);
+		expect(session.sent).toHaveLength(0);
+		const body = session.captures[0] ?? "";
 		// Frames the prompt as automated, not as the user's response.
 		expect(body).toMatch(/not a user reply|not from the user/i);
 		// Forbids inferring approval / acting on pending questions.
@@ -99,6 +103,7 @@ describe("AutoLearnController", () => {
 		install(session, { "autolearn.autoContinue": true });
 		session.toolCalls(4);
 		session.agentEnd();
+		expect(session.captures).toHaveLength(0);
 		expect(session.sent).toHaveLength(0);
 	});
 
@@ -108,7 +113,7 @@ describe("AutoLearnController", () => {
 		install(session, { "autolearn.autoContinue": true });
 		session.toolCalls(5);
 		session.agentEnd();
-		expect(session.sent).toHaveLength(0);
+		expect(session.captures).toHaveLength(0);
 	});
 	it("does not combine tool calls across separate sub-threshold turns", () => {
 		const session = new FakeSession();
@@ -118,7 +123,7 @@ describe("AutoLearnController", () => {
 		session.toolCalls(3);
 		session.agentEnd();
 		// Neither turn reached the threshold; the counter must not accumulate.
-		expect(session.sent).toHaveLength(0);
+		expect(session.captures).toHaveLength(0);
 	});
 
 	it("discards plan-mode tool calls instead of leaking them into the next turn", () => {
@@ -130,7 +135,7 @@ describe("AutoLearnController", () => {
 		session.planEnabled = false;
 		session.toolCalls(1);
 		session.agentEnd(); // 1 < threshold -> no fire (no plan-mode leak)
-		expect(session.sent).toHaveLength(0);
+		expect(session.captures).toHaveLength(0);
 	});
 
 	it("stops auto-continuing when autolearn is disabled mid-session", () => {
@@ -139,20 +144,26 @@ describe("AutoLearnController", () => {
 		// can be flipped and the controller's fire-time re-check is exercised.
 		const settings = Settings.isolated({ "autolearn.autoContinue": true });
 		settings.set("autolearn.enabled", true);
-		new AutoLearnController({ session: session as unknown as AgentSession, settings });
+		new AutoLearnController({
+			session: session as unknown as AgentSession,
+			settings,
+			capture: async content => {
+				session.captures.push(content);
+			},
+		});
 		session.toolCalls(5);
 		session.agentEnd();
-		expect(session.sent).toHaveLength(1); // fires while enabled
+		expect(session.captures).toHaveLength(1); // fires while enabled
 		settings.set("autolearn.enabled", false);
 		session.toolCalls(5);
 		session.agentEnd();
-		expect(session.sent).toHaveLength(1); // no new nudge after disable
+		expect(session.captures).toHaveLength(1); // no new capture after disable
 		// The disabled stop must NOT leave its tool calls queued: re-enabling and
 		// doing a sub-threshold turn must not fire from leaked counts.
 		settings.set("autolearn.enabled", true);
 		session.toolCalls(1);
 		session.agentEnd();
-		expect(session.sent).toHaveLength(1);
+		expect(session.captures).toHaveLength(1);
 	});
 
 	it("does not nudge during goal mode and leaks no suppression latch", () => {
@@ -162,12 +173,12 @@ describe("AutoLearnController", () => {
 		session.toolCalls(5);
 		session.agentEnd();
 		// Goal mode owns the continuation; auto-learn stays out of the loop.
-		expect(session.sent).toHaveLength(0);
-		// The skipped stop must not arm suppression for the next non-goal stop.
+		expect(session.captures).toHaveLength(0);
+		// The skipped stop must not leak into the next non-goal stop.
 		session.goalEnabled = false;
 		session.toolCalls(5);
 		session.agentEnd();
-		expect(session.sent).toHaveLength(1);
+		expect(session.captures).toHaveLength(1);
 	});
 
 	it("never nudges a turn that started in goal mode even if the goal ended mid-turn", () => {
@@ -181,64 +192,77 @@ describe("AutoLearnController", () => {
 		// off by the time the turn stops, but this turn must still never be nudged.
 		session.goalEnabled = false;
 		session.agentEnd();
-		expect(session.sent).toHaveLength(0);
+		expect(session.captures).toHaveLength(0);
 
 		// The capture is per-turn: a fresh turn that did not start in goal mode
 		// nudges normally, proving the latch resets.
 		session.agentStart();
 		session.toolCalls(5);
 		session.agentEnd();
-		expect(session.sent).toHaveLength(1);
+		expect(session.captures).toHaveLength(1);
 	});
 
-	it("auto-runs a capture turn and suppresses exactly one follow-up agent_end", () => {
+	it("does not overlap private captures and runs one pending capture after teardown", async () => {
 		const session = new FakeSession();
-		install(session, { "autolearn.autoContinue": true });
+		const gate = Promise.withResolvers<void>();
+		install(session, { "autolearn.autoContinue": true }, async content => {
+			session.captures.push(content);
+			await gate.promise;
+		});
 
 		session.toolCalls(5);
 		session.agentEnd();
-		expect(session.sent).toHaveLength(1);
-		expect(session.sent[0]?.options?.triggerTurn).toBe(true);
-
-		// The synthetic capture turn's agent_end is swallowed.
-		session.toolCalls(5);
-		session.agentEnd();
-		expect(session.sent).toHaveLength(1);
-
-		// Suppression is one-shot: the next qualifying stop fires again.
-		session.toolCalls(5);
-		session.agentEnd();
-		expect(session.sent).toHaveLength(2);
-	});
-
-	it("disarms suppression when the capture turn is deferred (not started)", async () => {
-		const session = new FakeSession();
-		// triggerTurn honored but downgraded to a queue: no synthetic agent_end.
-		session.turnStarts = false;
-		install(session, { "autolearn.autoContinue": true });
-		session.toolCalls(5);
-		session.agentEnd();
-		expect(session.sent).toHaveLength(1);
-		expect(session.sent[0]?.options?.triggerTurn).toBe(true);
-		await Bun.sleep(1); // flush the async disarm
-		// No turn ran, so the next real stop must still nudge.
-		session.toolCalls(5);
-		session.agentEnd();
-		expect(session.sent).toHaveLength(2);
-	});
-
-	it("disarms suppression when the capture-turn dispatch fails", async () => {
-		const session = new FakeSession();
-		session.failSend = true;
-		install(session, { "autolearn.autoContinue": true });
-		session.toolCalls(5);
-		session.agentEnd(); // dispatch rejects: armed, then disarmed in .catch
+		expect(session.captures).toHaveLength(1);
 		expect(session.sent).toHaveLength(0);
-		await Bun.sleep(1); // flush the async disarm
-		session.failSend = false;
+
 		session.toolCalls(5);
 		session.agentEnd();
-		expect(session.sent).toHaveLength(1);
+		session.toolCalls(5);
+		session.agentEnd();
+		expect(session.captures).toHaveLength(1);
+
+		gate.resolve();
+		await flushMicrotasks();
+		expect(session.captures).toHaveLength(2);
+	});
+
+	it("does not start a second capture while the private capture is pending", async () => {
+		const session = new FakeSession();
+		const gate = Promise.withResolvers<void>();
+		install(session, { "autolearn.autoContinue": true }, async content => {
+			session.captures.push(content);
+			await gate.promise;
+		});
+		session.toolCalls(5);
+		session.agentEnd();
+		expect(session.captures).toHaveLength(1);
+
+		session.toolCalls(5);
+		session.agentEnd();
+		expect(session.captures).toHaveLength(1);
+		gate.resolve();
+		await flushMicrotasks();
+		expect(session.captures).toHaveLength(2);
+	});
+
+	it("continues future captures when a private capture fails", async () => {
+		const session = new FakeSession();
+		let failNext = true;
+		install(session, { "autolearn.autoContinue": true }, async content => {
+			if (failNext) {
+				failNext = false;
+				throw new Error(`capture failed for ${content.slice(0, 8)}`);
+			}
+			session.captures.push(content);
+		});
+		session.toolCalls(5);
+		session.agentEnd();
+		expect(session.captures).toHaveLength(0);
+		await flushMicrotasks(); // flush the async failure cleanup
+		session.toolCalls(5);
+		session.agentEnd();
+		expect(session.captures).toHaveLength(1);
+		expect(session.sent).toHaveLength(0);
 	});
 
 	it("respects a custom minToolCalls threshold", () => {
@@ -246,7 +270,7 @@ describe("AutoLearnController", () => {
 		install(session, { "autolearn.autoContinue": true, "autolearn.minToolCalls": 2 });
 		session.toolCalls(2);
 		session.agentEnd();
-		expect(session.sent).toHaveLength(1);
+		expect(session.captures).toHaveLength(1);
 	});
 });
 

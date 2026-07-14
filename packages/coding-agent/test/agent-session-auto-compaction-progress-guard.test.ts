@@ -150,6 +150,23 @@ describe("AgentSession auto-compaction progress guard", () => {
 		};
 	}
 
+	function activateOngoingGoal(id: string): void {
+		const now = Date.now();
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id,
+				objective: "finish the ongoing work",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: now,
+				updatedAt: now,
+			},
+		});
+	}
+
 	/** Build a context-overflow assistant turn (input exceeds the 200k window). */
 	function overflowAssistant(content = [{ type: "text" as const, text: "" }]) {
 		return {
@@ -388,12 +405,11 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(noProgress.length).toBe(1);
 	});
 
-	it("auto-continues (no warning) when compaction creates headroom", async () => {
-		// The auto-continue path runs #scheduleAutoContinuePrompt → #promptWithMessage
-		// → agent.prompt. Stub both prompt and continue so no real agent loop runs.
+	it("does not auto-continue after compaction of a terminal text answer with no queued work", async () => {
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
-		vi.spyOn(session.agent, "continue").mockResolvedValue();
-		// Residual context drops well under the threshold: real reduction happened.
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		// Residual context drops well under the threshold: real reduction happened,
+		// so the only reason to avoid a continuation is the terminal-answer tail.
 		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
 
 		const notices = collectNotices();
@@ -410,9 +426,82 @@ describe("AgentSession auto-compaction progress guard", () => {
 		await compactionDone;
 		await session.waitForIdle();
 
-		// Headroom was created, so the guard scheduled the agent-authored
-		// continuation prompt and stayed silent.
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(continueSpy).not.toHaveBeenCalled();
+		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
+		expect(noProgress.length).toBe(0);
+	});
+
+	it("drains queued work after terminal-answer compaction instead of scheduling the generic auto-continue prompt", async () => {
+		session.agent.followUp({
+			role: "custom",
+			customType: "test",
+			content: [{ type: "text", text: "Queued work after final answer" }],
+			display: false,
+			timestamp: Date.now(),
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			session.agent.clearAllQueues();
+		});
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+
+		const notices = collectNotices();
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = highUsageAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
+		expect(noProgress.length).toBe(0);
+	});
+
+	it("keeps active-goal auto-continuation after compaction creates headroom", async () => {
+		const now = Date.now();
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-terminal-compaction",
+				objective: "continue after compaction",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: now,
+				updatedAt: now,
+			},
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined as never);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session, "getContextUsage").mockReturnValue({ tokens: 1000, contextWindow: 200000, percent: 0.5 });
+
+		const notices = collectNotices();
+
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		const assistantMsg = highUsageAssistant();
+		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+
+		await compactionDone;
+		await session.waitForIdle();
+
 		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
 		const noProgress = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes(NO_PROGRESS_FRAGMENT));
 		expect(noProgress.length).toBe(0);
 	});
@@ -993,6 +1082,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 	}
 
 	it("auto-continues when residual sits at the recovery band but the trigger was already sub-band", async () => {
+		activateOngoingGoal("recovery-band");
 		// Regression for the #3412 review: when stale/tool-output pruning already
 		// dropped context under the recovery band BEFORE this pass, the trigger
 		// (postMaintenanceContextTokens) is itself sub-band. The old guard returned
@@ -1087,6 +1177,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 	});
 
 	it("auto-continues (no warning) when a shake rescue frees the oversized tail", async () => {
+		activateOngoingGoal("shake-rescue");
 		// The escalation contract: compaction cut at the only turn boundary but the
 		// kept tail (e.g. a huge tool result) still sits over the recovery band. The
 		// guard now runs an elide shake INSIDE that tail; once it frees enough, the
