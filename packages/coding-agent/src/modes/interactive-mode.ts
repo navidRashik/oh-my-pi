@@ -1023,15 +1023,16 @@ export class InteractiveMode implements InteractiveModeContext {
 				clearMermaidCache();
 				this.ui.invalidate();
 				this.updateEditorBorderColor();
-				if (event.ephemeral || isInsideTerminalMultiplexer()) {
-					// Theme previews and multiplexer panes cannot safely replace native
-					// scrollback: previews must stay non-destructive, and multiplexers
-					// suppress ED3 so a forced replay would duplicate transcript history.
+				if (event.ephemeral || isInsideTerminalMultiplexer() || this.ui.hasRetiredNativeScrollback) {
+					// Theme previews, multiplexer panes, and sessions whose old rows
+					// now live only in terminal-owned scrollback cannot safely replace
+					// native history. Repaint the retained viewport without ED3;
+					// retired rows keep the palette they had when committed.
 					this.ui.requestRender();
 					return;
 				}
-				// Rows already committed to native scrollback are immutable; replay them
-				// after a theme swap so a reader scrolled up sees the same palette.
+				// A fully retained transcript can be replayed so committed history
+				// receives the new palette.
 				this.ui.requestRender(true, { clearScrollback: true });
 			}),
 		);

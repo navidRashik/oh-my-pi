@@ -7,6 +7,7 @@ import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
+import { takeRecentLoopPhase } from "@oh-my-pi/pi-utils";
 
 // Models a transcript block that re-lays-out (tool preview collapsing, assistant
 // message finalizing, late async result) after newer blocks were appended below
@@ -164,6 +165,16 @@ function plain(lines: readonly string[]): string {
 }
 
 describe("TranscriptContainer", () => {
+	it("attributes synchronous render work to the transcript phase", () => {
+		takeRecentLoopPhase();
+		const container = new TranscriptContainer();
+		container.addChild(new Text("history"));
+
+		container.render(40);
+
+		expect(takeRecentLoopPhase()).toBe("ui.transcript-render");
+	});
+
 	it("always renders a block's current content, even after newer blocks append below it", () => {
 		const container = new TranscriptContainer();
 		const a = new MutableBlock(["a1"]);
@@ -348,7 +359,7 @@ describe("TranscriptContainer", () => {
 		expect(container.render(40)).toEqual(["history", "", "live", "", "finalized-below-0", "finalized-below-1"]);
 		expect(container.getNativeScrollbackLiveRegionStart()).toBe(2);
 	});
-	it("does not re-render finalized rows already committed to native scrollback", () => {
+	it("retires finalized leading blocks after their rows enter native scrollback", () => {
 		const container = new TranscriptContainer();
 		const committed = new CountingFinalizedBlock(["committed"]);
 		const liveTail = new CountingFinalizedBlock(["tail"]);
@@ -360,13 +371,16 @@ describe("TranscriptContainer", () => {
 		expect(liveTail.renderCount).toBe(1);
 
 		container.setNativeScrollbackCommittedRows(1);
-		expect(container.render(40)).toEqual(["committed", "", "tail"]);
+		expect(container.takeNativeScrollbackRetiredRows()).toBe(1);
+		expect(container.children).toEqual([liveTail]);
+		expect(container.render(40)).toEqual(["", "tail"]);
 		expect(committed.renderCount).toBe(1);
 		expect(liveTail.renderCount).toBe(2);
 
 		container.invalidate();
-		expect(container.render(40)).toEqual(["committed", "", "tail"]);
-		expect(committed.renderCount).toBe(2);
+		expect(container.render(40)).toEqual(["", "tail"]);
+		expect(committed.renderCount).toBe(1);
+		expect(liveTail.renderCount).toBe(3);
 	});
 	it("re-renders a committed finalized block when its version changes", () => {
 		const container = new TranscriptContainer();
@@ -409,11 +423,12 @@ describe("TranscriptContainer", () => {
 		expect(container.render(40)).toEqual(["streaming", "done", "", "tail"]);
 		expect(block.renderCount).toBe(rendersBeforeTransition + 1);
 
-		// The post-finalize render is now trustworthy history: once its rows are
-		// committed, the bypass replays it without calling render().
+		// Once its final bytes are committed, the whole leading block is retired;
+		// only the separator and retained tail remain in the JS render surface.
 		container.setNativeScrollbackCommittedRows(2);
+		expect(container.takeNativeScrollbackRetiredRows()).toBe(2);
 		const rendersAfterTransition = block.renderCount;
-		expect(container.render(40)).toEqual(["streaming", "done", "", "tail"]);
+		expect(container.render(40)).toEqual(["", "tail"]);
 		expect(block.renderCount).toBe(rendersAfterTransition);
 	});
 	it("reports a new assistant block version after post-finalize error unpinning", () => {

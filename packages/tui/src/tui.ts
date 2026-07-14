@@ -203,12 +203,26 @@ export interface NativeScrollbackLiveRegion {
 	getNativeScrollbackLiveRegionStart(): number | undefined;
 }
 
+/** Receives the component-local prefix already committed to native scrollback. */
 export interface NativeScrollbackCommittedRows {
 	setNativeScrollbackCommittedRows(rows: number): void;
 }
 
-function setNativeScrollbackCommittedRows(component: Component, rows: number): void {
-	(component as Component & Partial<NativeScrollbackCommittedRows>).setNativeScrollbackCommittedRows?.(rows);
+/**
+ * Lets a component report leading rows it released after receiving the
+ * committed-row boundary. Reading consumes the report.
+ */
+export interface NativeScrollbackRowRetirement {
+	takeNativeScrollbackRetiredRows(): number;
+}
+
+function setNativeScrollbackCommittedRows(component: Component, rows: number): number {
+	const committed = component as Component &
+		Partial<NativeScrollbackCommittedRows> &
+		Partial<NativeScrollbackRowRetirement>;
+	committed.setNativeScrollbackCommittedRows?.(rows);
+	const retired = committed.takeNativeScrollbackRetiredRows?.();
+	return typeof retired === "number" && Number.isFinite(retired) ? Math.max(0, Math.trunc(retired)) : 0;
 }
 
 function isOverlayFocusTarget(owner: Component, component: Component | null): boolean {
@@ -965,6 +979,10 @@ export class TUI extends Container {
 	// references to component-cached strings, so the audit is a pointer walk
 	// in the common case.
 	#committedPrefix: string[] = [];
+	// Rows released from the retained frame after entering native scrollback.
+	// While non-zero, geometry changes must preserve terminal-owned history
+	// instead of clearing and replaying an intentionally incomplete frame.
+	#retiredNativeRows = 0;
 	// Rows of the committed prefix that were HARD-VERIFIED as exact-final
 	// bytes (committed below the exactness boundary, or frozen snapshots that
 	// passed the one-time strict scan when the boundary rose past them). Rows
@@ -1129,10 +1147,27 @@ export class TUI extends Container {
 				liveLocalStart = previous.liveLocalStart;
 			} else {
 				// Feed the engine's committed-row claim (from the previous frame's
-				// emit) before rendering so the child can skip re-deriving blocks
-				// that already live in immutable native scrollback. Reused segments
-				// skip this: they never call render(), so the signal is moot.
-				setNativeScrollbackCommittedRows(child, Math.max(0, this.#committedRows - offset));
+				// emit) before rendering so the child can skip or retire blocks
+				// that already live in immutable native scrollback. A retiring child
+				// reports the number of leading local rows it released; mirror that
+				// cut through every root-frame cache before composing its tail.
+				const retiredRows = setNativeScrollbackCommittedRows(child, Math.max(0, this.#committedRows - offset));
+				if (retiredRows > 0) {
+					if (
+						previous === undefined ||
+						previous.component !== child ||
+						previous.start !== offset ||
+						retiredRows > previous.rowCount ||
+						retiredRows > this.#committedRows - offset
+					) {
+						throw new Error("Component retired rows outside its previously composed committed prefix");
+					}
+					this.#retireComposedRows(offset, retiredRows);
+					previous.rowCount -= retiredRows;
+					for (let later = index + 1; later < previousSegments.length; later++) {
+						previousSegments[later]!.start -= retiredRows;
+					}
+				}
 				childLines = child.render(width);
 				const liveRegionStart = getNativeScrollbackLiveRegionStart(child);
 				if (liveRegionStart !== undefined) {
@@ -1210,6 +1245,58 @@ export class TUI extends Container {
 		return frame;
 	}
 
+	/** Release a component-retired range from every row-aligned frame ledger. */
+	#retireComposedRows(from: number, count: number): void {
+		const to = from + count;
+		this.#composedFrame.splice(from, count);
+		this.#preparedFrame.splice(from, count);
+		this.#preparedMeta.splice(from, count);
+		this.#committedPrefix.splice(from, count);
+		this.#committedRows -= count;
+		const auditedInRange = Math.max(0, Math.min(count, this.#committedPrefixAuditRows - from));
+		this.#committedPrefixAuditRows -= auditedInRange;
+		if (this.#windowTopRow >= to) {
+			this.#windowTopRow -= count;
+		} else if (this.#windowTopRow > from) {
+			this.#windowTopRow = from;
+		}
+		this.#previousFrameLength = Math.max(0, this.#previousFrameLength - count);
+		if (this.#hardwareCursorRow >= to) {
+			this.#hardwareCursorRow -= count;
+		} else if (this.#hardwareCursorRow > from) {
+			this.#hardwareCursorRow = from;
+		}
+		if (this.#hardwareCursorState) {
+			const row =
+				this.#hardwareCursorState.row >= to
+					? this.#hardwareCursorState.row - count
+					: Math.min(this.#hardwareCursorState.row, from);
+			this.#hardwareCursorState = { ...this.#hardwareCursorState, row };
+		}
+		for (let i = this.#frameCursorMarkers.length - 1; i >= 0; i--) {
+			const marker = this.#frameCursorMarkers[i]!;
+			if (marker.row < from) continue;
+			if (marker.row < to) {
+				this.#frameCursorMarkers.splice(i, 1);
+			} else {
+				marker.row -= count;
+			}
+		}
+		if (this.#nativeScrollbackLiveRegionStart !== undefined) {
+			this.#nativeScrollbackLiveRegionStart =
+				this.#nativeScrollbackLiveRegionStart >= to
+					? this.#nativeScrollbackLiveRegionStart - count
+					: Math.min(this.#nativeScrollbackLiveRegionStart, from);
+		}
+		if (this.#renderStablePrefixRows > from) {
+			this.#renderStablePrefixRows -= Math.min(count, this.#renderStablePrefixRows - from);
+		}
+		if (this.#preparedValidRows > from) {
+			this.#preparedValidRows -= Math.min(count, this.#preparedValidRows - from);
+		}
+		this.#retiredNativeRows += count;
+	}
+
 	/** Drop cached cursor markers at/after `fromRow` (those rows re-ingest). */
 	#pruneFrameCursorMarkers(fromRow: number): void {
 		const markers = this.#frameCursorMarkers;
@@ -1263,6 +1350,11 @@ export class TUI extends Container {
 	/** Whether a non-multiplexer resize drag is currently in flight. */
 	get resizeViewportActive(): boolean {
 		return this.#resizeViewportActive;
+	}
+
+	/** Whether this TUI has released rows now owned only by native scrollback. */
+	get hasRetiredNativeScrollback(): boolean {
+		return this.#retiredNativeRows > 0;
 	}
 
 	/** Shared budget that caps how many inline images render as live graphics. */
@@ -1474,10 +1566,12 @@ export class TUI extends Container {
 				// `#resizeEventPending` is set first so the eventual render still
 				// classifies as a resize.
 				this.#resizeEventPending = true;
-				if (!resizeRepaintsInPlace()) {
-					// Enter the viewport fast path and (re)arm the settle timer, then
-					// request the cheap viewport-only paint. The authoritative full
-					// replay fires from the settle timer once the drag goes quiet.
+				if (!resizeRepaintsInPlace() && this.#retiredNativeRows === 0) {
+					// A fully retained frame can use the alternate-screen viewport
+					// fast path and replay authoritatively after the drag. Once rows
+					// live only in native scrollback, keep the normal buffer active
+					// and use the in-place debounced path below so terminal-owned
+					// history survives the resize.
 					this.#beginResizeViewport();
 					this.#requestResizeViewportPaint();
 					return;
@@ -2686,7 +2780,7 @@ export class TUI extends Container {
 		// feedback loop), so committed history keeps its old wrap.
 		const firstPaint = !this.#hasEverRendered;
 		const replaceRequested = this.#clearScrollbackOnNextRender;
-		const geometryRebuild = geometryChanged && !resizeRepaintsInPlace();
+		const geometryRebuild = geometryChanged && !resizeRepaintsInPlace() && this.#retiredNativeRows === 0;
 		const fullPaint = firstPaint || replaceRequested || geometryRebuild;
 		let windowTop: number;
 		let chunkTo: number;
@@ -3268,6 +3362,7 @@ export class TUI extends Container {
 				};
 
 		this.#committedRows = chunkTo;
+		if (options.clearScrollback) this.#retiredNativeRows = 0;
 		this.#windowTopRow = windowTop;
 		this.#commit(frame, window, width, height, committedCursor);
 	}
@@ -3292,7 +3387,9 @@ export class TUI extends Container {
 			// rebuild — ED3 + full history — and the clearScrollback intent below
 			// matches the gesture-driven reset path.
 			this.#resizeEventPending = true;
-			this.requestRender(true, { clearScrollback: !isMultiplexerSession() });
+			this.requestRender(true, {
+				clearScrollback: !isMultiplexerSession() && this.#retiredNativeRows === 0,
+			});
 		}, TUI.#RESIZE_VIEWPORT_SETTLE_MS);
 	}
 

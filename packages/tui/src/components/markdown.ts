@@ -1,3 +1,4 @@
+import { popLoopPhase, pushLoopPhase } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "lru-cache/raw";
 import { Marked, type Token, Tokenizer, type TokenizerAndRendererExtension, type Tokens } from "marked";
 import { latexToBlock } from "../latex-block";
@@ -452,9 +453,22 @@ markdownParser.use({ extensions: [customHrExtension, mathBlockExtension, mathEnv
 // component lifetimes and eliminates redundant marked.lexer + highlightCode
 // (Rust FFI) work for content/layout combinations already seen this session.
 
-const RENDER_CACHE_MAX = 256; // sane cap: ~256 distinct message × width combos
+const RENDER_CACHE_MAX = 256;
+const RENDER_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const RENDER_CACHE_MAX_ENTRY_BYTES = 512 * 1024;
 const EMPTY_RENDER_LINES: readonly string[] = [];
-const renderCache = new LRUCache<string, readonly string[]>({ max: RENDER_CACHE_MAX });
+const renderCache = new LRUCache<string, readonly string[]>({
+	max: RENDER_CACHE_MAX,
+	maxSize: RENDER_CACHE_MAX_BYTES,
+	maxEntrySize: RENDER_CACHE_MAX_ENTRY_BYTES,
+	// Approximate retained UTF-16 storage for both the source-bearing key and
+	// rendered rows, plus one pointer per row. Oversized renders bypass L2.
+	sizeCalculation: (lines, key) => {
+		let bytes = key.length * 2 + lines.length * 8;
+		for (const line of lines) bytes += line.length * 2;
+		return Math.max(1, bytes);
+	},
+});
 
 // A reference-link definition (`[label]: dest`) resolves across the whole
 // document, so a split lex cannot reproduce it — disable the streaming fast path
@@ -986,6 +1000,15 @@ export class Markdown implements Component {
 	}
 
 	render(width: number): readonly string[] {
+		pushLoopPhase("ui.markdown-render");
+		try {
+			return this.#render(width);
+		} finally {
+			popLoopPhase();
+		}
+	}
+
+	#render(width: number): readonly string[] {
 		// L1: per-instance cache — fastest path for repeated renders of the same
 		// instance at the same width (e.g. resize debounce, repeated redraws).
 		// Returning the cached reference is load-bearing: parents memoize their

@@ -131,8 +131,10 @@ import {
 	isBunTestRuntime,
 	isEnoent,
 	logger,
+	popLoopPhase,
 	postmortem,
 	prompt,
+	pushLoopPhase,
 	relativePathWithinRoot,
 	Snowflake,
 	withTimeout,
@@ -10450,7 +10452,13 @@ export class AgentSession {
 		const assistantUsageContextTokens = assistantPredatesCompaction
 			? 0
 			: calculateContextTokens(assistantMessage.usage);
-		const storedContextTokens = this.#estimateStoredContextTokens();
+		let storedContextTokens: number;
+		pushLoopPhase("session.compaction-check");
+		try {
+			storedContextTokens = this.#estimateStoredContextTokens();
+		} finally {
+			popLoopPhase();
+		}
 		// Pruning frees bytes for the NEXT prompt; it does not change the size of
 		// the prompt the LLM just billed for. Earlier revisions subtracted the
 		// per-turn supersede/prune `tokensSaved` from the threshold input, which

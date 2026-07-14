@@ -4,6 +4,7 @@ import { clearRenderCache, Markdown, renderInlineMarkdown } from "@oh-my-pi/pi-t
 import { setTerminalTextSizing, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { type Component, TUI } from "@oh-my-pi/pi-tui/tui";
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
+import { takeRecentLoopPhase } from "@oh-my-pi/pi-utils";
 import { Chalk } from "chalk";
 import { defaultMarkdownTheme } from "./test-themes.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
@@ -1317,6 +1318,14 @@ describe("Inline color swatches", () => {
 });
 
 describe("Module-level LRU render cache", () => {
+	it("attributes synchronous render work to the Markdown phase", () => {
+		takeRecentLoopPhase();
+
+		new Markdown("phase probe", 0, 0, defaultMarkdownTheme).render(80);
+
+		expect(takeRecentLoopPhase()).toBe("ui.markdown-render");
+	});
+
 	it("invokes highlightCode only once for two distinct instances with identical (text, width, theme)", () => {
 		// Build a theme with a spy on highlightCode. The theme object reference
 		// is stable across both instances so objectId() returns the same ID,
@@ -1363,6 +1372,15 @@ describe("Module-level LRU render cache", () => {
 		// cache entry — same reference, not just equal content.
 		const l2Markdown = new Markdown(text, 0, 0, defaultMarkdownTheme);
 		expect(l2Markdown.render(width)).toBe(first);
+	});
+
+	it("does not retain an oversized rendered entry in the shared cache", () => {
+		clearRenderCache();
+		const text = "x".repeat(300 * 1024);
+		const first = new Markdown(text, 0, 0, defaultMarkdownTheme).render(80);
+		const second = new Markdown(text, 0, 0, defaultMarkdownTheme).render(80);
+
+		expect(second).not.toBe(first);
 	});
 
 	it("skips code-block highlighting for transient streaming renders", () => {

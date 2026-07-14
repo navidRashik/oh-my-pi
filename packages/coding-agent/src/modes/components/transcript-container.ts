@@ -3,9 +3,11 @@ import {
 	Container,
 	type NativeScrollbackCommittedRows,
 	type NativeScrollbackLiveRegion,
+	type NativeScrollbackRowRetirement,
 	type RenderStablePrefix,
 	type ViewportTailProvider,
 } from "@oh-my-pi/pi-tui";
+import { popLoopPhase, pushLoopPhase } from "@oh-my-pi/pi-utils";
 
 /**
  * A transcript block that is still mutating (a foreground tool awaiting its
@@ -126,17 +128,22 @@ const EMPTY_TAIL: readonly string[] = [];
  * a late tool result, a post-finalize error pin, or an expand toggle is
  * always reflected on screen while it remains in the window.
  *
- * Assembly is incremental: the returned array is persistent and mutated in
- * place. Each block's render is still called every frame, but a block whose
- * render returned the same array reference at an unchanged offset reuses its
- * previously assembled rows; the array is truncated and re-pushed only from
- * the first divergent block. The leading byte-identical row count is reported
- * through {@link RenderStablePrefix} so the engine can skip marker scanning,
- * line preparation, and the committed-prefix audit for those rows.
+ * Assembly is incremental and bounded to the retained tail. Each block's
+ * render is still called while it remains live, but finalized leading blocks
+ * are released once every row they contributed has entered native scrollback.
+ * Within the retained tail, the returned array is persistent and only the
+ * first divergent suffix is rebuilt. The leading byte-identical row count is
+ * reported through {@link RenderStablePrefix} so the engine can skip marker
+ * scanning, line preparation, and committed-prefix audits for those rows.
  */
 export class TranscriptContainer
 	extends Container
-	implements NativeScrollbackLiveRegion, NativeScrollbackCommittedRows, RenderStablePrefix, ViewportTailProvider
+	implements
+		NativeScrollbackLiveRegion,
+		NativeScrollbackCommittedRows,
+		NativeScrollbackRowRetirement,
+		RenderStablePrefix,
+		ViewportTailProvider
 {
 	// Bumped to retire every block segment at once (theme change / clear); a
 	// segment is only reused when its stored generation matches.
@@ -154,6 +161,10 @@ export class TranscriptContainer
 	// Finalized blocks wholly before this boundary are immutable on-screen history;
 	// their previous contribution can be replayed without calling render().
 	#committedRows = 0;
+	// A retired prefix still exists immediately above this retained frame in
+	// native scrollback. Preserve the one-row inter-block separator at the seam.
+	#hasRetiredPrefix = false;
+	#retiredRowsPending = 0;
 	// Stable-prefix floor accumulated across renders since the last
 	// getRenderStablePrefixRows() read (see RenderStablePrefix: reading
 	// consumes the report and re-bases the baseline). Out-of-band renders
@@ -168,11 +179,62 @@ export class TranscriptContainer
 
 	override clear(): void {
 		this.#generation++;
+		this.#hasRetiredPrefix = false;
+		this.#retiredRowsPending = 0;
 		super.clear();
 	}
 
 	setNativeScrollbackCommittedRows(rows: number): void {
-		this.#committedRows = Number.isFinite(rows) ? Math.max(0, Math.trunc(rows)) : 0;
+		const committedRows = Number.isFinite(rows) ? Math.max(0, Math.trunc(rows)) : 0;
+		const segmentCount = Math.min(this.#segments.length, this.children.length);
+		let removeCount = 0;
+		let retiredRows = 0;
+		// Keep at least the last block: it anchors the visible tail even when a
+		// zero-height/transition frame temporarily reports the whole transcript
+		// committed. Every removed block must be both currently finalized and
+		// represented by a finalized render wholly inside native scrollback.
+		while (removeCount < segmentCount - 1) {
+			const segment = this.#segments[removeCount]!;
+			const child = this.children[removeCount]!;
+			if (
+				segment.component !== child ||
+				!segment.finalized ||
+				!isBlockFinalized(child) ||
+				segment.startRow + segment.rowCount > committedRows
+			) {
+				break;
+			}
+			retiredRows = segment.startRow + segment.rowCount;
+			removeCount++;
+		}
+		if (removeCount === 0) {
+			this.#committedRows = committedRows;
+			return;
+		}
+
+		for (let i = 0; i < removeCount; i++) this.children[i]!.dispose?.();
+		this.children.copyWithin(0, removeCount);
+		this.children.length -= removeCount;
+		this.#lines.copyWithin(0, retiredRows);
+		this.#lines.length -= retiredRows;
+		this.#segments.copyWithin(0, removeCount);
+		this.#segments.length -= removeCount;
+		for (const segment of this.#segments) segment.startRow -= retiredRows;
+
+		this.#hasRetiredPrefix ||= retiredRows > 0;
+		this.#committedRows = Math.max(0, committedRows - retiredRows);
+		this.#stableRowsFloor = Math.max(0, this.#stableRowsFloor - retiredRows);
+		if (this.#nativeScrollbackLiveRegionStart !== undefined) {
+			this.#nativeScrollbackLiveRegionStart = Math.max(0, this.#nativeScrollbackLiveRegionStart - retiredRows);
+		}
+		this.#retiredRowsPending += retiredRows;
+	}
+
+	/** Consume the leading-row retirement produced by the last commit update. */
+	takeNativeScrollbackRetiredRows(): number {
+		const retiredRows = this.#retiredRowsPending;
+		this.#retiredRowsPending = 0;
+		return retiredRows;
 	}
 
 	getRenderStablePrefixRows(): number {
@@ -270,6 +332,15 @@ export class TranscriptContainer
 	}
 
 	override render(width: number): readonly string[] {
+		pushLoopPhase("ui.transcript-render");
+		try {
+			return this.#render(width);
+		} finally {
+			popLoopPhase();
+		}
+	}
+
+	#render(width: number): readonly string[] {
 		width = Math.max(1, width);
 		this.#nativeScrollbackLiveRegionStart = undefined;
 
@@ -386,11 +457,11 @@ export class TranscriptContainer
 			}
 
 			// Every block is separated from preceding visible content by exactly one
-			// blank row — skipped when it opens the transcript or the prior row is
-			// already a plain blank (a fragment's own trailing pad), never doubling.
-			// `lines[row - 1]` is valid in both modes: reused rows are still present
-			// in the persistent array, re-pushed rows were just written.
-			const sep = row > 0 && !isPlainBlank(lines[row - 1]!) ? 1 : 0;
+			// blank row — skipped only when it opens a brand-new transcript or the
+			// prior retained row is already blank. After prefix retirement, native
+			// scrollback owns preceding content, so the retained tail keeps its
+			// boundary separator even though its local row index starts at zero.
+			const sep = (row > 0 && !isPlainBlank(lines[row - 1]!)) || (row === 0 && this.#hasRetiredPrefix) ? 1 : 0;
 
 			// The separator before the first live block stays in the committed
 			// prefix (it is deterministic once the prior block's body is

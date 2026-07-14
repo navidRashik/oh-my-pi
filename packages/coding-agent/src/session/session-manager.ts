@@ -15,6 +15,8 @@ import {
 	getSessionsDir,
 	isEnoent,
 	logger,
+	popLoopPhase,
+	pushLoopPhase,
 	toError,
 } from "@oh-my-pi/pi-utils";
 import { ArtifactManager } from "./artifacts";
@@ -1681,7 +1683,12 @@ export class SessionManager {
 	 * the full-history display transcript, from the current leaf path.
 	 */
 	buildSessionContext(options?: BuildSessionContextOptions): SessionContext {
-		return buildSessionContext(this.#entries, this.#index.leafId(), this.#index.entriesById(), options);
+		pushLoopPhase("session.context-build");
+		try {
+			return buildSessionContext(this.#entries, this.#index.leafId(), this.#index.entriesById(), options);
+		} finally {
+			popLoopPhase();
+		}
 	}
 
 	/** Strip stale OpenAI Responses assistant replay metadata from loaded entries. */

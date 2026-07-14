@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bounded retained render memory by weighting the shared Markdown cache by approximate bytes and allowing native-scrollback-aware components to release committed frame rows without losing terminal-owned history ([#4820](https://github.com/can1357/oh-my-pi/issues/4820)).
+
 ## [16.3.10] - 2026-07-06
 
 ### Fixed

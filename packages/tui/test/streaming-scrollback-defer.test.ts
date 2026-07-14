@@ -3,6 +3,7 @@ import {
 	type Component,
 	type NativeScrollbackCommittedRows,
 	type NativeScrollbackLiveRegion,
+	type NativeScrollbackRowRetirement,
 	TUI,
 } from "@oh-my-pi/pi-tui";
 import { VirtualTerminal } from "./virtual-terminal";
@@ -77,6 +78,36 @@ class CommittedRowsProbe extends SeamLineList implements NativeScrollbackCommitt
 	override render(width: number): string[] {
 		this.committedRowsAtRender.push(this.#committedRows);
 		return super.render(width);
+	}
+}
+
+/** Drops committed leading rows while retaining a four-row live tail. */
+class RetiringRowsProbe implements Component, NativeScrollbackCommittedRows, NativeScrollbackRowRetirement {
+	#lines: string[];
+	#retiredRowsPending = 0;
+	retiredRows = 0;
+
+	constructor(lines: string[]) {
+		this.#lines = [...lines];
+	}
+
+	setNativeScrollbackCommittedRows(rows: number): void {
+		const count = Math.min(Math.max(0, Math.trunc(rows)), Math.max(0, this.#lines.length - 4));
+		if (count === 0) return;
+		this.#lines.copyWithin(0, count);
+		this.#lines.length -= count;
+		this.#retiredRowsPending += count;
+		this.retiredRows += count;
+	}
+
+	takeNativeScrollbackRetiredRows(): number {
+		const rows = this.#retiredRowsPending;
+		this.#retiredRowsPending = 0;
+		return rows;
+	}
+
+	render(width: number): string[] {
+		return this.#lines.map(line => line.slice(0, width));
 	}
 }
 
@@ -599,6 +630,37 @@ describe("streaming scrollback — visual record", () => {
 			await settle(term);
 
 			expect(probe.committedRowsAtRender.at(-1)!).toBeGreaterThan(0);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("releases committed rows without clearing terminal-owned history", async () => {
+		if (process.platform === "win32") return;
+		const term = new VirtualTerminal(20, 4);
+		overrideProbe(term, undefined);
+		const tui = new TUI(term);
+		const output = rows("retained-", 12);
+		const probe = new RetiringRowsProbe(output);
+
+		try {
+			tui.addChild(probe);
+			tui.start();
+			await settle(term);
+			const writes = capture(term);
+
+			tui.requestRender();
+			await settle(term);
+
+			expect(probe.retiredRows).toBe(8);
+			expect(tui.hasRetiredNativeScrollback).toBe(true);
+			expect(tape(term)).toEqual(output);
+
+			term.resize(30, 6);
+			await settleResize(term);
+
+			expect(eraseScrollbackCount(writes)).toBe(0);
+			expect(tape(term)).toEqual(output);
 		} finally {
 			tui.stop();
 		}
