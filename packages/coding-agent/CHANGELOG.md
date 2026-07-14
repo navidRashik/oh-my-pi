@@ -6,6 +6,10 @@
 
 - Memoized non-message token totals (system prompt, tool schemas, skills) so the per-turn compaction and context-threshold paths recompute them at most once per input change instead of on every call. `getContextBreakdown` and `#estimateStoredContextTokens` previously re-tokenized the system prompt and every tool's wire schema (per-tool `JSON.stringify`) several times per turn over inputs that change at most once per turn.
 
+### Fixed
+
+- Fixed local Mnemopi embeddings never loading via the fast direct `import("fastembed")` in released standalone binaries (Homebrew, GitHub release downloads): `scripts/ci-release-build-binaries.ts` omitted the `--external fastembed --external onnxruntime-node` flags that `build-binary.ts` and `bundle-dist.ts` both pass, so the compiled binary inlined fastembed's native `.node` addon. Bun extracts only the `.node` to `$TMPDIR` at load, never its `@loader_path`-linked ORT dylib/so, so the direct import always failed `ERR_DLOPEN_FAILED` on macOS/Linux and every embedding worker fell through to the slower on-demand runtime install on each launch. Both packages are now external in the release build, matching the other two build paths ([#4792](https://github.com/can1357/oh-my-pi/issues/4792)).
+
 ## [16.3.11] - 2026-07-06
 
 ### Changed

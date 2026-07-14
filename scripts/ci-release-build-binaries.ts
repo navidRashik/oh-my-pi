@@ -129,6 +129,18 @@ function buildCompileCommand(target: BinaryTarget): string[] {
 		'process.env.PI_COMPILED="true"',
 		"--define",
 		`process.env.PI_TINY_TRANSFORMERS_VERSION=${JSON.stringify(transformersVersion)}`,
+		// fastembed + onnxruntime-node ship a native addon that links its ORT
+		// dylib/so via `@loader_path`. `bun --compile` inlines the `.node` but
+		// extracts only that file to $TMPDIR at load time, never its sibling
+		// dylib, so an in-binary `import("fastembed")` always fails
+		// ERR_DLOPEN_FAILED (macOS #4792) and every worker falls back. Keep both
+		// external so the direct import cleanly ERR_MODULE_NOT_FOUNDs and routes
+		// straight to the on-demand runtime install, which places the dylib next
+		// to the addon. Matches `build-binary.ts` and `bundle-dist.ts`.
+		"--external",
+		"fastembed",
+		"--external",
+		"onnxruntime-node",
 		"--root",
 		".",
 		"--target",
