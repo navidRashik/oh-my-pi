@@ -138,6 +138,46 @@ describe("system prompt model identifier", () => {
 	});
 });
 
+describe("GPT-5.6 delegation prompt policy", () => {
+	let tempDir = "";
+	let tempHomeDir = "";
+	let originalHome: string | undefined;
+
+	beforeEach(() => {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-prompt-deleg-"));
+		tempHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-prompt-deleg-home-"));
+		originalHome = process.env.HOME;
+		process.env.HOME = tempHomeDir;
+	});
+
+	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
+
+	async function renderDelegation(eagerTasks: boolean): Promise<string> {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: tempDir,
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			toolNames: ["task", "read", "bash"],
+			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
+			model: "openai/gpt-5.6",
+			eagerTasks,
+		});
+		return systemPrompt.join("\n\n");
+	}
+
+	it("classifies GPT-5.6 under the Codex task prompt policy", () => {
+		expect(usesCodexTaskPrompt("openai/gpt-5.6")).toBe(true);
+	});
+
+	it("permits conservative autonomous fan-out for a default GPT-5.6 session", async () => {
+		const text = await renderDelegation(false);
+		expect(text).not.toContain("Do not spawn sub-agents unless the user");
+		expect(text).toContain("two genuinely independent runnable slices");
+		expect(text).toContain("The user does not need to request delegation explicitly");
+	});
+});
+
 describe("AgentSession model-change prompt refresh", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;

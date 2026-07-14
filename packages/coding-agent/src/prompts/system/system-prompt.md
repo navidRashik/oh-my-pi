@@ -147,7 +147,7 @@ You SHOULD use syntax-aware tools before text hacks:
 {{#if eagerTasks}}
 Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.
 {{else}}
-Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.
+Use sub-agents only when the work has at least two genuinely independent runnable slices and parallel execution would materially improve speed or quality. The user does not need to request delegation explicitly; do not spawn merely to offload planning or a single sequential slice.
 {{/if}}
 {{else}}
 {{#if eagerTasks}}

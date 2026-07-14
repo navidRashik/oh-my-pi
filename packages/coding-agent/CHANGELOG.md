@@ -25,6 +25,8 @@
 
 ### Fixed
 
+- Fixed GPT-5.6 sessions suppressing autonomous sub-agent fan-out: the Codex-specific delegation policy emitted a hard "do not spawn sub-agents unless the user explicitly asks" gate for default (`task.eager: default`) sessions, contradicting the delegation-gates guidance below it and collapsing batched `task` calls to single-agent spawns. Replaced it with a conservative parallelism gate that permits autonomous fan-out when the work has genuinely independent runnable slices ([#5334](https://github.com/can1357/oh-my-pi/issues/5334))
+
 - Fixed inconsistent history rendering when toggling the display setting for compacted items
 - Fixed configured `retry.fallbackChains` never engaging on non-retryable provider errors (e.g. "Cloud Code Assist API returned an empty response"): a hard error on a model covered by a fallback chain now switches to the next candidate instead of failing the turn, while still never backoff-retrying the failing model itself
 - Fixed transcript rebuilds (compaction, `/compact`, and toggling history display) repainting content below stale scrollback when collapsing history; rebuilds now correctly clear the scrollback buffer when history is collapsed
