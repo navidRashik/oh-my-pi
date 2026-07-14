@@ -3541,6 +3541,12 @@ export class AgentSession {
 		this.#standingResolveHandler = handler ?? undefined;
 	}
 
+	#sessionBeforeSwitchReconciler: (() => Promise<void>) | undefined;
+
+	setSessionBeforeSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
+		this.#sessionBeforeSwitchReconciler = reconciler ?? undefined;
+	}
+
 	#sessionSwitchReconciler: (() => Promise<void>) | undefined;
 
 	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
@@ -7628,6 +7634,12 @@ export class AgentSession {
 		this.#vibeModeState = state;
 	}
 
+	#assertVibeSessionTransitionAllowed(action: string): void {
+		if (this.#vibeModeState?.enabled) {
+			throw new Error(`Cannot ${action} while vibe mode is active. Exit vibe mode first.`);
+		}
+	}
+
 	get goalRuntime(): GoalRuntime {
 		return this.#goalRuntime;
 	}
@@ -9369,6 +9381,7 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook
 	 */
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
+		this.#assertVibeSessionTransitionAllowed("start a new session");
 		const previousSessionFile = this.sessionFile;
 		const nextDiscoverySessionToolNames = this.#mcpDiscoveryEnabled
 			? [
@@ -9475,6 +9488,7 @@ export class AgentSession {
 	 * @returns true if completed, false if cancelled by hook or not persisting
 	 */
 	async fork(): Promise<boolean> {
+		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "fork" (can be cancelled)
@@ -9535,6 +9549,12 @@ export class AgentSession {
 		}
 
 		return true;
+	}
+
+	/** Move the active session and artifacts after enforcing mode transition invariants. */
+	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
+		this.#assertVibeSessionTransitionAllowed("move the session");
+		await this.sessionManager.moveTo(newCwd, targetSessionDir);
 	}
 
 	// =========================================================================
@@ -10752,6 +10772,7 @@ export class AgentSession {
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
 	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		this.#assertVibeSessionTransitionAllowed("handoff to a new session");
 		const entries = this.sessionManager.getBranch();
 		const messageCount = entries.filter(e => e.type === "message").length;
 
@@ -15685,6 +15706,7 @@ export class AgentSession {
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
+		await this.#sessionBeforeSwitchReconciler?.();
 
 		// Flush pending writes before switching so restore snapshots reflect committed state.
 		await this.sessionManager.flush();
@@ -15924,6 +15946,14 @@ export class AgentSession {
 			this.#syncTodoPhasesFromBranch();
 			this.#resetAllAdvisorRuntimes();
 			this.#reconnectToAgent();
+			try {
+				await this.#sessionSwitchReconciler?.();
+			} catch (reconcileError) {
+				logger.warn("Failed to reconcile session mode after switch rollback", {
+					targetSessionFile: sessionPath,
+					error: String(reconcileError),
+				});
+			}
 			if (restoreMcpError) {
 				throw restoreMcpError;
 			}
