@@ -1960,7 +1960,16 @@ describe("advisor", () => {
 			expect(runtime.backlog).toBe(0);
 		});
 
-		it("accepts a silent empty stop that spent output tokens as a successful review", async () => {
+		it.each([
+			{ name: "output 0, no reasoning", output: 0, reasoningTokens: undefined, silent: false },
+			{ name: "output 1 (EOS-only), no reasoning", output: 1, reasoningTokens: undefined, silent: false },
+			{ name: "output 0, reasoning 640", output: 0, reasoningTokens: 640, silent: true },
+			{ name: "output 66, reasoning absent", output: 66, reasoningTokens: undefined, silent: true },
+		])("classifies a content-less advisor stop by billed work ($name)", async ({
+			output,
+			reasoningTokens,
+			silent,
+		}) => {
 			const promptInputs: string[] = [];
 			const turnErrors: unknown[] = [];
 			const failures: unknown[] = [];
@@ -1970,7 +1979,11 @@ describe("advisor", () => {
 				prompt: async input => {
 					promptCalls++;
 					promptInputs.push(input);
-					state.messages.push({ role: "user", content: input, timestamp: promptCalls * 2 - 1 } as AgentMessage);
+					state.messages.push({
+						role: "user",
+						content: input,
+						timestamp: promptCalls * 2 - 1,
+					} as AgentMessage);
 					state.messages.push({
 						role: "assistant",
 						content: [],
@@ -1979,11 +1992,11 @@ describe("advisor", () => {
 						model: "mock-advisor",
 						usage: {
 							input: 120,
-							output: 0,
+							output,
 							cacheRead: 0,
 							cacheWrite: 0,
-							reasoningTokens: 640,
-							totalTokens: 760,
+							...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+							totalTokens: 120 + output,
 						},
 						stopReason: "stop",
 						timestamp: promptCalls * 2,
@@ -1993,6 +2006,10 @@ describe("advisor", () => {
 				abort: () => {},
 				reset: () => {
 					state.messages.length = 0;
+					state.error = undefined;
+				},
+				rollbackTo: count => {
+					state.messages.length = count;
 					state.error = undefined;
 				},
 				state,
@@ -2013,11 +2030,25 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await runtime.waitForCatchup(1000, 1);
 
-			// A reasoning model that thought (reasoningTokens > 0) then chose to stay
-			// silent is a valid review, not a failed turn — no retry, no failure.
-			expect(promptInputs).toHaveLength(1);
-			expect(turnErrors).toEqual([]);
-			expect(failures).toEqual([]);
+			if (silent) {
+				// A turn that spent reasoning tokens or more than one output token
+				// (past the terminal-EOS boundary) is a deliberate silent review:
+				// accepted as-is, no retry, no failure.
+				expect(promptInputs).toHaveLength(1);
+				expect(turnErrors).toEqual([]);
+				expect(failures).toEqual([]);
+			} else {
+				// Zero-work stops (no reasoning, output <= 1) are the #5212 broken
+				// provider response: retried to the drop threshold and reported.
+				expect(promptInputs).toHaveLength(3);
+				expect(turnErrors).toHaveLength(3);
+				expect(failures).toHaveLength(1);
+				for (const error of turnErrors) {
+					const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+					expect(message).toContain("empty");
+					expect(message).toContain("response");
+				}
+			}
 			expect(runtime.backlog).toBe(0);
 		});
 

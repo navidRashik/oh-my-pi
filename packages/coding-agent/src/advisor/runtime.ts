@@ -605,9 +605,9 @@ function getAdvisorEmptyResponseError(messages: readonly AgentMessage[]): Error 
 		// deliberate silent review: the advisor is instructed to "prefer silence
 		// when the agent is on track", and reasoning models (e.g. codex
 		// gpt-5.6) routinely spend their turn thinking, then emit no visible
-		// content and skip `advise`. Only a stop with zero output tokens is the
-		// broken provider response from #5212 (HTTP 200, `content: []`, zero
-		// usage) that must be treated as a failed turn.
+		// content and skip `advise`. A stop with no such work is the broken
+		// provider response from #5212 (HTTP 200, `content: []`, near-zero usage)
+		// that must be treated as a failed turn.
 		if (advisorTurnDidWork(message)) return undefined;
 	}
 	if (sawAssistant) return new Error("Advisor turn returned an empty stop response without advice");
@@ -618,13 +618,18 @@ function getAdvisorEmptyResponseError(messages: readonly AgentMessage[]): Error 
 /**
  * Whether an advisor assistant turn actually produced model output, measured by
  * billed output/reasoning tokens. Distinguishes a deliberate silent review from
- * a content-less HTTP-200 with zero usage (the broken provider response of
+ * a content-less HTTP-200 with near-zero usage (the broken provider response of
  * #5212).
+ *
+ * The `output > 1` boundary (not `> 0`) mirrors the shared empty-completion
+ * retry policy in `packages/ai/src/utils/empty-completion-retry.ts`, which
+ * treats `output <= 1` as an empty completion because some providers bill a
+ * single terminal EOS token on an otherwise-invisible stop.
  */
 function advisorTurnDidWork(message: AssistantMessage): boolean {
 	const usage = message.usage;
 	if (!usage) return false;
-	return usage.output > 0 || (usage.reasoningTokens ?? 0) > 0;
+	return (usage.reasoningTokens ?? 0) > 0 || usage.output > 1;
 }
 
 function hasAdvisorResponseContent(message: AssistantMessage): boolean {
