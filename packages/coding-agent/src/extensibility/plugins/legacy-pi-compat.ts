@@ -201,7 +201,21 @@ const LEGACY_PI_IMPORT_SPECIFIER_REGEX = new RegExp(
 const resolvedSpecifierFallbacks = new Map<string, string>();
 const SOURCE_MODULE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"] as const;
 const NATIVE_ADDON_EXTENSION = ".node";
-const SUPPORTED_PACKAGE_IMPORT_CONDITIONS = new Set(["bun", "node", "import", "default"]);
+const SUPPORTED_PACKAGE_IMPORT_CONDITIONS: Record<string, true> = {
+	bun: true,
+	node: true,
+	import: true,
+	default: true,
+};
+const SUPPORTED_PACKAGE_REQUIRE_CONDITIONS: Record<string, true> = {
+	bun: true,
+	node: true,
+	require: true,
+	default: true,
+};
+const PACKAGE_IMPORT_FALLBACK_FIELDS = ["module", "main"] as const;
+const PACKAGE_REQUIRE_FALLBACK_FIELDS = ["main"] as const;
+type ExtensionDependencyCallKind = "import" | "require";
 const packageRootCache = new Map<string, string | null>();
 const packageImportsCache = new Map<string, Record<string, unknown> | null>();
 const nodePackageRootCache = new Map<string, Promise<string | null>>();
@@ -663,7 +677,10 @@ async function readPackageImports(packageRoot: string): Promise<Record<string, u
 type PackageImportTargetSelection = string | typeof PACKAGE_IMPORT_EXCLUDED | null;
 type ResolvedPackageImportTargetSelection = string | typeof PACKAGE_IMPORT_EXCLUDED;
 
-function selectPackageImportTarget(entry: unknown): PackageImportTargetSelection {
+function selectPackageImportTarget(
+	entry: unknown,
+	callKind: ExtensionDependencyCallKind = "import",
+): PackageImportTargetSelection {
 	if (entry === null) {
 		return PACKAGE_IMPORT_EXCLUDED;
 	}
@@ -672,7 +689,7 @@ function selectPackageImportTarget(entry: unknown): PackageImportTargetSelection
 	}
 	if (Array.isArray(entry)) {
 		for (const item of entry) {
-			const target = selectPackageImportTarget(item);
+			const target = selectPackageImportTarget(item, callKind);
 			if (target !== null) return target;
 		}
 		return null;
@@ -680,11 +697,14 @@ function selectPackageImportTarget(entry: unknown): PackageImportTargetSelection
 	if (!isRecord(entry)) {
 		return null;
 	}
-	for (const [condition, value] of Object.entries(entry)) {
-		if (!SUPPORTED_PACKAGE_IMPORT_CONDITIONS.has(condition)) {
+	const supportedConditions =
+		callKind === "require" ? SUPPORTED_PACKAGE_REQUIRE_CONDITIONS : SUPPORTED_PACKAGE_IMPORT_CONDITIONS;
+	for (const condition in entry) {
+		const value = entry[condition];
+		if (!Object.hasOwn(supportedConditions, condition)) {
 			continue;
 		}
-		const target = selectPackageImportTarget(value);
+		const target = selectPackageImportTarget(value, callKind);
 		if (target !== null) return target;
 	}
 	return null;
@@ -880,9 +900,10 @@ async function resolveNodePackageExport(
 	packageRoot: string,
 	subpath: string | null,
 	manifest: Record<string, unknown>,
+	callKind: ExtensionDependencyCallKind,
 ): Promise<string | null> {
 	const exportsField = manifest.exports;
-	const rootTarget = subpath === null ? selectPackageImportTarget(exportsField) : null;
+	const rootTarget = subpath === null ? selectPackageImportTarget(exportsField, callKind) : null;
 	if (rootTarget !== null && rootTarget !== PACKAGE_IMPORT_EXCLUDED) {
 		return resolvePackageExportTarget(packageRoot, rootTarget, null);
 	}
@@ -891,7 +912,7 @@ async function resolveNodePackageExport(
 	}
 
 	const exactKey = subpath === null ? "." : `./${subpath}`;
-	const exactTarget = selectPackageImportTarget(exportsField[exactKey]);
+	const exactTarget = selectPackageImportTarget(exportsField[exactKey], callKind);
 	if (exactTarget !== null && exactTarget !== PACKAGE_IMPORT_EXCLUDED) {
 		return resolvePackageExportTarget(packageRoot, exactTarget, null);
 	}
@@ -904,7 +925,7 @@ async function resolveNodePackageExport(
 		if (!subpath.startsWith(prefix) || !subpath.endsWith(suffix)) {
 			continue;
 		}
-		const target = selectPackageImportTarget(entry);
+		const target = selectPackageImportTarget(entry, callKind);
 		if (target === null || target === PACKAGE_IMPORT_EXCLUDED) {
 			continue;
 		}
@@ -921,11 +942,13 @@ async function resolveNodePackageFallback(
 	packageRoot: string,
 	subpath: string | null,
 	manifest: Record<string, unknown>,
+	callKind: ExtensionDependencyCallKind,
 ): Promise<string | null> {
 	if (subpath !== null) {
 		return resolveNodePackageModuleFile(path.join(packageRoot, subpath));
 	}
-	for (const field of ["module", "main"]) {
+	const fallbackFields = callKind === "require" ? PACKAGE_REQUIRE_FALLBACK_FIELDS : PACKAGE_IMPORT_FALLBACK_FIELDS;
+	for (const field of fallbackFields) {
 		const target = manifest[field];
 		if (typeof target === "string") {
 			const resolved = await resolveNodePackageModuleFile(path.resolve(packageRoot, target));
@@ -935,7 +958,11 @@ async function resolveNodePackageFallback(
 	return resolveNodePackageModuleFile(path.join(packageRoot, "index"));
 }
 
-async function resolveNodePackageDependency(specifier: string, importerPath: string): Promise<string | null> {
+async function resolveNodePackageDependency(
+	specifier: string,
+	importerPath: string,
+	callKind: ExtensionDependencyCallKind,
+): Promise<string | null> {
 	const parsed = splitBarePackageSpecifier(specifier);
 	if (!parsed) return null;
 	const packageRoot = await findNodePackageRoot(parsed.name, importerPath);
@@ -943,26 +970,37 @@ async function resolveNodePackageDependency(specifier: string, importerPath: str
 	const manifest = await readPackageManifest(packageRoot);
 	if (!manifest) return null;
 	return (
-		(await resolveNodePackageExport(packageRoot, parsed.subpath, manifest)) ??
-		(await resolveNodePackageFallback(packageRoot, parsed.subpath, manifest))
+		(await resolveNodePackageExport(packageRoot, parsed.subpath, manifest, callKind)) ??
+		(await resolveNodePackageFallback(packageRoot, parsed.subpath, manifest, callKind))
 	);
 }
 
-async function resolveExtensionBareDependency(specifier: string, importerPath: string): Promise<string | null> {
+async function resolveExtensionBareDependency(
+	specifier: string,
+	importerPath: string,
+	callKind: ExtensionDependencyCallKind,
+): Promise<string | null> {
 	if (!isBareExtensionDependencySpecifier(specifier)) {
 		return null;
 	}
 
-	const cacheKey = `${specifier}\0${path.resolve(path.dirname(importerPath))}`;
+	const cacheKey = `${callKind}\0${specifier}\0${path.resolve(path.dirname(importerPath))}`;
 	const cached = bareDependencyResolutionCache.get(cacheKey);
 	if (cached) return cached;
 
-	const promise = resolveExtensionBareDependencyUncached(specifier, importerPath);
+	const promise = resolveExtensionBareDependencyUncached(specifier, importerPath, callKind);
 	bareDependencyResolutionCache.set(cacheKey, promise);
 	return promise;
 }
 
-async function resolveExtensionBareDependencyUncached(specifier: string, importerPath: string): Promise<string | null> {
+async function resolveExtensionBareDependencyUncached(
+	specifier: string,
+	importerPath: string,
+	callKind: ExtensionDependencyCallKind,
+): Promise<string | null> {
+	if (callKind === "require") {
+		return resolveNodePackageDependency(specifier, importerPath, callKind);
+	}
 	try {
 		const resolved = Bun.resolveSync(specifier, path.dirname(importerPath));
 		if (resolved && resolved !== specifier && !resolved.startsWith("node:") && !resolved.startsWith("bun:")) {
@@ -971,7 +1009,7 @@ async function resolveExtensionBareDependencyUncached(specifier: string, importe
 	} catch {
 		// Compiled binaries do not reliably resolve runtime extension node_modules.
 	}
-	return resolveNodePackageDependency(specifier, importerPath);
+	return resolveNodePackageDependency(specifier, importerPath, callKind);
 }
 
 async function rewriteExtensionBareImports(
@@ -988,7 +1026,8 @@ async function rewriteExtensionBareImports(
 		const [fullMatch, prefix, specifier, suffix] = match;
 		if (!prefix || !specifier || !suffix) continue;
 
-		const resolved = await resolveExtensionBareDependency(specifier, importerPath);
+		const callKind = prefix.startsWith("require") ? "require" : "import";
+		const resolved = await resolveExtensionBareDependency(specifier, importerPath, callKind);
 		if (!resolved) continue;
 
 		rewritten += source.slice(lastIndex, matchIndex);
@@ -1096,7 +1135,9 @@ async function collectExtensionModules(entryRealPath: string): Promise<Map<strin
 					const parsed = splitBarePackageSpecifier(specifier);
 					const packageRoot = parsed ? await findNodePackageRoot(parsed.name, file) : null;
 					const manifest = packageRoot ? await readPackageManifest(packageRoot) : null;
-					const dependencyEntry = manifest ? await resolveExtensionBareDependency(specifier, file) : null;
+					const dependencyEntry = manifest
+						? await resolveExtensionBareDependency(specifier, file, "import")
+						: null;
 					const dependencyExtension = dependencyEntry ? path.extname(dependencyEntry).toLowerCase() : null;
 					const isCommonJsEntry =
 						dependencyExtension === ".cjs" ||

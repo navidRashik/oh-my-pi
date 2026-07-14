@@ -505,15 +505,17 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(rewritten).toContain('from "node:path"');
 	});
 
-	it("rewrites native addon package mains without cache-busting the binary", async () => {
+	it("keeps import and require export conditions isolated for native addon package mains", async () => {
 		const dir = await writePackage({
 			"package.json": JSON.stringify({ name: "native-addon-ext", version: "1.0.0" }),
 			"node_modules/native-addon/package.json": JSON.stringify({
 				name: "native-addon",
 				version: "1.0.0",
 				main: "addon.node",
+				exports: { ".": { require: "./addon.node", import: "./index.js" } },
 			}),
 			"node_modules/native-addon/addon.node": "fixture",
+			"node_modules/native-addon/index.js": "export default {};",
 			"index.ts": "",
 		});
 		const importer = path.join(dir, "index.ts");
@@ -521,9 +523,15 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		const resolveSpy = spyOn(Bun, "resolveSync").mockImplementation(() => {
 			throw new Error("compiled fallback");
 		});
-		let rewritten: string;
+		let importRewritten: string;
+		let requireRewritten: string;
 		try {
-			rewritten = await __rewriteLegacyExtensionSourceForTests(
+			importRewritten = await __rewriteLegacyExtensionSourceForTests(
+				'import nativeAddon from "native-addon";',
+				importer,
+				"123",
+			);
+			requireRewritten = await __rewriteLegacyExtensionSourceForTests(
 				'const nativeAddon = require("native-addon");',
 				importer,
 				"123",
@@ -534,7 +542,8 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		}
 
 		const addonUrl = url.pathToFileURL(await fs.realpath(addonPath)).href;
-		expect(rewritten).toBe(`const nativeAddon = require("${addonUrl}");`);
+		expect(importRewritten).toContain("index.js");
+		expect(requireRewritten).toBe(`const nativeAddon = require("${addonUrl}");`);
 	});
 
 	it("remaps legacy pi-ai utils/oauth subpaths to registry OAuth exports", async () => {
