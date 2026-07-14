@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the session tree selector hiding the summarize-and-branch choice by default, so `/tree` and default `/branch` selections can route to branch summaries. ([#5152](https://github.com/can1357/oh-my-pi/issues/5152))
+
 ## [16.4.2] - 2026-07-10
 
 ### Fixed

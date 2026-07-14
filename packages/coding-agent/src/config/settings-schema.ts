@@ -2305,12 +2305,12 @@ export const SETTINGS_SCHEMA = {
 	// Branch summaries
 	"branchSummary.enabled": {
 		type: "boolean",
-		default: false,
+		default: true,
 		ui: {
 			tab: "context",
 			group: "General",
 			label: "Branch Summaries",
-			description: "Prompt to summarize when leaving a branch",
+			description: "Offer a summarize-and-branch choice when leaving the current tree branch",
 		},
 	},
 
