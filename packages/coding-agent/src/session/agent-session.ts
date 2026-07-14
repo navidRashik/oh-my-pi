@@ -7232,7 +7232,14 @@ export class AgentSession {
 		});
 	}
 
-	#normalizeImagesForModel(images: ImageContent[] | undefined): Promise<ImageContent[] | undefined> {
+	async #normalizeImagesForModel(images: ImageContent[] | undefined): Promise<ImageContent[] | undefined> {
+		if (
+			images?.length &&
+			this.hasBuiltInTool("inspect_image") &&
+			!this.getActiveToolNames().includes("inspect_image")
+		) {
+			await this.activateDiscoveredTools(["inspect_image"]);
+		}
 		return normalizeModelContextImages(images, { model: this.model });
 	}
 

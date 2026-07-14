@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { AuthStorage, Effort, type Model } from "@oh-my-pi/pi-ai";
+import { AuthStorage, Effort, type ImageContent, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -44,6 +44,12 @@ function createReasoningModel(): Model<"openai-responses"> {
 		maxTokens: 2048,
 	});
 }
+
+const TINY_PNG: ImageContent = {
+	type: "image",
+	data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2Z0AAAAASUVORK5CYII=",
+	mimeType: "image/png",
+};
 
 const oldSessionMtime = new Date("2000-01-01T00:00:00.000Z");
 
@@ -157,6 +163,31 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		expect(session.getActiveToolNames()).not.toContain("search");
 		expect(prompt).toContain("call `search_tool_bm25` before concluding no such tool exists");
 		expect(searchTool?.description).toContain("Total discoverable tools available:");
+	});
+
+	it("activates inspect_image when a user attaches an image under discovery all", async () => {
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			modelRegistry,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "tools.discoveryMode": "all", "inspect_image.enabled": true }),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		expect(session.getActiveToolNames()).not.toContain("inspect_image");
+		await session.steer("Inspect the attached image", [TINY_PNG]);
+
+		expect(session.getActiveToolNames()).toContain("inspect_image");
+		expect(session.systemPrompt.join("\n")).toContain("Image tasks: prefer `inspect_image` over `read`");
+		await session.dispose();
 	});
 
 	it("exposes task under tools.discoveryMode all when task.eager is preferred", async () => {
