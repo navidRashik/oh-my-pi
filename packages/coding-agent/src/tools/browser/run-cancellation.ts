@@ -1,14 +1,22 @@
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import { throwIfAborted } from "../tool-errors";
 
-/** Sleeps inside evaluated browser code while honoring the owning run's cancellation signal. */
-export async function waitForBrowserRun(ms: number, signal: AbortSignal): Promise<void> {
-	throwIfAborted(signal);
-	await untilAborted(signal, () => Bun.sleep(ms));
-	throwIfAborted(signal);
+function markHandled<T>(promise: Promise<T>): Promise<T> {
+	void promise.catch(() => {});
+	return promise;
 }
 
-/** Binds a long-lived browser facade to one evaluated run's abort signal. */
+/** Sleeps inside evaluated browser code while honoring cancellation without leaking detached rejections. */
+export function waitForBrowserRun(ms: number, signal: AbortSignal): Promise<void> {
+	const promise = (async () => {
+		throwIfAborted(signal);
+		await untilAborted(signal, () => Bun.sleep(ms));
+		throwIfAborted(signal);
+	})();
+	return markHandled(promise);
+}
+
+/** Binds a long-lived browser facade to one run and marks detached call rejections as handled. */
 export function bindBrowserRunFacade<T extends object>(target: T, signal: AbortSignal): T {
 	const cache = new Map<PropertyKey, unknown>();
 	return new Proxy(target, {
@@ -24,10 +32,11 @@ export function bindBrowserRunFacade<T extends object>(target: T, signal: AbortS
 					if (result && typeof result === "object") {
 						const then = Reflect.get(result, "then");
 						if (typeof then === "function") {
-							return Promise.resolve(result).then(resolved => {
+							const promise = Promise.resolve(result).then(resolved => {
 								throwIfAborted(signal);
 								return resolved;
 							});
+							return markHandled(promise);
 						}
 					}
 					throwIfAborted(signal);

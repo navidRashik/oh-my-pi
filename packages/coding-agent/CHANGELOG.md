@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed browser run cleanup from surfacing detached run-scoped cancellations as fatal unhandled rejections, preserving the active CLI session when a cmux browser run ends ([#4672](https://github.com/can1357/oh-my-pi/issues/4672)).
+
 ## [16.3.9] - 2026-07-06
 
 ### Added

@@ -56,4 +56,34 @@ describe("browser run cancellation", () => {
 		expect(state.lateNavigation).toBeUndefined();
 		expect(state.displays).toEqual([]);
 	});
+
+	it("does not emit unhandledRejection when unawaited run-scoped promises are aborted", async () => {
+		const runAc = new AbortController();
+		const { promise: navigation, resolve: finishNavigation } = Promise.withResolvers<void>();
+		const tab = bindBrowserRunFacade(
+			{
+				goto: async (): Promise<void> => {
+					await navigation;
+				},
+			},
+			runAc.signal,
+		);
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown): void => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandled);
+
+		try {
+			void waitForBrowserRun(60_000, runAc.signal);
+			void tab.goto();
+			runAc.abort(new Error("Browser run ended"));
+			finishNavigation();
+			for (let flush = 0; flush < 5; flush++) await Promise.resolve();
+
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
 });
