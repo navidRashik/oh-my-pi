@@ -200,6 +200,7 @@ const LEGACY_PI_IMPORT_SPECIFIER_REGEX = new RegExp(
 );
 const resolvedSpecifierFallbacks = new Map<string, string>();
 const SOURCE_MODULE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"] as const;
+const NATIVE_ADDON_EXTENSION = ".node";
 const SUPPORTED_PACKAGE_IMPORT_CONDITIONS = new Set(["bun", "node", "import", "default"]);
 const packageRootCache = new Map<string, string | null>();
 const packageImportsCache = new Map<string, Record<string, unknown> | null>();
@@ -542,6 +543,9 @@ function toGraphImportSpecifier(resolvedPath: string, mtimeTag: string | null): 
 	if (isBundledVirtualSpecifier(resolvedPath)) {
 		return resolvedPath;
 	}
+	if (path.extname(resolvedPath).toLowerCase() === NATIVE_ADDON_EXTENSION) {
+		return url.pathToFileURL(stripWindowsExtendedLengthPathPrefix(resolvedPath)).href;
+	}
 	if (process.platform === "win32" || !mtimeTag) {
 		return url.pathToFileURL(stripWindowsExtendedLengthPathPrefix(resolvedPath)).href;
 	}
@@ -594,6 +598,25 @@ async function resolveSourceModuleFile(basePath: string): Promise<string | null>
 		if (resolved) return resolved;
 	}
 	return null;
+}
+
+async function resolveNodePackageModuleFile(basePath: string): Promise<string | null> {
+	const sourceModule = await resolveSourceModuleFile(basePath);
+	if (sourceModule) {
+		return sourceModule;
+	}
+
+	const extension = path.extname(basePath).toLowerCase();
+	if (extension && extension !== NATIVE_ADDON_EXTENSION) {
+		return null;
+	}
+	const nativeAddonPath = extension ? basePath : `${basePath}${NATIVE_ADDON_EXTENSION}`;
+	try {
+		const stats = await fs.promises.stat(nativeAddonPath);
+		return stats.isFile() ? realpathOrSelf(nativeAddonPath) : null;
+	} catch {
+		return null;
+	}
 }
 
 async function findPackageRoot(importerPath: string): Promise<string | null> {
@@ -763,7 +786,8 @@ async function rewriteExtensionPackageImports(
 	return `${rewritten}${source.slice(lastIndex)}`;
 }
 
-const BARE_EXTENSION_IMPORT_SPECIFIER_REGEX = /((?:from\s+|import\s+|import\s*\(\s*)["'])([^"'()\s]+)(["'])/g;
+const BARE_EXTENSION_IMPORT_SPECIFIER_REGEX =
+	/((?:from\s+|import\s+|import\s*\(\s*|require\s*\(\s*)["'])([^"'()\s]+)(["'])/g;
 
 function isBareExtensionDependencySpecifier(specifier: string): boolean {
 	if (
@@ -849,7 +873,7 @@ async function resolvePackageExportTarget(
 		return null;
 	}
 	const substituted = wildcard === null ? target : target.replaceAll("*", wildcard);
-	return resolveSourceModuleFile(path.resolve(packageRoot, substituted));
+	return resolveNodePackageModuleFile(path.resolve(packageRoot, substituted));
 }
 
 async function resolveNodePackageExport(
@@ -899,16 +923,16 @@ async function resolveNodePackageFallback(
 	manifest: Record<string, unknown>,
 ): Promise<string | null> {
 	if (subpath !== null) {
-		return resolveSourceModuleFile(path.join(packageRoot, subpath));
+		return resolveNodePackageModuleFile(path.join(packageRoot, subpath));
 	}
 	for (const field of ["module", "main"]) {
 		const target = manifest[field];
 		if (typeof target === "string") {
-			const resolved = await resolveSourceModuleFile(path.resolve(packageRoot, target));
+			const resolved = await resolveNodePackageModuleFile(path.resolve(packageRoot, target));
 			if (resolved) return resolved;
 		}
 	}
-	return resolveSourceModuleFile(path.join(packageRoot, "index"));
+	return resolveNodePackageModuleFile(path.join(packageRoot, "index"));
 }
 
 async function resolveNodePackageDependency(specifier: string, importerPath: string): Promise<string | null> {
@@ -1073,12 +1097,15 @@ async function collectExtensionModules(entryRealPath: string): Promise<Map<strin
 					const packageRoot = parsed ? await findNodePackageRoot(parsed.name, file) : null;
 					const manifest = packageRoot ? await readPackageManifest(packageRoot) : null;
 					const dependencyEntry = manifest ? await resolveExtensionBareDependency(specifier, file) : null;
-					const dependencyExtension = dependencyEntry ? path.extname(dependencyEntry) : null;
+					const dependencyExtension = dependencyEntry ? path.extname(dependencyEntry).toLowerCase() : null;
 					const isCommonJsEntry =
 						dependencyExtension === ".cjs" ||
 						dependencyExtension === ".cts" ||
 						((dependencyExtension === ".js" || dependencyExtension === ".jsx") && manifest?.type !== "module");
-					resolved = dependencyEntry && !isCommonJsEntry ? await realpathOrSelf(dependencyEntry) : null;
+					resolved =
+						dependencyEntry && dependencyExtension !== NATIVE_ADDON_EXTENSION && !isCommonJsEntry
+							? await realpathOrSelf(dependencyEntry)
+							: null;
 					nextFollowsBareDependencies = false;
 				}
 				if (resolved && !modules.has(resolved)) {

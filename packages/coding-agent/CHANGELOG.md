@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed compiled extension validation for transitive native addon packages by resolving `.node` entry points to their on-disk URLs without source-loader cache-busting ([#4763](https://github.com/can1357/oh-my-pi/issues/4763)).
+
 ## [16.3.11] - 2026-07-06
 
 ### Changed

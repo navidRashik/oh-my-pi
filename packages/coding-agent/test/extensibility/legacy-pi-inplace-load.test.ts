@@ -1,9 +1,10 @@
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import {
+	__resetLegacyPiResolutionCache,
 	__rewriteLegacyExtensionSourceForTests,
 	loadLegacyPiModule,
 } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
@@ -502,6 +503,38 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(expectedEsmDepUrls.some(expected => rewritten.includes(expected))).toBe(true);
 		expect(expectedRootDepUrls.some(expected => rewritten.includes(expected))).toBe(true);
 		expect(rewritten).toContain('from "node:path"');
+	});
+
+	it("rewrites native addon package mains without cache-busting the binary", async () => {
+		const dir = await writePackage({
+			"package.json": JSON.stringify({ name: "native-addon-ext", version: "1.0.0" }),
+			"node_modules/native-addon/package.json": JSON.stringify({
+				name: "native-addon",
+				version: "1.0.0",
+				main: "addon.node",
+			}),
+			"node_modules/native-addon/addon.node": "fixture",
+			"index.ts": "",
+		});
+		const importer = path.join(dir, "index.ts");
+		const addonPath = path.join(dir, "node_modules", "native-addon", "addon.node");
+		const resolveSpy = spyOn(Bun, "resolveSync").mockImplementation(() => {
+			throw new Error("compiled fallback");
+		});
+		let rewritten: string;
+		try {
+			rewritten = await __rewriteLegacyExtensionSourceForTests(
+				'const nativeAddon = require("native-addon");',
+				importer,
+				"123",
+			);
+		} finally {
+			resolveSpy.mockRestore();
+			__resetLegacyPiResolutionCache();
+		}
+
+		const addonUrl = url.pathToFileURL(await fs.realpath(addonPath)).href;
+		expect(rewritten).toBe(`const nativeAddon = require("${addonUrl}");`);
 	});
 
 	it("remaps legacy pi-ai utils/oauth subpaths to registry OAuth exports", async () => {
