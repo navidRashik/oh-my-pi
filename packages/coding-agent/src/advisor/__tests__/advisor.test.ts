@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import type { AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import type { TUI } from "@oh-my-pi/pi-tui";
 import { type } from "arktype";
 import type { ModelRegistry } from "../../config/model-registry";
@@ -1459,6 +1461,7 @@ describe("advisor", () => {
 							content: [{ type: "text", text: "" }],
 							stopReason: "error",
 							errorMessage: "404 No endpoints available",
+							errorId: AIError.create(AIError.Flag.Transient),
 							timestamp: Date.now(),
 						} as unknown as AgentMessage);
 						state.error = "404 No endpoints available";
@@ -1514,6 +1517,74 @@ describe("advisor", () => {
 			expect(lengthsBeforePrompt[lengthsBeforePrompt.length - 1]).toBe(0);
 			expect(rollbackCalls).toHaveLength(3);
 			expect(state.messages).toHaveLength(2);
+		});
+
+		it("drops a terminal non-retriable assistant failure without retrying", async () => {
+			const errorMessage = "Codex error event: Request blocked. (code=invalid_prompt)";
+			const promptInputs: string[] = [];
+			const rollbackCalls: number[] = [];
+			const turnErrors: unknown[] = [];
+			const failures: unknown[] = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					state.messages.push({ role: "user", content: input, timestamp: 1 } as AgentMessage);
+					const failure: AssistantMessage = {
+						role: "assistant",
+						content: [],
+						api: "openai-codex-responses",
+						provider: "openai-codex",
+						model: "gpt-5.6-sol",
+						usage: {
+							input: 1,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 1,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "error",
+						errorMessage,
+						errorId: 0,
+						timestamp: 2,
+					};
+					state.messages.push(failure);
+					state.error = errorMessage;
+				},
+				abort: () => {},
+				reset: () => {
+					state.messages.length = 0;
+					state.error = undefined;
+				},
+				rollbackTo: count => {
+					rollbackCalls.push(count);
+					state.messages.length = Math.min(count, state.messages.length);
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "aaa", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				onTurnError: error => {
+					turnErrors.push(error);
+				},
+				notifyFailure: error => {
+					failures.push(error);
+				},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 1);
+
+			runtime.onTurnEnd(messages);
+			await runtime.waitForCatchup(1000, 1);
+
+			expect(promptInputs).toHaveLength(1);
+			expect(rollbackCalls).toEqual([0]);
+			expect(turnErrors).toHaveLength(1);
+			expect(failures).toHaveLength(1);
+			expect(runtime.backlog).toBe(0);
 		});
 
 		it("drops the in-flight batch when a reset aborts the advisor prompt", async () => {

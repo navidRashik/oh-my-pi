@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { logger } from "@oh-my-pi/pi-utils";
 import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatSessionHistoryMarkdown, PRIMARY_CONTEXT_CUSTOM_TYPES } from "../session/session-history-format";
@@ -270,6 +271,15 @@ export class AdvisorRuntime {
 	 * append-only context); falls back to truncating `state.messages` for tests
 	 * that hand-roll a minimal facade.
 	 */
+	#terminalAssistantFailure(snapshot: number): AssistantMessage | undefined {
+		const messages = this.agent.state.messages;
+		for (let i = messages.length - 1; i >= snapshot; i--) {
+			const message = messages[i];
+			if (message.role === "assistant" && message.stopReason === "error") return message;
+		}
+		return undefined;
+	}
+
 	#rollbackFailedTurn(snapshot: number): void {
 		const messages = this.agent.state.messages;
 		if (messages.length <= snapshot) return;
@@ -361,6 +371,13 @@ export class AdvisorRuntime {
 					// (reset already cleared #pending and rewound the cursor) instead of
 					// requeuing it into the post-reset conversation.
 					if (this.#epoch !== epoch) continue;
+					const terminalFailure = this.#terminalAssistantFailure(messageSnapshot);
+					const terminalFailureId =
+						terminalFailure === undefined ? undefined : AIError.classifyMessage(terminalFailure);
+					const terminalFailureRetriable =
+						terminalFailureId === undefined ||
+						AIError.retriable(terminalFailureId) ||
+						AIError.is(terminalFailureId, AIError.Flag.ContextOverflow);
 					this.#rollbackFailedTurn(messageSnapshot);
 					logger.debug("advisor turn failed", { err: String(err) });
 					try {
@@ -371,9 +388,8 @@ export class AdvisorRuntime {
 					// The hook awaits; a reset during it invalidates this batch like the
 					// prompt await above — drop it instead of requeueing stale content.
 					if (this.#epoch !== epoch) continue;
-					this.#consecutiveFailures++;
-					if (this.#consecutiveFailures >= 3) {
-						logger.warn("advisor failed consecutively 3 times; dropping backlog to prevent stall");
+					if (!terminalFailureRetriable) {
+						logger.warn("advisor terminal failure is non-retriable; dropping bounded batch");
 						if (!this.#failureNotified) {
 							this.#failureNotified = true;
 							try {
@@ -383,14 +399,30 @@ export class AdvisorRuntime {
 							}
 						}
 						this.#consecutiveFailures = 0;
-						// The dropped batch may carry primary-context we never delivered; drop
-						// the seen-state too so the next turn re-expands it instead of marking
-						// it "unchanged" against content the advisor never received.
 						this.#seenContext.clear();
 						success = true;
 					} else {
-						this.#pending.unshift({ text: batch, turns: finalTurns });
-						await Bun.sleep(this.retryDelayMs);
+						this.#consecutiveFailures++;
+						if (this.#consecutiveFailures >= 3) {
+							logger.warn("advisor failed consecutively 3 times; dropping backlog to prevent stall");
+							if (!this.#failureNotified) {
+								this.#failureNotified = true;
+								try {
+									this.host.notifyFailure?.(err);
+								} catch (notifyErr) {
+									logger.warn("advisor failure notification failed", { err: String(notifyErr) });
+								}
+							}
+							this.#consecutiveFailures = 0;
+							// The dropped batch may carry primary-context we never delivered; drop
+							// the seen-state too so the next turn re-expands it instead of marking
+							// it "unchanged" against content the advisor never received.
+							this.#seenContext.clear();
+							success = true;
+						} else {
+							this.#pending.unshift({ text: batch, turns: finalTurns });
+							await Bun.sleep(this.retryDelayMs);
+						}
 					}
 				}
 

@@ -10,6 +10,10 @@
 
 - Updated status event log to prioritize the most recent entries in the display window
 
+### Fixed
+
+- Fixed advisor turns retrying terminal non-retriable provider failures such as Codex `invalid_prompt` errors; these failures now roll back and notify immediately while transient failures retain bounded retries ([#5312](https://github.com/can1357/oh-my-pi/issues/5312))
+
 ### Removed
 
 - Removed the unreliable Bing and Yahoo HTML-scraping web search providers
