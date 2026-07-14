@@ -410,6 +410,22 @@ describe("IRC", () => {
 			expect(IrcTool.createIf(session)).toBeNull();
 		});
 
+		it("does not advertise speculative discovery or self-addressed sends to the model", () => {
+			const tool = new IrcTool(makeToolSession(registry, "Main"));
+
+			expect(tool.summary).toContain("known peers");
+			expect(tool.description).toContain("Your IRC id: `Main`");
+			expect(tool.description).toContain("NEVER call `list`, `inbox`, or `wait` speculatively");
+			expect(tool.description).not.toContain("DM `Main`");
+			for (const example of tool.examples) {
+				if (!("call" in example)) continue;
+				expect(example.call.op).not.toBe("list");
+				if (example.call.op === "send") {
+					expect(example.call.to).not.toBe("Main");
+				}
+			}
+		});
+
 		it("op=list includes parked peers, unread counts, and parent ids", async () => {
 			const sub = makeFakeSession();
 			registry.register({

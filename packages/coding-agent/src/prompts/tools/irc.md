@@ -1,7 +1,12 @@
-Send and receive short text messages between the agents running in this process.
+Coordinate with known peer agents during active multi-agent work.
+
+# Scope
+You MUST use IRC only when a `task` result names a peer, an IRC message arrives, or the user explicitly requests peer coordination.
+- Your IRC id: `{{selfId}}`. NEVER send messages to yourself.
+- Without a coordination trigger, you MUST use task-relevant tools; NEVER call `list`, `inbox`, or `wait` speculatively.
 
 # Addressing and Discovery
-The main agent is always `Main`. Subagents inherit their task ID (e.g., `AuthLoader`). If you don't know who is currently running, use `op: "list"` to view all peers alongside their status, unread message count, and recent activity. Address peers by their exact ID from the roster; NEVER invent names.
+The main agent id is `Main`; subagents inherit their task id (e.g., `AuthLoader`). Address peers by exact ids from task results or incoming messages; NEVER invent names. During active coordination, you MAY use `op: "list"` to recover a roster after ids become unavailable. NEVER use `list` to check whether peers exist.
 
 # Messaging Rules
 Use `op: "send"` to deliver a message to a specific peer or broadcast to `"all"`.
@@ -14,11 +19,11 @@ Use `op: "send"` to deliver a message to a specific peer or broadcast to `"all"`
 Messages only arrive when the peer actively sends one—do not interrogate a peer for status.
 - If you are completely blocked and MUST wait for an answer, use `op: "wait"` (or `await: true` on a send). The wait returns when a matching message arrives, the timeout elapses, or any IRC / steering message interrupts the wait. Parent-agent IRC interrupts with steering-level priority.
 - No need to alternate `irc wait`, `irc inbox`, and `job poll`: waits surface cross-channel interrupts promptly. The next turn includes the interrupt reason and message.
-- To check for messages without blocking, use `op: "inbox"` to drain your queue.
+- After an IRC notification, you MAY use `op: "inbox"` to drain queued messages without blocking.
 
 # When to Coordinate
-Message peers instead of guessing, duplicating work, or spying.
-- Use IRC when you hit an unexpected state (e.g., missing files) or an out-of-scope decision. DM `Main` or your spawner for guidance.
-- If you overlap with another agent's work or need a file they are touching, DM them before editing.
+During active coordination, message known peers instead of guessing, duplicating work, or spying.
+- If a known peer has context needed for an unexpected state or out-of-scope decision, you SHOULD message that peer.
+- Before editing overlapping work, you MUST message the known peer touching it.
 - NEVER use shell tools, grep, or read other sessions' files to figure out what a peer is doing. Message them directly.
 - NEVER use IRC for something a tool can answer (e.g., grepping codebase, running a build).

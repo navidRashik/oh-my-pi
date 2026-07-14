@@ -93,54 +93,54 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 	readonly name = "irc";
 	readonly approval = "read" as const;
 	readonly label = "IRC";
-	readonly summary = "Send and receive messages between agents";
+	readonly summary = "Coordinate with known peers during active multi-agent work";
 	readonly description: string;
 	readonly parameters = ircSchema;
 	readonly strict = true;
 	readonly interruptible = true;
 
-	readonly examples: readonly ToolExample<typeof ircSchema.infer>[] = [
-		{
-			caption: "List peers",
-			call: { op: "list" },
-		},
-		{
-			caption: "Fire-and-forget DM — same send wakes idle/parked peers",
-			call: {
-				op: "send",
-				to: "AuthLoader",
-				message: "Still touching src/server/auth.ts? I need to add a 401 path.",
-			},
-		},
-		{
-			caption: "Round-trip when you cannot proceed without the answer",
-			call: {
-				op: "send",
-				to: "Main",
-				message: "JWT or session cookies for the auth flow?",
-				await: true,
-			},
-		},
-		{
-			caption: "Block until a specific peer answers",
-			call: { op: "wait", from: "AuthLoader", timeoutMs: 60000 },
-		},
-		{
-			caption: "Drain pending messages",
-			call: { op: "inbox" },
-		},
-		{
-			caption: "Broadcast to live peers (no replies expected)",
-			call: {
-				op: "send",
-				to: "all",
-				message: "About to refactor src/server/middleware/*. Anyone already in there?",
-			},
-		},
-	];
+	readonly examples: readonly ToolExample<typeof ircSchema.infer>[];
 	readonly loadMode = "discoverable";
 	constructor(private readonly session: ToolSession) {
-		this.description = prompt.render(ircDescription);
+		const roundTripPeer = (session.taskDepth ?? 0) > 0 ? MAIN_AGENT_ID : "AuthLoader";
+		this.examples = [
+			{
+				caption: "Fire-and-forget DM to a known peer — same send wakes idle/parked peers",
+				call: {
+					op: "send",
+					to: "AuthLoader",
+					message: "Still touching src/server/auth.ts? I need to add a 401 path.",
+				},
+			},
+			{
+				caption: "Round-trip with a known peer when you cannot proceed without the answer",
+				call: {
+					op: "send",
+					to: roundTripPeer,
+					message: "JWT or session cookies for the auth flow?",
+					await: true,
+				},
+			},
+			{
+				caption: "Block until a known peer answers",
+				call: { op: "wait", from: "AuthLoader", timeoutMs: 60000 },
+			},
+			{
+				caption: "Drain pending messages after an IRC notification",
+				call: { op: "inbox" },
+			},
+			{
+				caption: "Broadcast to known live peers (no replies expected)",
+				call: {
+					op: "send",
+					to: "all",
+					message: "About to refactor src/server/middleware/*. Anyone already in there?",
+				},
+			},
+		];
+		this.description = prompt.render(ircDescription, {
+			selfId: session.getAgentId?.() ?? "this agent",
+		});
 	}
 
 	static createIf(session: ToolSession): IrcTool | null {
