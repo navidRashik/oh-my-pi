@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an optional `Terminal.refreshAppearance()` that issues a single bounded OSC 11 background re-query through the existing query/DA1 pipeline, letting consumers refresh the detected dark/light appearance on an explicit user gesture without reintroducing periodic polling ([#5352](https://github.com/can1357/oh-my-pi/issues/5352))
+
 ## [16.4.7] - 2026-07-12
 
 ### Fixed
