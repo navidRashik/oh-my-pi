@@ -64,6 +64,25 @@ pub fn build_glob_pattern(glob: &str, recursive: bool) -> String {
 	fix_unclosed_braces(pattern)
 }
 
+/// Maximum walk-relative traversal depth a compiled glob pattern can match.
+///
+/// Patterns are compiled with [`GlobBuilder::literal_separator`] enabled, so
+/// `*`, `?`, and `[...]` never cross a `/`. A pattern without a `**` component
+/// can therefore only match paths whose segment count equals the pattern's, so
+/// the walker never needs to descend past that depth. `**` matches across
+/// separators, so any pattern containing it stays unbounded ([`usize::MAX`]).
+///
+/// Root children are walk-relative depth 1 (zero `/`), so the bound is the
+/// number of `/` separators plus one. The result is a safe upper bound: brace
+/// unions (e.g. `{a,b/c}`) are counted by total `/`, which is always at least
+/// the separator count of every concrete expansion, so no match is ever pruned.
+pub fn max_match_depth(pattern: &str) -> usize {
+	if pattern.contains("**") {
+		return usize::MAX;
+	}
+	pattern.bytes().filter(|&byte| byte == b'/').count() + 1
+}
+
 /// Compile a glob pattern string into a [`CompiledGlob`].
 ///
 /// When `recursive` is true, simple patterns (no path separators, no leading
@@ -277,5 +296,19 @@ mod tests {
 	#[test]
 	fn glob_brace_union_still_gets_recursive_prefix() {
 		assert_eq!(build_glob_pattern("{*.ts,*.tsx}", true), "**/{*.ts,*.tsx}");
+	}
+
+	#[test]
+	fn max_match_depth_bounds_non_recursive_patterns_by_segment_count() {
+		assert_eq!(max_match_depth("*widget*"), 1);
+		assert_eq!(max_match_depth("foo/*"), 2);
+		assert_eq!(max_match_depth("foo/bar/*.ts"), 3);
+	}
+
+	#[test]
+	fn max_match_depth_is_unbounded_for_recursive_patterns() {
+		assert_eq!(max_match_depth("**/*.ts"), usize::MAX);
+		assert_eq!(max_match_depth("**/*"), usize::MAX);
+		assert_eq!(max_match_depth("src/**/widget"), usize::MAX);
 	}
 }

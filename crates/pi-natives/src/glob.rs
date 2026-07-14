@@ -172,6 +172,12 @@ fn run_glob(
 	ct: task::CancelToken,
 ) -> Result<GlobResult> {
 	let walk_glob_pattern = glob_util::build_glob_pattern(&config.pattern, config.recursive);
+	// A pattern without `**` matches at a fixed depth (globs compile with
+	// literal_separator, so `*` never crosses `/`). Bound traversal to that
+	// depth so a non-recursive glob (`dir/*`) does not descend the whole
+	// subtree — the walker descends on `WalkDecision::Skip`, so an unbounded
+	// depth would scan every non-matching directory until the timeout.
+	let max_depth = glob_util::max_match_depth(&walk_glob_pattern);
 	let walk_glob = pi_walker::CompiledWalkGlob::new([walk_glob_pattern])
 		.map_err(|err| Error::from_reason(format!("Invalid glob pattern: {err}")))?;
 	if config.max_results == 0 {
@@ -192,7 +198,7 @@ fn run_glob(
 		.detail(scan_detail)
 		.order(pi_walker::WalkOrder::Path)
 		.emit_root(false)
-		.depth(1, usize::MAX)
+		.depth(1, max_depth)
 		.directory_errors(pi_walker::DirectoryErrorMode::SkipSkippable)
 		.cache(config.cache)
 		.empty_recheck(pi_walker::EmptyRecheck::Configured)
@@ -376,6 +382,76 @@ mod tests {
 				.iter()
 				.any(|entry| entry.path.starts_with("ignored/")),
 			"gitignored directory should be pruned before matching, got {paths:?}"
+		);
+	}
+
+	#[test]
+	fn run_glob_non_recursive_matches_direct_child_and_ignores_nested() {
+		let root = TempDirGuard::new();
+		fs::create_dir_all(root.path().join("widget-direct")).expect("create direct match dir");
+		fs::create_dir_all(root.path().join("workspace-a/widget-nested"))
+			.expect("create nested match dir");
+		// A deep unrelated subtree the pre-fix walker would descend fully.
+		fs::create_dir_all(root.path().join("workspace-a/deep/deeper/deepest"))
+			.expect("create deep subtree");
+
+		let result = super::run_glob(
+			super::GlobConfig {
+				root:                  root.path().to_path_buf(),
+				pattern:               "*widget*".to_string(),
+				recursive:             false,
+				include_hidden:        true,
+				file_type_filter:      None,
+				max_results:           usize::MAX,
+				use_gitignore:         false,
+				mentions_node_modules: false,
+				sort_by_mtime:         false,
+				cache:                 false,
+			},
+			None,
+			crate::task::CancelToken::default(),
+		)
+		.expect("glob succeeds");
+
+		let paths = match_paths(&result);
+		assert_eq!(paths, ["widget-direct"], "only the direct child should match");
+		assert!(
+			!result.matches.iter().any(|entry| entry.path.contains('/')),
+			"non-recursive glob must not return nested matches, got {paths:?}"
+		);
+	}
+
+	#[test]
+	fn run_glob_non_recursive_two_segment_pattern_matches_at_its_depth() {
+		let root = TempDirGuard::new();
+		fs::create_dir_all(root.path().join("workspace-a/widget-nested"))
+			.expect("create depth-2 match dir");
+		fs::create_dir_all(root.path().join("workspace-a/widget-nested/too-deep"))
+			.expect("create depth-3 dir");
+
+		let result = super::run_glob(
+			super::GlobConfig {
+				root:                  root.path().to_path_buf(),
+				pattern:               "*/*widget*".to_string(),
+				recursive:             false,
+				include_hidden:        true,
+				file_type_filter:      None,
+				max_results:           usize::MAX,
+				use_gitignore:         false,
+				mentions_node_modules: false,
+				sort_by_mtime:         false,
+				cache:                 false,
+			},
+			None,
+			crate::task::CancelToken::default(),
+		)
+		.expect("glob succeeds");
+
+		let paths = match_paths(&result);
+		assert_eq!(
+			paths,
+			["workspace-a/widget-nested"],
+			"a two-segment pattern must match at depth 2 but not deeper"
 		);
 	}
 }

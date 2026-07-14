@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed the native build script failing to locate the `@napi-rs/cli` `napi` binary on Windows because the `PATH` lookup joined entries with a Unix `:` separator instead of the platform delimiter (`path.delimiter`).
+- Fixed non-recursive `glob` patterns traversing the entire subtree: `run_glob` now bounds walker depth to the glob's segment count when the pattern has no `**`, so `dir/*` no longer descends unrelated subdirectories and times out with zero matches on large roots. Patterns containing `**` stay fully recursive ([#4793](https://github.com/can1357/oh-my-pi/issues/4793)).
 
 ## [16.3.6] - 2026-07-04
 
