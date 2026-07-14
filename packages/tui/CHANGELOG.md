@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored `@` file-reference completions after slash commands that do not provide argument completions ([#4852](https://github.com/can1357/oh-my-pi/issues/4852)).
+
 ## [16.3.10] - 2026-07-06
 
 ### Fixed

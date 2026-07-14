@@ -429,28 +429,21 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				// path (`/tmp/fo` at prompt start, `see /tmp` mid-prompt); fall
 				// through to file-path completion.
 			} else if (!isMidPromptSkillLookup) {
-				// Submitted slash commands own their argument text only when the
-				// matched command accepts args. No-arg slash-looking prompts such
-				// as `/settings @file` still fall through to prompt-composer
-				// completions because submit treats them as normal prompt text.
+				// Slash commands own their argument text only when they provide
+				// context-specific completions. Otherwise prompt-composer
+				// completions handle the trailing token.
 				const commandName = commandText.slice(1, spaceIndex); // Command without "/"
 				const argumentText = commandText.slice(spaceIndex + 1); // Text after space
 
 				const command = this.#commands.find(cmd => commandMatchesNameOrAlias(cmd, commandName));
-				if (command && (!("allowArgs" in command) || command.allowArgs !== false)) {
-					if (!("getArgumentCompletions" in command) || !command.getArgumentCompletions) {
-						return null; // No argument completion for this command
-					}
-
+				if (command && "getArgumentCompletions" in command && command.getArgumentCompletions) {
 					const argumentSuggestions = await command.getArgumentCompletions(argumentText);
-					if (!Array.isArray(argumentSuggestions) || argumentSuggestions.length === 0) {
-						return null;
+					if (Array.isArray(argumentSuggestions) && argumentSuggestions.length > 0) {
+						return {
+							items: argumentSuggestions,
+							prefix: argumentText,
+						};
 					}
-
-					return {
-						items: argumentSuggestions,
-						prefix: argumentText,
-					};
 				}
 			}
 		}

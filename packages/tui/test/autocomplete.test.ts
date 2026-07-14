@@ -119,7 +119,7 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(result?.items.map(item => item.value)).toContain("/tmp/");
 		});
 
-		it("treats @ file-reference tokens as literal text inside slash command arguments without completions", async () => {
+		it("falls through to @ file-reference completions for slash commands without argument completions", async () => {
 			const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-rename-args-"));
 			try {
 				fs.writeFileSync(path.join(baseDir, "copy-target.ts"), "export {};\n");
@@ -130,7 +130,26 @@ describe("CombinedAutocompleteProvider", () => {
 				const line = "/rename repro @";
 				const result = await provider.getSuggestions([line], 0, line.length);
 
-				expect(result).toBeNull();
+				expect(result?.prefix).toBe("@");
+				expect(result?.items.map(item => item.value)).toContain("@copy-target.ts");
+			} finally {
+				fs.rmSync(baseDir, { recursive: true, force: true });
+			}
+		});
+
+		it("returns @ file-reference completions for slash commands that omit allowArgs", async () => {
+			const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-undefined-args-"));
+			try {
+				fs.writeFileSync(path.join(baseDir, "copy-target.ts"), "export {};\n");
+				const provider = new CombinedAutocompleteProvider(
+					[{ name: "hotkeys", description: "Show keyboard shortcuts" }],
+					baseDir,
+				);
+				const line = "/hotkeys @";
+				const result = await provider.getSuggestions([line], 0, line.length);
+
+				expect(result?.prefix).toBe("@");
+				expect(result?.items.map(item => item.value)).toContain("@copy-target.ts");
 			} finally {
 				fs.rmSync(baseDir, { recursive: true, force: true });
 			}
