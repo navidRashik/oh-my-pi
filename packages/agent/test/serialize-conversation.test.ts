@@ -95,4 +95,43 @@ describe("serializeConversation — useless pairs", () => {
 
 		expect(out).toBe("");
 	});
+
+	// Harmony/Gemma renderTranscript emits chat-template control tokens
+	// (`<|channel|>analysis`, `<|start|>`) that GPT-5.6 rejects with
+	// `Request blocked` when the summary payload is re-sent as prompt text
+	// (issues #5184, #5337). Those dialects must fall back to the plain-text
+	// form while still carrying the reasoning content forward.
+	test("harmony summaries strip control tokens but keep thinking content", () => {
+		const out = serializeConversation(
+			[
+				assistantMessage([
+					{ type: "thinking", thinking: "Planning broad tool discovery." },
+					{ type: "text", text: "Let me search." },
+				]),
+			],
+			"harmony",
+		);
+
+		expect(out).not.toContain("<|channel|>");
+		expect(out).not.toContain("<|start|>");
+		expect(out).toContain("[Think]: Planning broad tool discovery.");
+		expect(out).toContain("[Assistant]: Let me search.");
+	});
+
+	test("gemma summaries strip control tokens but keep thinking content", () => {
+		const out = serializeConversation(
+			[
+				assistantMessage([
+					{ type: "thinking", thinking: "Reasoning step." },
+					{ type: "text", text: "Answer." },
+				]),
+			],
+			"gemma",
+		);
+
+		expect(out).not.toContain("<start_of_turn>");
+		expect(out).not.toContain("<|channel");
+		expect(out).toContain("[Think]: Reasoning step.");
+		expect(out).toContain("[Assistant]: Answer.");
+	});
 });

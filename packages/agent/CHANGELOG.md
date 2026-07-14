@@ -11,6 +11,10 @@
 
 - Improved compaction dead-end notifications with specific recovery instructions
 
+### Fixed
+
+- Fixed GPT-5.6 auto-compaction failing with `Request blocked` when summarizing turns that contain assistant reasoning: Harmony/Gemma transcript serialization no longer embeds chat-template control tokens (`<|channel|>analysis`) in summary payloads ([#5337](https://github.com/can1357/oh-my-pi/issues/5337))
+
 ## [16.4.5] - 2026-07-11
 
 ### Added

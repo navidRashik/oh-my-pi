@@ -208,6 +208,19 @@ export function truncateToolResultForSummary(text: string): string {
 }
 
 /**
+ * Dialects whose `renderTranscript` embeds chat-template control tokens
+ * (`<|channel|>analysis`, `<|start|>`, …) rather than inline-safe XML/markdown.
+ *
+ * Those tokens are legal on the owned *text transport*, but summarization
+ * re-sends the serialized transcript as plain prompt text to the same model
+ * family, and GPT-5.6 rejects inbound Harmony control tokens with
+ * `Request blocked` (issues #5184, #5337). Summary serialization therefore
+ * falls back to the control-token-free legacy plain-text form for these
+ * dialects — the same carve-out {@link renderDemotedThinking} applies.
+ */
+const SUMMARY_UNSAFE_DIALECTS: Partial<Record<Dialect, true>> = { harmony: true, gemma: true };
+
+/**
  * Serialize LLM messages to text for summarization.
  * This prevents the model from treating it as a conversation to continue.
  * Call convertToLlm() first to handle custom message types.
@@ -223,7 +236,7 @@ export function serializeConversation(messages: Message[], dialect?: Dialect): s
 			uselessCallIds.add(msg.toolCallId);
 		}
 	}
-	if (dialect) {
+	if (dialect && !SUMMARY_UNSAFE_DIALECTS[dialect]) {
 		const processed: Message[] = [];
 		for (const msg of messages) {
 			if (msg.role === "assistant") {
