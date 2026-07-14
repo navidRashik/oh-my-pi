@@ -172,8 +172,12 @@ async function registerPersistedSubagentsFromDir(
 			continue;
 		}
 		const id = entry.name.slice(0, -6);
-		if (vibeOwnedIds.has(id) && registry.get(id)?.sessionFile !== sessionFile) continue;
-		if (!registry.get(id)) {
+		// A Vibe-owned worker whose authoritative ref lives at a different session
+		// file must not be re-registered as a stale parked row — but its artifacts
+		// dir may still hold nested subagent transcripts, so skip only this row and
+		// keep recursing so those nested workers register and stay revivable.
+		const skipVibeWorkerRow = vibeOwnedIds.has(id) && registry.get(id)?.sessionFile !== sessionFile;
+		if (!skipVibeWorkerRow && !registry.get(id)) {
 			registry.register({
 				id,
 				displayName: id,
