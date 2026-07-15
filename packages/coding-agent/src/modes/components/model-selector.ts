@@ -284,6 +284,11 @@ export class ModelSelectorComponent extends Container {
 					this.#updateList();
 				})
 				.finally(() => this.#tui.requestRender());
+
+			// Retry hidden local providers: if the user started a local model
+			// server after launching the agent, re-probe so its tab reappears
+			// without an app restart.
+			this.#reprobeHiddenOptionalProviders();
 		}
 	}
 
@@ -548,13 +553,15 @@ export class ModelSelectorComponent extends Container {
 
 	/**
 	 * A discoverable provider tab is shown when it has models to offer or when
-	 * hiding it would strand the user without a retry path. Optional local
-	 * providers (`ollama`, `llama.cpp`, `lm-studio`) start in `idle` state on a
-	 * fresh install with no cache — hide those so the menu isn't three dead
-	 * tabs. Once a probe runs and lands in `unavailable`/`empty`/`cached`/etc.,
-	 * keep the tab visible: selecting it schedules an online re-probe through
-	 * {@link #scheduleSelectedProviderRefresh}, which is the only in-session way
-	 * to rediscover a server that came up after the first attempt failed.
+	 * the provider is explicitly configured. The implicit local providers
+	 * (`ollama`, `llama.cpp`, `lm-studio`) are registered `optional`; on a
+	 * machine with no local server their startup probe leaves discovery in
+	 * `idle` (uncached, never probed) or `unavailable` (probe failed) with no
+	 * models, so those tabs are dead — hide them. `empty`/`unauthenticated`/
+	 * `cached`/`ok` stay visible because they carry actionable state. Hidden
+	 * providers are not stranded: {@link #reprobeHiddenOptionalProviders} runs an
+	 * online re-probe every time the selector opens, so a server started later
+	 * resurfaces its tab without restarting the app.
 	 */
 	#shouldShowDiscoverableProvider(providerId: string, providersWithModels: ReadonlySet<string>): boolean {
 		if (providersWithModels.has(providerId)) {
@@ -564,7 +571,39 @@ export class ModelSelectorComponent extends Container {
 		if (!discoveryState?.optional) {
 			return true;
 		}
-		return discoveryState.status !== "idle";
+		return discoveryState.status !== "idle" && discoveryState.status !== "unavailable";
+	}
+
+	/**
+	 * Kick off a background online re-probe for every optional discoverable
+	 * provider that is currently hidden (no models, `idle`/`unavailable`). This
+	 * is the in-session retry path: when the user starts their local model
+	 * server after launching the agent, opening the selector rediscovers it and
+	 * {@link #shouldShowDiscoverableProvider} then surfaces the tab. A `--models`
+	 * scope is registry-independent, so this is a no-op there.
+	 */
+	#reprobeHiddenOptionalProviders(): void {
+		if (this.#scopedModels.length > 0) {
+			return;
+		}
+		const providersWithModels = new Set(this.#allModels.map(item => item.provider));
+		for (const providerId of this.#modelRegistry.getDiscoverableProviders()) {
+			if (providersWithModels.has(providerId)) {
+				continue;
+			}
+			const discoveryState = this.#modelRegistry.getProviderDiscoveryState(providerId);
+			if (!discoveryState?.optional) {
+				continue;
+			}
+			if (discoveryState.status !== "idle" && discoveryState.status !== "unavailable") {
+				continue;
+			}
+			if (this.#refreshingProviders.has(providerId) || this.#scheduledProviderRefreshes.has(providerId)) {
+				continue;
+			}
+			this.#setProviderRefreshing(providerId, true);
+			void this.#refreshProviderInBackground(providerId);
+		}
 	}
 
 	#buildProviderTabs(): void {

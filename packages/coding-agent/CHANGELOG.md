@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Hide the implicit local-provider tabs (`ollama`, `llama.cpp`, `lm-studio`) in the model selector on a fresh install: an `optional` discoverable provider whose discovery state is `idle` (never probed, no cache) and that contributes no models is no longer added to the tab bar, so the menu stops showing dead tabs for services the user isn't running. Providers whose probe already ran and failed (`unavailable`) stay visible so selecting the tab still triggers an online re-probe when the local server comes up later ([#2761](https://github.com/can1357/oh-my-pi/issues/2761)).
+- Hide the implicit local-provider tabs (`ollama`, `llama.cpp`, `lm-studio`) in the model selector when they are inactive: an `optional` discoverable provider that contributes no models and whose discovery state is `idle` (never probed) or `unavailable` (probe failed — e.g. no local server running) is no longer added to the tab bar, so the menu stops showing dead tabs for services the user isn't running. Opening the selector now runs an online re-probe of the hidden local providers, so a server started after launch resurfaces its tab without restarting the app ([#2761](https://github.com/can1357/oh-my-pi/issues/2761)).
 
 ## [16.0.1] - 2026-06-15
 

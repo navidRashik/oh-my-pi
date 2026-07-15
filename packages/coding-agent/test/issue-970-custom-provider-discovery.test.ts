@@ -178,31 +178,71 @@ describe("issue #970 custom provider discovery", () => {
 		expect(rendered).toContain("baseUrl");
 	});
 
-	test("hides optional idle discoverable providers that have no models", async () => {
+	test("hides optional idle and unavailable local providers that have no models", async () => {
 		installTestTheme();
-		const selector = await createSelector({
-			provider: "ollama",
-			status: "idle",
-			optional: true,
-			stale: false,
-			models: [],
-		});
+		for (const status of ["idle", "unavailable"] as const) {
+			const selector = await createSelector({
+				provider: "ollama",
+				status,
+				optional: true,
+				stale: false,
+				models: [],
+				error: status === "unavailable" ? "connect ECONNREFUSED 127.0.0.1:11434" : undefined,
+			});
 
-		const rendered = normalizeRenderedText(selector.render(200).join("\n"));
-		expect(rendered).not.toContain("OLLAMA");
+			const rendered = normalizeRenderedText(selector.render(200).join("\n"));
+			expect(rendered).not.toContain("OLLAMA");
+		}
 	});
 
-	test("keeps optional unavailable providers visible so the user can retry after starting the server", async () => {
+	test("re-probes hidden optional providers on open so a started server resurfaces its tab", async () => {
 		installTestTheme();
-		const selector = await createSelector({
+		const ollama = buildModel({
+			id: "llama3",
 			provider: "ollama",
-			status: "unavailable",
-			optional: true,
-			stale: false,
-			models: [],
-			error: "connect ECONNREFUSED 127.0.0.1:11434",
-		});
+			api: "openai-responses",
+			name: "Llama 3",
+		} as Parameters<typeof buildModel>[0]);
+		let probed = false;
+		let models: Model[] = [];
+		const modelRegistry = {
+			refresh: async () => {},
+			refreshProvider: async (provider: string) => {
+				if (provider === "ollama") {
+					probed = true;
+					models = [ollama];
+				}
+			},
+			getError: () => undefined,
+			getAvailable: () => models,
+			getAll: () => models,
+			getDiscoverableProviders: () => ["ollama"],
+			getCanonicalModelSelections: () => [],
+			getProviderDiscoveryState: (provider: string) =>
+				provider === "ollama"
+					? {
+							provider: "ollama",
+							status: models.length > 0 ? "ok" : "unavailable",
+							optional: true,
+							stale: false,
+							models: models.map(model => model.id),
+						}
+					: undefined,
+		} as unknown as ModelRegistry;
+		const ui = { requestRender: vi.fn() } as unknown as TUI;
+		const selector = new ModelSelectorComponent(
+			ui,
+			undefined,
+			Settings.isolated({}),
+			modelRegistry,
+			[],
+			() => {},
+			() => {},
+		);
+		await Bun.sleep(0);
+		installTestTheme();
 
+		expect(probed).toBe(true);
 		const rendered = normalizeRenderedText(selector.render(200).join("\n"));
 		expect(rendered).toContain("OLLAMA");
 	});
