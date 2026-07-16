@@ -301,27 +301,42 @@ describe("Markdown incremental streaming lex (E2)", () => {
 		}
 	});
 
-	// The completed table (final, non-transient render) still renders as a fully
-	// aligned box — the streaming raw-source view is only for the volatile tail.
-	it("a completed table renders aligned once frozen or finalized", () => {
-		const table = "Head:\n\n| A | B |\n| --- | --- |\n| xx | yyyy |\n| zzzz | w |\n\nTail line after the table.";
+	// Once a table has rendered as raw source in the volatile tail, that exact
+	// representation must survive both transitions that can happen after rows
+	// enter native scrollback: moving into the frozen prefix when a following
+	// block arrives, and the final non-transient render. A fresh/cold component
+	// has no committed streaming history and may render the aligned box.
+	it("keeps a streamed table byte-stable through freezing and finalization", () => {
+		const table = "Head:\n\n| A | B |\n| --- | --- |\n| xx | yyyy |\n| zzzz | w |";
+		const withTail = `${table}\n\nTail line after the table.`;
 		const streaming = new Markdown("", 1, 0, THEME);
 		streaming.transientRenderCache = true;
-		// Stream to completion, then a final non-transient render.
 		for (let len = 5; len <= table.length; len += 7) {
 			clearRenderCache();
 			streaming.setText(table.slice(0, len));
 			streaming.render(60);
 		}
-		streaming.transientRenderCache = false;
-		clearRenderCache();
 		streaming.setText(table);
-		const finalLines = streaming.render(60);
-		// Byte-identical to a cold render of the same instance config (paddingX 1).
+		const volatile = streaming.render(60);
+		const volatileTableRows = volatile.filter(line => Bun.stripANSI(line).includes("|"));
+		expect(volatileTableRows.length).toBeGreaterThan(0);
+		expect(volatile.some(line => /[+┌][-─]/.test(Bun.stripANSI(line)))).toBe(false);
+
+		// Appending a following block freezes the table token. It must retain
+		// the raw rows previously exposed in the volatile tail.
+		streaming.setText(withTail);
+		const frozen = streaming.render(60);
+		expect(frozen.filter(line => Bun.stripANSI(line).includes("|"))).toEqual(volatileTableRows);
+		expect(frozen.some(line => /[+┌][-─]/.test(Bun.stripANSI(line)))).toBe(false);
+
+		// Finalization must not switch bytes either, even if a cold aligned
+		// render of the same text is already present in the module LRU.
 		clearRenderCache();
-		const cold = new Markdown(table, 1, 0, THEME).render(60);
-		expect(finalLines).toEqual(cold);
-		// A box border row proves it aligned rather than showing raw pipes.
-		expect(finalLines.some(line => /[+┌][-─]/.test(Bun.stripANSI(line)))).toBe(true);
+		const cold = new Markdown(withTail, 1, 0, THEME).render(60);
+		expect(cold.some(line => /[+┌][-─]/.test(Bun.stripANSI(line)))).toBe(true);
+		streaming.transientRenderCache = false;
+		const finalized = streaming.render(60);
+		expect(finalized).toEqual(frozen);
+		expect(finalized.some(line => /[+┌][-─]/.test(Bun.stripANSI(line)))).toBe(false);
 	});
 });

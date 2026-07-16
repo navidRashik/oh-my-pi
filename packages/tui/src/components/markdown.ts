@@ -966,6 +966,11 @@ export class Markdown implements Component {
 	#streamPrefixText?: string;
 	#streamPrefixTokens?: Token[];
 	#streamPrefixLineCache?: StreamPrefixLineCache;
+	// Tables first observed in the volatile transient tail stay in raw-source
+	// form for this text lineage. Switching those rows to an aligned box after
+	// they enter native scrollback would rewrite immutable bytes and duplicate
+	// the table during the finalize-time commit repair (issue #5341).
+	#streamingRawTablePrefixes = new Map<string, string>();
 	// Rows of the most recent render() that are settled — top padding plus the
 	// rendered frozen token prefix — exposed via getLastRenderSettledRows()
 	// for native-scrollback commit gating.
@@ -1013,6 +1018,11 @@ export class Markdown implements Component {
 		// full lex + wrap runs per re-emit — one of the top CPU hotspots during
 		// streaming (issue #4353). Mirrors `Text.setText`'s guard.
 		if (text === this.#text) return false;
+		if (!text.startsWith(this.#text)) {
+			// A rewind/replacement starts a new source lineage; token paths may
+			// now name unrelated tables, so no raw-mode decision survives it.
+			this.#streamingRawTablePrefixes.clear();
+		}
 		this.#text = text;
 		if (!text.trim()) {
 			// Blank replacement: render() early-returns before #lexTokens can see
@@ -1022,6 +1032,7 @@ export class Markdown implements Component {
 			this.#streamPrefixTokens = undefined;
 			this.#streamPrefixLineCache = undefined;
 			this.#settledExposedText = undefined;
+			this.#streamingRawTablePrefixes.clear();
 		}
 		this.invalidate();
 		return true;
@@ -1176,7 +1187,7 @@ export class Markdown implements Component {
 		// theme.heading is used as the representative theme probe — it's required
 		// by MarkdownTheme and is one of the most styling-sensitive entries.
 		let cacheKey: string | undefined;
-		if (!this.transientRenderCache) {
+		if (!this.transientRenderCache && this.#streamingRawTablePrefixes.size === 0) {
 			cacheKey = this.#renderCacheKey(normalizedText, signature);
 			const cached = renderCache.get(cacheKey);
 			if (cached !== undefined) {
@@ -1331,7 +1342,7 @@ export class Markdown implements Component {
 		for (let i = start; i < end; i++) {
 			const token = tokens[i];
 			const nextToken = tokens[i + 1];
-			renderedLines.push(...this.#renderToken(token, contentWidth, nextToken?.type));
+			renderedLines.push(...this.#renderToken(token, contentWidth, nextToken?.type, undefined, String(i)));
 		}
 
 		const wrappedLines: string[] = [];
@@ -1480,7 +1491,13 @@ export class Markdown implements Component {
 		};
 	}
 
-	#renderToken(token: Token, width: number, nextTokenType?: string, styleContext?: InlineStyleContext): string[] {
+	#renderToken(
+		token: Token,
+		width: number,
+		nextTokenType?: string,
+		styleContext?: InlineStyleContext,
+		tokenPath?: string,
+	): string[] {
 		const lines: string[] = [];
 
 		// Display math block (own-line `$$…$$` / `\[…\]`): stack `\frac` vertically
@@ -1591,22 +1608,26 @@ export class Markdown implements Component {
 			}
 
 			case "table": {
-				// A table's column widths are the max over every row, so each new
-				// streamed row can re-widen columns already emitted above — the
-				// rendered box is NOT append-only stable. In the volatile transient
-				// tail that churn rewrites rows that may already have scrolled into
-				// immutable native scrollback, which the commit auditor then
-				// re-anchors and recommits, duplicating the summary on finalize
-				// (issue #5341). Frozen-prefix and final (non-transient) renders
-				// align the box for real; the still-streaming tail shows the raw
-				// monospace source instead, which only ever grows append-only.
-				if (this.transientRenderCache && !this.#renderingFrozenPrefix) {
-					const raw = (token as TableToken).raw ?? "";
+				const table = token as TableToken;
+				const raw = table.raw ?? "";
+				let renderRaw = false;
+				if (tokenPath !== undefined) {
+					const prefix = this.#streamingRawTablePrefixes.get(tokenPath);
+					if (prefix !== undefined) {
+						if (raw.startsWith(prefix)) renderRaw = true;
+						else this.#streamingRawTablePrefixes.delete(tokenPath);
+					}
+					if (this.transientRenderCache && !this.#renderingFrozenPrefix && raw.length > 0) {
+						this.#streamingRawTablePrefixes.set(tokenPath, raw);
+						renderRaw = true;
+					}
+				}
+				if (renderRaw) {
 					for (const rawLine of raw.split("\n")) lines.push(rawLine);
 					if (nextTokenType && nextTokenType !== "space") lines.push("");
 					break;
 				}
-				const tableLines = this.#renderTable(token as TableToken, width, nextTokenType, styleContext);
+				const tableLines = this.#renderTable(table, width, nextTokenType, styleContext);
 				lines.push(...tableLines);
 				break;
 			}
@@ -1623,8 +1644,15 @@ export class Markdown implements Component {
 				for (let i = 0; i < quoteTokens.length; i++) {
 					const quoteToken = quoteTokens[i];
 					const nextQuoteToken = quoteTokens[i + 1];
+					const quoteTokenPath = tokenPath === undefined ? undefined : `${tokenPath}.${i}`;
 					renderedQuoteLines.push(
-						...this.#renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext),
+						...this.#renderToken(
+							quoteToken,
+							quoteContentWidth,
+							nextQuoteToken?.type,
+							quoteInlineStyleContext,
+							quoteTokenPath,
+						),
 					);
 				}
 
