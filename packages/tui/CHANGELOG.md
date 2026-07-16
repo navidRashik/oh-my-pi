@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed streaming GFM tables duplicating/mixing with the block below them (e.g. a tool-result box) during fast token streaming. A table sizes its columns to the widest cell across all rows, so re-rendering it as new rows arrive re-widened rows already committed to native scrollback; the streaming tail now shows append-only-stable raw source and aligns the box only once the table is frozen or finalized ([#5341](https://github.com/can1357/oh-my-pi/issues/5341)).
+
 ## [16.4.7] - 2026-07-12
 
 ### Fixed

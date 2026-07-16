@@ -1591,6 +1591,21 @@ export class Markdown implements Component {
 			}
 
 			case "table": {
+				// A table's column widths are the max over every row, so each new
+				// streamed row can re-widen columns already emitted above — the
+				// rendered box is NOT append-only stable. In the volatile transient
+				// tail that churn rewrites rows that may already have scrolled into
+				// immutable native scrollback, which the commit auditor then
+				// re-anchors and recommits, duplicating the summary on finalize
+				// (issue #5341). Frozen-prefix and final (non-transient) renders
+				// align the box for real; the still-streaming tail shows the raw
+				// monospace source instead, which only ever grows append-only.
+				if (this.transientRenderCache && !this.#renderingFrozenPrefix) {
+					const raw = (token as TableToken).raw ?? "";
+					for (const rawLine of raw.split("\n")) lines.push(rawLine);
+					if (nextTokenType && nextTokenType !== "space") lines.push("");
+					break;
+				}
 				const tableLines = this.#renderTable(token as TableToken, width, nextTokenType, styleContext);
 				lines.push(...tableLines);
 				break;

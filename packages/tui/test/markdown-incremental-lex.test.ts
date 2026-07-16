@@ -243,4 +243,85 @@ describe("Markdown incremental streaming lex (E2)", () => {
 			expect(streamLines).toEqual(renderCold(crlf.slice(0, len), 60));
 		}
 	});
+
+	// Regression (issue #5341): a GFM table sizes its columns to the widest
+	// value across every row, so a naive re-render re-widens columns already
+	// emitted above whenever a new row streams in. In the transient (streaming)
+	// path those already-emitted rows can have scrolled into immutable native
+	// scrollback, and the commit auditor then re-anchors and recommits them —
+	// duplicating the summary table beside the next block. The streaming tail
+	// must therefore be append-only stable: every row above the growing last
+	// row keeps its exact bytes as the stream advances.
+	it("a streaming table's already-emitted rows are append-only stable (transient)", () => {
+		const table =
+			"Verification result:\n\n" +
+			"| Path | Status |\n| --- | --- |\n" +
+			"| doc/researches/sources/**/bin/obj | ignored (whole sources) |\n" +
+			"| product bin/obj | ignored (build-only) |\n" +
+			"| tracked bin/obj | 0 |\n" +
+			"| on-disk backend bin/obj | 28 (local residue) |";
+		const streaming = new Markdown("", 1, 0, THEME);
+		streaming.transientRenderCache = true;
+		let previous: string[] = [];
+		for (let len = 5; len <= table.length; len += 6) {
+			clearRenderCache();
+			streaming.setText(table.slice(0, len));
+			const rendered = streaming.render(60).map(line => Bun.stripANSI(line).trimEnd());
+			// Every row strictly above the last (still-growing) row must be
+			// byte-identical to the previous frame's row at the same index.
+			const compareUpTo = Math.min(rendered.length, previous.length) - 1;
+			for (let i = 0; i < compareUpTo; i++) {
+				expect(rendered[i]).toBe(previous[i]!);
+			}
+			previous = rendered;
+		}
+	});
+
+	// The settled-rows count the host commits to native scrollback must also be
+	// append-only stable while a table streams: a settled row that later changes
+	// bytes is exactly the stale commit that duplicates on finalize (#5341).
+	it("a streaming table exposes only append-only-stable settled rows (transient)", () => {
+		const table =
+			"Summary:\n\n" +
+			"| Key | Value |\n| --- | --- |\n" +
+			"| short | one |\n| a-much-longer-key-here | a considerably longer value |";
+		const streaming = new Markdown("", 1, 0, THEME);
+		streaming.transientRenderCache = true;
+		let previousSettled: string[] = [];
+		for (let len = 5; len <= table.length; len += 4) {
+			clearRenderCache();
+			streaming.setText(table.slice(0, len));
+			const rendered = streaming.render(60);
+			const settled = streaming.getLastRenderSettledRows();
+			const settledRows = rendered.slice(0, settled).map(line => Bun.stripANSI(line).trimEnd());
+			for (let i = 0; i < Math.min(settledRows.length, previousSettled.length); i++) {
+				expect(settledRows[i]).toBe(previousSettled[i]!);
+			}
+			previousSettled = settledRows;
+		}
+	});
+
+	// The completed table (final, non-transient render) still renders as a fully
+	// aligned box — the streaming raw-source view is only for the volatile tail.
+	it("a completed table renders aligned once frozen or finalized", () => {
+		const table = "Head:\n\n| A | B |\n| --- | --- |\n| xx | yyyy |\n| zzzz | w |\n\nTail line after the table.";
+		const streaming = new Markdown("", 1, 0, THEME);
+		streaming.transientRenderCache = true;
+		// Stream to completion, then a final non-transient render.
+		for (let len = 5; len <= table.length; len += 7) {
+			clearRenderCache();
+			streaming.setText(table.slice(0, len));
+			streaming.render(60);
+		}
+		streaming.transientRenderCache = false;
+		clearRenderCache();
+		streaming.setText(table);
+		const finalLines = streaming.render(60);
+		// Byte-identical to a cold render of the same instance config (paddingX 1).
+		clearRenderCache();
+		const cold = new Markdown(table, 1, 0, THEME).render(60);
+		expect(finalLines).toEqual(cold);
+		// A box border row proves it aligned rather than showing raw pipes.
+		expect(finalLines.some(line => /[+┌][-─]/.test(Bun.stripANSI(line)))).toBe(true);
+	});
 });
