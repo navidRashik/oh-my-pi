@@ -339,4 +339,27 @@ describe("Markdown incremental streaming lex (E2)", () => {
 		expect(finalized).toEqual(frozen);
 		expect(finalized.some(line => /[+┌][-─]/.test(Bun.stripANSI(line)))).toBe(false);
 	});
+
+	// A streamed raw-source table must still carry the instance's default text
+	// style (e.g. a thinking block's foreground/italic). The raw branch bypasses
+	// #renderInlineTokens, so it applies the default style itself; without it the
+	// styling would never return, since the raw representation is retained at
+	// finalization (#5341 review follow-up).
+	it("applies the default text style to raw streaming table rows", () => {
+		const table = "| Path | Status |\n| --- | --- |\n| src/main.ts | ignored (build residue here) |";
+		const marker = "\u0001STYLED\u0002";
+		const defaultStyle = { color: (text: string) => `${marker}${text}` };
+		const streaming = new Markdown("", 1, 0, THEME, defaultStyle);
+		streaming.transientRenderCache = true;
+		clearRenderCache();
+		streaming.setText(table);
+		const rendered = streaming.render(60);
+		const tableRows = rendered.filter(line => line.includes("|"));
+		expect(tableRows.length).toBeGreaterThan(0);
+		// Raw view (not the aligned box), and every non-blank row is styled.
+		expect(rendered.some(line => /[+┌][-─]/.test(Bun.stripANSI(line)))).toBe(false);
+		for (const row of tableRows) {
+			expect(row).toContain(marker);
+		}
+	});
 });

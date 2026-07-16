@@ -1623,7 +1623,15 @@ export class Markdown implements Component {
 					}
 				}
 				if (renderRaw) {
-					for (const rawLine of raw.split("\n")) lines.push(rawLine);
+					// Raw rows still carry the instance's default text style (a
+					// thinking block's foreground/italic) — styling the box cells
+					// goes through #renderInlineTokens, so the raw branch must too.
+					// Styling is deterministic per line, so append-only stability
+					// holds (and the commit auditor ignores SGR regardless).
+					const applyStyle = styleContext?.applyText ?? ((text: string) => this.#applyDefaultStyle(text));
+					for (const rawLine of raw.split("\n")) {
+						lines.push(rawLine === "" ? "" : applyStyle(rawLine));
+					}
 					if (nextTokenType && nextTokenType !== "space") lines.push("");
 					break;
 				}
