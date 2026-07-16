@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed disabling **Show Inline Images** leaving stale Kitty graphics over the transcript; runtime toggles now update tool and assistant image owners, delete tracked graphics, and replay committed scrollback with text fallbacks ([#5766](https://github.com/can1357/oh-my-pi/issues/5766)).
+
 ## [17.0.1] - 2026-07-16
 
 ### Changed

@@ -675,6 +675,41 @@ describe("TUI inline-image budget", () => {
 		}
 	});
 
+	it("deletes tracked Kitty graphics and retransmits them after a purge", async () => {
+		const term = new VirtualTerminal(40, 12);
+		const writes: string[] = [];
+		const realWrite = term.write.bind(term);
+		vi.spyOn(term, "write").mockImplementation((data: string) => {
+			writes.push(data);
+			realWrite(data);
+		});
+
+		const tui = new TUI(term);
+		const imageId = tui.imageBudget.acquireId("only");
+		tui.addChild(makeImage(tui.imageBudget, "only"));
+
+		try {
+			tui.start();
+			await settle(term);
+			writes.length = 0;
+
+			tui.purgeImages();
+
+			expect(writes.join("")).toContain(encodeKittyDeleteImage(imageId));
+			writes.length = 0;
+
+			tui.clear();
+			tui.addChild(makeImage(tui.imageBudget, "only"));
+			tui.requestRender(true, { clearScrollback: true });
+			await settle(term);
+
+			expect(writes.join("")).toContain("\x1b_Ga=t");
+			expect(writes.join("")).toContain(BASE64_ONE_PIXEL_PNG);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("transmits image data only once; a later full redraw re-emits just the placement", async () => {
 		const term = new VirtualTerminal(40, 12);
 		const writes: string[] = [];

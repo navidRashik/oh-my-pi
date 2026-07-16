@@ -1334,6 +1334,15 @@ export class TUI extends Container {
 		this.#imageBudget.setCap(cap);
 	}
 
+	/** Delete every tracked Kitty image and reset their transmit identities. */
+	purgeImages(): void {
+		const ids = this.#imageBudget.takeAllTransmittedIds();
+		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty) return;
+		for (const id of ids) {
+			this.terminal.write(encodeKittyDeleteImage(id));
+		}
+	}
+
 	/**
 	 * Get whether scrollback divergence rebuild is enabled.
 	 */
@@ -1750,11 +1759,7 @@ export class TUI extends Container {
 			this.#altPreviousLines = [];
 			this.#pendingAltExit = "";
 		}
-		if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
-			for (const id of this.#imageBudget.takeAllTransmittedIds()) {
-				this.terminal.write(encodeKittyDeleteImage(id));
-			}
-		}
+		this.purgeImages();
 		this.#clearSixelProbeState();
 		this.#stopped = true;
 		this.#watchdog.stop();

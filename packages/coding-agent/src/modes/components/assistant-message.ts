@@ -559,13 +559,14 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	#renderImageEntries(entries: Array<{ image: ImageContent; key: string }>, withLeadingSpacer: boolean): void {
-		if (!this.#showImages || entries.length === 0) return;
-		this.#convertImagesForKitty(entries);
+		if (entries.length === 0) return;
+		if (this.#showImages) this.#convertImagesForKitty(entries);
 
 		if (withLeadingSpacer) this.#contentContainer.addChild(new Spacer(1));
 		for (const { image, key } of entries) {
-			const displayImage =
-				TERMINAL.imageProtocol === ImageProtocol.Kitty && image.mimeType !== "image/png"
+			const displayImage = !this.#showImages
+				? undefined
+				: TERMINAL.imageProtocol === ImageProtocol.Kitty && image.mimeType !== "image/png"
 					? this.#convertedKittyImages.get(key)
 					: image;
 			if (TERMINAL.imageProtocol && displayImage) {
@@ -834,7 +835,7 @@ export class AssistantMessageComponent extends Container {
 				}
 			} else if (content.type === "image" && content.data && content.mimeType) {
 				this.#renderImageEntries([{ image: content, key: `native:${i}` }], hasRenderedContent);
-				hasRenderedContent ||= this.#showImages;
+				hasRenderedContent = true;
 			}
 		}
 

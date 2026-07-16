@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed runtime image visibility changes lacking a way to delete every tracked Kitty graphic and reset its transmit identity ([#5766](https://github.com/can1357/oh-my-pi/issues/5766)).
+
 ## [17.0.1] - 2026-07-16
 
 ### Added

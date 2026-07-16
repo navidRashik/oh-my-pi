@@ -1,15 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { ResolvedRoleModel } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
+import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 let settingsState: SettingsTestState | undefined;
@@ -314,5 +318,64 @@ describe("selector setting side effects", () => {
 		expect(setModelTemporary).not.toHaveBeenCalled();
 		expect(showModelCycleTrack).toHaveBeenCalledTimes(1);
 		expect(showError).not.toHaveBeenCalled();
+	});
+	it("replays image owners as fallbacks after disabling inline images", () => {
+		const previousProtocol = TERMINAL.imageProtocol;
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		const actions: string[] = [];
+		const ui = {
+			requestRender: vi.fn(),
+			requestComponentRender: vi.fn(),
+			purgeImages: () => actions.push("purge"),
+			resetDisplay: () => actions.push("reset"),
+		};
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{
+					type: "image",
+					data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==",
+					mimeType: "image/png",
+				},
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "test",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const assistant = new AssistantMessageComponent(message);
+		const tool = new ToolExecutionComponent("image_tool", {}, {}, undefined, ui);
+		tool.updateResult({ content: [message.content[0]] });
+		const controller = new SelectorController({
+			chatContainer: { children: [assistant, tool] },
+			ui,
+		} as unknown as InteractiveModeContext);
+
+		try {
+			controller.handleSettingChange("showImages", false);
+
+			expect(stripVTControlCharacters(assistant.render(80).join("\n"))).toContain("[Image: image/png]");
+			expect(stripVTControlCharacters(tool.render(80).join("\n"))).toContain("[Image: [image/png]");
+			expect(actions).toEqual(["purge", "reset"]);
+
+			actions.length = 0;
+			controller.handleSettingChange("showImages", true);
+
+			expect(assistant.render(80).join("\n")).toContain("\x1b_Ga=T");
+			expect(tool.render(80).join("\n")).toContain("\x1b_Ga=T");
+			expect(actions).toEqual(["reset"]);
+		} finally {
+			setTerminalImageProtocol(previousProtocol);
+			tool.dispose();
+		}
 	});
 });

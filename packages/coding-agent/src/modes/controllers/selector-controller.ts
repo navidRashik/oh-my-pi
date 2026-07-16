@@ -417,13 +417,19 @@ export class SelectorController {
 				break;
 
 			// Settings with UI side effects
-			case "showImages":
+			case "showImages": {
+				const showImages = value as boolean;
 				for (const child of this.ctx.chatContainer.children) {
 					if (child instanceof ToolExecutionComponent) {
-						child.setShowImages(value as boolean);
+						child.setShowImages(showImages);
+					} else if (child instanceof AssistantMessageComponent) {
+						child.setImagesVisible(showImages);
 					}
 				}
+				if (!showImages) this.ctx.ui.purgeImages();
+				this.ctx.ui.resetDisplay();
 				break;
+			}
 			case "hideThinkingBlock":
 				this.ctx.hideThinkingBlock = value as boolean;
 				for (const child of this.ctx.chatContainer.children) {
