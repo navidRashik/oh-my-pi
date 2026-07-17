@@ -38,6 +38,7 @@ import {
 	adaptSchemaForStrict,
 	findStrictToolSchemaViolation,
 	NO_STRICT,
+	normalizeSchemaForMoonshot,
 	sanitizeSchemaForOpenAIResponses,
 	toolWireSchema,
 } from "../utils/schema";
@@ -1000,7 +1001,17 @@ export function convertTools(
 		const strict = !NO_STRICT && strictMode && tool.strict !== false;
 		const baseParameters = toolWireSchema(tool);
 		const responseParameters = sanitizeSchemaForOpenAIResponses(baseParameters);
-		const { schema: parameters, strict: effectiveStrict } = adaptSchemaForStrict(responseParameters, strict);
+		const adapted = adaptSchemaForStrict(responseParameters, strict);
+		const effectiveStrict = adapted.strict;
+		// Moonshot's MFJS validator (native and via OpenRouter) rejects boolean
+		// subschemas and other standard-JSON-Schema constructs the wire pipeline
+		// emits (e.g. `outputSchema: true` from empty-schema widening). Normalize
+		// to MFJS on this transport too — the chat-completions path already does
+		// (#5918).
+		const parameters =
+			model.compat.toolSchemaFlavor === "moonshot-mfjs"
+				? (normalizeSchemaForMoonshot(adapted.schema) as Record<string, unknown>)
+				: adapted.schema;
 		// Quarantine a tool whose emitted schema carries a provider-rejecting
 		// enum/const-vs-type contradiction: dropping just that tool keeps the rest
 		// of the request valid instead of letting one bad MCP schema 400 the whole

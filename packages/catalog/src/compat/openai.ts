@@ -532,7 +532,13 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		supportsStrictMode: detectStrictModeSupport(provider, baseUrl),
 		extraBody: isDirectDeepseekReasoning ? { thinking: { type: "enabled" } } : undefined,
 		toolStrictMode: isCerebras ? "all_strict" : "mixed",
-		toolSchemaFlavor: isMoonshotNative ? "moonshot-mfjs" : undefined,
+		// Moonshot's MFJS validator also sits behind OpenRouter's Kimi routing
+		// (Moonshot AI is the primary `moonshotai/kimi-*` endpoint) and rejects
+		// boolean subschemas + other standard-JSON-Schema constructs. MFJS
+		// normalization only ever narrows to a valid standard schema, so it is
+		// safe even when OpenRouter routes a Kimi id to a non-Moonshot backend
+		// (#5918).
+		toolSchemaFlavor: isMoonshotNative || (isKimiModel && isOpenRouter) ? "moonshot-mfjs" : undefined,
 		streamIdleTimeoutMs,
 		stripDeepseekSpecialTokens:
 			isDeepseekModelIdOrName(spec.id) && (provider === "nvidia" || provider === "deepseek"),
@@ -672,6 +678,10 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 		streamIdleTimeoutMs: isLocalOpenAICompatBackend
 			? LOCAL_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS
 			: spec.compat?.streamIdleTimeoutMs,
+		// Kimi/Moonshot on a Responses endpoint (OpenRouter routes to Moonshot's
+		// MFJS validator) rejects boolean subschemas and other standard-JSON
+		// constructs; normalize tool parameters to MFJS (#5918).
+		toolSchemaFlavor: isKimiModel && isOpenRouter ? "moonshot-mfjs" : undefined,
 	};
 	applyCompatOverrides(compat, spec.compat);
 	if (spec.compat?.reasoningDisableMode === undefined) {

@@ -514,6 +514,13 @@ export interface ResolvedOpenAISharedCompat {
 	openRouterRouting?: OpenAICompat["openRouterRouting"];
 	/** Provider-specific wire model-id transform applied to the base id. */
 	wireModelIdMode: "raw" | "firepass" | "fireworks" | "openrouter";
+	/**
+	 * Tool-schema dialect the endpoint validates `tools.function.parameters`
+	 * against. `"moonshot-mfjs"` triggers Moonshot Flavored JSON Schema
+	 * normalization. Shared across the chat-completions and Responses transports
+	 * so OpenRouter-routed Moonshot/Kimi models sanitize on either path (#5918).
+	 */
+	toolSchemaFlavor?: OpenAICompat["toolSchemaFlavor"];
 }
 
 /**
@@ -584,7 +591,6 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 		thinkingKeep?: OpenAICompat["thinkingKeep"];
 		streamIdleTimeoutMs?: number;
 		toolStrictMode: ResolvedToolStrictMode;
-		toolSchemaFlavor?: OpenAICompat["toolSchemaFlavor"];
 		/** The model sits behind Vercel AI Gateway. */
 		isVercelGatewayHost: boolean;
 		dropThinkingWhenReasoningEffort: boolean;
