@@ -26,6 +26,7 @@ import {
 import { createBundledReferenceMap, createReferenceResolver, toModelSpec } from "./bundled-references";
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
+const KIMI_K3_THINKING: ThinkingConfig = { mode: "effort", efforts: [Effort.Max], requiresEffort: true };
 
 /**
  * Uses a cancellable timer rather than the native abort-timeout helper so
@@ -2528,15 +2529,18 @@ export function kimiCodeModelManagerOptions(
 						_context: OpenAICompatibleModelMapperContext<"openai-completions">,
 					): ModelSpec<"openai-completions"> => {
 						const id = defaults.id;
+						const isK3 = id === "k3";
 						return {
 							...defaults,
 							name: typeof entry.display_name === "string" ? entry.display_name : defaults.name,
-							reasoning: entry.supports_reasoning === true || id.includes("thinking"),
-							input: entry.supports_image_in === true || id.includes("k2.5") ? ["text", "image"] : ["text"],
+							reasoning: isK3 || entry.supports_reasoning === true || id.includes("thinking"),
+							input:
+								isK3 || entry.supports_image_in === true || id.includes("k2.5") ? ["text", "image"] : ["text"],
 							contextWindow: typeof entry.context_length === "number" ? entry.context_length : 262144,
 							maxTokens: 32000,
+							thinking: isK3 ? KIMI_K3_THINKING : undefined,
 							compat: {
-								thinkingFormat: "zai",
+								thinkingFormat: isK3 ? "openai" : "zai",
 								reasoningContentField: "reasoning_content",
 								supportsDeveloperRole: false,
 							},
@@ -2932,7 +2936,6 @@ export interface MoonshotModelManagerConfig {
 const MOONSHOT_KIMI_K3_COST = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 } as const;
 const MOONSHOT_KIMI_K3_CONTEXT_WINDOW = 1_048_576;
 const MOONSHOT_KIMI_K3_MAX_TOKENS = 131_072;
-const MOONSHOT_KIMI_K3_THINKING: ThinkingConfig = { mode: "effort", efforts: [Effort.Max], requiresEffort: true };
 
 export function moonshotModelManagerOptions(
 	config?: MoonshotModelManagerConfig,
@@ -2972,7 +2975,7 @@ export function moonshotModelManagerOptions(
 								cost: isZeroCost ? { ...MOONSHOT_KIMI_K3_COST } : model.cost,
 								contextWindow: model.contextWindow ?? MOONSHOT_KIMI_K3_CONTEXT_WINDOW,
 								maxTokens: model.maxTokens ?? MOONSHOT_KIMI_K3_MAX_TOKENS,
-								thinking: model.thinking ?? { ...MOONSHOT_KIMI_K3_THINKING },
+								thinking: model.thinking ?? { ...KIMI_K3_THINKING },
 							};
 						}
 						// Moonshot's K2.x family (K2.5, K2.6, kimi-k2-thinking, …) is reasoning-capable

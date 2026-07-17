@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `kimi-code/k3` catalog metadata to expose its supported max-only reasoning effort instead of generic unsupported tiers ([#5831](https://github.com/can1357/oh-my-pi/issues/5831)).
+
 ## [17.0.2] - 2026-07-17
 
 ### Changed

@@ -61,6 +61,7 @@ const GEMINI_3_FLASH_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, E
 const GPT_5_2_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
 const LOW_MEDIUM_HIGH_REASONING_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
+const MAX_ONLY_REASONING_EFFORTS: readonly Effort[] = [Effort.Max];
 /** Wire-exact two-tier scale (`high`/`max`): GLM-5.2 on Z.ai/Umans/Ollama Cloud/Baseten, Sakana Fugu, DeepSeek. */
 const HIGH_MAX_REASONING_EFFORTS: readonly Effort[] = [Effort.High, Effort.Max];
 /** OpenRouter's DeepSeek route accepts only `high`. */
@@ -173,7 +174,7 @@ function fillThinkingWireDefaults<TApi extends Api>(
 		thinking.supportsDisplay === undefined &&
 		(spec.api === "anthropic-messages" || spec.api === "bedrock-converse-stream") &&
 		supportsAdaptiveThinkingDisplay(spec.id);
-	const needsRequiresEffort = thinking.requiresEffort === undefined && impliesMandatoryReasoning(parsed, spec.id);
+	const needsRequiresEffort = thinking.requiresEffort === undefined && impliesMandatoryReasoning(parsed, spec);
 	if (!effortsChanged && !shouldReplaceEffortMap && !needsDisplay && !needsRequiresEffort) {
 		return thinking;
 	}
@@ -218,7 +219,7 @@ export function deriveThinking<TApi extends Api>(spec: ModelSpec<TApi>, compat: 
 	) {
 		config.supportsDisplay = true;
 	}
-	if (impliesMandatoryReasoning(parsed, spec.id)) {
+	if (impliesMandatoryReasoning(parsed, spec)) {
 		config.requiresEffort = true;
 	}
 	return config;
@@ -301,6 +302,9 @@ function getModelDefinedEfforts<TApi extends Api>(
 	spec: ModelSpec<TApi>,
 	compat: CompatOf<TApi>,
 ): readonly Effort[] | undefined {
+	if (spec.provider === "kimi-code" && spec.id === "k3") {
+		return MAX_ONLY_REASONING_EFFORTS;
+	}
 	if (isGlm52ReasoningEffortModelId(spec.id)) {
 		// GLM-5.2's reasoning_effort dialect is host-specific (verified against
 		// live endpoints):
@@ -539,14 +543,15 @@ const OPENAI_O_SERIES_RE = /^o[134](?:$|[-:.])/i;
  *   (variant-collapse) and the collapsed entry owns off — this floor protects
  *   the orphans.
  */
-function impliesMandatoryReasoning(parsed: ParsedModel, modelId: string): boolean {
+function impliesMandatoryReasoning<TApi extends Api>(parsed: ParsedModel, spec: ModelSpec<TApi>): boolean {
 	if (parsed.family === "gemini") {
 		if (semverGte(parsed.version, "3.0")) return true;
 		if (parsed.kind === "pro" && semverGte(parsed.version, "2.5")) return true;
 	}
-	if (isMinimaxM2FamilyModelId(modelId)) return true;
-	if (OPENAI_O_SERIES_RE.test(bareModelId(modelId))) return true;
-	return findThinkingVariantToken(modelId) !== undefined;
+	if (isMinimaxM2FamilyModelId(spec.id)) return true;
+	if (spec.provider === "kimi-code" && spec.id === "k3") return true;
+	if (OPENAI_O_SERIES_RE.test(bareModelId(spec.id))) return true;
+	return findThinkingVariantToken(spec.id) !== undefined;
 }
 
 function inferAnthropicSupportedEfforts<TApi extends Api>(

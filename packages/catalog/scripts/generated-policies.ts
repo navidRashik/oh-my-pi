@@ -233,6 +233,13 @@ function applyGeneratedModelPolicy(model: ModelSpec<Api>): void {
 	) {
 		model.contextWindow = 1_000_000;
 	}
+	if (model.provider === "kimi-code" && model.id === "k3") {
+		model.reasoning = true;
+		model.compat = {
+			...(model.compat ?? {}),
+			thinkingFormat: "openai",
+		};
+	}
 
 	if (
 		model.api === "openai-completions" &&
