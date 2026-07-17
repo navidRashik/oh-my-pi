@@ -518,8 +518,8 @@ const PREWALK_CONTINUE_MESSAGE_TYPE = "prewalk-continue";
  *  multi-site fixes, unnecessarily broad rewrites, and reported-test-only
  *  verification. */
 const PREWALK_CHECKLIST_MESSAGE_TYPE = "prewalk-checklist";
-/** Hidden steered notice announcing a mid-session `xd://` mount/unmount delta
- *  (see {@link AgentSession.#notifyXdevMountDelta}). */
+/** Hidden notice announcing a mid-session `xd://` mount/unmount delta, delivered
+ *  as passive context (see {@link AgentSession.#notifyXdevMountDelta}). */
 const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 /** Tools whose first successful call triggers the switch — once the todo
  *  gate is open (see {@link AgentSession.#prewalkTodoSeen}). Bash is
@@ -7307,12 +7307,21 @@ export class AgentSession {
 	}
 
 	/**
-	 * Announce a mid-session `xd://` mount delta to the model as a steered
-	 * system notice instead of rewriting the system prompt: the prompt (and
-	 * its provider cache prefix) stays byte-stable across MCP connects and
+	 * Announce a mid-session `xd://` mount delta to the model as passive
+	 * context instead of rewriting the system prompt: the prompt (and its
+	 * provider cache prefix) stays byte-stable across MCP connects and
 	 * disconnects, and the model learns about new devices from the notice
 	 * (docs + schema stay one `read xd://<tool>` away). The full docs join
 	 * the system prompt opportunistically on the next unrelated rebuild.
+	 *
+	 * The notice is tool-state, not a prompt: it MUST never force an
+	 * unsolicited assistant turn. A mid-turn mount folds the notice into the
+	 * next real turn via `#pendingNextTurnMessages` (a steer here would be
+	 * treated as pending work by the loop's stop-boundary poll and start a
+	 * second, unsolicited provider request — issue #5892). An idle mount lands
+	 * it directly in the transcript so it is context for whatever turn runs
+	 * next, without leaving a stale steer that could wake a spurious turn
+	 * (issues #5800, #5737).
 	 */
 	#notifyXdevMountDelta(previousMounted: ReadonlySet<string>): void {
 		const registry = this.#xdevRegistry;
@@ -7323,14 +7332,28 @@ export class AgentSession {
 		if (addedNames.length === 0 && removed.length === 0) return;
 		const summaries = new Map(registry.entries().map(entry => [entry.name, entry.summary]));
 		const added = addedNames.map(name => ({ name, summary: summaries.get(name) ?? "" }));
-		this.agent.steer({
+		const notice: CustomMessage = {
 			role: "custom",
 			customType: XDEV_MOUNT_NOTICE_MESSAGE_TYPE,
 			content: prompt.render(xdevMountNoticePrompt, { added, removed }),
 			attribution: "agent",
 			display: false,
 			timestamp: Date.now(),
-		});
+		};
+		if (this.isStreaming) {
+			// Fold into the next real turn as passive context; never force a turn.
+			this.#queueHiddenNextTurnMessage(notice, false);
+		} else {
+			// Idle: land it in the transcript so it is context for the next turn.
+			this.agent.appendMessage(notice);
+			this.sessionManager.appendCustomMessageEntry(
+				notice.customType,
+				notice.content,
+				notice.display,
+				notice.details,
+				notice.attribution,
+			);
+		}
 		if (this.settings.get("startup.quiet")) return;
 		const parts: string[] = [];
 		if (added.length > 0) parts.push(`mounted ${added.map(entry => entry.name).join(", ")}`);

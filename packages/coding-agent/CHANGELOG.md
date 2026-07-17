@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a mid-session `xd://` tool mount/unmount triggering an unsolicited second assistant response: the hidden mount notice is now delivered as passive context (folded into the next real turn, or appended to the transcript when idle) instead of a turn-forcing steer ([#5892](https://github.com/can1357/oh-my-pi/issues/5892)).
+
 ## [17.0.2] - 2026-07-17
 
 ### Added

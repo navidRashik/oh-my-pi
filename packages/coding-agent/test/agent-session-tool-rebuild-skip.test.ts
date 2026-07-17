@@ -514,7 +514,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(rebuildCount).toBe(2);
 	});
 
-	it("announces xd:// mount deltas as steered notices instead of rebuilding the prompt", async () => {
+	it("announces idle xd:// mount deltas as passive transcript context instead of rebuilding the prompt", async () => {
 		let rebuildCount = 0;
 		const { session } = newSession(
 			async toolNames => {
@@ -525,14 +525,19 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		);
 		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
 		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
+		// An idle mount is tool-state, not a prompt: it lands directly in the
+		// transcript as passive context and NEVER onto the turn-forcing steering
+		// queue (issue #5892).
 		const noticeTexts = () =>
+			session.agent.state.messages.flatMap(msg =>
+				msg.role === "custom" && msg.customType === "xdev-mount-notice" && typeof msg.content === "string"
+					? [msg.content]
+					: [],
+			);
+		const steeredNotices = () =>
 			session.agent
 				.peekSteeringQueue()
-				.flatMap(msg =>
-					msg.role === "custom" && msg.customType === "xdev-mount-notice" && typeof msg.content === "string"
-						? [msg.content]
-						: [],
-				);
+				.filter(msg => msg.role === "custom" && msg.customType === "xdev-mount-notice");
 
 		// First refresh: initial signature record → one rebuild; the MCP tool is
 		// discoverable, so it mounts as a device and is announced.
@@ -561,6 +566,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await session.refreshMCPTools([search]);
 		expect(rebuildCount).toBe(1);
 		expect(noticeTexts().length).toBe(noticeCount);
+
+		// No mount ever queued a turn-forcing steer.
+		expect(steeredNotices()).toEqual([]);
 	});
 
 	it("keeps xd:// mount deltas model-visible without rendering them during quiet startup", async () => {
@@ -578,9 +586,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 		expect(notices).toEqual([]);
 		expect(
-			session.agent
-				.peekSteeringQueue()
-				.some(message => message.role === "custom" && message.customType === "xdev-mount-notice"),
+			session.agent.state.messages.some(
+				message => message.role === "custom" && message.customType === "xdev-mount-notice",
+			),
 		).toBe(true);
 	});
 
