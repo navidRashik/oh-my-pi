@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved Kimi rate-limit reset timestamps in duration-based usage windows so `omp usage` reports can render reset countdowns. ([#5899](https://github.com/can1357/oh-my-pi/issues/5899))
+
 ## [17.0.2] - 2026-07-17
 
 ### Fixed

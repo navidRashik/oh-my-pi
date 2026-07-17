@@ -144,15 +144,17 @@ function buildUsageStatus(amount: UsageAmount): UsageStatus {
 }
 
 function toUsageLimit(row: KimiUsageRow, provider: string, index: number, accountId?: string): UsageLimit {
-	const window: UsageWindow | undefined =
-		row.window ??
-		(row.resetsAt
+	const window: UsageWindow | undefined = row.window
+		? row.window.resetsAt === undefined && row.resetsAt !== undefined
+			? { ...row.window, resetsAt: row.resetsAt }
+			: row.window
+		: row.resetsAt
 			? {
 					id: "default",
 					label: "Usage window",
 					resetsAt: row.resetsAt,
 				}
-			: undefined);
+			: undefined;
 
 	const amount = buildUsageAmount(row);
 	return {
