@@ -368,6 +368,30 @@ describe("TranscriptContainer", () => {
 		expect(history.renderCount).toBe(2);
 	});
 
+	it("keeps the full frame on a replay that arrives before any compaction", () => {
+		// The resume startup paint (renderInitialMessages + clearTerminalHistory)
+		// commits a prefix, then issues a destructive replay before an ordinary
+		// compaction frame ever runs — so #compactedChildStart is still 0. The
+		// replay compose must paint the COMPLETE transcript onto the freshly
+		// cleared tape; compacting the committed prefix here (against the stale
+		// pre-clear #committedRows) drops the leading blocks from both the tape
+		// and the frame, and only a later destructive replay brings them back —
+		// the resume-paint transcript-vanish of issue #5990.
+		const container = new TranscriptContainer();
+		const history = new VersionedFinalizedBlock(["committed-history"]);
+		const tail = new CountingFinalizedBlock(["retained-tail"]);
+		container.addChild(history);
+		container.addChild(tail);
+
+		expect(container.render(40)).toEqual(["committed-history", "", "retained-tail"]);
+		// Engine commits the leading block + separator, then replays WITHOUT a
+		// compaction frame in between (#compactedChildStart never advanced).
+		container.setNativeScrollbackCommittedRows(2);
+		container.prepareNativeScrollbackReplay();
+		container.setNativeScrollbackCommittedRows(2);
+		expect(container.render(40)).toEqual(["committed-history", "", "retained-tail"]);
+	});
+
 	it("does not re-render finalized rows already committed to native scrollback", () => {
 		const container = new TranscriptContainer();
 		const committed = new CountingFinalizedBlock(["committed"]);

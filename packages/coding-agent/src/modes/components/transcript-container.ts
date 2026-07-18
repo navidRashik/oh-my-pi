@@ -247,9 +247,19 @@ export class TranscriptContainer
 		// Replay retires the old terminal tape, so descendants may discard layout
 		// locks whose only purpose was keeping that immutable history byte-stable.
 		super.prepareNativeScrollbackReplay();
+		// The next compose must paint the COMPLETE frame onto the freshly cleared
+		// tape, so suppress its committed-prefix compaction unconditionally — even
+		// when nothing has been compacted yet (#compactedChildStart === 0). The
+		// pre-clear commit boundary still points at rows the ED3 just erased;
+		// letting compaction run against that stale #committedRows would drop the
+		// leading finalized blocks from the very frame meant to reprint them,
+		// leaving them on neither the tape nor the frame until the next replay
+		// (the resume-paint transcript-vanish, issue #5990). Rehydrating already
+		// compacted children additionally rewinds #compactedChildStart and clears
+		// the assembled rows so the whole history recomposes.
+		this.#replayPending = true;
 		if (this.#compactedChildStart === 0) return;
 		this.#compactedChildStart = 0;
-		this.#replayPending = true;
 		this.#generation++;
 		this.#lines.length = 0;
 		this.#stableRowsFloor = 0;
