@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Process, type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
 import { isEexist, isEnoent, logger, postmortem, procmgr, sanitizeText } from "@oh-my-pi/pi-utils";
-import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { truncateHead, truncateHeadBytes, truncateTail, truncateTailBytes } from "../session/streaming-output";
 import { workerEnvFromParent } from "../subprocess/worker-client";
 import { daemonBrokerEndpoint } from "./paths";
@@ -38,10 +37,7 @@ const PID_FILE = "broker.pid";
 const META_FILE = "meta.json";
 const LOG_FILE = "output.log";
 const PREVIOUS_LOG_FILE = "output.previous.log";
-const DAEMON_SPAWN_OPTIONS = resolveDaemonSpawnOptions({
-	platform: process.platform,
-	hostHasInheritableConsole: hostHasInheritableConsole(),
-});
+const DAEMON_SPAWN_OPTIONS = resolveDaemonSpawnOptions(process.platform);
 
 const SIGNAL_NUMBER: Record<DaemonSignal, number> = {
 	SIGINT: os.constants.signals.SIGINT,
