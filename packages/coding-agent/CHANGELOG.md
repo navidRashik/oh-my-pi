@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed local llama-server requests failing when the task tool's caller-provided output schema emitted an unsupported boolean JSON Schema ([#5948](https://github.com/can1357/oh-my-pi/issues/5948)).
+
 ## [17.0.3] - 2026-07-17
 
 ### Changed

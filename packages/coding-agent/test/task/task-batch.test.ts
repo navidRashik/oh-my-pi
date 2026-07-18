@@ -102,6 +102,7 @@ describe("task.batch schema gating", () => {
 		expect(offProperties.task).toBeDefined();
 		expect(offProperties.name).toBeDefined();
 		expect(offProperties.outputSchema).toBeDefined();
+		expect(offProperties.outputSchema).toEqual({ type: "object" });
 		expect(offProperties.schemaMode).toBeDefined();
 
 		const on = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
@@ -120,6 +121,7 @@ describe("task.batch schema gating", () => {
 		expect(items?.properties?.name).toBeDefined();
 		expect(items?.properties?.agent).toBeDefined();
 		expect(items?.properties?.outputSchema).toBeDefined();
+		expect(items?.properties?.outputSchema).toEqual({ type: "object" });
 		expect(items?.properties?.schemaMode).toBeDefined();
 	});
 
