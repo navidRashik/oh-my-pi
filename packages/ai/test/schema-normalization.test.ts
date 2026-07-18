@@ -1276,10 +1276,17 @@ describe("normalizeSchemaForMoonshot", () => {
 		expect(props.limit).toEqual({ type: "integer", default: 10 });
 	});
 
-	it("preserves boolean subschemas rather than synthesizing MFJS-forbidden not", () => {
+	it("coerces a `false` subschema to `{ not: {} }` (accept-nothing; #5918)", () => {
+		// Moonshot rejects the bare boolean but accepts `{ not: {} }` in every
+		// subschema slot; the draft-2020-12 closed-tuple `items: false` idiom is
+		// the common third-party source of a `false` subschema.
 		expect(normalizeSchemaForMoonshot({ type: "object", properties: { forbidden: false } })).toEqual({
 			type: "object",
-			properties: { forbidden: false },
+			properties: { forbidden: { not: {} } },
+		});
+		expect(normalizeSchemaForMoonshot({ type: "array", prefixItems: [{ type: "string" }], items: false })).toEqual({
+			type: "array",
+			items: { not: {} },
 		});
 	});
 
