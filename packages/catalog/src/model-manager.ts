@@ -108,9 +108,9 @@ interface CachedHeaderRestoreResult<TApi extends Api> {
 /**
  * Restore cache-omitted headers from the current static source.
  *
- * Dynamic-only header-bearing models cannot be reconstructed safely without
- * persisting arbitrary credential values; callers must refetch them online or
- * omit them from an offline result rather than return a broken model.
+ * Header-bearing models without a same-id or `requestModelId` static source
+ * cannot be reconstructed safely without persisting arbitrary credential
+ * values; callers must refetch or omit them rather than return a broken model.
  */
 function restoreCachedModelHeaders<TApi extends Api>(
 	cachedModels: readonly ModelSpec<TApi>[],
@@ -132,7 +132,8 @@ function restoreCachedModelHeaders<TApi extends Api>(
 			unresolvedModelIds.add(model.id);
 			return model;
 		}
-		const staticModel = staticById.get(model.id);
+		const staticModel =
+			staticById.get(model.id) ?? (model.requestModelId ? staticById.get(model.requestModelId) : undefined);
 		if (!staticModel?.headers) {
 			unresolvedModelIds.add(model.id);
 			return model;

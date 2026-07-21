@@ -1140,7 +1140,9 @@ export class ModelRegistry {
 					continue;
 				}
 				if (unrestorableHeaderIds.has(spec.id)) continue;
-				const bundledHeaders = bundledById?.get(spec.id)?.headers;
+				const bundledHeaders = (
+					bundledById?.get(spec.id) ?? (spec.requestModelId ? bundledById?.get(spec.requestModelId) : undefined)
+				)?.headers;
 				if (!bundledHeaders) continue;
 				models.push({ ...spec, headers: bundledHeaders });
 			}

@@ -226,7 +226,9 @@ export function writeModelCache<TApi extends Api>(
 			for (const model of models) {
 				if (hasModelHeaders(model)) {
 					headerOmittedModelIds.push(model.id);
-					if (!headersEqual(model.headers, staticById.get(model.id)?.headers)) {
+					const staticHeaderSource =
+						staticById.get(model.id) ?? (model.requestModelId ? staticById.get(model.requestModelId) : undefined);
+					if (!headersEqual(model.headers, staticHeaderSource?.headers)) {
 						unrestorableHeaderModelIds.push(model.id);
 					}
 				}

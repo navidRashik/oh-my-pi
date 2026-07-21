@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed cached model variants that reuse a bundled request model, including GitHub Copilot `-1m` entries, being discarded after request headers were sanitized from the cache. ([#6037](https://github.com/can1357/oh-my-pi/issues/6037))
+
 ## [17.0.5] - 2026-07-18
 
 ### Added

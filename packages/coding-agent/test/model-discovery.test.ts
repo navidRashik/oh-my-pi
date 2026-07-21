@@ -6,6 +6,7 @@ import { Effort, type FetchImpl, type Model } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { applyLlamaCppQwenThinking } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -278,6 +279,27 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(refreshCalls).toEqual([]);
 		expect(capture.modelListCalls).toBe(0);
 		expect(authStorage.getOAuthCredential("anthropic")?.access).toBe("sk-ant-oat-expired-anthropic");
+	});
+
+	test("restores cached request-model variants from bundled headers on startup", () => {
+		const bundledBase = getBundledModel("github-copilot", "gpt-5.6-sol");
+		if (!bundledBase?.headers) {
+			throw new Error("Expected bundled Copilot transport headers");
+		}
+		const cachedLongContextModel = buildModel({
+			...bundledBase,
+			id: "gpt-5.6-sol-1m",
+			requestModelId: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol (1M)",
+			contextWindow: 1_000_000,
+		});
+		writeModelCache("github-copilot", Date.now() - 60_000, [cachedLongContextModel], true, "", cacheDbPath, [
+			bundledBase,
+		]);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		expect(registry.find("github-copilot", "gpt-5.6-sol-1m")?.contextWindow).toBe(1_000_000);
 	});
 
 	test("online-if-uncached refreshes expired OAuth for authoritative providers even when the cache is fresh", async () => {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed GitHub Copilot 1M-context models disappearing on restart until the model picker was manually refreshed. ([#6037](https://github.com/can1357/oh-my-pi/issues/6037))
+
 ## [17.0.5] - 2026-07-18
 
 ### Added
