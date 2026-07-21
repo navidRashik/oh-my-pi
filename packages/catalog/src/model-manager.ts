@@ -108,9 +108,14 @@ interface CachedHeaderRestoreResult<TApi extends Api> {
 /**
  * Restore cache-omitted headers from the current static source.
  *
- * Header-bearing models without a same-id or `requestModelId` static source
- * cannot be reconstructed safely without persisting arbitrary credential
- * values; callers must refetch or omit them rather than return a broken model.
+ * A same-id static match is trusted only when the row did not flag the model
+ * unrestorable (its live headers matched static when cached). A synthesized
+ * variant instead recovers headers through `requestModelId`, whose static
+ * source is by construction where the variant's headers came from — this path
+ * is honoured even past a stale `unrestorable` marker written before the
+ * fallback existed. Models that resolve to no static headers cannot be rebuilt
+ * safely without persisting arbitrary credential values; callers must refetch
+ * or omit them rather than return a broken model.
  */
 function restoreCachedModelHeaders<TApi extends Api>(
 	cachedModels: readonly ModelSpec<TApi>[],
@@ -128,12 +133,9 @@ function restoreCachedModelHeaders<TApi extends Api>(
 	const unresolvedModelIds = new Set<string>();
 	const restored = models.map(model => {
 		if (!omittedIds.has(model.id)) return model;
-		if (unrestorableIds.has(model.id)) {
-			unresolvedModelIds.add(model.id);
-			return model;
-		}
 		const staticModel =
-			staticById.get(model.id) ?? (model.requestModelId ? staticById.get(model.requestModelId) : undefined);
+			(unrestorableIds.has(model.id) ? undefined : staticById.get(model.id)) ??
+			(model.requestModelId ? staticById.get(model.requestModelId) : undefined);
 		if (!staticModel?.headers) {
 			unresolvedModelIds.add(model.id);
 			return model;

@@ -302,6 +302,28 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(registry.find("github-copilot", "gpt-5.6-sol-1m")?.contextWindow).toBe(1_000_000);
 	});
 
+	test("restores legacy cache rows that stale-marked request-model variants unrestorable", () => {
+		const bundledBase = getBundledModel("github-copilot", "gpt-5.6-sol");
+		if (!bundledBase?.headers) {
+			throw new Error("Expected bundled Copilot transport headers");
+		}
+		const cachedLongContextModel = buildModel({
+			...bundledBase,
+			id: "gpt-5.6-sol-1m",
+			requestModelId: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol (1M)",
+			contextWindow: 1_000_000,
+		});
+		// Pre-fix writer only matched static headers by the model's own id, so
+		// the variant landed in unrestorable_header_model_ids. Reproduce that
+		// legacy row by omitting the static header source at write time.
+		writeModelCache("github-copilot", Date.now() - 60_000, [cachedLongContextModel], true, "", cacheDbPath);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		expect(registry.find("github-copilot", "gpt-5.6-sol-1m")?.contextWindow).toBe(1_000_000);
+	});
+
 	test("online-if-uncached refreshes expired OAuth for authoritative providers even when the cache is fresh", async () => {
 		// Regression for #5364: openai-codex is authoritative, so its bundled
 		// models are pruned only when the manager is actually constructed — which
