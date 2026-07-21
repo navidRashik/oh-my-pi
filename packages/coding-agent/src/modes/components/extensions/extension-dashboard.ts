@@ -257,7 +257,7 @@ export class ExtensionDashboard implements Component {
 	}
 
 	#handleProviderToggle(providerId: string): void {
-		toggleProvider(providerId);
+		toggleProvider(providerId, this.cwd);
 		void this.#refreshFromState();
 	}
 
