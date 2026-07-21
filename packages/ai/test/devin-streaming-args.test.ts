@@ -7,6 +7,7 @@ import { GetChatMessageResponseSchema } from "@oh-my-pi/pi-catalog/discovery/dev
 import { GetUserJwtResponseSchema } from "@oh-my-pi/pi-catalog/discovery/devin-gen/exa/auth_pb/auth_pb";
 import {
 	ChatToolCallSchema,
+	ModelUsageStatsSchema,
 	StopReason,
 } from "@oh-my-pi/pi-catalog/discovery/devin-gen/exa/codeium_common_pb/codeium_common_pb";
 
@@ -24,6 +25,25 @@ function toolCallDelta(argumentsJson: string, stopReason = StopReason.UNSPECIFIE
 		messageId: "msg-1",
 		stopReason,
 		deltaToolCalls: [create(ChatToolCallSchema, { id: "call-1", name: "task", argumentsJson })],
+	});
+	return frameConnectMessage(toBinary(GetChatMessageResponseSchema, msg));
+}
+
+function usageFrame(usage: {
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+}): Uint8Array {
+	const msg = create(GetChatMessageResponseSchema, {
+		messageId: "msg-1",
+		stopReason: StopReason.STOP_PATTERN,
+		usage: create(ModelUsageStatsSchema, {
+			inputTokens: BigInt(usage.inputTokens),
+			outputTokens: BigInt(usage.outputTokens),
+			cacheReadTokens: BigInt(usage.cacheReadTokens),
+			cacheWriteTokens: BigInt(usage.cacheWriteTokens),
+		}),
 	});
 	return frameConnectMessage(toBinary(GetChatMessageResponseSchema, msg));
 }
@@ -83,5 +103,35 @@ describe("streamDevin args streaming", () => {
 		expect(snapshots[2]).toBe(snapshots[0]);
 		expect(result.content[0]?.type).toBe("toolCall");
 		expect((result.content[0] as ToolCall).arguments).toEqual({ agent: "task", note: "initial", step: 12 });
+	});
+
+	it("counts cache read/write tokens in usage.totalTokens", async () => {
+		// Regression: cache-heavy Devin turns previously set totalTokens =
+		// input + output, hiding ~181k cache-read tokens from
+		// calculateContextTokens so auto-compaction never fired before the
+		// model window overflowed (#6084).
+		const authPayload = toBinary(GetUserJwtResponseSchema, create(GetUserJwtResponseSchema, { userJwt: "jwt" }));
+		const chunks = [
+			usageFrame({ inputTokens: 17_111, outputTokens: 666, cacheReadTokens: 181_248, cacheWriteTokens: 0 }),
+		];
+		const fetchImpl = (async (input: string | URL | Request) => {
+			const url = String(input);
+			if (url.includes("GetUserJwt")) return new Response(authPayload);
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						for (const chunk of chunks) controller.enqueue(chunk);
+						controller.close();
+					},
+				}),
+				{ status: 200 },
+			);
+		}) as typeof fetch;
+
+		const stream = streamDevin(devinModel, context, { apiKey: "token", fetch: fetchImpl });
+		const result = await stream.result();
+
+		expect(result.usage.cacheRead).toBe(181_248);
+		expect(result.usage.totalTokens).toBe(17_111 + 666 + 181_248);
 	});
 });

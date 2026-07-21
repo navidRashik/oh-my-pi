@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Devin (`streamDevin`) reporting `usage.totalTokens` as `input + output` only, which hid cache-read/write tokens from context accounting so auto-compaction never fired before the model window overflowed ([#6084](https://github.com/can1357/oh-my-pi/issues/6084)).
+
 ## [17.0.5] - 2026-07-18
 
 ### Changed
