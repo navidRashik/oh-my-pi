@@ -2202,50 +2202,69 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// path-scoped `enabledModels` allow-list when configured. Skip when the
 		// user explicitly requested a model via --model that wasn't found.
 		if (!model && deferredModelPatterns.length === 0) {
-			// Re-resolve the allowed set: extension factories above may have
-			// registered providers/models that weren't visible at startup.
-			const fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
+			// Resolve a startup model from the current registry catalog: retry the
+			// configured default role, then fall back to the first authed default.
+			// Factored so it can run again after an on-demand discovery pass below.
+			const resolveFallbackModel = async (): Promise<Model | undefined> => {
+				// Re-resolve the allowed set: extension factories above may have
+				// registered providers/models that weren't visible at startup.
+				const fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
 
-			// Retry the default-role lookup against the post-extension allowed
-			// set. Extension factories register providers AFTER the early
-			// `defaultRoleSpec` resolution, so a role pointing at an extension
-			// model (e.g. an openai-compat plugin's `posthog/claude-opus-4-8`)
-			// returned `undefined` there. Without this retry the next step's
-			// `pickDefaultAvailableModel` happily replaces the user's configured
-			// default with a bundled provider's default whenever a stray
-			// `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` is in the environment.
-			// (issue #3569)
-			if (!hasExplicitModel && !defaultRoleSpec.model) {
-				const reResolvedRoleSpec = resolveModelRoleValue(settings.getModelRole("default"), fallbackCandidates, {
-					settings,
-					matchPreferences: modelMatchPreferences,
-				});
-				if (reResolvedRoleSpec.model) {
-					defaultRoleSpec = reResolvedRoleSpec;
-					const resolvedDefaultModel = reResolvedRoleSpec.model;
-					model = resolvedDefaultModel;
-					modelFallbackMessage = undefined;
-					// Recompute the thinking level against the now-real model.
-					// `pickInitialThinkingLevel` closes over `defaultRoleSpec`,
-					// so the role's explicit selector (e.g. `:max`) now applies.
-					thinkingLevel = pickInitialThinkingLevel(resolvedDefaultModel);
-					autoThinking = thinkingLevel === AUTO_THINKING;
-					effectiveThinkingLevel = concreteThinkingLevel(thinkingLevel);
-					effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
-						autoThinking
-							? resolveProvisionalAutoLevel(resolvedDefaultModel)
-							: resolveThinkingLevelForModel(resolvedDefaultModel, effectiveThinkingLevel),
-					);
-					preconnectModelHost(resolvedDefaultModel.baseUrl);
+				// Retry the default-role lookup against the post-extension allowed
+				// set. Extension factories register providers AFTER the early
+				// `defaultRoleSpec` resolution, so a role pointing at an extension
+				// model (e.g. an openai-compat plugin's `posthog/claude-opus-4-8`)
+				// returned `undefined` there. Without this retry the next step's
+				// `pickDefaultAvailableModel` happily replaces the user's configured
+				// default with a bundled provider's default whenever a stray
+				// `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` is in the environment.
+				// (issue #3569)
+				if (!hasExplicitModel && !defaultRoleSpec.model) {
+					const reResolvedRoleSpec = resolveModelRoleValue(settings.getModelRole("default"), fallbackCandidates, {
+						settings,
+						matchPreferences: modelMatchPreferences,
+					});
+					if (reResolvedRoleSpec.model) {
+						defaultRoleSpec = reResolvedRoleSpec;
+						const resolvedDefaultModel = reResolvedRoleSpec.model;
+						modelFallbackMessage = undefined;
+						// Recompute the thinking level against the now-real model.
+						// `pickInitialThinkingLevel` closes over `defaultRoleSpec`,
+						// so the role's explicit selector (e.g. `:max`) now applies.
+						thinkingLevel = pickInitialThinkingLevel(resolvedDefaultModel);
+						autoThinking = thinkingLevel === AUTO_THINKING;
+						effectiveThinkingLevel = concreteThinkingLevel(thinkingLevel);
+						effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
+							autoThinking
+								? resolveProvisionalAutoLevel(resolvedDefaultModel)
+								: resolveThinkingLevelForModel(resolvedDefaultModel, effectiveThinkingLevel),
+						);
+						preconnectModelHost(resolvedDefaultModel.baseUrl);
+						return resolvedDefaultModel;
+					}
 				}
+
+				return pickDefaultAvailableModel(fallbackCandidates.filter(hasModelAuth));
+			};
+
+			model = await resolveFallbackModel();
+
+			// Cold start against a discovery-only local provider (lm-studio, ollama,
+			// llama.cpp): those ship no bundled models, so the static+cached catalog
+			// resolved nothing above. The background discovery in main.ts fires only
+			// AFTER createAgentSession returns, so on a cache-cold boot nothing has
+			// populated the catalog yet and a configured local default silently
+			// degrades to "No models available" — even though `omp models` (which
+			// awaits discovery) lists them. Await one cache-aware discovery pass and
+			// retry resolution, matching `omp models`. Gated on the already-failed
+			// resolution and the presence of discoverable providers, so the common
+			// path (a bundled provider's key resolves a model above) never pays for
+			// it. (issue #6114)
+			if (!model && !hasExplicitModel && modelRegistry.getDiscoverableProviders().length > 0) {
+				await logger.time("resolveModelDiscoveryFallback", () => modelRegistry.refresh("online-if-uncached"));
+				model = await resolveFallbackModel();
 			}
 
-			if (!model) {
-				const defaultModel = pickDefaultAvailableModel(fallbackCandidates.filter(hasModelAuth));
-				if (defaultModel) {
-					model = defaultModel;
-				}
-			}
 			if (model) {
 				if (modelFallbackMessage) {
 					modelFallbackMessage += `. Using ${model.provider}/${model.id}`;

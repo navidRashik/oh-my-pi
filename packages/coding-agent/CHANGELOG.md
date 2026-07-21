@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the configured default model for discovery-only local providers (LM Studio, Ollama, llama.cpp) being ignored on a cache-cold interactive launch, surfacing as "No models available" even though `omp models` listed them. Startup now awaits one cache-aware discovery pass and retries resolution when the initial fallback finds no model and discoverable providers exist ([#6114](https://github.com/can1357/oh-my-pi/issues/6114)).
+
 ## [17.0.5] - 2026-07-18
 
 ### Added
