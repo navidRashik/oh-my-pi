@@ -9949,9 +9949,9 @@
 		"openai.gpt-5.4": {
 			"id": "openai.gpt-5.4",
 			"name": "GPT-5.4",
-			"api": "bedrock-converse-stream",
+			"api": "openai-responses",
 			"provider": "amazon-bedrock",
-			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"baseUrl": "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
 			"reasoning": true,
 			"input": [
 				"text",
@@ -9978,9 +9978,9 @@
 		"openai.gpt-5.5": {
 			"id": "openai.gpt-5.5",
 			"name": "GPT-5.5",
-			"api": "bedrock-converse-stream",
+			"api": "openai-responses",
 			"provider": "amazon-bedrock",
-			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"baseUrl": "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
 			"reasoning": true,
 			"input": [
 				"text",
@@ -10008,9 +10008,9 @@
 		"openai.gpt-5.6-luna": {
 			"id": "openai.gpt-5.6-luna",
 			"name": "GPT-5.6 Luna",
-			"api": "bedrock-converse-stream",
+			"api": "openai-responses",
 			"provider": "amazon-bedrock",
-			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"baseUrl": "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
 			"reasoning": true,
 			"input": [
 				"text",
@@ -10038,9 +10038,9 @@
 		"openai.gpt-5.6-sol": {
 			"id": "openai.gpt-5.6-sol",
 			"name": "GPT-5.6 Sol",
-			"api": "bedrock-converse-stream",
+			"api": "openai-responses",
 			"provider": "amazon-bedrock",
-			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"baseUrl": "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
 			"reasoning": true,
 			"input": [
 				"text",
@@ -10068,9 +10068,9 @@
 		"openai.gpt-5.6-terra": {
 			"id": "openai.gpt-5.6-terra",
 			"name": "GPT-5.6 Terra",
-			"api": "bedrock-converse-stream",
+			"api": "openai-responses",
 			"provider": "amazon-bedrock",
-			"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+			"baseUrl": "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
 			"reasoning": true,
 			"input": [
 				"text",
