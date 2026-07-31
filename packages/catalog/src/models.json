@@ -13109,7 +13109,8 @@
 			},
 			"contextWindow": 8192,
 			"maxTokens": 5000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"moonshotai/Kimi-K2.6": {
 			"id": "moonshotai/Kimi-K2.6",
@@ -13274,7 +13275,8 @@
 			},
 			"contextWindow": 32768,
 			"maxTokens": 5000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"thinkingmachines/inkling": {
 			"id": "thinkingmachines/inkling",
@@ -13317,7 +13319,8 @@
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 32768,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"zai-org/GLM-4.7": {
 			"id": "zai-org/GLM-4.7",
@@ -15688,7 +15691,8 @@
 					"high": "claude-4-sonnet-thinking"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-4.5-opus-high": {
 			"id": "claude-4.5-opus-high",
@@ -15726,7 +15730,8 @@
 				}
 			},
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-4.5-sonnet": {
 			"id": "claude-4.5-sonnet",
@@ -15764,7 +15769,8 @@
 				}
 			},
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-4.6-opus-high": {
 			"id": "claude-4.6-opus-high",
@@ -15801,7 +15807,8 @@
 				}
 			},
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-4.6-opus-max": {
 			"id": "claude-4.6-opus-max",
@@ -15839,7 +15846,8 @@
 					"high": "claude-4.6-opus-max-thinking"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-4.6-sonnet-medium": {
 			"id": "claude-4.6-sonnet-medium",
@@ -15876,7 +15884,8 @@
 				}
 			},
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-fable-5-high": {
 			"id": "claude-fable-5-high",
@@ -15914,7 +15923,8 @@
 					"high": "claude-fable-5-thinking-high"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-fable-5-low": {
 			"id": "claude-fable-5-low",
@@ -15952,7 +15962,8 @@
 					"high": "claude-fable-5-thinking-low"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-fable-5-max": {
 			"id": "claude-fable-5-max",
@@ -15990,7 +16001,8 @@
 					"high": "claude-fable-5-thinking-max"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-fable-5-medium": {
 			"id": "claude-fable-5-medium",
@@ -16028,7 +16040,8 @@
 					"high": "claude-fable-5-thinking-medium"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-fable-5-xhigh": {
 			"id": "claude-fable-5-xhigh",
@@ -16066,7 +16079,8 @@
 					"high": "claude-fable-5-thinking-xhigh"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-7-high": {
 			"id": "claude-opus-4-7-high",
@@ -16104,7 +16118,8 @@
 					"high": "claude-opus-4-7-thinking-high"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-7-high-fast": {
 			"id": "claude-opus-4-7-high-fast",
@@ -16142,7 +16157,8 @@
 					"high": "claude-opus-4-7-thinking-high-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-7-low": {
 			"id": "claude-opus-4-7-low",
@@ -16180,7 +16196,8 @@
 					"high": "claude-opus-4-7-thinking-low"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-7-low-fast": {
 			"id": "claude-opus-4-7-low-fast",
@@ -16218,7 +16235,8 @@
 					"high": "claude-opus-4-7-thinking-low-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-7-max": {
 			"id": "claude-opus-4-7-max",
@@ -16256,7 +16274,8 @@
 					"high": "claude-opus-4-7-thinking-max"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-7-max-fast": {
 			"id": "claude-opus-4-7-max-fast",
@@ -16294,7 +16313,8 @@
 					"high": "claude-opus-4-7-thinking-max-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-7-medium": {
 			"id": "claude-opus-4-7-medium",
@@ -16332,7 +16352,8 @@
 					"high": "claude-opus-4-7-thinking-medium"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-7-medium-fast": {
 			"id": "claude-opus-4-7-medium-fast",
@@ -16370,7 +16391,8 @@
 					"high": "claude-opus-4-7-thinking-medium-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-7-xhigh": {
 			"id": "claude-opus-4-7-xhigh",
@@ -16408,7 +16430,8 @@
 					"high": "claude-opus-4-7-thinking-xhigh"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-7-xhigh-fast": {
 			"id": "claude-opus-4-7-xhigh-fast",
@@ -16446,7 +16469,8 @@
 					"high": "claude-opus-4-7-thinking-xhigh-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-8-high": {
 			"id": "claude-opus-4-8-high",
@@ -16484,7 +16508,8 @@
 					"high": "claude-opus-4-8-thinking-high"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-8-high-fast": {
 			"id": "claude-opus-4-8-high-fast",
@@ -16522,7 +16547,8 @@
 					"high": "claude-opus-4-8-thinking-high-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-8-low": {
 			"id": "claude-opus-4-8-low",
@@ -16560,7 +16586,8 @@
 					"high": "claude-opus-4-8-thinking-low"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-8-low-fast": {
 			"id": "claude-opus-4-8-low-fast",
@@ -16598,7 +16625,8 @@
 					"high": "claude-opus-4-8-thinking-low-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-8-max": {
 			"id": "claude-opus-4-8-max",
@@ -16636,7 +16664,8 @@
 					"high": "claude-opus-4-8-thinking-max"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-8-max-fast": {
 			"id": "claude-opus-4-8-max-fast",
@@ -16674,7 +16703,8 @@
 					"high": "claude-opus-4-8-thinking-max-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-8-medium": {
 			"id": "claude-opus-4-8-medium",
@@ -16712,7 +16742,8 @@
 					"high": "claude-opus-4-8-thinking-medium"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-8-medium-fast": {
 			"id": "claude-opus-4-8-medium-fast",
@@ -16750,7 +16781,8 @@
 					"high": "claude-opus-4-8-thinking-medium-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-8-xhigh": {
 			"id": "claude-opus-4-8-xhigh",
@@ -16788,7 +16820,8 @@
 					"high": "claude-opus-4-8-thinking-xhigh"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-4-8-xhigh-fast": {
 			"id": "claude-opus-4-8-xhigh-fast",
@@ -16826,7 +16859,8 @@
 					"high": "claude-opus-4-8-thinking-xhigh-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-5-high": {
 			"id": "claude-opus-5-high",
@@ -16864,7 +16898,8 @@
 					"high": "claude-opus-5-thinking-high"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-5-high-fast": {
 			"id": "claude-opus-5-high-fast",
@@ -16902,7 +16937,8 @@
 					"high": "claude-opus-5-thinking-high-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-5-low": {
 			"id": "claude-opus-5-low",
@@ -16940,7 +16976,8 @@
 					"high": "claude-opus-5-thinking-low"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-5-low-fast": {
 			"id": "claude-opus-5-low-fast",
@@ -16978,7 +17015,8 @@
 					"high": "claude-opus-5-thinking-low-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-5-medium": {
 			"id": "claude-opus-5-medium",
@@ -17016,7 +17054,8 @@
 					"high": "claude-opus-5-thinking-medium"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-5-medium-fast": {
 			"id": "claude-opus-5-medium-fast",
@@ -17054,7 +17093,8 @@
 					"high": "claude-opus-5-thinking-medium-fast"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-5-thinking-max": {
 			"id": "claude-opus-5-thinking-max",
@@ -17076,7 +17116,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-5-thinking-max-fast": {
 			"id": "claude-opus-5-thinking-max-fast",
@@ -17098,7 +17139,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": true,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-5-thinking-xhigh": {
 			"id": "claude-opus-5-thinking-xhigh",
@@ -17120,7 +17162,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-opus-5-thinking-xhigh-fast": {
 			"id": "claude-opus-5-thinking-xhigh-fast",
@@ -17142,7 +17185,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": true,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-sonnet-5-high": {
 			"id": "claude-sonnet-5-high",
@@ -17180,7 +17224,8 @@
 					"high": "claude-sonnet-5-thinking-high"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-sonnet-5-low": {
 			"id": "claude-sonnet-5-low",
@@ -17218,7 +17263,8 @@
 					"high": "claude-sonnet-5-thinking-low"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-sonnet-5-max": {
 			"id": "claude-sonnet-5-max",
@@ -17256,7 +17302,8 @@
 					"high": "claude-sonnet-5-thinking-max"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-sonnet-5-medium": {
 			"id": "claude-sonnet-5-medium",
@@ -17294,7 +17341,8 @@
 					"high": "claude-sonnet-5-thinking-medium"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"claude-sonnet-5-xhigh": {
 			"id": "claude-sonnet-5-xhigh",
@@ -17332,7 +17380,8 @@
 					"high": "claude-sonnet-5-thinking-xhigh"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"composer-1": {
 			"id": "composer-1",
@@ -17352,7 +17401,8 @@
 			},
 			"contextWindow": 200000,
 			"maxTokens": 64000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"composer-1.5": {
 			"id": "composer-1.5",
@@ -17372,7 +17422,8 @@
 			},
 			"contextWindow": 200000,
 			"maxTokens": 64000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"composer-2.5": {
 			"id": "composer-2.5",
@@ -17393,7 +17444,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"composer-2.5-fast": {
 			"id": "composer-2.5-fast",
@@ -17414,7 +17466,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"cursor-grok-4.5-high": {
 			"id": "cursor-grok-4.5-high",
@@ -17435,7 +17488,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"cursor-grok-4.5-high-fast": {
 			"id": "cursor-grok-4.5-high-fast",
@@ -17456,7 +17510,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"cursor-grok-4.5-low": {
 			"id": "cursor-grok-4.5-low",
@@ -17477,7 +17532,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"cursor-grok-4.5-low-fast": {
 			"id": "cursor-grok-4.5-low-fast",
@@ -17498,7 +17554,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"cursor-grok-4.5-medium": {
 			"id": "cursor-grok-4.5-medium",
@@ -17519,7 +17576,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"cursor-grok-4.5-medium-fast": {
 			"id": "cursor-grok-4.5-medium-fast",
@@ -17540,7 +17598,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"default": {
 			"id": "default",
@@ -17562,7 +17621,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gemini-3-flash": {
 			"id": "gemini-3-flash",
@@ -17594,7 +17654,8 @@
 				"requiresEffort": true
 			},
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gemini-3-pro": {
 			"id": "gemini-3-pro",
@@ -17623,7 +17684,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gemini-3.1-pro": {
 			"id": "gemini-3.1-pro",
@@ -17653,7 +17715,8 @@
 				"requiresEffort": true
 			},
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gemini-3.5-flash": {
 			"id": "gemini-3.5-flash",
@@ -17685,7 +17748,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gemini-3.6-flash-high": {
 			"id": "gemini-3.6-flash-high",
@@ -17707,7 +17771,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gemini-3.6-flash-low": {
 			"id": "gemini-3.6-flash-low",
@@ -17729,7 +17794,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gemini-3.6-flash-medium": {
 			"id": "gemini-3.6-flash-medium",
@@ -17751,7 +17817,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gemini-3.6-flash-minimal": {
 			"id": "gemini-3.6-flash-minimal",
@@ -17773,7 +17840,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"glm-5.2-high": {
 			"id": "glm-5.2-high",
@@ -17794,7 +17862,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"glm-5.2-max": {
 			"id": "glm-5.2-max",
@@ -17815,7 +17884,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5-mini": {
 			"id": "gpt-5-mini",
@@ -17846,7 +17916,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.1": {
 			"id": "gpt-5.1",
@@ -17877,7 +17948,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.1-codex-max": {
 			"id": "gpt-5.1-codex-max",
@@ -17907,7 +17979,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.1-codex-max-high": {
 			"id": "gpt-5.1-codex-max-high",
@@ -17937,7 +18010,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.1-codex-mini": {
 			"id": "gpt-5.1-codex-mini",
@@ -17965,7 +18039,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.1-high": {
 			"id": "gpt-5.1-high",
@@ -17986,7 +18061,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.1-low": {
 			"id": "gpt-5.1-low",
@@ -18008,7 +18084,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2": {
 			"id": "gpt-5.2",
@@ -18039,7 +18116,8 @@
 				]
 			},
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-codex": {
 			"id": "gpt-5.2-codex",
@@ -18069,7 +18147,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-codex-fast": {
 			"id": "gpt-5.2-codex-fast",
@@ -18089,7 +18168,8 @@
 			},
 			"contextWindow": 272000,
 			"maxTokens": 64000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-codex-high": {
 			"id": "gpt-5.2-codex-high",
@@ -18109,7 +18189,8 @@
 			},
 			"contextWindow": 272000,
 			"maxTokens": 64000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-codex-high-fast": {
 			"id": "gpt-5.2-codex-high-fast",
@@ -18129,7 +18210,8 @@
 			},
 			"contextWindow": 272000,
 			"maxTokens": 64000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-codex-low": {
 			"id": "gpt-5.2-codex-low",
@@ -18149,7 +18231,8 @@
 			},
 			"contextWindow": 272000,
 			"maxTokens": 64000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-codex-low-fast": {
 			"id": "gpt-5.2-codex-low-fast",
@@ -18169,7 +18252,8 @@
 			},
 			"contextWindow": 272000,
 			"maxTokens": 64000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-codex-xhigh": {
 			"id": "gpt-5.2-codex-xhigh",
@@ -18189,7 +18273,8 @@
 			},
 			"contextWindow": 272000,
 			"maxTokens": 64000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-codex-xhigh-fast": {
 			"id": "gpt-5.2-codex-xhigh-fast",
@@ -18209,7 +18294,8 @@
 			},
 			"contextWindow": 272000,
 			"maxTokens": 64000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-fast": {
 			"id": "gpt-5.2-fast",
@@ -18231,7 +18317,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-high": {
 			"id": "gpt-5.2-high",
@@ -18262,7 +18349,8 @@
 				]
 			},
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-high-fast": {
 			"id": "gpt-5.2-high-fast",
@@ -18284,7 +18372,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-low": {
 			"id": "gpt-5.2-low",
@@ -18306,7 +18395,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-low-fast": {
 			"id": "gpt-5.2-low-fast",
@@ -18328,7 +18418,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-xhigh": {
 			"id": "gpt-5.2-xhigh",
@@ -18350,7 +18441,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.2-xhigh-fast": {
 			"id": "gpt-5.2-xhigh-fast",
@@ -18372,7 +18464,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.3-codex": {
 			"id": "gpt-5.3-codex",
@@ -18403,7 +18496,8 @@
 				]
 			},
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.3-codex-fast": {
 			"id": "gpt-5.3-codex-fast",
@@ -18424,7 +18518,8 @@
 			"contextWindow": 272000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.3-codex-high": {
 			"id": "gpt-5.3-codex-high",
@@ -18445,7 +18540,8 @@
 			"contextWindow": 272000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.3-codex-high-fast": {
 			"id": "gpt-5.3-codex-high-fast",
@@ -18466,7 +18562,8 @@
 			"contextWindow": 272000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.3-codex-low": {
 			"id": "gpt-5.3-codex-low",
@@ -18487,7 +18584,8 @@
 			"contextWindow": 272000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.3-codex-low-fast": {
 			"id": "gpt-5.3-codex-low-fast",
@@ -18508,7 +18606,8 @@
 			"contextWindow": 272000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.3-codex-spark-preview": {
 			"id": "gpt-5.3-codex-spark-preview",
@@ -18529,7 +18628,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.5-low"
+			"contextPromotionTarget": "cursor/gpt-5.5-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.3-codex-xhigh": {
 			"id": "gpt-5.3-codex-xhigh",
@@ -18550,7 +18650,8 @@
 			"contextWindow": 272000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.3-codex-xhigh-fast": {
 			"id": "gpt-5.3-codex-xhigh-fast",
@@ -18571,7 +18672,8 @@
 			"contextWindow": 272000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-high": {
 			"id": "gpt-5.4-high",
@@ -18592,7 +18694,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-high-fast": {
 			"id": "gpt-5.4-high-fast",
@@ -18613,7 +18716,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-low": {
 			"id": "gpt-5.4-low",
@@ -18634,7 +18738,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-medium": {
 			"id": "gpt-5.4-medium",
@@ -18655,7 +18760,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-medium-fast": {
 			"id": "gpt-5.4-medium-fast",
@@ -18676,7 +18782,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-mini-high": {
 			"id": "gpt-5.4-mini-high",
@@ -18698,7 +18805,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-mini-low": {
 			"id": "gpt-5.4-mini-low",
@@ -18720,7 +18828,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-mini-medium": {
 			"id": "gpt-5.4-mini-medium",
@@ -18742,7 +18851,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-mini-none": {
 			"id": "gpt-5.4-mini-none",
@@ -18764,7 +18874,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-mini-xhigh": {
 			"id": "gpt-5.4-mini-xhigh",
@@ -18786,7 +18897,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-nano-high": {
 			"id": "gpt-5.4-nano-high",
@@ -18808,7 +18920,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-nano-low": {
 			"id": "gpt-5.4-nano-low",
@@ -18830,7 +18943,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-nano-medium": {
 			"id": "gpt-5.4-nano-medium",
@@ -18852,7 +18966,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-nano-none": {
 			"id": "gpt-5.4-nano-none",
@@ -18874,7 +18989,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-nano-xhigh": {
 			"id": "gpt-5.4-nano-xhigh",
@@ -18896,7 +19012,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-xhigh": {
 			"id": "gpt-5.4-xhigh",
@@ -18917,7 +19034,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-xhigh-fast": {
 			"id": "gpt-5.4-xhigh-fast",
@@ -18938,7 +19056,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"supportsComputerUse": false,
-			"cursorMaxMode": false
+			"cursorMaxMode": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-extra-high": {
 			"id": "gpt-5.5-extra-high",
@@ -18961,7 +19080,8 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low"
+			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-extra-high-fast": {
 			"id": "gpt-5.5-extra-high-fast",
@@ -18984,7 +19104,8 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low"
+			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-high": {
 			"id": "gpt-5.5-high",
@@ -19007,7 +19128,8 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low"
+			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-high-fast": {
 			"id": "gpt-5.5-high-fast",
@@ -19030,7 +19152,8 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low"
+			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-low": {
 			"id": "gpt-5.5-low",
@@ -19053,7 +19176,8 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low"
+			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-low-fast": {
 			"id": "gpt-5.5-low-fast",
@@ -19076,7 +19200,8 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low"
+			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-medium": {
 			"id": "gpt-5.5-medium",
@@ -19099,7 +19224,8 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low"
+			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-medium-fast": {
 			"id": "gpt-5.5-medium-fast",
@@ -19122,7 +19248,8 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low"
+			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-none": {
 			"id": "gpt-5.5-none",
@@ -19145,7 +19272,8 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low"
+			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-none-fast": {
 			"id": "gpt-5.5-none-fast",
@@ -19168,7 +19296,8 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low"
+			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-high": {
 			"id": "gpt-5.6-luna-high",
@@ -19190,7 +19319,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-high-fast": {
 			"id": "gpt-5.6-luna-high-fast",
@@ -19212,7 +19342,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-low": {
 			"id": "gpt-5.6-luna-low",
@@ -19234,7 +19365,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-low-fast": {
 			"id": "gpt-5.6-luna-low-fast",
@@ -19256,7 +19388,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-max": {
 			"id": "gpt-5.6-luna-max",
@@ -19278,7 +19411,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-max-fast": {
 			"id": "gpt-5.6-luna-max-fast",
@@ -19300,7 +19434,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-medium": {
 			"id": "gpt-5.6-luna-medium",
@@ -19322,7 +19457,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-medium-fast": {
 			"id": "gpt-5.6-luna-medium-fast",
@@ -19344,7 +19480,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-none": {
 			"id": "gpt-5.6-luna-none",
@@ -19366,7 +19503,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-none-fast": {
 			"id": "gpt-5.6-luna-none-fast",
@@ -19388,7 +19526,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-xhigh": {
 			"id": "gpt-5.6-luna-xhigh",
@@ -19410,7 +19549,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-xhigh-fast": {
 			"id": "gpt-5.6-luna-xhigh-fast",
@@ -19432,7 +19572,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-high": {
 			"id": "gpt-5.6-sol-high",
@@ -19454,7 +19595,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-high-fast": {
 			"id": "gpt-5.6-sol-high-fast",
@@ -19476,7 +19618,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-low": {
 			"id": "gpt-5.6-sol-low",
@@ -19498,7 +19641,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-low-fast": {
 			"id": "gpt-5.6-sol-low-fast",
@@ -19520,7 +19664,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-max": {
 			"id": "gpt-5.6-sol-max",
@@ -19542,7 +19687,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-max-fast": {
 			"id": "gpt-5.6-sol-max-fast",
@@ -19564,7 +19710,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-medium": {
 			"id": "gpt-5.6-sol-medium",
@@ -19586,7 +19733,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-medium-fast": {
 			"id": "gpt-5.6-sol-medium-fast",
@@ -19608,7 +19756,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-none": {
 			"id": "gpt-5.6-sol-none",
@@ -19630,7 +19779,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-none-fast": {
 			"id": "gpt-5.6-sol-none-fast",
@@ -19652,7 +19802,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-xhigh": {
 			"id": "gpt-5.6-sol-xhigh",
@@ -19674,7 +19825,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-xhigh-fast": {
 			"id": "gpt-5.6-sol-xhigh-fast",
@@ -19696,7 +19848,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-high": {
 			"id": "gpt-5.6-terra-high",
@@ -19718,7 +19871,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-high-fast": {
 			"id": "gpt-5.6-terra-high-fast",
@@ -19740,7 +19894,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-low": {
 			"id": "gpt-5.6-terra-low",
@@ -19762,7 +19917,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-low-fast": {
 			"id": "gpt-5.6-terra-low-fast",
@@ -19784,7 +19940,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-max": {
 			"id": "gpt-5.6-terra-max",
@@ -19806,7 +19963,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-max-fast": {
 			"id": "gpt-5.6-terra-max-fast",
@@ -19828,7 +19986,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-medium": {
 			"id": "gpt-5.6-terra-medium",
@@ -19850,7 +20009,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-medium-fast": {
 			"id": "gpt-5.6-terra-medium-fast",
@@ -19872,7 +20032,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-none": {
 			"id": "gpt-5.6-terra-none",
@@ -19894,7 +20055,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-none-fast": {
 			"id": "gpt-5.6-terra-none-fast",
@@ -19916,7 +20078,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-xhigh": {
 			"id": "gpt-5.6-terra-xhigh",
@@ -19938,7 +20101,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-xhigh-fast": {
 			"id": "gpt-5.6-terra-xhigh-fast",
@@ -19960,7 +20124,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"grok-code-fast-1": {
 			"id": "grok-code-fast-1",
@@ -19989,7 +20154,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"kimi-k2.5": {
 			"id": "kimi-k2.5",
@@ -20019,7 +20185,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"kimi-k2.7-code": {
 			"id": "kimi-k2.7-code",
@@ -20050,7 +20217,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"kimi-k3-high": {
 			"id": "kimi-k3-high",
@@ -20071,7 +20239,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"kimi-k3-low": {
 			"id": "kimi-k3-low",
@@ -20092,7 +20261,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"kimi-k3-max": {
 			"id": "kimi-k3-max",
@@ -20113,7 +20283,8 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		}
 	},
 	"deepseek": {
@@ -22864,7 +23035,7 @@
 			"cost": {
 				"input": 0.14,
 				"output": 0.28,
-				"cacheRead": 0,
+				"cacheRead": 0.028,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -44962,7 +45133,8 @@
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 384000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"deepseek/deepseek-v4-flash:thinking": {
 			"id": "deepseek/deepseek-v4-flash:thinking",
@@ -58212,7 +58384,8 @@
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 131072,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"TEE/llama3-3-70b": {
 			"id": "TEE/llama3-3-70b",
@@ -58894,7 +59067,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"THUDM/GLM-4-32B-0414": {
 			"id": "THUDM/GLM-4-32B-0414",
@@ -61927,7 +62101,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"mindai/macaron-v1-venti": {
 			"id": "mindai/macaron-v1-venti",
@@ -74287,7 +74462,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-haiku-4.5": {
 			"id": "anthropic/claude-haiku-4.5",
@@ -74348,7 +74524,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-opus-4": {
 			"id": "anthropic/claude-opus-4",
@@ -74440,7 +74617,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-opus-4.5": {
 			"id": "anthropic/claude-opus-4.5",
@@ -74501,7 +74679,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-opus-4.6": {
 			"id": "anthropic/claude-opus-4.6",
@@ -74593,7 +74772,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-opus-4.7": {
 			"id": "anthropic/claude-opus-4.7",
@@ -74688,7 +74868,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-opus-4.8": {
 			"id": "anthropic/claude-opus-4.8",
@@ -74783,7 +74964,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-opus-5": {
 			"id": "anthropic/claude-opus-5",
@@ -74939,7 +75121,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-sonnet-4.6": {
 			"id": "anthropic/claude-sonnet-4.6",
@@ -75033,7 +75216,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"arcee-ai/trinity-large-preview": {
 			"id": "arcee-ai/trinity-large-preview",
@@ -75820,7 +76004,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"deepseek/deepseek-v4-flash:free": {
 			"id": "deepseek/deepseek-v4-flash:free",
@@ -76062,7 +76247,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-2.5-flash-preview-09-2025": {
 			"id": "google/gemini-2.5-flash-preview-09-2025",
@@ -76123,7 +76309,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-2.5-pro": {
 			"id": "google/gemini-2.5-pro",
@@ -76250,7 +76437,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-3-flash-preview": {
 			"id": "google/gemini-3-flash-preview",
@@ -76313,7 +76501,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-3-pro-image": {
 			"id": "google/gemini-3-pro-image",
@@ -76458,7 +76647,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-3.1-pro-preview": {
 			"id": "google/gemini-3.1-pro-preview",
@@ -76547,7 +76737,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-3.5-flash": {
 			"id": "google/gemini-3.5-flash",
@@ -76642,7 +76833,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-3.5-flash:batch": {
 			"id": "google/gemini-3.5-flash:batch",
@@ -76673,7 +76865,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-3.6-flash": {
 			"id": "google/gemini-3.6-flash",
@@ -76736,7 +76929,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemma-3-12b-it": {
 			"id": "google/gemma-3-12b-it",
@@ -77804,7 +77998,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"mistralai/codestral-2508": {
 			"id": "mistralai/codestral-2508",
@@ -79756,7 +79951,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5-nano": {
 			"id": "openai/gpt-5-nano",
@@ -79817,7 +80013,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5-pro": {
 			"id": "openai/gpt-5-pro",
@@ -79878,7 +80075,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.1": {
 			"id": "openai/gpt-5.1",
@@ -80052,7 +80250,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.2": {
 			"id": "openai/gpt-5.2",
@@ -80197,7 +80396,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.3-chat": {
 			"id": "openai/gpt-5.3-chat",
@@ -80342,7 +80542,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.4-nano": {
 			"id": "openai/gpt-5.4-nano",
@@ -80403,7 +80604,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.4-pro": {
 			"id": "openai/gpt-5.4-pro",
@@ -80464,7 +80666,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.5": {
 			"id": "openai/gpt-5.5",
@@ -80559,7 +80762,8 @@
 				]
 			},
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "openrouter/openai/gpt-5.4"
+			"contextPromotionTarget": "openrouter/openai/gpt-5.4",
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.6-luna": {
 			"id": "openai/gpt-5.6-luna",
@@ -83223,7 +83427,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"qwen/qwen3.7-max": {
 			"id": "qwen/qwen3.7-max",
@@ -84999,7 +85204,8 @@
 			},
 			"contextWindow": 524288,
 			"maxTokens": 8192,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": {
 			"id": "hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
@@ -88621,7 +88827,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"olafangensan-glm-4.7-flash-heretic": {
 			"id": "olafangensan-glm-4.7-flash-heretic",
