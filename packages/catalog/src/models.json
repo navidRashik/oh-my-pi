@@ -74224,7 +74224,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"~google/gemini-flash-latest": {
 			"id": "~google/gemini-flash-latest",
