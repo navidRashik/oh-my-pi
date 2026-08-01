@@ -70680,6 +70680,80 @@
 		}
 	},
 	"openai-codex": {
+		"gpt-5.3-codex-spark": {
+			"id": "gpt-5.3-codex-spark",
+			"name": "GPT-5.3 Codex Spark",
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": "https://chatgpt.com/backend-api",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 1.75,
+				"output": 14,
+				"cacheRead": 0.175,
+				"cacheWrite": 0
+			},
+			"remoteCompaction": {
+				"enabled": true,
+				"api": "openai-codex-responses",
+				"v2StreamingEnabled": true
+			},
+			"contextWindow": 128000,
+			"maxTokens": 128000,
+			"preferWebsockets": true,
+			"priority": 26,
+			"applyPatchToolType": "freeform",
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"low",
+					"medium",
+					"high",
+					"xhigh"
+				]
+			},
+			"contextPromotionTarget": "openai-codex/gpt-5.5"
+		},
+		"gpt-5.4": {
+			"id": "gpt-5.4",
+			"name": "GPT-5.4",
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": "https://chatgpt.com/backend-api",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 2.5,
+				"output": 15,
+				"cacheRead": 0.25,
+				"cacheWrite": 0
+			},
+			"remoteCompaction": {
+				"enabled": true,
+				"api": "openai-codex-responses",
+				"v2StreamingEnabled": true
+			},
+			"contextWindow": 272000,
+			"maxTokens": 128000,
+			"preferWebsockets": true,
+			"priority": 0,
+			"applyPatchToolType": "freeform",
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"low",
+					"medium",
+					"high",
+					"xhigh"
+				]
+			}
+		},
 		"gpt-5.4-mini": {
 			"id": "gpt-5.4-mini",
 			"name": "GPT-5.4 mini",
@@ -70753,7 +70827,7 @@
 					"xhigh"
 				]
 			},
-			"contextPromotionTarget": "openai-codex/gpt-5.4-mini"
+			"contextPromotionTarget": "openai-codex/gpt-5.4"
 		},
 		"gpt-5.6-luna": {
 			"id": "gpt-5.6-luna",
@@ -70782,6 +70856,45 @@
 			"preferWebsockets": true,
 			"useResponsesLite": true,
 			"priority": 3,
+			"applyPatchToolType": "freeform",
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"low",
+					"medium",
+					"high",
+					"xhigh",
+					"max"
+				]
+			}
+		},
+		"gpt-5.6-sol": {
+			"id": "gpt-5.6-sol",
+			"name": "GPT-5.6 Sol",
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": "https://chatgpt.com/backend-api",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 30,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"remoteCompaction": {
+				"enabled": true,
+				"api": "openai-codex-responses",
+				"v2StreamingEnabled": true
+			},
+			"contextWindow": 372000,
+			"maxTokens": 128000,
+			"preferWebsockets": true,
+			"useResponsesLite": true,
+			"priority": 1,
 			"applyPatchToolType": "freeform",
 			"thinking": {
 				"mode": "effort",
