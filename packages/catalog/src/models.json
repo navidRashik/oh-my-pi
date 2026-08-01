@@ -11768,8 +11768,7 @@
 				],
 				"supportsDisplay": true
 			},
-			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false
+			"supportsComputerUse": false
 		},
 		"claude-opus-4-0": {
 			"id": "claude-opus-4-0",
@@ -76433,7 +76432,9 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"high"
+					"low",
+					"high",
+					"max"
 				]
 			},
 			"supportsComputerUse": false,
@@ -85668,8 +85669,6 @@
 			},
 			"contextWindow": 524288,
 			"maxTokens": 65536,
-			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false,
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
@@ -85682,7 +85681,8 @@
 					"max": "max"
 				},
 				"requiresEffort": true
-			}
+			},
+			"supportsComputerUse": false
 		},
 		"hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": {
 			"id": "hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
@@ -85712,8 +85712,7 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false
+			"supportsComputerUse": false
 		},
 		"hf:openai/gpt-oss-120b": {
 			"id": "hf:openai/gpt-oss-120b",
@@ -85741,8 +85740,7 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false
+			"supportsComputerUse": false
 		},
 		"hf:Qwen/Qwen3.6-27B": {
 			"id": "hf:Qwen/Qwen3.6-27B",
@@ -85772,8 +85770,7 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false
+			"supportsComputerUse": false
 		},
 		"hf:zai-org/GLM-4.7-Flash": {
 			"id": "hf:zai-org/GLM-4.7-Flash",
@@ -85803,8 +85800,7 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false
+			"supportsComputerUse": false
 		},
 		"hf:zai-org/GLM-5.2": {
 			"id": "hf:zai-org/GLM-5.2",
@@ -85834,8 +85830,7 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false
+			"supportsComputerUse": false
 		},
 		"syn:large:text": {
 			"id": "syn:large:text",
@@ -98552,7 +98547,6 @@
 			"contextWindow": 2000000,
 			"maxTokens": 2000000,
 			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
 					"minimal": "low"
@@ -98584,7 +98578,6 @@
 			"contextWindow": 2000000,
 			"maxTokens": 2000000,
 			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
 					"minimal": "low"
@@ -98628,7 +98621,6 @@
 				}
 			},
 			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
 					"minimal": "low"
@@ -98673,7 +98665,6 @@
 				}
 			},
 			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
 					"minimal": "low"
@@ -98718,7 +98709,6 @@
 				}
 			},
 			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
 					"minimal": "low"
@@ -98750,7 +98740,6 @@
 			"contextWindow": 512000,
 			"maxTokens": 512000,
 			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
 					"minimal": "low"
@@ -98782,7 +98771,6 @@
 			"contextWindow": 256000,
 			"maxTokens": 256000,
 			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
 					"minimal": "low"
@@ -98813,7 +98801,6 @@
 			"contextWindow": 200000,
 			"maxTokens": 200000,
 			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
 					"minimal": "low"
