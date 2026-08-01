@@ -68099,7 +68099,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 1048576,
+			"maxTokens": 65536,
 			"omitMaxOutputTokens": true,
 			"thinking": {
 				"mode": "effort",
@@ -68139,7 +68139,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 8192,
+			"maxTokens": 65536,
 			"omitMaxOutputTokens": true,
 			"supportsComputerUse": false
 		},
@@ -68160,7 +68160,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 1048576,
+			"maxTokens": 65536,
 			"omitMaxOutputTokens": true,
 			"thinking": {
 				"mode": "effort",
