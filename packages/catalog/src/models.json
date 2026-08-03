@@ -103730,7 +103730,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-2-1212": {
 			"id": "grok-2-1212",
@@ -103749,7 +103756,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-2-latest": {
 			"id": "grok-2-latest",
@@ -103768,7 +103782,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-2-vision": {
 			"id": "grok-2-vision",
@@ -103788,7 +103809,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 8192,
-			"maxTokens": 4096
+			"maxTokens": 4096,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-2-vision-1212": {
 			"id": "grok-2-vision-1212",
@@ -103808,7 +103836,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 8192,
-			"maxTokens": 4096
+			"maxTokens": 4096,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-2-vision-latest": {
 			"id": "grok-2-vision-latest",
@@ -103828,7 +103863,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 8192,
-			"maxTokens": 4096
+			"maxTokens": 4096,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-3": {
 			"id": "grok-3",
@@ -103847,7 +103889,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-3-fast": {
 			"id": "grok-3-fast",
@@ -103866,7 +103915,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-3-fast-latest": {
 			"id": "grok-3-fast-latest",
@@ -103885,7 +103941,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-3-latest": {
 			"id": "grok-3-latest",
@@ -103904,7 +103967,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-3-mini": {
 			"id": "grok-3-mini",
@@ -103930,8 +104000,19 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-3-mini-fast": {
@@ -103958,8 +104039,19 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-3-mini-fast-latest": {
@@ -103986,8 +104078,19 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-3-mini-latest": {
@@ -104014,8 +104117,19 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-4": {
@@ -104036,14 +104150,12 @@
 			},
 			"contextWindow": 256000,
 			"maxTokens": 64000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-4-1-fast": {
@@ -104065,14 +104177,12 @@
 			},
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-4-1-fast-non-reasoning": {
@@ -104093,7 +104203,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 2000000,
-			"maxTokens": 30000
+			"maxTokens": 30000,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-4-fast": {
 			"id": "grok-4-fast",
@@ -104114,14 +104231,12 @@
 			},
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-4-fast-non-reasoning": {
@@ -104142,7 +104257,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 2000000,
-			"maxTokens": 30000
+			"maxTokens": 30000,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-4.20-0309-non-reasoning": {
 			"id": "grok-4.20-0309-non-reasoning",
@@ -104162,7 +104284,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 30000
+			"maxTokens": 30000,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-4.20-0309-reasoning": {
 			"id": "grok-4.20-0309-reasoning",
@@ -104183,15 +104312,12 @@
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 30000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				],
-				"requiresEffort": true
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-4.20-beta-latest-non-reasoning": {
@@ -104212,7 +104338,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 2000000,
-			"maxTokens": 30000
+			"maxTokens": 30000,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-4.20-beta-latest-reasoning": {
 			"id": "grok-4.20-beta-latest-reasoning",
@@ -104233,15 +104366,12 @@
 			},
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				],
-				"requiresEffort": true
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-4.20-multi-agent-beta-latest": {
@@ -104269,8 +104399,19 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-4.3": {
@@ -104298,8 +104439,19 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-4.5": {
@@ -104327,8 +104479,19 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-4.6": {
@@ -104377,7 +104540,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 4096
+			"maxTokens": 4096,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-build-0.1": {
 			"id": "grok-build-0.1",
@@ -104398,14 +104568,12 @@
 			},
 			"contextWindow": 256000,
 			"maxTokens": 256000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-code-fast-1": {
@@ -104426,14 +104594,12 @@
 			},
 			"contextWindow": 256000,
 			"maxTokens": 10000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-vision-beta": {
@@ -104454,7 +104620,14 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 8192,
-			"maxTokens": 4096
+			"maxTokens": 4096,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		}
 	},
 	"xai-oauth": {
