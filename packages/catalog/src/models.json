@@ -104484,7 +104484,7 @@
 					"minimal": "low"
 				},
 				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": true,
 				"supportsReasoningEffort": false
@@ -104516,7 +104516,7 @@
 					"minimal": "low"
 				},
 				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": true,
 				"supportsReasoningEffort": false
@@ -104560,7 +104560,7 @@
 					"minimal": "low"
 				},
 				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": false,
 				"supportsReasoningEffort": true
@@ -104605,7 +104605,7 @@
 					"minimal": "low"
 				},
 				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": false,
 				"supportsReasoningEffort": true
@@ -104650,7 +104650,7 @@
 					"minimal": "low"
 				},
 				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": false,
 				"supportsReasoningEffort": true
@@ -104710,7 +104710,7 @@
 					"minimal": "low"
 				},
 				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": true,
 				"supportsReasoningEffort": false
@@ -104742,7 +104742,7 @@
 					"minimal": "low"
 				},
 				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": true,
 				"supportsReasoningEffort": false
@@ -104773,7 +104773,7 @@
 					"minimal": "low"
 				},
 				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": true,
 				"supportsReasoningEffort": false
