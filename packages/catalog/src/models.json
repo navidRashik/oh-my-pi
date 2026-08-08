@@ -8048,7 +8048,8 @@
 			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
 			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0,
@@ -29404,7 +29405,8 @@
 			},
 			"contextWindow": 200000,
 			"maxTokens": 8192,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-3.5-sonnet": {
 			"id": "anthropic/claude-3.5-sonnet",
@@ -29690,7 +29692,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-opus-4.7": {
 			"id": "anthropic/claude-opus-4.7",
@@ -30176,7 +30179,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"arcee-ai/virtuoso-large": {
 			"id": "arcee-ai/virtuoso-large",
@@ -30225,7 +30229,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"baidu/ernie-4.5-21b-a3b": {
 			"id": "baidu/ernie-4.5-21b-a3b",
@@ -30245,7 +30250,8 @@
 			},
 			"contextWindow": 120000,
 			"maxTokens": 8000,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"baidu/ernie-4.5-300b-a47b": {
 			"id": "baidu/ernie-4.5-300b-a47b",
@@ -30297,7 +30303,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"baidu/ernie-4.5-vl-424b-a47b": {
 			"id": "baidu/ernie-4.5-vl-424b-a47b",
@@ -31160,7 +31167,8 @@
 			},
 			"contextWindow": 32768,
 			"maxTokens": 6554,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"giga-potato": {
 			"id": "giga-potato",
@@ -31220,7 +31228,8 @@
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 8192,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-2.0-flash-lite-001": {
 			"id": "google/gemini-2.0-flash-lite-001",
@@ -31241,7 +31250,8 @@
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 8192,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-2.5-flash": {
 			"id": "google/gemini-2.5-flash",
@@ -31349,7 +31359,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"google/gemini-2.5-pro": {
 			"id": "google/gemini-2.5-pro",
@@ -32911,7 +32922,8 @@
 			},
 			"contextWindow": 8192,
 			"maxTokens": 16384,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"meta-llama/llama-3.1-405b": {
 			"id": "meta-llama/llama-3.1-405b",
@@ -33607,7 +33619,8 @@
 			},
 			"contextWindow": 262144,
 			"maxTokens": 65536,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"mistralai/devstral-medium": {
 			"id": "mistralai/devstral-medium",
@@ -33627,7 +33640,8 @@
 			},
 			"contextWindow": 131072,
 			"maxTokens": 26215,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"mistralai/devstral-small": {
 			"id": "mistralai/devstral-small",
@@ -33647,7 +33661,8 @@
 			},
 			"contextWindow": 131072,
 			"maxTokens": 26215,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"mistralai/ministral-14b-2512": {
 			"id": "mistralai/ministral-14b-2512",
@@ -33828,7 +33843,8 @@
 			},
 			"contextWindow": 131072,
 			"maxTokens": 26215,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"mistralai/mistral-large-2512": {
 			"id": "mistralai/mistral-large-2512",
@@ -34128,7 +34144,8 @@
 			},
 			"contextWindow": 131072,
 			"maxTokens": 32768,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"mistralai/voxtral-small-24b-2507": {
 			"id": "mistralai/voxtral-small-24b-2507",
@@ -34524,7 +34541,8 @@
 			},
 			"contextWindow": 131072,
 			"maxTokens": 163840,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"nex-agi/nex-n2-mini": {
 			"id": "nex-agi/nex-n2-mini",
@@ -34788,7 +34806,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"nvidia/nemotron-3-nano-30b-a3b": {
 			"id": "nvidia/nemotron-3-nano-30b-a3b",
@@ -35046,7 +35065,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-3.5-turbo": {
 			"id": "openai/gpt-3.5-turbo",
@@ -35162,7 +35182,8 @@
 			},
 			"contextWindow": 8191,
 			"maxTokens": 4096,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-4-1106-preview": {
 			"id": "openai/gpt-4-1106-preview",
@@ -35182,7 +35203,8 @@
 			},
 			"contextWindow": 128000,
 			"maxTokens": 4096,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-4-turbo": {
 			"id": "openai/gpt-4-turbo",
@@ -35381,7 +35403,8 @@
 			},
 			"contextWindow": 128000,
 			"maxTokens": 16384,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-4o-mini": {
 			"id": "openai/gpt-4o-mini",
@@ -35564,7 +35587,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5-image": {
 			"id": "openai/gpt-5-image",
@@ -35761,7 +35785,8 @@
 			},
 			"contextWindow": 128000,
 			"maxTokens": 16384,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.1-codex": {
 			"id": "openai/gpt-5.1-codex",
@@ -36652,7 +36677,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/o3-mini": {
 			"id": "openai/o3-mini",
@@ -36806,7 +36832,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/o4-mini-high": {
 			"id": "openai/o4-mini-high",
@@ -37071,7 +37098,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openrouter/pareto-code": {
 			"id": "openrouter/pareto-code",
@@ -37270,7 +37298,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"poolside/laguna-s-2.1": {
 			"id": "poolside/laguna-s-2.1",
@@ -37447,7 +37476,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"prime-intellect/intellect-3": {
 			"id": "prime-intellect/intellect-3",
@@ -37477,7 +37507,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"qwen/qwen-2.5-72b-instruct": {
 			"id": "qwen/qwen-2.5-72b-instruct",
@@ -39132,7 +39163,8 @@
 			},
 			"contextWindow": 8192,
 			"maxTokens": 8192,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"sao10k/l3-lunaris-8b": {
 			"id": "sao10k/l3-lunaris-8b",
@@ -40332,7 +40364,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"xiaomi/mimo-v2-omni": {
 			"id": "xiaomi/mimo-v2-omni",
@@ -40361,7 +40394,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"xiaomi/mimo-v2-omni:free": {
 			"id": "xiaomi/mimo-v2-omni:free",
@@ -40410,7 +40444,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"xiaomi/mimo-v2-pro:free": {
 			"id": "xiaomi/mimo-v2-pro:free",
@@ -40506,7 +40541,8 @@
 			},
 			"contextWindow": 128000,
 			"maxTokens": 32768,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"z-ai/glm-4.5": {
 			"id": "z-ai/glm-4.5",
@@ -64252,7 +64288,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"inclusionai/ring-2.6-1t": {
 			"id": "inclusionai/ring-2.6-1t",
@@ -65818,7 +65855,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"sao10k/l3-70b-euryale-v2.1": {
 			"id": "sao10k/l3-70b-euryale-v2.1",
@@ -77611,7 +77649,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-sonnet-4": {
 			"id": "anthropic/claude-sonnet-4",
@@ -77765,7 +77804,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"anthropic/claude-sonnet-5": {
 			"id": "anthropic/claude-sonnet-5",
@@ -79944,7 +79984,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"inclusionai/ling-3.0-flash:free": {
 			"id": "inclusionai/ling-3.0-flash:free",
@@ -80003,7 +80044,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"inclusionai/ring-2.6-1t": {
 			"id": "inclusionai/ring-2.6-1t",
@@ -80460,7 +80502,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"minimax/minimax-m1": {
 			"id": "minimax/minimax-m1",
@@ -81529,7 +81572,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"moonshotai/kimi-k3": {
 			"id": "moonshotai/kimi-k3",
@@ -82000,7 +82044,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"nvidia/nemotron-3-ultra-550b-a55b:free": {
 			"id": "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -82204,7 +82249,8 @@
 			},
 			"contextWindow": 16385,
 			"maxTokens": 4096,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-4": {
 			"id": "openai/gpt-4",
@@ -82331,7 +82377,8 @@
 			},
 			"contextWindow": 128000,
 			"maxTokens": 4096,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-4.1": {
 			"id": "openai/gpt-4.1",
@@ -82396,7 +82443,8 @@
 			},
 			"contextWindow": 1047576,
 			"maxTokens": 32768,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-4.1-nano": {
 			"id": "openai/gpt-4.1-nano",
@@ -82439,7 +82487,8 @@
 			},
 			"contextWindow": 1047576,
 			"maxTokens": 32768,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-4.1:batch": {
 			"id": "openai/gpt-4.1:batch",
@@ -82460,7 +82509,8 @@
 			},
 			"contextWindow": 1047576,
 			"maxTokens": 32768,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-4o": {
 			"id": "openai/gpt-4o",
@@ -82634,7 +82684,8 @@
 			},
 			"contextWindow": 128000,
 			"maxTokens": 16384,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-4o:batch": {
 			"id": "openai/gpt-4o:batch",
@@ -82655,7 +82706,8 @@
 			},
 			"contextWindow": 128000,
 			"maxTokens": 16384,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-4o:extended": {
 			"id": "openai/gpt-4o:extended",
@@ -82769,7 +82821,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5-image": {
 			"id": "openai/gpt-5-image",
@@ -83016,7 +83069,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5:batch": {
 			"id": "openai/gpt-5:batch",
@@ -83367,7 +83421,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.2:batch": {
 			"id": "openai/gpt-5.2:batch",
@@ -83667,7 +83722,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.4:batch": {
 			"id": "openai/gpt-5.4:batch",
@@ -83793,7 +83849,8 @@
 				]
 			},
 			"supportsComputerUse": false,
-			"contextPromotionTarget": "openrouter/openai/gpt-5.4"
+			"contextPromotionTarget": "openrouter/openai/gpt-5.4",
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.5:batch": {
 			"id": "openai/gpt-5.5:batch",
@@ -83920,7 +83977,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.6-luna:batch": {
 			"id": "openai/gpt-5.6-luna:batch",
@@ -83951,7 +84009,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.6-sol": {
 			"id": "openai/gpt-5.6-sol",
@@ -84046,7 +84105,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.6-sol:batch": {
 			"id": "openai/gpt-5.6-sol:batch",
@@ -84077,7 +84137,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.6-terra": {
 			"id": "openai/gpt-5.6-terra",
@@ -84172,7 +84233,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-5.6-terra:batch": {
 			"id": "openai/gpt-5.6-terra:batch",
@@ -84203,7 +84265,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/gpt-audio": {
 			"id": "openai/gpt-audio",
@@ -84513,7 +84576,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/o3": {
 			"id": "openai/o3",
@@ -84669,7 +84733,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/o3-mini:batch": {
 			"id": "openai/o3-mini:batch",
@@ -84699,7 +84764,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/o3-pro": {
 			"id": "openai/o3-pro",
@@ -84762,7 +84828,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/o3:batch": {
 			"id": "openai/o3:batch",
@@ -84793,7 +84860,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/o4-mini": {
 			"id": "openai/o4-mini",
@@ -84920,7 +84988,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openai/o4-mini:batch": {
 			"id": "openai/o4-mini:batch",
@@ -84951,7 +85020,8 @@
 				],
 				"requiresEffort": true
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"openrouter/aurora-alpha": {
 			"id": "openrouter/aurora-alpha",
@@ -86992,7 +87062,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"qwen/qwq-32b": {
 			"id": "qwen/qwq-32b",
@@ -87514,7 +87585,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"tngtech/deepseek-r1t2-chimera": {
 			"id": "tngtech/deepseek-r1t2-chimera",
@@ -88545,13 +88617,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.2212,
-				"output": 0.6952,
-				"cacheRead": 0.04108,
+				"input": 0.2198,
+				"output": 0.6908,
+				"cacheRead": 0.040819999999999995,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 128000,
+			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
@@ -88593,7 +88665,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"z-ai/glm-5v-turbo": {
 			"id": "z-ai/glm-5v-turbo",
@@ -90133,6 +90206,7 @@
 			"contextWindow": 1048576,
 			"maxTokens": 393215,
 			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false,
 			"compat": {
 				"escapeBuiltinToolNames": true
 			}
