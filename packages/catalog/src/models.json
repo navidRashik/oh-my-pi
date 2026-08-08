@@ -28668,7 +28668,7 @@
 				"image"
 			],
 			"cost": {
-				"input": 2.5,
+				"input": 2.8,
 				"output": 14,
 				"cacheRead": 0.29,
 				"cacheWrite": 0
@@ -73165,7 +73165,7 @@
 		"deepseek-v4-flash": {
 			"id": "deepseek-v4-flash",
 			"name": "DeepSeek V4 Flash (2x usage)",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "opencode-go",
 			"baseUrl": "https://opencode.ai/zen/go/v1",
 			"reasoning": true,
@@ -73180,18 +73180,14 @@
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 384000,
-			"compat": {
-				"supportsToolChoice": false,
-				"maxTokensField": "max_tokens",
-				"reasoningContentField": "reasoning_content",
-				"requiresReasoningContentForToolCalls": true
-			},
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
+					"minimal",
 					"low",
+					"medium",
 					"high",
-					"max"
+					"xhigh"
 				]
 			}
 		},
@@ -76435,7 +76431,7 @@
 				"image"
 			],
 			"cost": {
-				"input": 2.5,
+				"input": 2.8,
 				"output": 14,
 				"cacheRead": 0.29,
 				"cacheWrite": 0
@@ -88594,9 +88590,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.2058,
-				"output": 0.6468,
-				"cacheRead": 0.038220000000000004,
+				"input": 0.182,
+				"output": 0.572,
+				"cacheRead": 0.0338,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
