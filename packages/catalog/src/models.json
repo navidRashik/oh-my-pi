@@ -103733,7 +103733,9 @@
 			"maxTokens": 8192,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -103759,7 +103761,9 @@
 			"maxTokens": 8192,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -103785,7 +103789,9 @@
 			"maxTokens": 8192,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -103812,7 +103818,9 @@
 			"maxTokens": 4096,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -103839,7 +103847,9 @@
 			"maxTokens": 4096,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -103866,7 +103876,9 @@
 			"maxTokens": 4096,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -103892,7 +103904,9 @@
 			"maxTokens": 8192,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -103918,7 +103932,9 @@
 			"maxTokens": 8192,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -103944,7 +103960,9 @@
 			"maxTokens": 8192,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -103970,7 +103988,9 @@
 			"maxTokens": 8192,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104000,8 +104020,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104009,7 +104028,9 @@
 			},
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": true,
 				"omitReasoningEffort": false
@@ -104039,8 +104060,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104048,7 +104068,9 @@
 			},
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": true,
 				"omitReasoningEffort": false
@@ -104078,8 +104100,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104087,7 +104108,9 @@
 			},
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": true,
 				"omitReasoningEffort": false
@@ -104117,8 +104140,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104126,7 +104148,9 @@
 			},
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": true,
 				"omitReasoningEffort": false
@@ -104152,7 +104176,9 @@
 			"maxTokens": 64000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104179,7 +104205,9 @@
 			"maxTokens": 30000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104206,7 +104234,9 @@
 			"maxTokens": 30000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104233,7 +104263,9 @@
 			"maxTokens": 30000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104260,7 +104292,9 @@
 			"maxTokens": 30000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104287,7 +104321,9 @@
 			"maxTokens": 30000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104314,7 +104350,9 @@
 			"maxTokens": 30000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104341,7 +104379,9 @@
 			"maxTokens": 30000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104368,7 +104408,9 @@
 			"maxTokens": 30000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104399,8 +104441,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104408,7 +104449,9 @@
 			},
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": true,
 				"omitReasoningEffort": false
@@ -104439,8 +104482,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104448,7 +104490,9 @@
 			},
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": true,
 				"omitReasoningEffort": false
@@ -104479,8 +104523,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104488,7 +104531,9 @@
 			},
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": true,
 				"omitReasoningEffort": false
@@ -104543,7 +104588,9 @@
 			"maxTokens": 4096,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104570,7 +104617,9 @@
 			"maxTokens": 256000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104596,7 +104645,9 @@
 			"maxTokens": 10000,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104623,7 +104674,9 @@
 			"maxTokens": 4096,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
@@ -104719,8 +104772,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104764,8 +104816,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104809,8 +104860,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
