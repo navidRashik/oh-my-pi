@@ -103732,11 +103732,6 @@
 			"contextWindow": 131072,
 			"maxTokens": 8192,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -103760,11 +103755,6 @@
 			"contextWindow": 131072,
 			"maxTokens": 8192,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -103788,11 +103778,6 @@
 			"contextWindow": 131072,
 			"maxTokens": 8192,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -103817,11 +103802,6 @@
 			"contextWindow": 8192,
 			"maxTokens": 4096,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -103846,11 +103826,6 @@
 			"contextWindow": 8192,
 			"maxTokens": 4096,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -103875,11 +103850,6 @@
 			"contextWindow": 8192,
 			"maxTokens": 4096,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -103903,11 +103873,6 @@
 			"contextWindow": 131072,
 			"maxTokens": 8192,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -103931,11 +103896,6 @@
 			"contextWindow": 131072,
 			"maxTokens": 8192,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -103959,11 +103919,6 @@
 			"contextWindow": 131072,
 			"maxTokens": 8192,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -103987,11 +103942,6 @@
 			"contextWindow": 131072,
 			"maxTokens": 8192,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104175,11 +104125,6 @@
 			"contextWindow": 256000,
 			"maxTokens": 64000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104204,11 +104149,6 @@
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104233,11 +104173,6 @@
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104262,11 +104197,6 @@
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104291,11 +104221,6 @@
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104320,11 +104245,6 @@
 			"contextWindow": 1000000,
 			"maxTokens": 30000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104349,11 +104269,6 @@
 			"contextWindow": 1000000,
 			"maxTokens": 30000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104378,11 +104293,6 @@
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104407,11 +104317,6 @@
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104587,11 +104492,6 @@
 			"contextWindow": 131072,
 			"maxTokens": 4096,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104616,11 +104516,6 @@
 			"contextWindow": 256000,
 			"maxTokens": 256000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104644,11 +104539,6 @@
 			"contextWindow": 256000,
 			"maxTokens": 10000,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104673,11 +104563,6 @@
 			"contextWindow": 8192,
 			"maxTokens": 4096,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
-				},
 				"supportsReasoningEffort": false,
 				"omitReasoningEffort": true
 			}
@@ -104706,9 +104591,6 @@
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low"
-				},
 				"includeEncryptedReasoning": true,
 				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
@@ -104738,9 +104620,6 @@
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low"
-				},
 				"includeEncryptedReasoning": true,
 				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
@@ -104782,7 +104661,9 @@
 			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"includeEncryptedReasoning": true,
 				"filterReasoningHistory": false,
@@ -104826,7 +104707,9 @@
 			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"includeEncryptedReasoning": true,
 				"filterReasoningHistory": false,
@@ -104870,7 +104753,9 @@
 			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
 				"includeEncryptedReasoning": true,
 				"filterReasoningHistory": false,
@@ -104929,9 +104814,6 @@
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low"
-				},
 				"includeEncryptedReasoning": true,
 				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
@@ -104961,9 +104843,6 @@
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low"
-				},
 				"includeEncryptedReasoning": true,
 				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
@@ -104992,9 +104871,6 @@
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low"
-				},
 				"includeEncryptedReasoning": true,
 				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
