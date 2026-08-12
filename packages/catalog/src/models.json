@@ -70186,10 +70186,8 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
+					"high",
+					"max"
 				]
 			},
 			"supportsComputerUse": false,
@@ -70217,10 +70215,8 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
+					"high",
+					"max"
 				]
 			},
 			"supportsComputerUse": false,
@@ -70248,11 +70244,9 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
-					"medium",
 					"high",
-					"xhigh"
+					"max"
 				]
 			}
 		},
@@ -70278,10 +70272,9 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
-					"medium",
-					"high"
+					"high",
+					"max"
 				]
 			}
 		},
@@ -70295,11 +70288,9 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
-					"medium",
 					"high",
-					"xhigh"
+					"max"
 				]
 			},
 			"input": [
@@ -70338,11 +70329,8 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
 					"high",
-					"xhigh"
+					"max"
 				]
 			}
 		},
