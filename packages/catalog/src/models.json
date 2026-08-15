@@ -104446,7 +104446,7 @@
 		"grok-4.6": {
 			"id": "grok-4.6",
 			"name": "Grok 4.6",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104469,7 +104469,19 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-beta": {
@@ -104781,13 +104793,31 @@
 			},
 			"contextWindow": 500000,
 			"maxTokens": 500000,
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"includeEncryptedReasoning": false,
-				"filterReasoningHistory": true,
+				"reasoningEffortMap": {
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
+				},
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
-				"omitReasoningEffort": true
+				"omitReasoningEffort": false,
+				"supportsReasoningEffort": true
 			}
 		},
 		"grok-build": {
