@@ -55994,8 +55994,7 @@
 			"baseUrl": "https://server.codeium.com",
 			"reasoning": true,
 			"input": [
-				"text",
-				"image"
+				"text"
 			],
 			"supportsTools": true,
 			"cost": {
@@ -56018,8 +56017,7 @@
 			"baseUrl": "https://server.codeium.com",
 			"reasoning": true,
 			"input": [
-				"text",
-				"image"
+				"text"
 			],
 			"supportsTools": true,
 			"cost": {
