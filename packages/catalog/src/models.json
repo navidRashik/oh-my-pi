@@ -104468,7 +104468,8 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
+					"high",
+					"xhigh"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104476,9 +104477,7 @@
 			},
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
+					"minimal": "low"
 				},
 				"supportsReasoningEffort": true,
 				"omitReasoningEffort": false
@@ -104799,7 +104798,8 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
+					"high",
+					"xhigh"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104809,9 +104809,7 @@
 			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low",
-					"xhigh": "high",
-					"max": "high"
+					"minimal": "low"
 				},
 				"includeEncryptedReasoning": true,
 				"filterReasoningHistory": false,
