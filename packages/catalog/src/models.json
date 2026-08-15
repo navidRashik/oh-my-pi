@@ -103716,7 +103716,7 @@
 		"grok-2": {
 			"id": "grok-2",
 			"name": "Grok 2",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -103730,12 +103730,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-2-1212": {
 			"id": "grok-2-1212",
 			"name": "Grok 2 (1212)",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -103749,12 +103753,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-2-latest": {
 			"id": "grok-2-latest",
 			"name": "Grok 2 Latest",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -103768,12 +103776,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-2-vision": {
 			"id": "grok-2-vision",
 			"name": "Grok 2 Vision",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -103788,12 +103800,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 8192,
-			"maxTokens": 4096
+			"maxTokens": 4096,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-2-vision-1212": {
 			"id": "grok-2-vision-1212",
 			"name": "Grok 2 Vision (1212)",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -103808,12 +103824,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 8192,
-			"maxTokens": 4096
+			"maxTokens": 4096,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-2-vision-latest": {
 			"id": "grok-2-vision-latest",
 			"name": "Grok 2 Vision Latest",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -103828,12 +103848,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 8192,
-			"maxTokens": 4096
+			"maxTokens": 4096,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-3": {
 			"id": "grok-3",
 			"name": "Grok 3",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -103847,12 +103871,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-3-fast": {
 			"id": "grok-3-fast",
 			"name": "Grok 3 Fast",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -103866,12 +103894,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-3-fast-latest": {
 			"id": "grok-3-fast-latest",
 			"name": "Grok 3 Fast Latest",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -103885,12 +103917,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-3-latest": {
 			"id": "grok-3-latest",
 			"name": "Grok 3 Latest",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -103904,12 +103940,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192
+			"maxTokens": 8192,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-3-mini": {
 			"id": "grok-3-mini",
 			"name": "Grok 3 Mini",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -103931,13 +103971,25 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-3-mini-fast": {
 			"id": "grok-3-mini-fast",
 			"name": "Grok 3 Mini Fast",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -103959,13 +104011,25 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-3-mini-fast-latest": {
 			"id": "grok-3-mini-fast-latest",
 			"name": "Grok 3 Mini Fast Latest",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -103987,13 +104051,25 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-3-mini-latest": {
 			"id": "grok-3-mini-latest",
 			"name": "Grok 3 Mini Latest",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104015,13 +104091,25 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-4": {
 			"id": "grok-4",
 			"name": "Grok 4",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104036,20 +104124,15 @@
 			},
 			"contextWindow": 256000,
 			"maxTokens": 64000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-4-1-fast": {
 			"id": "grok-4-1-fast",
 			"name": "Grok 4.1 Fast",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104065,20 +104148,15 @@
 			},
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-4-1-fast-non-reasoning": {
 			"id": "grok-4-1-fast-non-reasoning",
 			"name": "Grok 4.1 Fast (Non-Reasoning)",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -104093,12 +104171,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 2000000,
-			"maxTokens": 30000
+			"maxTokens": 30000,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-4-fast": {
 			"id": "grok-4-fast",
 			"name": "Grok 4 Fast",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104114,20 +104196,15 @@
 			},
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-4-fast-non-reasoning": {
 			"id": "grok-4-fast-non-reasoning",
 			"name": "Grok 4 Fast (Non-Reasoning)",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -104142,12 +104219,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 2000000,
-			"maxTokens": 30000
+			"maxTokens": 30000,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-4.20-0309-non-reasoning": {
 			"id": "grok-4.20-0309-non-reasoning",
 			"name": "Grok 4.20 (Non-Reasoning)",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -104162,12 +104243,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 30000
+			"maxTokens": 30000,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-4.20-0309-reasoning": {
 			"id": "grok-4.20-0309-reasoning",
 			"name": "Grok 4.20 (Reasoning)",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104183,21 +104268,15 @@
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 30000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				],
-				"requiresEffort": true
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-4.20-beta-latest-non-reasoning": {
 			"id": "grok-4.20-beta-latest-non-reasoning",
 			"name": "Grok 4.20 Beta (Non-Reasoning)",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -104212,12 +104291,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 2000000,
-			"maxTokens": 30000
+			"maxTokens": 30000,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-4.20-beta-latest-reasoning": {
 			"id": "grok-4.20-beta-latest-reasoning",
 			"name": "Grok 4.20 Beta (Reasoning)",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104233,21 +104316,15 @@
 			},
 			"contextWindow": 2000000,
 			"maxTokens": 30000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				],
-				"requiresEffort": true
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-4.20-multi-agent-beta-latest": {
 			"id": "grok-4.20-multi-agent-beta-latest",
 			"name": "Grok 4.20 Multi-Agent Beta",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104269,14 +104346,25 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-4.3": {
 			"id": "grok-4.3",
 			"name": "Grok 4.3",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104299,13 +104387,25 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-4.5": {
 			"id": "grok-4.5",
 			"name": "Grok 4.5",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104328,13 +104428,25 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-4.6": {
 			"id": "grok-4.6",
 			"name": "Grok 4.6",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104356,14 +104468,25 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low"
+				},
+				"supportsReasoningEffort": true,
+				"omitReasoningEffort": false
 			}
 		},
 		"grok-beta": {
 			"id": "grok-beta",
 			"name": "Grok Beta",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -104377,12 +104500,16 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 4096
+			"maxTokens": 4096,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		},
 		"grok-build-0.1": {
 			"id": "grok-build-0.1",
 			"name": "Grok Build 0.1",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104398,20 +104525,15 @@
 			},
 			"contextWindow": 256000,
 			"maxTokens": 256000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-code-fast-1": {
 			"id": "grok-code-fast-1",
 			"name": "Grok Code Fast 1",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": true,
@@ -104426,20 +104548,15 @@
 			},
 			"contextWindow": 256000,
 			"maxTokens": 10000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
 			}
 		},
 		"grok-vision-beta": {
 			"id": "grok-vision-beta",
 			"name": "Grok Vision Beta",
-			"api": "openai-completions",
+			"api": "openai-responses",
 			"provider": "xai",
 			"baseUrl": "https://api.x.ai/v1",
 			"reasoning": false,
@@ -104454,7 +104571,11 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 8192,
-			"maxTokens": 4096
+			"maxTokens": 4096,
+			"compat": {
+				"supportsReasoningEffort": false,
+				"omitReasoningEffort": true
+			}
 		}
 	},
 	"xai-oauth": {
@@ -104480,11 +104601,8 @@
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low"
-				},
-				"includeEncryptedReasoning": false,
-				"filterReasoningHistory": true,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": true,
 				"supportsReasoningEffort": false
@@ -104512,11 +104630,8 @@
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low"
-				},
-				"includeEncryptedReasoning": false,
-				"filterReasoningHistory": true,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": true,
 				"supportsReasoningEffort": false
@@ -104559,8 +104674,8 @@
 				"reasoningEffortMap": {
 					"minimal": "low"
 				},
-				"includeEncryptedReasoning": false,
-				"filterReasoningHistory": true,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": false,
 				"supportsReasoningEffort": true
@@ -104591,8 +104706,7 @@
 					"minimal",
 					"low",
 					"medium",
-					"high",
-					"xhigh"
+					"high"
 				],
 				"effortMap": {
 					"minimal": "low"
@@ -104602,10 +104716,12 @@
 			"supportsComputerUseConfig": false,
 			"compat": {
 				"reasoningEffortMap": {
-					"minimal": "low"
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
 				},
-				"includeEncryptedReasoning": false,
-				"filterReasoningHistory": true,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": false,
 				"supportsReasoningEffort": true
@@ -104614,6 +104730,52 @@
 		"grok-4.5": {
 			"id": "grok-4.5",
 			"name": "Grok 4.5",
+			"api": "openai-responses",
+			"provider": "xai-oauth",
+			"baseUrl": "https://api.x.ai/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 500000,
+			"maxTokens": 500000,
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high"
+				],
+				"effortMap": {
+					"minimal": "low"
+				}
+			},
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false,
+			"compat": {
+				"reasoningEffortMap": {
+					"minimal": "low",
+					"xhigh": "high",
+					"max": "high"
+				},
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"supportsImageDetailOriginal": false,
+				"omitReasoningEffort": false,
+				"supportsReasoningEffort": true
+			}
+		},
+		"grok-4.6": {
+			"id": "grok-4.6",
+			"name": "Grok 4.6",
 			"api": "openai-responses",
 			"provider": "xai-oauth",
 			"baseUrl": "https://api.x.ai/v1",
@@ -104649,39 +104811,11 @@
 				"reasoningEffortMap": {
 					"minimal": "low"
 				},
-				"includeEncryptedReasoning": false,
-				"filterReasoningHistory": true,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": false,
 				"supportsReasoningEffort": true
-			}
-		},
-		"grok-4.6": {
-			"id": "grok-4.6",
-			"name": "Grok 4.6",
-			"api": "openai-responses",
-			"provider": "xai-oauth",
-			"baseUrl": "https://api.x.ai/v1",
-			"reasoning": true,
-			"input": [
-				"text",
-				"image"
-			],
-			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
-				"cacheWrite": 0
-			},
-			"contextWindow": 500000,
-			"maxTokens": 500000,
-			"supportsComputerUse": false,
-			"supportsComputerUseConfig": false,
-			"compat": {
-				"includeEncryptedReasoning": false,
-				"filterReasoningHistory": true,
-				"supportsImageDetailOriginal": false,
-				"omitReasoningEffort": true
 			}
 		},
 		"grok-build": {
@@ -104706,11 +104840,8 @@
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low"
-				},
-				"includeEncryptedReasoning": false,
-				"filterReasoningHistory": true,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": true,
 				"supportsReasoningEffort": false
@@ -104738,11 +104869,8 @@
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low"
-				},
-				"includeEncryptedReasoning": false,
-				"filterReasoningHistory": true,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": true,
 				"supportsReasoningEffort": false
@@ -104769,11 +104897,8 @@
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false,
 			"compat": {
-				"reasoningEffortMap": {
-					"minimal": "low"
-				},
-				"includeEncryptedReasoning": false,
-				"filterReasoningHistory": true,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
 				"supportsImageDetailOriginal": false,
 				"omitReasoningEffort": true,
 				"supportsReasoningEffort": false
