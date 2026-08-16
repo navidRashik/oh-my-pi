@@ -23053,7 +23053,8 @@
 					"minimal": "none"
 				}
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"qwen3.8-max": {
 			"id": "qwen3.8-max",
@@ -40416,7 +40417,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 262144,
+			"maxTokens": 65536,
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
@@ -57132,7 +57133,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"nvidia/nemotron-3-super-120b-a12b:thinking": {
 			"id": "nvidia/nemotron-3-super-120b-a12b:thinking",
@@ -57162,7 +57164,8 @@
 					"xhigh"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"nvidia/nemotron-3-ultra-550b-a55b": {
 			"id": "nvidia/nemotron-3-ultra-550b-a55b",
@@ -59582,7 +59585,8 @@
 			},
 			"contextWindow": 256000,
 			"maxTokens": 262144,
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"Qwen/Qwen3-235B-A22B-Instruct-2507-TEE": {
 			"id": "Qwen/Qwen3-235B-A22B-Instruct-2507-TEE",
@@ -66945,7 +66949,8 @@
 					"max"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"dev/glm46": {
 			"id": "dev/glm46",
@@ -82257,7 +82262,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"essentialai/rnj-1-instruct": {
 			"id": "essentialai/rnj-1-instruct",
@@ -85128,9 +85134,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.5415,
-				"output": 2.2800000000000002,
-				"cacheRead": 0.09119999999999999,
+				"input": 0.65,
+				"output": 3.41,
+				"cacheRead": 0.15,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -90454,13 +90460,13 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.6,
-				"output": 3.5999999999999996,
-				"cacheRead": 0.12,
+				"input": 0.3,
+				"output": 2,
+				"cacheRead": 0.03,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 262144,
+			"maxTokens": 65536,
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
@@ -90807,7 +90813,8 @@
 					"high"
 				]
 			},
-			"supportsComputerUse": false
+			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false
 		},
 		"qwen/qwen3.8-max": {
 			"id": "qwen/qwen3.8-max",
@@ -94026,6 +94033,7 @@
 			"contextWindow": 1048576,
 			"maxTokens": 393215,
 			"supportsComputerUse": false,
+			"supportsComputerUseConfig": false,
 			"compat": {
 				"escapeBuiltinToolNames": true
 			}
