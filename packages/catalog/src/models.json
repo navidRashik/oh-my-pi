@@ -76470,6 +76470,12 @@
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 384000,
+			"compat": {
+				"supportsToolChoice": false,
+				"maxTokensField": "max_tokens",
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true
+			},
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
@@ -76479,12 +76485,6 @@
 					"high",
 					"xhigh"
 				]
-			},
-			"compat": {
-				"supportsToolChoice": false,
-				"maxTokensField": "max_tokens",
-				"reasoningContentField": "reasoning_content",
-				"requiresReasoningContentForToolCalls": true
 			}
 		},
 		"deepseek-v4-pro": {
