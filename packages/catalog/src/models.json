@@ -45718,7 +45718,6 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gemini-3.6-flash-minimal",
 			"thinking": {
 				"mode": "effort",
@@ -45736,6 +45735,7 @@
 					"high": "gemini-3.6-flash-high"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gemini-3.7-flash": {
@@ -45758,7 +45758,6 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gemini-3.7-flash-low",
 			"thinking": {
 				"mode": "effort",
@@ -45774,11 +45773,12 @@
 					"high": "gemini-3.7-flash-high"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"glm-5.2": {
 			"id": "glm-5.2",
-			"name": "GLM 5.2",
+			"name": "GLM-5.2",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -45796,7 +45796,6 @@
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
 			"tokenizer": "glm5",
-			"supportsComputerUse": false,
 			"requestModelId": "glm-5.2-high",
 			"thinking": {
 				"mode": "effort",
@@ -45810,6 +45809,7 @@
 					"max": "glm-5.2-max"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5-mini": {
@@ -46552,7 +46552,7 @@
 			},
 			"contextWindow": 200000,
 			"maxTokens": 64000,
-			"contextPromotionTarget": "cursor/gpt-5.5-low",
+			"contextPromotionTarget": "cursor/gpt-5.5",
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
@@ -46602,13 +46602,14 @@
 		},
 		"gpt-5.4": {
 			"id": "gpt-5.4",
-			"name": "GPT-5.4 1M",
+			"name": "GPT-5.4",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
 			"reasoning": true,
 			"input": [
-				"text"
+				"text",
+				"image"
 			],
 			"cost": {
 				"input": 0,
@@ -46619,7 +46620,6 @@
 			"contextWindow": 1000000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gpt-5.4-low",
 			"thinking": {
 				"mode": "effort",
@@ -46637,6 +46637,7 @@
 					"xhigh": "gpt-5.4-xhigh"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-fast": {
@@ -46658,7 +46659,6 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gpt-5.4-medium-fast",
 			"thinking": {
 				"mode": "effort",
@@ -46674,11 +46674,12 @@
 					"xhigh": "gpt-5.4-xhigh-fast"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-mini": {
 			"id": "gpt-5.4-mini",
-			"name": "GPT-5.4 Mini",
+			"name": "GPT-5.4 mini",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -46696,7 +46697,6 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gpt-5.4-mini-none",
 			"thinking": {
 				"mode": "effort",
@@ -46714,11 +46714,12 @@
 					"xhigh": "gpt-5.4-mini-xhigh"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.4-nano": {
 			"id": "gpt-5.4-nano",
-			"name": "GPT-5.4 Nano",
+			"name": "GPT-5.4 nano",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -46736,7 +46737,6 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gpt-5.4-nano-none",
 			"thinking": {
 				"mode": "effort",
@@ -46754,11 +46754,12 @@
 					"xhigh": "gpt-5.4-nano-xhigh"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5": {
 			"id": "gpt-5.5",
-			"name": "GPT-5.5 1M",
+			"name": "GPT-5.5",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -46776,8 +46777,7 @@
 			"contextWindow": 1000000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low",
-			"supportsComputerUse": false,
+			"contextPromotionTarget": "cursor/gpt-5.4",
 			"requestModelId": "gpt-5.5-none",
 			"thinking": {
 				"mode": "effort",
@@ -46793,6 +46793,7 @@
 					"high": "gpt-5.5-high"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.5-extra-high": {
@@ -46815,7 +46816,7 @@
 			"contextWindow": 1000000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"contextPromotionTarget": "cursor/gpt-5.4",
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
@@ -46839,7 +46840,7 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low",
+			"contextPromotionTarget": "cursor/gpt-5.4",
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
@@ -46863,8 +46864,7 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"contextPromotionTarget": "cursor/gpt-5.4-low",
-			"supportsComputerUse": false,
+			"contextPromotionTarget": "cursor/gpt-5.4",
 			"requestModelId": "gpt-5.5-none-fast",
 			"thinking": {
 				"mode": "effort",
@@ -46880,6 +46880,7 @@
 					"high": "gpt-5.5-high-fast"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna": {
@@ -46902,7 +46903,6 @@
 			"contextWindow": 1000000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gpt-5.6-luna-none",
 			"thinking": {
 				"mode": "effort",
@@ -46922,6 +46922,7 @@
 					"max": "gpt-5.6-luna-max"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-luna-fast": {
@@ -46944,7 +46945,6 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gpt-5.6-luna-none-fast",
 			"thinking": {
 				"mode": "effort",
@@ -46964,6 +46964,7 @@
 					"max": "gpt-5.6-luna-max-fast"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol": {
@@ -46986,7 +46987,6 @@
 			"contextWindow": 1000000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gpt-5.6-sol-none",
 			"thinking": {
 				"mode": "effort",
@@ -47006,6 +47006,7 @@
 					"max": "gpt-5.6-sol-max"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-sol-fast": {
@@ -47028,7 +47029,6 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gpt-5.6-sol-none-fast",
 			"thinking": {
 				"mode": "effort",
@@ -47048,6 +47048,7 @@
 					"max": "gpt-5.6-sol-max-fast"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra": {
@@ -47070,7 +47071,6 @@
 			"contextWindow": 1000000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gpt-5.6-terra-none",
 			"thinking": {
 				"mode": "effort",
@@ -47090,6 +47090,7 @@
 					"max": "gpt-5.6-terra-max"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"gpt-5.6-terra-fast": {
@@ -47112,7 +47113,6 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000,
 			"cursorMaxMode": false,
-			"supportsComputerUse": false,
 			"requestModelId": "gpt-5.6-terra-none-fast",
 			"thinking": {
 				"mode": "effort",
@@ -47132,6 +47132,7 @@
 					"max": "gpt-5.6-terra-max-fast"
 				}
 			},
+			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
 		"grok-code-fast-1": {
@@ -98311,9 +98312,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.14,
-				"output": 0.58,
-				"cacheRead": 0.035,
+				"input": 0.132,
+				"output": 0.528,
+				"cacheRead": 0.033,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
