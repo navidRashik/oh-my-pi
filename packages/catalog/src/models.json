@@ -202316,11 +202316,9 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
-					"medium",
 					"high",
-					"xhigh"
+					"max"
 				]
 			},
 			"requiresGlyphTokenization": false,
