@@ -26194,83 +26194,6 @@
 		}
 	},
 	"alibaba-token-plan": {
-		"deepseek-v4-flash-0731": {
-			"id": "deepseek-v4-flash-0731",
-			"name": "DeepSeek V4 Flash 0731",
-			"api": "openai-completions",
-			"provider": "alibaba-token-plan",
-			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
-			"reasoning": true,
-			"input": [
-				"text"
-			],
-			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
-				"cacheWrite": 0
-			},
-			"contextWindow": 1000000,
-			"maxTokens": 384000,
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"low",
-					"high",
-					"max"
-				]
-			},
-			"requiresGlyphTokenization": false,
-			"tokenizer": "deepseek-v3",
-			"compat": {
-				"supportsStore": false,
-				"supportsDeveloperRole": false,
-				"supportsMultipleSystemMessages": false,
-				"supportsReasoningEffort": true,
-				"supportsReasoningParams": true,
-				"supportsSamplingParams": true,
-				"supportsPenaltyAndStopParams": true,
-				"reasoningEffortMap": {},
-				"supportsUsageInStreaming": true,
-				"alwaysSendMaxTokens": false,
-				"disableReasoningOnForcedToolChoice": false,
-				"disableReasoningOnToolChoice": true,
-				"supportsToolChoice": true,
-				"supportsForcedToolChoice": true,
-				"supportsNamedToolChoice": true,
-				"maxTokensField": "max_completion_tokens",
-				"requiresToolResultName": false,
-				"requiresAssistantAfterToolResult": false,
-				"requiresThinkingAsText": false,
-				"requiresMistralToolIds": false,
-				"thinkingFormat": "qwen",
-				"reasoningDisableMode": "qwen-enable-thinking-false",
-				"omitReasoningEffort": false,
-				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": false,
-				"reasoningContentField": "reasoning_content",
-				"requiresReasoningContentForToolCalls": true,
-				"requiresReasoningContentForAllAssistantTurns": true,
-				"allowsSyntheticReasoningContentForToolCalls": false,
-				"replayReasoningContent": false,
-				"qwenPreserveThinking": false,
-				"qwenTemplateReasoningEffort": false,
-				"requiresAssistantContentForToolCalls": false,
-				"supportsPromptCacheBreakpoints": false,
-				"isOpenRouterHost": false,
-				"wireModelIdMode": "raw",
-				"isVercelGatewayHost": false,
-				"supportsStrictMode": false,
-				"toolStrictMode": "mixed",
-				"stripDeepseekSpecialTokens": false,
-				"streamMarkupHealingPattern": "thinking",
-				"reasoningDeltasMayBeCumulative": false,
-				"emptyLengthFinishIsContextError": false,
-				"usesOpenAIToolCallIdLimit": false,
-				"dropThinkingWhenReasoningEffort": false
-			},
-			"supportsComputerUse": false
-		},
 		"deepseek-v4-pro": {
 			"id": "deepseek-v4-pro",
 			"name": "DeepSeek V4 Pro",
@@ -46284,7 +46207,7 @@
 					"high": "cursor-grok-4.5-high"
 				}
 			},
-			"requestModelId": "cursor-grok-4.5-low",
+			"requestModelId": "cursor-grok-4.5-medium",
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
@@ -46322,7 +46245,7 @@
 					"high": "cursor-grok-4.5-high-fast"
 				}
 			},
-			"requestModelId": "cursor-grok-4.5-low-fast",
+			"requestModelId": "cursor-grok-4.5-medium-fast",
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
@@ -46362,7 +46285,7 @@
 					"xhigh": "cursor-grok-4.6-xhigh"
 				}
 			},
-			"requestModelId": "cursor-grok-4.6-low",
+			"requestModelId": "cursor-grok-4.6-medium",
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
@@ -46402,7 +46325,7 @@
 					"xhigh": "cursor-grok-4.6-xhigh-fast"
 				}
 			},
-			"requestModelId": "cursor-grok-4.6-low-fast",
+			"requestModelId": "cursor-grok-4.6-medium-fast",
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
@@ -65803,8 +65726,8 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.055,
-				"output": 0.14,
+				"input": 0.04,
+				"output": 0.13,
 				"cacheRead": 0.01,
 				"cacheWrite": 0
 			},
@@ -81265,7 +81188,7 @@
 				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
-			"contextWindow": 204800,
+			"contextWindow": 196608,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
@@ -129343,6 +129266,85 @@
 			},
 			"supportsComputerUseConfig": false
 		},
+		"Gemma-4-31B-MeroMero-v2": {
+			"id": "Gemma-4-31B-MeroMero-v2",
+			"name": "Gemma 4 31B MeroMero v2",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.08,
+				"output": 0.33,
+				"cacheRead": 0.04,
+				"cacheWrite": 0
+			},
+			"contextWindow": 65536,
+			"maxTokens": 32768,
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh"
+				]
+			},
+			"requiresGlyphTokenization": false,
+			"supportsComputerUse": false,
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false
+			}
+		},
 		"Gemma-4-31B-Musica-v1": {
 			"id": "Gemma-4-31B-Musica-v1",
 			"name": "Gemma-4-31B-Musica-v1",
@@ -152496,6 +152498,85 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
+			"maxTokens": 32768,
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh"
+				]
+			},
+			"requiresGlyphTokenization": false,
+			"supportsComputerUse": false,
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false
+			}
+		},
+		"ornith-ai/ornith-1.5-9b": {
+			"id": "ornith-ai/ornith-1.5-9b",
+			"name": "Ornith 1.5 9B",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.05,
+				"output": 0.1,
+				"cacheRead": 0.025,
+				"cacheWrite": 0
+			},
+			"contextWindow": 131072,
 			"maxTokens": 32768,
 			"thinking": {
 				"mode": "effort",
@@ -179158,7 +179239,7 @@
 		},
 		"minimax/minimax-m2.7": {
 			"id": "minimax/minimax-m2.7",
-			"name": "MiniMax-M2.7",
+			"name": "MiniMax M2.7",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -202301,6 +202382,94 @@
 				"usesOpenAIToolCallIdLimit": false
 			},
 			"supportsComputerUse": false
+		},
+		"gpt-daybreak-blue-latest": {
+			"id": "gpt-daybreak-blue-latest",
+			"name": "Daybreak Blue",
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": "https://chatgpt.com/backend-api",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 5,
+				"output": 30,
+				"cacheRead": 0.5,
+				"cacheWrite": 6.25
+			},
+			"remoteCompaction": {
+				"enabled": true,
+				"api": "openai-codex-responses",
+				"v2StreamingEnabled": true
+			},
+			"contextWindow": 272000,
+			"maxTokens": 128000,
+			"preferWebsockets": true,
+			"useResponsesLite": true,
+			"toolMode": "code_mode_only",
+			"priority": 3,
+			"applyPatchToolType": "freeform",
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"low",
+					"medium",
+					"high",
+					"xhigh",
+					"max"
+				]
+			},
+			"requiresGlyphTokenization": false,
+			"compat": {
+				"supportsDeveloperRole": false,
+				"supportsStrictMode": false,
+				"supportsReasoningEffort": true,
+				"supportsLongPromptCacheRetention": false,
+				"supportsPromptCacheBreakpoints": false,
+				"strictResponsesPairing": false,
+				"supportsImageDetailOriginal": true,
+				"supportsReasoningSummary": true,
+				"reasoningEffortMap": {},
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": false,
+				"supportsPenaltyAndStopParams": true,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresAssistantContentForToolCalls": false,
+				"isOpenRouterHost": false,
+				"isVercelGatewayHost": false,
+				"wireModelIdMode": "raw",
+				"alwaysSendMaxTokens": false,
+				"supportsObfuscationOptOut": false,
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false
+			},
+			"supportsComputerUse": false
 		}
 	},
 	"opencode": {
@@ -213552,11 +213721,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
+					"minimal",
 					"low",
+					"medium",
 					"high",
-					"max"
-				],
-				"requiresEffort": true
+					"xhigh"
+				]
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -213679,11 +213849,14 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh",
+					"max"
+				],
+				"defaultLevel": "high",
+				"requiresEffort": true
 			},
 			"tokenizer": "claude-v3",
 			"requiresGlyphTokenization": true,
@@ -214008,8 +214181,8 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.055,
-				"output": 0.14,
+				"input": 0.04,
+				"output": 0.13,
 				"cacheRead": 0.01,
 				"cacheWrite": 0
 			},
@@ -214102,11 +214275,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -214186,11 +214360,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -214523,11 +214698,13 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"defaultLevel": "high",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -214606,11 +214783,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
-					"medium",
-					"high"
-				]
+					"high",
+					"max"
+				],
+				"defaultLevel": "max",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -215973,7 +216151,9 @@
 					"high",
 					"xhigh",
 					"max"
-				]
+				],
+				"defaultLevel": "high",
+				"requiresEffort": true
 			},
 			"tokenizer": "claude-v5-sonnet",
 			"requiresGlyphTokenization": true,
@@ -216060,7 +216240,9 @@
 					"high",
 					"xhigh",
 					"max"
-				]
+				],
+				"defaultLevel": "high",
+				"requiresEffort": true
 			},
 			"tokenizer": "claude-v5-sonnet",
 			"requiresGlyphTokenization": true,
@@ -220711,9 +220893,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.05306,
-				"output": 0.10612,
-				"cacheRead": 0.010612,
+				"input": 0.05026,
+				"output": 0.10052,
+				"cacheRead": 0.010052,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -221043,9 +221225,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.413772,
-				"output": 0.827544,
-				"cacheRead": 0.034481000000000005,
+				"input": 0.396894,
+				"output": 0.793788,
+				"cacheRead": 0.0330745,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -222375,6 +222557,7 @@
 					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -222460,6 +222643,7 @@
 					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -222711,6 +222895,7 @@
 					"medium",
 					"high"
 				],
+				"defaultLevel": "minimal",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -222871,6 +223056,7 @@
 					"medium",
 					"high"
 				],
+				"defaultLevel": "minimal",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -222952,8 +223138,10 @@
 				"mode": "effort",
 				"efforts": [
 					"low",
+					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -223035,8 +223223,10 @@
 				"mode": "effort",
 				"efforts": [
 					"low",
+					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -223118,8 +223308,10 @@
 				"mode": "effort",
 				"efforts": [
 					"low",
+					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -223205,6 +223397,7 @@
 					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -223290,6 +223483,7 @@
 					"medium",
 					"high"
 				],
+				"defaultLevel": "minimal",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -223375,6 +223569,7 @@
 					"medium",
 					"high"
 				],
+				"defaultLevel": "minimal",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -223460,6 +223655,7 @@
 					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -223545,6 +223741,7 @@
 					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -223630,6 +223827,7 @@
 					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -223710,11 +223908,11 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -223795,11 +223993,11 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
 					"high"
 				],
+				"defaultLevel": "medium",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -225290,11 +225488,11 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"defaultLevel": "high",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -226671,11 +226869,13 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -226758,8 +226958,11 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -226842,8 +227045,11 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -226926,8 +227132,11 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"compat": {
@@ -227401,7 +227610,7 @@
 		},
 		"minimax/minimax-m2.7": {
 			"id": "minimax/minimax-m2.7",
-			"name": "MiniMax-M2.7",
+			"name": "MiniMax M2.7",
 			"api": "openrouter",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -227410,9 +227619,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.3,
-				"output": 1.2,
-				"cacheRead": 0.06,
+				"input": 0.24,
+				"output": 0.96,
+				"cacheRead": 0.048,
 				"cacheWrite": 0
 			},
 			"contextWindow": 204800,
@@ -234144,7 +234353,9 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -234564,7 +234775,9 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -234648,7 +234861,9 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -234732,7 +234947,9 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -234816,7 +235033,9 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -234896,11 +235115,10 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "high",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -234980,11 +235198,10 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "high",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -235068,7 +235285,9 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -235307,11 +235526,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -235391,11 +235611,13 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -235804,7 +236026,9 @@
 					"medium",
 					"high",
 					"xhigh"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -235884,11 +236108,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"low",
 					"medium",
 					"high",
 					"xhigh"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -235968,11 +236193,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"low",
 					"medium",
 					"high",
 					"xhigh"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -236714,11 +236940,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"low",
 					"medium",
 					"high",
 					"xhigh"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -236798,11 +237025,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"low",
 					"medium",
 					"high",
 					"xhigh"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -237051,11 +237279,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"low",
 					"medium",
 					"high",
 					"xhigh"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"contextPromotionTarget": "openrouter/openai/gpt-5.4",
 			"requiresGlyphTokenization": false,
@@ -237136,11 +237365,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"low",
 					"medium",
 					"high",
 					"xhigh"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"contextPromotionTarget": "openrouter/openai/gpt-5.4",
 			"requiresGlyphTokenization": false,
@@ -238560,7 +238790,9 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -238806,7 +239038,9 @@
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -239473,11 +239707,9 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
 					"high"
 				],
+				"defaultLevel": "high",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -239557,11 +239789,9 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
 					"high"
 				],
+				"defaultLevel": "high",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -240151,11 +240381,9 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
 					"high"
 				],
+				"defaultLevel": "high",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -240236,11 +240464,9 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
 					"high"
 				],
+				"defaultLevel": "high",
 				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
@@ -246291,11 +246517,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"xhigh"
+				],
+				"defaultLevel": "xhigh",
+				"requiresEffort": true
 			},
 			"tokenizer": "qwen3",
 			"requiresGlyphTokenization": false,
@@ -246464,8 +246691,11 @@
 					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"defaultLevel": "xhigh",
+				"requiresEffort": true
 			},
 			"tokenizer": "qwen3",
 			"requiresGlyphTokenization": false,
@@ -246853,11 +247083,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				]
+					"high",
+					"xhigh",
+					"max"
+				],
+				"defaultLevel": "xhigh",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -247169,11 +247400,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
-					"medium",
-					"high"
-				]
+					"high",
+					"max"
+				],
+				"defaultLevel": "max",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"compat": {
@@ -247418,11 +247650,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "medium",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -249636,11 +249869,12 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
 					"high"
-				]
+				],
+				"defaultLevel": "high",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -249720,11 +249954,13 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"high",
+					"xhigh"
+				],
+				"defaultLevel": "high",
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -272751,7 +272987,7 @@
 		"minimax/minimax-m2.7": {
 			"id": "minimax/minimax-m2.7",
 			"requiresGlyphTokenization": false,
-			"name": "MiniMax-M2.7",
+			"name": "MiniMax M2.7",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
