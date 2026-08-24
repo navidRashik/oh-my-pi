@@ -293880,7 +293880,7 @@
 				"allowsSyntheticReasoningContentForToolCalls": true,
 				"replayReasoningContent": false,
 				"qwenPreserveThinking": false,
-				"qwenTemplateReasoningEffort": false,
+				"qwenTemplateReasoningEffort": true,
 				"requiresAssistantContentForToolCalls": false,
 				"supportsPromptCacheBreakpoints": false,
 				"isOpenRouterHost": false,
@@ -293898,11 +293898,11 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
 					"low",
 					"medium",
-					"high"
-				]
+					"xhigh"
+				],
+				"requiresEffort": true
 			},
 			"requiresGlyphTokenization": false,
 			"tokenizer": "qwen3",
@@ -293911,7 +293911,8 @@
 				"supportsDeveloperRole": false,
 				"supportsStore": false,
 				"supportsReasoningEffort": true,
-				"thinkingFormat": "qwen-chat-template"
+				"thinkingFormat": "qwen-chat-template",
+				"qwenTemplateReasoningEffort": true
 			}
 		}
 	},
