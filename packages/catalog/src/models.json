@@ -293829,9 +293829,9 @@
 		}
 	},
 	"yolo-auto": {
-		"qwen3.8-27b": {
-			"id": "qwen3.8-27b",
-			"name": "Qwen3.8 27B",
+		"deepseek-flash-v4": {
+			"id": "deepseek-flash-v4",
+			"name": "DeepSeek Flash V4",
 			"api": "openai-completions",
 			"provider": "yolo-auto",
 			"baseUrl": "https://yolo-auto.com/v1",
@@ -293840,6 +293840,25 @@
 				"text",
 				"image"
 			],
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh",
+					"max"
+				],
+				"effortMap": {
+					"minimal": "low",
+					"low": "low",
+					"medium": "high",
+					"high": "high",
+					"xhigh": "max",
+					"max": "max"
+				}
+			},
 			"cost": {
 				"input": 0,
 				"output": 0,
@@ -293847,11 +293866,11 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 32768,
+			"maxTokens": null,
 			"compat": {
 				"supportsStore": false,
 				"supportsDeveloperRole": false,
-				"supportsMultipleSystemMessages": false,
+				"supportsMultipleSystemMessages": true,
 				"supportsReasoningEffort": true,
 				"supportsReasoningParams": true,
 				"supportsSamplingParams": true,
@@ -293860,7 +293879,7 @@
 				"supportsUsageInStreaming": true,
 				"alwaysSendMaxTokens": false,
 				"disableReasoningOnForcedToolChoice": false,
-				"disableReasoningOnToolChoice": false,
+				"disableReasoningOnToolChoice": true,
 				"supportsToolChoice": true,
 				"supportsForcedToolChoice": true,
 				"supportsNamedToolChoice": true,
@@ -293869,18 +293888,18 @@
 				"requiresAssistantAfterToolResult": false,
 				"requiresThinkingAsText": false,
 				"requiresMistralToolIds": false,
-				"thinkingFormat": "qwen-chat-template",
-				"reasoningDisableMode": "qwen-template-false",
+				"thinkingFormat": "chat-template",
+				"reasoningDisableMode": "chat-template-thinking-false",
 				"omitReasoningEffort": false,
 				"includeEncryptedReasoning": true,
 				"filterReasoningHistory": false,
 				"reasoningContentField": "reasoning_content",
-				"requiresReasoningContentForToolCalls": false,
-				"requiresReasoningContentForAllAssistantTurns": false,
-				"allowsSyntheticReasoningContentForToolCalls": true,
+				"requiresReasoningContentForToolCalls": true,
+				"requiresReasoningContentForAllAssistantTurns": true,
+				"allowsSyntheticReasoningContentForToolCalls": false,
 				"replayReasoningContent": false,
 				"qwenPreserveThinking": false,
-				"qwenTemplateReasoningEffort": true,
+				"qwenTemplateReasoningEffort": false,
 				"requiresAssistantContentForToolCalls": false,
 				"supportsPromptCacheBreakpoints": false,
 				"isOpenRouterHost": false,
@@ -293895,24 +293914,14 @@
 				"usesOpenAIToolCallIdLimit": false,
 				"dropThinkingWhenReasoningEffort": false
 			},
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"low",
-					"medium",
-					"xhigh"
-				],
-				"requiresEffort": true
-			},
 			"requiresGlyphTokenization": false,
-			"tokenizer": "qwen3",
+			"tokenizer": "deepseek-v3",
 			"supportsComputerUse": false,
 			"compatConfig": {
 				"supportsDeveloperRole": false,
 				"supportsStore": false,
 				"supportsReasoningEffort": true,
-				"thinkingFormat": "qwen-chat-template",
-				"qwenTemplateReasoningEffort": true
+				"thinkingFormat": "chat-template"
 			}
 		}
 	},
