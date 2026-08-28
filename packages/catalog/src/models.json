@@ -64887,38 +64887,6 @@
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false
 		},
-		"gemini-3.7-flash-tiered": {
-			"id": "gemini-3.7-flash-tiered",
-			"name": "gemini-3.7-flash-tiered",
-			"api": "google-gemini-cli",
-			"provider": "google-antigravity",
-			"baseUrl": "https://daily-cloudcode-pa.googleapis.com",
-			"reasoning": true,
-			"input": [
-				"text",
-				"image"
-			],
-			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
-				"cacheWrite": 0
-			},
-			"contextWindow": 1048576,
-			"maxTokens": 65536,
-			"thinking": {
-				"mode": "google-level",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high"
-				],
-				"requiresEffort": true
-			},
-			"requiresGlyphTokenization": false,
-			"supportsComputerUse": false
-		},
 		"gpt-oss-120b": {
 			"id": "gpt-oss-120b",
 			"name": "GPT OSS 120B",
