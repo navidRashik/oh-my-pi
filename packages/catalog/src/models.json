@@ -116130,7 +116130,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 512000,
+			"maxTokens": 128000,
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"efforts": [
@@ -116540,7 +116540,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 512000,
+			"maxTokens": 128000,
 			"thinking": {
 				"mode": "anthropic-adaptive",
 				"efforts": [
@@ -117257,7 +117257,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 512000,
+			"maxTokens": 128000,
 			"compat": {
 				"supportsStore": false,
 				"supportsDeveloperRole": false,
@@ -118007,7 +118007,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
-			"maxTokens": 512000,
+			"maxTokens": 128000,
 			"compat": {
 				"supportsStore": false,
 				"supportsDeveloperRole": false,
@@ -304885,9 +304885,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.075,
-				"output": 0.25,
-				"cacheRead": 0.015,
+				"input": 0.15,
+				"output": 0.5,
+				"cacheRead": 0.03,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
