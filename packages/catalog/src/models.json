@@ -42190,7 +42190,8 @@
 			"maxTokens": 32768,
 			"requiresGlyphTokenization": false,
 			"identity": {
-				"class": "unknown"
+				"class": "glm",
+				"revision": "4.6.0"
 			},
 			"supportsComputerUse": false,
 			"compat": {
@@ -42276,7 +42277,8 @@
 			},
 			"requiresGlyphTokenization": false,
 			"identity": {
-				"class": "unknown"
+				"class": "glm",
+				"revision": "4.7.0"
 			},
 			"supportsComputerUse": false,
 			"compat": {
@@ -42340,7 +42342,7 @@
 			"api": "openai-completions",
 			"provider": "cline-pass",
 			"baseUrl": "https://api.cline.bot/api/v1",
-			"reasoning": false,
+			"reasoning": true,
 			"input": [
 				"text"
 			],
@@ -42865,7 +42867,7 @@
 				"cacheRead": 0.015,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
+			"contextWindow": 1310720,
 			"maxTokens": 131072,
 			"identity": {
 				"class": "glm",
@@ -65877,7 +65879,7 @@
 			"cost": {
 				"input": 1.2,
 				"output": 4,
-				"cacheRead": 0.24,
+				"cacheRead": 0.12,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -79324,6 +79326,7 @@
 				"class": "deepseek",
 				"family": "r1"
 			},
+			"tokenizer": "deepseek-v3",
 			"compat": {
 				"supportsStore": true,
 				"supportsDeveloperRole": false,
@@ -79376,7 +79379,6 @@
 				"stripImageInput": true,
 				"thinkingLoopGuard": "deepseek"
 			},
-			"tokenizer": "deepseek-v3",
 			"supportsComputerUse": false
 		},
 		"gemma2-9b-it": {
@@ -80757,6 +80759,93 @@
 			"identity": {
 				"class": "qwen",
 				"revision": "3.6.0"
+			},
+			"requiresGlyphTokenization": false,
+			"tokenizer": "qwen3",
+			"supportsComputerUse": false,
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "qwen",
+				"reasoningDisableMode": "qwen-enable-thinking-false",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false
+			}
+		},
+		"qwen/qwen3.8-27b": {
+			"id": "qwen/qwen3.8-27b",
+			"name": "Qwen3.8 27B",
+			"api": "openai-completions",
+			"provider": "groq",
+			"baseUrl": "https://api.groq.com/openai/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.8,
+				"output": 4,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 131042,
+			"maxTokens": 16384,
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high"
+				]
+			},
+			"identity": {
+				"class": "qwen",
+				"revision": "3.8.0"
 			},
 			"requiresGlyphTokenization": false,
 			"tokenizer": "qwen3",
@@ -87192,9 +87281,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.03,
+				"input": 0.05,
 				"output": 0.16,
-				"cacheRead": 0.01,
+				"cacheRead": 0.013,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -87804,13 +87893,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 1.1875,
-				"output": 4.18,
-				"cacheRead": 0.247,
+				"input": 1.17,
+				"output": 3.96,
+				"cacheRead": 0.234,
 				"cacheWrite": 0
 			},
-			"contextWindow": 262144,
-			"maxTokens": 131072,
+			"contextWindow": 1048576,
+			"maxTokens": 943718,
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
@@ -91978,8 +92067,8 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.22,
-				"output": 0.85,
+				"input": 0.25,
+				"output": 0.8,
 				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
@@ -94141,8 +94230,8 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.4,
-				"output": 1.3,
+				"input": 0.2574,
+				"output": 1.0287,
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
@@ -94218,9 +94307,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.27,
-				"output": 1.12,
-				"cacheRead": 0.135,
+				"input": 0.25,
+				"output": 1,
+				"cacheRead": 0,
 				"cacheWrite": 0
 			},
 			"contextWindow": 163840,
@@ -95289,9 +95378,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.22,
-				"output": 0.66,
-				"cacheRead": 0.007,
+				"input": 0.44,
+				"output": 1.32,
+				"cacheRead": 0.028,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -96901,10 +96990,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.5,
-				"output": 3,
-				"cacheRead": 0.05,
-				"cacheWrite": 0.083333
+				"input": 0.25,
+				"output": 1.5,
+				"cacheRead": 0.025,
+				"cacheWrite": 0.041667
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 65536,
@@ -97408,10 +97497,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.25,
-				"output": 1.5,
-				"cacheRead": 0.025,
-				"cacheWrite": 0.083333
+				"input": 0.125,
+				"output": 0.75,
+				"cacheRead": 0.0125,
+				"cacheWrite": 0.041667
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 65536,
@@ -97575,10 +97664,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.25,
-				"output": 1.5,
-				"cacheRead": 0.025,
-				"cacheWrite": 0.083333
+				"input": 0.125,
+				"output": 0.75,
+				"cacheRead": 0.0125,
+				"cacheWrite": 0.041667
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 65536,
@@ -97664,10 +97753,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 2,
-				"output": 12,
-				"cacheRead": 0.2,
-				"cacheWrite": 0.375
+				"input": 1,
+				"output": 6,
+				"cacheRead": 0.1,
+				"cacheWrite": 0.1875
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 65536,
@@ -97838,10 +97927,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 1.5,
-				"output": 9,
-				"cacheRead": 0.15,
-				"cacheWrite": 0.083333
+				"input": 0.75,
+				"output": 4.5,
+				"cacheRead": 0.075,
+				"cacheWrite": 0.041667
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 65536,
@@ -97927,10 +98016,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.3,
-				"output": 2.5,
-				"cacheRead": 0.03,
-				"cacheWrite": 0.083333
+				"input": 0.15,
+				"output": 1.25,
+				"cacheRead": 0.015,
+				"cacheWrite": 0.041667
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 65536,
@@ -98016,10 +98105,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.75,
-				"output": 3.75,
-				"cacheRead": 0.075,
-				"cacheWrite": 0.041667
+				"input": 0.375,
+				"output": 1.875,
+				"cacheRead": 0.0375,
+				"cacheWrite": 0.020833
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 65536,
@@ -98105,10 +98194,10 @@
 				"image"
 			],
 			"cost": {
-				"input": 1.5,
-				"output": 7.5,
-				"cacheRead": 0.15,
-				"cacheWrite": 0.083333
+				"input": 0.75,
+				"output": 3.75,
+				"cacheRead": 0.075,
+				"cacheWrite": 0.041667
 			},
 			"contextWindow": 1048576,
 			"maxTokens": 65536,
@@ -99127,6 +99216,91 @@
 			},
 			"contextWindow": 131072,
 			"maxTokens": 117964,
+			"identity": {
+				"class": "unknown"
+			},
+			"requiresGlyphTokenization": false,
+			"supportsComputerUse": false,
+			"compat": {
+				"supportsStore": false,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false
+			}
+		},
+		"ibm-granite/granite-4.2-8b": {
+			"id": "ibm-granite/granite-4.2-8b",
+			"name": "Granite 4.2 8B",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.1,
+				"output": 0.15,
+				"cacheRead": 0.05,
+				"cacheWrite": 0
+			},
+			"contextWindow": 131072,
+			"maxTokens": 117964,
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh"
+				]
+			},
 			"identity": {
 				"class": "unknown"
 			},
@@ -101027,7 +101201,7 @@
 		},
 		"kwaipilot/kat-coder-air-v2.5": {
 			"id": "kwaipilot/kat-coder-air-v2.5",
-			"name": "KAT-Coder-Air V2.5",
+			"name": "KAT Coder Air V2.5",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -101047,7 +101221,6 @@
 				"class": "unknown"
 			},
 			"requiresGlyphTokenization": false,
-			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": false,
 				"supportsDeveloperRole": false,
@@ -101098,7 +101271,8 @@
 				"zaiReasoningEffortDialect": false,
 				"clampOutputToModelMax": false,
 				"stripImageInput": false
-			}
+			},
+			"supportsComputerUse": false
 		},
 		"kwaipilot/kat-coder-pro": {
 			"id": "kwaipilot/kat-coder-pro",
@@ -101192,8 +101366,8 @@
 				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
-			"contextWindow": 256000,
-			"maxTokens": 80000,
+			"contextWindow": 262144,
+			"maxTokens": 144000,
 			"identity": {
 				"class": "unknown"
 			},
@@ -101267,8 +101441,8 @@
 				"cacheRead": 0.15,
 				"cacheWrite": 0
 			},
-			"contextWindow": 256000,
-			"maxTokens": 80000,
+			"contextWindow": 262144,
+			"maxTokens": 235929,
 			"identity": {
 				"class": "unknown"
 			},
@@ -102818,8 +102992,8 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 1048576,
-			"maxTokens": 16384,
+			"contextWindow": 128000,
+			"maxTokens": 115200,
 			"identity": {
 				"class": "meta",
 				"family": "llama"
@@ -104908,9 +105082,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.44,
-				"output": 2.2,
-				"cacheRead": 0.044,
+				"input": 0.4,
+				"output": 2,
+				"cacheRead": 0.04,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -106218,9 +106392,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.165,
-				"output": 0.165,
-				"cacheRead": 0.0165,
+				"input": 0.019,
+				"output": 0.03,
+				"cacheRead": 0,
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
@@ -106610,9 +106784,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.11,
-				"output": 0.33,
-				"cacheRead": 0.011,
+				"input": 0.075,
+				"output": 0.2,
+				"cacheRead": 0,
 				"cacheWrite": 0
 			},
 			"contextWindow": 128000,
@@ -111037,7 +111211,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 1047576,
-			"maxTokens": 942818,
+			"maxTokens": 32768,
 			"identity": {
 				"class": "openai",
 				"family": "gpt",
@@ -120644,7 +120818,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 16384,
+			"maxTokens": 235929,
 			"identity": {
 				"class": "qwen",
 				"family": "next",
@@ -125767,9 +125941,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.14,
-				"output": 0.58,
-				"cacheRead": 0.035,
+				"input": 0.0825,
+				"output": 0.33,
+				"cacheRead": 0.020625,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -126034,7 +126208,6 @@
 				"class": "unknown"
 			},
 			"requiresGlyphTokenization": false,
-			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": false,
 				"supportsDeveloperRole": false,
@@ -126085,7 +126258,8 @@
 				"zaiReasoningEffortDialect": false,
 				"clampOutputToModelMax": false,
 				"stripImageInput": false
-			}
+			},
+			"supportsComputerUse": false
 		},
 		"tencent/hy4-preview": {
 			"id": "tencent/hy4-preview",
@@ -126839,6 +127013,7 @@
 				"class": "deepseek",
 				"family": "r1"
 			},
+			"tokenizer": "deepseek-v3",
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": false,
@@ -126892,7 +127067,6 @@
 				"stripImageInput": true,
 				"thinkingLoopGuard": "deepseek"
 			},
-			"tokenizer": "deepseek-v3",
 			"supportsComputerUseConfig": false
 		},
 		"undi95/remm-slerp-l2-13b": {
@@ -136544,13 +136718,15 @@
 					"low",
 					"medium",
 					"high",
-					"xhigh"
+					"max"
 				]
 			},
 			"identity": {
-				"class": "unknown"
+				"class": "glm",
+				"revision": "5.2.0"
 			},
 			"requiresGlyphTokenization": false,
+			"tokenizer": "glm5",
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": false,
@@ -138242,6 +138418,81 @@
 			},
 			"supportsComputerUse": false
 		},
+		"abliteration-ai/abliterated-model": {
+			"id": "abliteration-ai/abliterated-model",
+			"name": "abliteration-ai/abliterated-model",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": null,
+			"maxTokens": null,
+			"identity": {
+				"class": "unknown"
+			},
+			"requiresGlyphTokenization": false,
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false
+			},
+			"supportsComputerUse": false
+		},
 		"abliteration-ai/abliterated-model-large": {
 			"id": "abliteration-ai/abliterated-model-large",
 			"name": "Abliterated Model Large",
@@ -138326,6 +138577,81 @@
 				"clampOutputToModelMax": false,
 				"stripImageInput": false
 			}
+		},
+		"abliteration-ai/abliterated-model-large-v2": {
+			"id": "abliteration-ai/abliterated-model-large-v2",
+			"name": "abliteration-ai/abliterated-model-large-v2",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": null,
+			"maxTokens": null,
+			"identity": {
+				"class": "unknown"
+			},
+			"requiresGlyphTokenization": false,
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false
+			},
+			"supportsComputerUse": false
 		},
 		"aion-labs/aion-1.0": {
 			"id": "aion-labs/aion-1.0",
@@ -145290,7 +145616,6 @@
 			},
 			"requiresGlyphTokenization": true,
 			"tokenizer": "claude-v3",
-			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": true,
 				"supportsDeveloperRole": false,
@@ -145341,7 +145666,8 @@
 				"zaiReasoningEffortDialect": false,
 				"clampOutputToModelMax": false,
 				"stripImageInput": false
-			}
+			},
+			"supportsComputerUse": false
 		},
 		"claude-opus-4-1-thinking:32768": {
 			"id": "claude-opus-4-1-thinking:32768",
@@ -145999,7 +146325,6 @@
 			},
 			"requiresGlyphTokenization": true,
 			"tokenizer": "claude-v3",
-			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": true,
 				"supportsDeveloperRole": false,
@@ -146050,7 +146375,8 @@
 				"zaiReasoningEffortDialect": false,
 				"clampOutputToModelMax": false,
 				"stripImageInput": false
-			}
+			},
+			"supportsComputerUse": false
 		},
 		"claude-opus-4-thinking:32768": {
 			"id": "claude-opus-4-thinking:32768",
@@ -148702,6 +149028,7 @@
 			"identity": {
 				"class": "deepseek"
 			},
+			"tokenizer": "deepseek-v3",
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": true,
@@ -148755,7 +149082,6 @@
 				"stripImageInput": true,
 				"thinkingLoopGuard": "deepseek"
 			},
-			"tokenizer": "deepseek-v3",
 			"supportsComputerUseConfig": false
 		},
 		"deepseek-r1": {
@@ -149264,6 +149590,7 @@
 			"identity": {
 				"class": "deepseek"
 			},
+			"tokenizer": "deepseek-v3",
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": true,
@@ -149317,7 +149644,6 @@
 				"stripImageInput": true,
 				"thinkingLoopGuard": "deepseek"
 			},
-			"tokenizer": "deepseek-v3",
 			"supportsComputerUseConfig": false
 		},
 		"deepseek/deepseek-v3.2": {
@@ -156125,9 +156451,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.06,
-				"output": 0.3,
-				"cacheRead": 0.03,
+				"input": 0.05,
+				"output": 0.25,
+				"cacheRead": 0.025,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -156201,9 +156527,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -156287,9 +156613,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -156373,9 +156699,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -156449,9 +156775,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -156535,9 +156861,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -156621,9 +156947,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -156707,9 +157033,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -156793,9 +157119,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -156879,9 +157205,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -156965,9 +157291,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -157051,9 +157377,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -158852,9 +159178,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.1,
+				"output": 0.45,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -158938,9 +159264,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.1,
+				"output": 0.45,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -159024,9 +159350,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.1,
+				"output": 0.45,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -159110,9 +159436,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.1,
+				"output": 0.45,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -159196,9 +159522,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.1,
+				"output": 0.45,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -159282,9 +159608,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.1,
+				"output": 0.45,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -159368,9 +159694,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.1,
+				"output": 0.45,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -160062,9 +160388,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.1,
+				"output": 0.45,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -160148,9 +160474,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.1,
+				"output": 0.45,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -163953,9 +164279,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.12,
+				"output": 0.38,
+				"cacheRead": 0.06,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -164889,9 +165215,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.08,
-				"output": 0.33,
-				"cacheRead": 0.04,
+				"input": 0.1,
+				"output": 0.45,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -167079,6 +167405,91 @@
 				"stripImageInput": false
 			}
 		},
+		"ibm-granite/granite-4.2-8b": {
+			"id": "ibm-granite/granite-4.2-8b",
+			"name": "Granite 4.2 8B",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.1,
+				"output": 0.15,
+				"cacheRead": 0.05,
+				"cacheWrite": 0
+			},
+			"contextWindow": 131072,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh"
+				]
+			},
+			"identity": {
+				"class": "unknown"
+			},
+			"requiresGlyphTokenization": false,
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false
+			},
+			"supportsComputerUse": false
+		},
 		"inclusionai/ling-2.6-1t": {
 			"id": "inclusionai/ling-2.6-1t",
 			"name": "Ling 2.6 1T",
@@ -168730,6 +169141,7 @@
 			"identity": {
 				"class": "kimi"
 			},
+			"tokenizer": "kimi-k2",
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": true,
@@ -168783,7 +169195,6 @@
 				"clampOutputToModelMax": false,
 				"stripImageInput": false
 			},
-			"tokenizer": "kimi-k2",
 			"supportsComputerUseConfig": false
 		},
 		"kwaipilot/kat-coder-air-v2.5": {
@@ -178270,6 +178681,7 @@
 			"identity": {
 				"class": "kimi"
 			},
+			"tokenizer": "kimi-k2",
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": true,
@@ -178323,7 +178735,6 @@
 				"clampOutputToModelMax": false,
 				"stripImageInput": false
 			},
-			"tokenizer": "kimi-k2",
 			"supportsComputerUseConfig": false
 		},
 		"moonshotai/kimi-k2-instruct": {
@@ -187476,9 +187887,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.05,
-				"output": 0.1,
-				"cacheRead": 0.025,
+				"input": 0.1,
+				"output": 0.2,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -187562,9 +187973,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.05,
-				"output": 0.1,
-				"cacheRead": 0.025,
+				"input": 0.1,
+				"output": 0.2,
+				"cacheRead": 0.05,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -191407,7 +191818,7 @@
 			],
 			"cost": {
 				"input": 0.15,
-				"output": 0.5,
+				"output": 0.95,
 				"cacheRead": 0.075,
 				"cacheWrite": 0
 			},
@@ -191494,7 +191905,7 @@
 			],
 			"cost": {
 				"input": 0.15,
-				"output": 0.5,
+				"output": 0.95,
 				"cacheRead": 0.075,
 				"cacheWrite": 0
 			},
@@ -191745,9 +192156,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.2,
-				"output": 1.4,
-				"cacheRead": 0.04,
+				"input": 0.25,
+				"output": 1.5,
+				"cacheRead": 0.125,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -191832,9 +192243,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.18,
-				"output": 0.5,
-				"cacheRead": 0.075,
+				"input": 0.25,
+				"output": 1.5,
+				"cacheRead": 0.125,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -191919,9 +192330,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.18,
-				"output": 0.5,
-				"cacheRead": 0.075,
+				"input": 0.25,
+				"output": 1.5,
+				"cacheRead": 0.125,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -192006,9 +192417,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.18,
-				"output": 0.5,
-				"cacheRead": 0.075,
+				"input": 0.25,
+				"output": 1.5,
+				"cacheRead": 0.125,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -192093,9 +192504,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.18,
-				"output": 0.5,
-				"cacheRead": 0.075,
+				"input": 0.25,
+				"output": 1.5,
+				"cacheRead": 0.125,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -203221,6 +203632,93 @@
 				"stripImageInput": false
 			}
 		},
+		"TEE/glm-5.3": {
+			"id": "TEE/glm-5.3",
+			"name": "GLM 5.3 TEE",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 1.4,
+				"output": 4.4,
+				"cacheRead": 0.26,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"low",
+					"high",
+					"max"
+				],
+				"defaultLevel": "max",
+				"requiresEffort": true
+			},
+			"identity": {
+				"class": "glm",
+				"revision": "5.3.0"
+			},
+			"requiresGlyphTokenization": false,
+			"tokenizer": "glm5",
+			"supportsComputerUse": false,
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false
+			}
+		},
 		"TEE/glm-5.3-flash": {
 			"id": "TEE/glm-5.3-flash",
 			"name": "GLM 5.3 Flash TEE",
@@ -207094,6 +207592,7 @@
 			"identity": {
 				"class": "deepseek"
 			},
+			"tokenizer": "deepseek-v3",
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": true,
@@ -207147,7 +207646,6 @@
 				"stripImageInput": true,
 				"thinkingLoopGuard": "deepseek"
 			},
-			"tokenizer": "deepseek-v3",
 			"supportsComputerUseConfig": false
 		},
 		"tngtech/tng-r1t-chimera": {
@@ -211474,6 +211972,93 @@
 				"stripImageInput": false
 			}
 		},
+		"z-ai/GLM-4.6-turbo": {
+			"id": "z-ai/GLM-4.6-turbo",
+			"name": "z-ai/GLM-4.6-turbo",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 204800,
+			"maxTokens": 131072,
+			"identity": {
+				"class": "glm",
+				"family": "turbo",
+				"revision": "4.6.0"
+			},
+			"requiresGlyphTokenization": false,
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh"
+				]
+			},
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false
+			},
+			"supportsComputerUse": false
+		},
 		"z-ai/glm-4.6:thinking": {
 			"id": "z-ai/glm-4.6:thinking",
 			"name": "GLM 4.6 Thinking",
@@ -211594,6 +212179,159 @@
 				"class": "glm",
 				"revision": "4.0.0"
 			},
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false
+			},
+			"supportsComputerUse": false
+		},
+		"z-ai/glm-4.6v-flash-original": {
+			"id": "z-ai/glm-4.6v-flash-original",
+			"name": "z-ai/glm-4.6v-flash-original",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000,
+			"identity": {
+				"class": "glm",
+				"family": "flash",
+				"revision": "4.0.0"
+			},
+			"requiresGlyphTokenization": false,
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false
+			},
+			"supportsComputerUse": false
+		},
+		"z-ai/glm-4.6v-original": {
+			"id": "z-ai/glm-4.6v-original",
+			"name": "z-ai/glm-4.6v-original",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 32768,
+			"identity": {
+				"class": "glm",
+				"revision": "4.0.0"
+			},
+			"requiresGlyphTokenization": false,
 			"compat": {
 				"supportsStore": true,
 				"supportsDeveloperRole": false,
@@ -213301,9 +214039,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.125,
-				"output": 0.5,
-				"cacheRead": 0.0625,
+				"input": 0.35,
+				"output": 1.4,
+				"cacheRead": 0.175,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -213640,9 +214378,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.42,
-				"output": 1.32,
-				"cacheRead": 0.078,
+				"input": 1,
+				"output": 3.2,
+				"cacheRead": 0.2,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -213815,6 +214553,16 @@
 				"family": "air",
 				"revision": "4.5.0"
 			},
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh"
+				]
+			},
 			"compat": {
 				"supportsStore": true,
 				"supportsDeveloperRole": false,
@@ -213865,16 +214613,6 @@
 				"zaiReasoningEffortDialect": false,
 				"clampOutputToModelMax": false,
 				"stripImageInput": false
-			},
-			"thinking": {
-				"mode": "effort",
-				"efforts": [
-					"minimal",
-					"low",
-					"medium",
-					"high",
-					"xhigh"
-				]
 			},
 			"supportsComputerUse": false
 		},
@@ -216100,7 +216838,7 @@
 	"novita": {
 		"baichuan/baichuan-m2-32b": {
 			"id": "baichuan/baichuan-m2-32b",
-			"name": "BaiChuan M2 32B",
+			"name": "Baichuan M2 32B",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -216587,7 +217325,7 @@
 		},
 		"deepseek/deepseek-ocr-2": {
 			"id": "deepseek/deepseek-ocr-2",
-			"name": "DeepSeek-OCR 2",
+			"name": "DeepSeek OCR 2",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -216841,7 +217579,7 @@
 		},
 		"deepseek/deepseek-r1-0528-qwen3-8b": {
 			"id": "deepseek/deepseek-r1-0528-qwen3-8b",
-			"name": "DeepSeek R1 0528 Qwen3 8B",
+			"name": "DeepSeek R1 Distill Qwen3 8B 0528",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -216919,7 +217657,7 @@
 		},
 		"deepseek/deepseek-r1-distill-llama-70b": {
 			"id": "deepseek/deepseek-r1-distill-llama-70b",
-			"name": "DeepSeek R1 Distill LLama 70B",
+			"name": "DeepSeek R1 Distill Llama 70B",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -217006,7 +217744,7 @@
 		},
 		"deepseek/deepseek-r1-turbo": {
 			"id": "deepseek/deepseek-r1-turbo",
-			"name": "DeepSeek R1 (Turbo)",
+			"name": "DeepSeek R1 Turbo",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -217152,166 +217890,6 @@
 				"requiresReasoningContentForToolCalls": true,
 				"requiresReasoningContentForAllAssistantTurns": true,
 				"allowsSyntheticReasoningContentForToolCalls": false,
-				"replayReasoningContent": false,
-				"qwenPreserveThinking": false,
-				"qwenTemplateReasoningEffort": false,
-				"requiresAssistantContentForToolCalls": false,
-				"supportsPromptCacheBreakpoints": false,
-				"isOpenRouterHost": false,
-				"wireModelIdMode": "raw",
-				"isVercelGatewayHost": false,
-				"supportsStrictMode": false,
-				"toolStrictMode": "mixed",
-				"stripDeepseekSpecialTokens": false,
-				"streamMarkupHealingPattern": "thinking",
-				"reasoningDeltasMayBeCumulative": false,
-				"emptyLengthFinishIsContextError": false,
-				"usesOpenAIToolCallIdLimit": false,
-				"dropThinkingWhenReasoningEffort": false,
-				"nativeKimiK3Reasoning": false,
-				"zaiReasoningEffortDialect": false,
-				"clampOutputToModelMax": false,
-				"stripImageInput": true,
-				"thinkingLoopGuard": "deepseek"
-			},
-			"supportsComputerUseConfig": false
-		},
-		"deepseek/deepseek-v3-0324": {
-			"id": "deepseek/deepseek-v3-0324",
-			"name": "DeepSeek V3 0324",
-			"api": "openai-completions",
-			"provider": "novita",
-			"baseUrl": "https://api.novita.ai/openai/v1",
-			"reasoning": false,
-			"input": [
-				"text"
-			],
-			"cost": {
-				"input": 0.27,
-				"output": 1.12,
-				"cacheRead": 0.135,
-				"cacheWrite": 0
-			},
-			"contextWindow": 163840,
-			"maxTokens": 65536,
-			"supportsTools": true,
-			"tokenizer": "deepseek-v3",
-			"requiresGlyphTokenization": false,
-			"identity": {
-				"class": "deepseek",
-				"family": "v3"
-			},
-			"supportsComputerUse": false,
-			"compat": {
-				"supportsStore": true,
-				"supportsDeveloperRole": false,
-				"supportsMultipleSystemMessages": true,
-				"supportsReasoningEffort": true,
-				"supportsReasoningParams": true,
-				"supportsSamplingParams": true,
-				"supportsPenaltyAndStopParams": true,
-				"reasoningEffortMap": {},
-				"supportsUsageInStreaming": true,
-				"alwaysSendMaxTokens": false,
-				"disableReasoningOnForcedToolChoice": false,
-				"disableReasoningOnToolChoice": false,
-				"supportsToolChoice": true,
-				"supportsForcedToolChoice": true,
-				"supportsNamedToolChoice": true,
-				"maxTokensField": "max_completion_tokens",
-				"requiresToolResultName": false,
-				"requiresAssistantAfterToolResult": false,
-				"requiresThinkingAsText": false,
-				"requiresMistralToolIds": false,
-				"thinkingFormat": "openai",
-				"reasoningDisableMode": "lowest-effort",
-				"omitReasoningEffort": false,
-				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": false,
-				"reasoningContentField": "reasoning_content",
-				"requiresReasoningContentForToolCalls": false,
-				"requiresReasoningContentForAllAssistantTurns": false,
-				"allowsSyntheticReasoningContentForToolCalls": true,
-				"replayReasoningContent": false,
-				"qwenPreserveThinking": false,
-				"qwenTemplateReasoningEffort": false,
-				"requiresAssistantContentForToolCalls": false,
-				"supportsPromptCacheBreakpoints": false,
-				"isOpenRouterHost": false,
-				"wireModelIdMode": "raw",
-				"isVercelGatewayHost": false,
-				"supportsStrictMode": false,
-				"toolStrictMode": "mixed",
-				"stripDeepseekSpecialTokens": false,
-				"streamMarkupHealingPattern": "thinking",
-				"reasoningDeltasMayBeCumulative": false,
-				"emptyLengthFinishIsContextError": false,
-				"usesOpenAIToolCallIdLimit": false,
-				"dropThinkingWhenReasoningEffort": false,
-				"nativeKimiK3Reasoning": false,
-				"zaiReasoningEffortDialect": false,
-				"clampOutputToModelMax": false,
-				"stripImageInput": true,
-				"thinkingLoopGuard": "deepseek"
-			},
-			"supportsComputerUseConfig": false
-		},
-		"deepseek/deepseek-v3-turbo": {
-			"id": "deepseek/deepseek-v3-turbo",
-			"name": "DeepSeek V3 (Turbo)",
-			"api": "openai-completions",
-			"provider": "novita",
-			"baseUrl": "https://api.novita.ai/openai/v1",
-			"reasoning": false,
-			"input": [
-				"text"
-			],
-			"cost": {
-				"input": 0.4,
-				"output": 1.3,
-				"cacheRead": 0,
-				"cacheWrite": 0
-			},
-			"contextWindow": 64000,
-			"maxTokens": 16000,
-			"supportsTools": true,
-			"tokenizer": "deepseek-v3",
-			"requiresGlyphTokenization": false,
-			"identity": {
-				"class": "deepseek",
-				"family": "v3"
-			},
-			"supportsComputerUse": false,
-			"compat": {
-				"supportsStore": true,
-				"supportsDeveloperRole": false,
-				"supportsMultipleSystemMessages": true,
-				"supportsReasoningEffort": true,
-				"supportsReasoningParams": true,
-				"supportsSamplingParams": true,
-				"supportsPenaltyAndStopParams": true,
-				"reasoningEffortMap": {},
-				"supportsUsageInStreaming": true,
-				"alwaysSendMaxTokens": false,
-				"disableReasoningOnForcedToolChoice": false,
-				"disableReasoningOnToolChoice": false,
-				"supportsToolChoice": true,
-				"supportsForcedToolChoice": true,
-				"supportsNamedToolChoice": true,
-				"maxTokensField": "max_completion_tokens",
-				"requiresToolResultName": false,
-				"requiresAssistantAfterToolResult": false,
-				"requiresThinkingAsText": false,
-				"requiresMistralToolIds": false,
-				"thinkingFormat": "openai",
-				"reasoningDisableMode": "lowest-effort",
-				"omitReasoningEffort": false,
-				"includeEncryptedReasoning": true,
-				"filterReasoningHistory": false,
-				"reasoningContentField": "reasoning_content",
-				"requiresReasoningContentForToolCalls": false,
-				"requiresReasoningContentForAllAssistantTurns": false,
-				"allowsSyntheticReasoningContentForToolCalls": true,
 				"replayReasoningContent": false,
 				"qwenPreserveThinking": false,
 				"qwenTemplateReasoningEffort": false,
@@ -218613,7 +219191,7 @@
 		},
 		"gryphe/mythomax-l2-13b": {
 			"id": "gryphe/mythomax-l2-13b",
-			"name": "Mythomax L2 13B",
+			"name": "MythoMax L2 13B",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -218941,7 +219519,7 @@
 		},
 		"kwaipilot/kat-coder-pro": {
 			"id": "kwaipilot/kat-coder-pro",
-			"name": "Kat Coder Pro",
+			"name": "KAT Coder Pro",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -219410,7 +219988,7 @@
 		},
 		"microsoft/wizardlm-2-8x22b": {
 			"id": "microsoft/wizardlm-2-8x22b",
-			"name": "Wizardlm 2 8x22B",
+			"name": "WizardLM 2 8x22B",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -219922,7 +220500,7 @@
 		},
 		"minimax/minimax-m2.5-highspeed": {
 			"id": "minimax/minimax-m2.5-highspeed",
-			"name": "MiniMax M2.5-highspeed",
+			"name": "MiniMax M2.5 Highspeed",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -221400,7 +221978,7 @@
 		},
 		"paddlepaddle/paddleocr-vl": {
 			"id": "paddlepaddle/paddleocr-vl",
-			"name": "PaddleOCR-VL",
+			"name": "PaddleOCR VL",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -222201,7 +222779,7 @@
 		},
 		"qwen/qwen3-next-80b-a3b-instruct": {
 			"id": "qwen/qwen3-next-80b-a3b-instruct",
-			"name": "Qwen3-Next-80B-A3B-Instruct",
+			"name": "Qwen3-Next 80B-A3B Instruct",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -223856,7 +224434,7 @@
 		},
 		"sao10k/l3-70b-euryale-v2.1": {
 			"id": "sao10k/l3-70b-euryale-v2.1",
-			"name": "L3 70B Euryale V2.1",
+			"name": "Llama 3 70B Euryale V2.1",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -223933,7 +224511,7 @@
 		},
 		"sao10k/l3-8b-lunaris": {
 			"id": "sao10k/l3-8b-lunaris",
-			"name": "Sao10k L3 8B Lunaris",
+			"name": "Llama 3 8B Lunaris",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -224010,7 +224588,7 @@
 		},
 		"Sao10K/L3-8B-Stheno-v3.2": {
 			"id": "Sao10K/L3-8B-Stheno-v3.2",
-			"name": "L3 8B Stheno V3.2",
+			"name": "Llama 3 8B Stheno V3.2",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -224087,7 +224665,7 @@
 		},
 		"sao10k/l31-70b-euryale-v2.2": {
 			"id": "sao10k/l31-70b-euryale-v2.2",
-			"name": "L31 70B Euryale V2.2",
+			"name": "Llama 3.1 70B Euryale V2.2",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -224428,7 +225006,7 @@
 		},
 		"xiaomimimo/mimo-v2.5": {
 			"id": "xiaomimimo/mimo-v2.5",
-			"name": "XiaomiMiMo/MiMo-V2.5",
+			"name": "Xiaomi MiMo V2.5",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -224518,7 +225096,7 @@
 		},
 		"xiaomimimo/mimo-v2.5-pro": {
 			"id": "xiaomimimo/mimo-v2.5-pro",
-			"name": "XiaomiMiMo/MiMo-V2.5-Pro",
+			"name": "Xiaomi MiMo V2.5 Pro",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -224607,7 +225185,7 @@
 		},
 		"zai-org/autoglm-phone-9b-multilingual": {
 			"id": "zai-org/autoglm-phone-9b-multilingual",
-			"name": "AutoGLM-Phone-9B-Multilingual",
+			"name": "AutoGLM Phone 9B Multilingual",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -224685,7 +225263,7 @@
 		},
 		"zai-org/glm-4.5-air": {
 			"id": "zai-org/glm-4.5-air",
-			"name": "zai-org/glm-4.5-air",
+			"name": "GLM 4.5 Air",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -225040,7 +225618,7 @@
 		},
 		"zai-org/glm-4.7": {
 			"id": "zai-org/glm-4.7",
-			"name": "GLM-4.7",
+			"name": "GLM 4.7",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -225128,7 +225706,7 @@
 		},
 		"zai-org/glm-4.7-flash": {
 			"id": "zai-org/glm-4.7-flash",
-			"name": "GLM-4.7-Flash",
+			"name": "GLM 4.7 Flash",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -225217,7 +225795,7 @@
 		},
 		"zai-org/glm-4.7-h": {
 			"id": "zai-org/glm-4.7-h",
-			"name": "GLM-4.7",
+			"name": "GLM 4.7",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -225305,7 +225883,7 @@
 		},
 		"zai-org/glm-5": {
 			"id": "zai-org/glm-5",
-			"name": "GLM-5",
+			"name": "GLM 5",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -225484,7 +226062,7 @@
 		},
 		"zai-org/glm-5.1": {
 			"id": "zai-org/glm-5.1",
-			"name": "GLM-5.1",
+			"name": "GLM 5.1",
 			"api": "openai-completions",
 			"provider": "novita",
 			"baseUrl": "https://api.novita.ai/openai/v1",
@@ -226704,6 +227282,7 @@
 			"identity": {
 				"class": "deepseek"
 			},
+			"tokenizer": "deepseek-v3",
 			"compat": {
 				"supportsStore": true,
 				"supportsDeveloperRole": false,
@@ -226756,7 +227335,6 @@
 				"stripImageInput": true,
 				"thinkingLoopGuard": "deepseek"
 			},
-			"tokenizer": "deepseek-v3",
 			"supportsComputerUse": false
 		},
 		"deepseek-ai/deepseek-r1-0528": {
@@ -259860,9 +260438,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.03,
+				"input": 0.049999999999999996,
 				"output": 0.16,
-				"cacheRead": 0.01,
+				"cacheRead": 0.013000000000000001,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1310720,
@@ -260526,13 +261104,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 1.1875,
-				"output": 4.18,
-				"cacheRead": 0.24699999999999997,
+				"input": 1.17,
+				"output": 3.9600000000000004,
+				"cacheRead": 0.234,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1310720,
-			"maxTokens": 131072,
+			"maxTokens": 943718,
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
@@ -267405,9 +267983,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.08064,
-				"output": 0.16128,
-				"cacheRead": 0.016128,
+				"input": 0.07938,
+				"output": 0.15876,
+				"cacheRead": 0.015875999999999998,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -267874,9 +268452,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.47797800000000007,
-				"output": 0.9559560000000001,
-				"cacheRead": 0.0398315,
+				"input": 0.87,
+				"output": 1.74,
+				"cacheRead": 0.0725,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -271997,6 +272575,97 @@
 			},
 			"supportsComputerUseConfig": false
 		},
+		"ibm-granite/granite-4.2-8b": {
+			"id": "ibm-granite/granite-4.2-8b",
+			"name": "Granite 4.2 8B",
+			"api": "openrouter",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0.09999999999999999,
+				"output": 0.15,
+				"cacheRead": 0.049999999999999996,
+				"cacheWrite": 0
+			},
+			"contextWindow": 131072,
+			"maxTokens": 117964,
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high"
+				]
+			},
+			"identity": {
+				"class": "unknown"
+			},
+			"requiresGlyphTokenization": false,
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": true,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openrouter",
+				"reasoningDisableMode": "openrouter-enabled-false",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": true,
+				"wireModelIdMode": "openrouter",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": true,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false,
+				"supportsLongPromptCacheRetention": false,
+				"strictResponsesPairing": false,
+				"supportsImageDetailOriginal": true,
+				"supportsObfuscationOptOut": false,
+				"supportsAllTurnsReasoningContext": false,
+				"requiresReasoningOffJuiceInstruction": false,
+				"supportsReasoningSummary": true
+			},
+			"supportsComputerUse": false
+		},
 		"inception/mercury": {
 			"id": "inception/mercury",
 			"name": "Mercury",
@@ -273140,7 +273809,7 @@
 		},
 		"kwaipilot/kat-coder-air-v2.5": {
 			"id": "kwaipilot/kat-coder-air-v2.5",
-			"name": "KAT-Coder-Air V2.5",
+			"name": "KAT Coder Air V2.5",
 			"api": "openrouter",
 			"provider": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
@@ -273321,7 +273990,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 80000,
+			"maxTokens": 144000,
 			"requiresGlyphTokenization": false,
 			"identity": {
 				"class": "unknown"
@@ -273404,7 +274073,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 80000,
+			"maxTokens": 235929,
 			"requiresGlyphTokenization": false,
 			"identity": {
 				"class": "unknown"
@@ -274347,12 +275016,12 @@
 			],
 			"cost": {
 				"input": 0.19999999999999998,
-				"output": 0.7999999999999999,
+				"output": 0.696,
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 16384,
+			"maxTokens": 115200,
 			"requiresGlyphTokenization": false,
 			"identity": {
 				"class": "meta",
@@ -276087,9 +276756,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.44,
-				"output": 2.2,
-				"cacheRead": 0.044,
+				"input": 0.39999999999999997,
+				"output": 2,
+				"cacheRead": 0.04,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -279003,9 +279672,9 @@
 				"image"
 			],
 			"cost": {
-				"input": 0.6,
-				"output": 3,
-				"cacheRead": 0.09999999999999999,
+				"input": 0.44999999999999996,
+				"output": 2.25,
+				"cacheRead": 0.07,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -282731,11 +283400,11 @@
 			"cost": {
 				"input": 0.09999999999999999,
 				"output": 0.39999999999999997,
-				"cacheRead": 0.03,
+				"cacheRead": 0.024999999999999998,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1047576,
-			"maxTokens": 942818,
+			"maxTokens": 32768,
 			"requiresGlyphTokenization": false,
 			"identity": {
 				"class": "openai",
@@ -295027,7 +295696,7 @@
 		},
 		"qwen/qwen3-next-80b-a3b-instruct": {
 			"id": "qwen/qwen3-next-80b-a3b-instruct",
-			"name": "Qwen3-Next-80B-A3B-Instruct",
+			"name": "Qwen3-Next 80B-A3B Instruct",
 			"api": "openrouter",
 			"baseUrl": "https://openrouter.ai/api/v1",
 			"provider": "openrouter",
@@ -295036,13 +295705,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.09,
+				"input": 0.09999999999999999,
 				"output": 1.1,
 				"cacheRead": 0.07,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 16384,
+			"maxTokens": 235929,
 			"requiresGlyphTokenization": false,
 			"identity": {
 				"class": "qwen",
@@ -299289,9 +299958,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.13199999999999998,
-				"output": 0.5279999999999999,
-				"cacheRead": 0.032999999999999995,
+				"input": 0.0825,
+				"output": 0.33,
+				"cacheRead": 0.020625,
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
@@ -300493,6 +301162,7 @@
 				"class": "deepseek",
 				"family": "r1"
 			},
+			"tokenizer": "deepseek-v3",
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": true,
@@ -300553,7 +301223,6 @@
 				"requiresReasoningOffJuiceInstruction": false,
 				"supportsReasoningSummary": true
 			},
-			"tokenizer": "deepseek-v3",
 			"supportsComputerUseConfig": false
 		},
 		"tngtech/tng-r1t-chimera": {
@@ -323408,6 +324077,62 @@
 			},
 			"supportsComputerUse": false
 		},
+		"alibaba/qwen3.8-flash-next": {
+			"id": "alibaba/qwen3.8-flash-next",
+			"name": "Qwen 3.8 Flash Next",
+			"api": "anthropic-messages",
+			"provider": "vercel-ai-gateway",
+			"baseUrl": "https://ai-gateway.vercel.sh",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.12,
+				"output": 0.39999999999999997,
+				"cacheRead": 0.01,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 1048576,
+			"identity": {
+				"class": "qwen",
+				"revision": "3.8.0"
+			},
+			"requiresGlyphTokenization": false,
+			"tokenizer": "qwen3",
+			"thinking": {
+				"mode": "budget",
+				"efforts": [
+					"minimal",
+					"low",
+					"medium",
+					"high",
+					"xhigh"
+				]
+			},
+			"compat": {
+				"officialEndpoint": false,
+				"signingEndpoint": false,
+				"supportsContextManagement": true,
+				"disableStrictTools": false,
+				"disableAdaptiveThinking": false,
+				"allowAnthropicHeaderOverrides": false,
+				"supportsEagerToolInputStreaming": false,
+				"supportsLongCacheRetention": false,
+				"supportsMidConversationSystem": false,
+				"supportsForcedToolChoice": true,
+				"supportsSamplingParams": true,
+				"requiresToolResultId": false,
+				"requiresThinkingEnabled": false,
+				"replayUnsignedThinking": true,
+				"escapeBuiltinToolNames": false,
+				"injectClaudeCodeInstruction": true,
+				"stripImageInput": false
+			},
+			"supportsComputerUse": false
+		},
 		"alibaba/qwen3.8-max": {
 			"id": "alibaba/qwen3.8-max",
 			"requiresGlyphTokenization": false,
@@ -327143,7 +327868,7 @@
 		"kwaipilot/kat-coder-air-v2.5": {
 			"id": "kwaipilot/kat-coder-air-v2.5",
 			"requiresGlyphTokenization": false,
-			"name": "KAT-Coder-Air V2.5",
+			"name": "KAT Coder Air V2.5",
 			"api": "anthropic-messages",
 			"provider": "vercel-ai-gateway",
 			"baseUrl": "https://ai-gateway.vercel.sh",
