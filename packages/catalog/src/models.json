@@ -32190,7 +32190,8 @@
 					"medium",
 					"high"
 				],
-				"supportsDisplay": true
+				"supportsDisplay": true,
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -32854,7 +32855,8 @@
 					"medium",
 					"high"
 				],
-				"supportsDisplay": true
+				"supportsDisplay": true,
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -35078,7 +35080,8 @@
 					"medium",
 					"high"
 				],
-				"supportsDisplay": true
+				"supportsDisplay": true,
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -35783,7 +35786,8 @@
 					"medium",
 					"high"
 				],
-				"supportsDisplay": true
+				"supportsDisplay": true,
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -37122,7 +37126,8 @@
 					"xhigh",
 					"max"
 				],
-				"supportsDisplay": true
+				"supportsDisplay": true,
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -55330,7 +55335,8 @@
 					"low": "claude-fable-5-1-thinking-high",
 					"medium": "claude-fable-5-1-thinking-high",
 					"high": "claude-fable-5-1-thinking-high"
-				}
+				},
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -55378,7 +55384,8 @@
 					"low": "claude-fable-5-1-thinking-low",
 					"medium": "claude-fable-5-1-thinking-low",
 					"high": "claude-fable-5-1-thinking-low"
-				}
+				},
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -55426,7 +55433,8 @@
 					"low": "claude-fable-5-1-thinking-max",
 					"medium": "claude-fable-5-1-thinking-max",
 					"high": "claude-fable-5-1-thinking-max"
-				}
+				},
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -55474,7 +55482,8 @@
 					"low": "claude-fable-5-1-thinking-medium",
 					"medium": "claude-fable-5-1-thinking-medium",
 					"high": "claude-fable-5-1-thinking-medium"
-				}
+				},
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -55522,7 +55531,8 @@
 					"low": "claude-fable-5-1-thinking-xhigh",
 					"medium": "claude-fable-5-1-thinking-xhigh",
 					"high": "claude-fable-5-1-thinking-xhigh"
-				}
+				},
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -81218,7 +81228,8 @@
 					"xhigh",
 					"max"
 				],
-				"supportsDisplay": true
+				"supportsDisplay": true,
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -94073,7 +94084,8 @@
 					"medium",
 					"high",
 					"xhigh"
-				]
+				],
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -261323,7 +261335,8 @@
 					"xhigh",
 					"max"
 				],
-				"supportsDisplay": true
+				"supportsDisplay": true,
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -273129,7 +273142,8 @@
 					"max"
 				],
 				"defaultLevel": "high",
-				"requiresEffort": true
+				"requiresEffort": true,
+				"prefixBinding": true
 			},
 			"identity": {
 				"class": "anthropic",
@@ -324110,7 +324124,8 @@
 					"medium",
 					"high",
 					"xhigh"
-				]
+				],
+				"prefixBinding": true
 			},
 			"compat": {
 				"supportsStore": true,
@@ -338516,7 +338531,8 @@
 					"xhigh",
 					"max"
 				],
-				"supportsDisplay": true
+				"supportsDisplay": true,
+				"prefixBinding": true
 			},
 			"compat": {
 				"officialEndpoint": false,
