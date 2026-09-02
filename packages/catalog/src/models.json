@@ -80448,7 +80448,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80502,7 +80502,7 @@
 			},
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80541,7 +80541,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80591,7 +80591,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80649,7 +80649,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80713,7 +80713,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80770,7 +80770,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80827,7 +80827,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81139,7 +81139,7 @@
 			},
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81187,7 +81187,7 @@
 			},
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81236,7 +81236,7 @@
 			},
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81283,7 +81283,7 @@
 			},
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82190,7 +82190,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82239,7 +82239,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82286,7 +82286,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82333,7 +82333,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82382,7 +82382,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82431,7 +82431,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82480,7 +82480,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82528,7 +82528,7 @@
 			"supportsComputerUse": false,
 			"compat": {
 				"supportsFunctionPartId": false,
-				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignature": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
