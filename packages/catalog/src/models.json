@@ -55590,6 +55590,7 @@
 				"effort": "high",
 				"logicalId": "claude-fable-5"
 			},
+			"requiresCursorToolSchemaProjection": true,
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
@@ -55638,6 +55639,7 @@
 				"effort": "low",
 				"logicalId": "claude-fable-5"
 			},
+			"requiresCursorToolSchemaProjection": true,
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
@@ -55686,6 +55688,7 @@
 				"effort": "max",
 				"logicalId": "claude-fable-5"
 			},
+			"requiresCursorToolSchemaProjection": true,
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
@@ -55734,6 +55737,7 @@
 				"effort": "medium",
 				"logicalId": "claude-fable-5"
 			},
+			"requiresCursorToolSchemaProjection": true,
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
@@ -55782,6 +55786,7 @@
 				"effort": "xhigh",
 				"logicalId": "claude-fable-5"
 			},
+			"requiresCursorToolSchemaProjection": true,
 			"supportsComputerUse": false,
 			"supportsComputerUseConfig": false
 		},
