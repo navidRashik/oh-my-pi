@@ -78217,6 +78217,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78262,6 +78263,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78299,6 +78301,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78338,6 +78341,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78377,6 +78381,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78416,6 +78421,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78455,6 +78461,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78503,6 +78510,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78559,6 +78567,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78615,6 +78624,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78670,6 +78680,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78726,6 +78737,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78782,6 +78794,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78838,6 +78851,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78894,6 +78908,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -78952,6 +78967,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -79008,6 +79024,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -79065,6 +79082,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -79115,6 +79133,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79161,6 +79180,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79211,6 +79231,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79260,6 +79281,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79309,6 +79331,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79358,6 +79381,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79405,6 +79429,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79452,6 +79477,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79501,6 +79527,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79550,6 +79577,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79599,6 +79627,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79647,6 +79676,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79696,6 +79726,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -79743,6 +79774,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -79790,6 +79822,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -79845,6 +79878,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -79900,6 +79934,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -79947,6 +79982,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -79984,6 +80020,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80029,6 +80066,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80075,6 +80113,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80119,6 +80158,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80164,6 +80204,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80210,6 +80251,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80254,6 +80296,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80299,6 +80342,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80357,6 +80401,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": true,
 				"ccaLegacyParametersSchema": true,
 				"multimodalFunctionResponse": false,
@@ -80408,6 +80453,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": true,
 				"ccaLegacyParametersSchema": true,
 				"multimodalFunctionResponse": false,
@@ -80464,6 +80510,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": true,
 				"ccaLegacyParametersSchema": true,
 				"multimodalFunctionResponse": false,
@@ -80514,6 +80561,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": true,
 				"ccaLegacyParametersSchema": true,
 				"multimodalFunctionResponse": false,
@@ -80569,6 +80617,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80618,6 +80667,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80666,6 +80716,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -80731,6 +80782,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80785,6 +80837,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80824,6 +80877,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80874,6 +80928,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80932,6 +80987,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -80996,6 +81052,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81053,6 +81110,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81110,6 +81168,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81167,6 +81226,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81215,6 +81275,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -81250,6 +81311,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -81285,6 +81347,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -81324,6 +81387,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -81380,6 +81444,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -81430,6 +81495,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -81479,6 +81545,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81527,6 +81594,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81576,6 +81644,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -81623,6 +81692,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": true,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82368,6 +82438,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -82424,6 +82495,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -82481,6 +82553,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -82530,6 +82603,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82579,6 +82653,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82626,6 +82701,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82673,6 +82749,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82722,6 +82799,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82771,6 +82849,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82820,6 +82899,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82868,6 +82948,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82917,6 +82998,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -82964,6 +83046,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -83011,6 +83094,7 @@
 			"compat": {
 				"supportsFunctionPartId": false,
 				"requiresSkipThoughtSignature": false,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": false,
@@ -263457,6 +263541,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -263503,6 +263588,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -263551,6 +263637,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -263600,6 +263687,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -263649,6 +263737,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -263698,6 +263787,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
@@ -263746,6 +263836,7 @@
 			"compat": {
 				"supportsFunctionPartId": true,
 				"requiresSkipThoughtSignature": true,
+				"requiresSkipThoughtSignatureOnFirstFunctionCall": false,
 				"dropUnsignedThinking": false,
 				"ccaLegacyParametersSchema": false,
 				"multimodalFunctionResponse": true,
