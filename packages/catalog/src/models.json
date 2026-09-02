@@ -45774,7 +45774,7 @@
 		},
 		"z-ai/glm-5.3-flash": {
 			"id": "z-ai/glm-5.3-flash",
-			"name": "GLM 5.3 Flash (free)",
+			"name": "GLM-5.3-Flash (free)",
 			"api": "openai-completions",
 			"provider": "cline-pass",
 			"baseUrl": "https://api.cline.bot/api/v1",
@@ -362277,7 +362277,7 @@
 			"name": "GLM-5.3-Flash",
 			"api": "openai-completions",
 			"provider": "zai",
-			"baseUrl": "https://api.z.ai/api/paas/v4",
+			"baseUrl": "https://api.z.ai/api/coding/paas/v4",
 			"reasoning": true,
 			"input": [
 				"text",
