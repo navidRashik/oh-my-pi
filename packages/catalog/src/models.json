@@ -43046,6 +43046,94 @@
 			},
 			"supportsComputerUse": false
 		},
+		"zai-org/GLM-5.3-Fast": {
+			"id": "zai-org/GLM-5.3-Fast",
+			"name": "GLM 5.3 Fast",
+			"api": "openai-completions",
+			"provider": "baseten",
+			"baseUrl": "https://inference.baseten.co/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 262144,
+			"identity": {
+				"class": "glm",
+				"revision": "5.3.0"
+			},
+			"requiresGlyphTokenization": false,
+			"tokenizer": "glm5",
+			"thinking": {
+				"mode": "effort",
+				"efforts": [
+					"high",
+					"max"
+				]
+			},
+			"compat": {
+				"supportsStore": true,
+				"supportsDeveloperRole": false,
+				"supportsMultipleSystemMessages": false,
+				"supportsReasoningEffort": true,
+				"supportsReasoningParams": true,
+				"supportsSamplingParams": true,
+				"supportsPenaltyAndStopParams": true,
+				"reasoningEffortMap": {},
+				"supportsUsageInStreaming": true,
+				"alwaysSendMaxTokens": false,
+				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningOnToolChoice": false,
+				"supportsToolChoice": true,
+				"supportsForcedToolChoice": true,
+				"supportsNamedToolChoice": true,
+				"maxTokensField": "max_completion_tokens",
+				"requiresToolResultName": false,
+				"requiresAssistantAfterToolResult": false,
+				"requiresThinkingAsText": false,
+				"requiresMistralToolIds": false,
+				"thinkingFormat": "openai",
+				"reasoningDisableMode": "lowest-effort",
+				"omitReasoningEffort": false,
+				"includeEncryptedReasoning": true,
+				"filterReasoningHistory": false,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": false,
+				"requiresReasoningContentForAllAssistantTurns": false,
+				"allowsSyntheticReasoningContentForToolCalls": true,
+				"replayReasoningContent": false,
+				"qwenPreserveThinking": false,
+				"qwenTemplateReasoningEffort": false,
+				"requiresAssistantContentForToolCalls": false,
+				"supportsPromptCacheBreakpoints": false,
+				"isOpenRouterHost": false,
+				"wireModelIdMode": "raw",
+				"isVercelGatewayHost": false,
+				"supportsStrictMode": false,
+				"toolStrictMode": "mixed",
+				"stripDeepseekSpecialTokens": false,
+				"streamMarkupHealingPattern": "thinking",
+				"reasoningDeltasMayBeCumulative": false,
+				"emptyLengthFinishIsContextError": false,
+				"usesOpenAIToolCallIdLimit": false,
+				"dropThinkingWhenReasoningEffort": false,
+				"nativeKimiK3Reasoning": false,
+				"zaiReasoningEffortDialect": false,
+				"clampOutputToModelMax": false,
+				"stripImageInput": false,
+				"rejectRootObjectUnion": false,
+				"retryWithoutStrictOnGrammarError": false,
+				"supportsPromptCacheKey": false
+			},
+			"supportsComputerUse": false
+		},
 		"zai-org/GLM-5.3-Flash": {
 			"id": "zai-org/GLM-5.3-Flash",
 			"name": "GLM 5.3 Flash",
@@ -108778,7 +108866,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.1.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -108867,7 +108957,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -108956,7 +109048,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -109045,7 +109139,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -109134,7 +109230,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -138035,7 +138133,9 @@
 				"usesOpenAIToolCallIdLimit": false
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.1.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -138127,7 +138227,9 @@
 				"usesOpenAIToolCallIdLimit": false
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -138219,7 +138321,9 @@
 				"usesOpenAIToolCallIdLimit": false
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -138311,7 +138415,9 @@
 				"usesOpenAIToolCallIdLimit": false
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -138403,7 +138509,9 @@
 				"usesOpenAIToolCallIdLimit": false
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -183501,7 +183609,9 @@
 			},
 			"requiresGlyphTokenization": false,
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.1.0"
 			},
 			"supportsComputerUse": false,
 			"compat": {
@@ -183590,7 +183700,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -183679,7 +183791,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -183768,7 +183882,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -183857,7 +183973,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -261547,7 +261665,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -261635,7 +261755,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -270455,7 +270577,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -270543,7 +270667,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -270631,7 +270757,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"supportsComputerUse": false,
@@ -280569,9 +280697,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.07938,
-				"output": 0.15876,
-				"cacheRead": 0.015875999999999998,
+				"input": 0.07784,
+				"output": 0.15568,
+				"cacheRead": 0.015568,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
@@ -288684,7 +288812,9 @@
 			},
 			"requiresGlyphTokenization": false,
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.1.0"
 			},
 			"supportsComputerUse": false,
 			"compat": {
@@ -288785,7 +288915,9 @@
 			},
 			"requiresGlyphTokenization": false,
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"supportsComputerUse": false,
 			"compat": {
@@ -288886,7 +289018,9 @@
 			},
 			"requiresGlyphTokenization": false,
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"compat": {
 				"supportsStore": true,
@@ -288985,7 +289119,9 @@
 				"requiresEffort": true
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"compat": {
@@ -289085,7 +289221,9 @@
 				"requiresEffort": true
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"compat": {
@@ -345362,7 +345500,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.1.0"
 			},
 			"compat": {
 				"officialEndpoint": false,
@@ -345421,7 +345561,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"compat": {
 				"officialEndpoint": false,
@@ -345480,7 +345622,9 @@
 				]
 			},
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"compat": {
 				"officialEndpoint": false,
@@ -345528,7 +345672,9 @@
 			"contextWindow": 1048576,
 			"maxTokens": 1048576,
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"thinking": {
@@ -345587,7 +345733,9 @@
 			"contextWindow": 1048576,
 			"maxTokens": 1048576,
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.3.0"
 			},
 			"requiresGlyphTokenization": false,
 			"thinking": {
@@ -371499,7 +371647,9 @@
 			},
 			"requiresGlyphTokenization": false,
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.1.0"
 			},
 			"compat": {
 				"supportsStore": true,
@@ -371588,7 +371738,9 @@
 			},
 			"requiresGlyphTokenization": false,
 			"identity": {
-				"class": "meta"
+				"class": "meta",
+				"family": "muse-spark",
+				"revision": "1.2.0"
 			},
 			"compat": {
 				"supportsStore": true,
