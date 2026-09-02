@@ -362358,7 +362358,7 @@
 				"dropThinkingWhenReasoningEffort": false,
 				"nativeKimiK3Reasoning": false,
 				"zaiReasoningEffortDialect": false,
-				"clampOutputToModelMax": false,
+				"clampOutputToModelMax": true,
 				"stripImageInput": false,
 				"rejectRootObjectUnion": false,
 				"retryWithoutStrictOnGrammarError": false,
