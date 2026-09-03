@@ -232,7 +232,11 @@ impl Component for Hr {
 					.saturating_add(rect.width.saturating_sub(1).saturating_sub(total)),
 			);
 			let gap_style = Style::new().bg(style.background_color());
-			let label_style = if self.props.has_foreground() { style } else { gap_style };
+			let label_style = if self.props.has_foreground() {
+				style
+			} else {
+				gap_style
+			};
 			let mut end = x;
 			if left_pad {
 				end = pc.frame.put(end, rect.y, " ", gap_style);

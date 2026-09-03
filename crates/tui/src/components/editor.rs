@@ -28,7 +28,7 @@ use crate::{
 	imagefmt::dimensions,
 	input::{Key, Mouse, UiEvent, byte_at_column, sanitize_paste},
 	markup::Border,
-	paste::{dropped_paths, is_image_path},
+	paste::{PastedPathKind, classify_attachment_path, dropped_paths},
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
 	spelling::{SpellingAssist, SpellingFeatures, TypoRange},
@@ -646,6 +646,24 @@ impl EditInput {
 	/// actions.
 	pub fn current_line(&self) -> &str {
 		self.editor.current_line()
+	}
+
+	/// Shows or replaces one volatile speech-recognition preview.
+	pub fn set_volatile_text(&mut self, text: &str) {
+		self.editor.set_volatile_text(text);
+		self.refresh_keyword_spans();
+	}
+
+	/// Discards the active volatile speech-recognition preview.
+	pub fn clear_volatile_text(&mut self) {
+		self.editor.clear_volatile_text();
+		self.refresh_keyword_spans();
+	}
+
+	/// Commits one finalized speech-recognition segment as an editor edit.
+	pub fn commit_volatile_text(&mut self, text: &str) {
+		self.editor.commit_volatile_text(text);
+		self.refresh_keyword_spans();
 	}
 
 	/// Sets one editor property, updating its buffer for `value`.
@@ -1666,25 +1684,32 @@ impl Component for EditInput {
 	fn paste(&mut self, ec: &mut EventCtx<'_>, text: &str) -> Flow {
 		if let Some(attachments) = &self.attachments {
 			let paths = dropped_paths(text);
-			// Requiring real files keeps prose that merely resembles a path out of the
-			// band.
-			if !paths.is_empty()
-				&& paths
-					.iter()
-					.all(|path| is_image_path(path) && Path::new(path.as_str()).exists())
-			{
-				// pi `#insertPendingImage`: the buffer holds the compact chip;
-				// its submitted form is the positional wire marker.
-				let references: Vec<_> = paths
+			// Classification is all-or-nothing: every path must be previewable and
+			// exist locally. A mixed, missing, or ambiguous payload falls through as
+			// literal text so no pasted path disappears.
+			let classified = paths
+				.iter()
+				.map(|path| {
+					let kind = classify_attachment_path(path)?;
+					let source = attachment_source_path(path)?;
+					Path::new(source.as_str())
+						.exists()
+						.then_some((source, kind))
+				})
+				.collect::<Option<Vec<_>>>();
+			if let Some(classified) = classified.filter(|paths| !paths.is_empty()) {
+				// One gesture is one undo group. Staging and reference insertion
+				// both preserve the source order from the paste payload.
+				let references: Vec<_> = classified
 					.into_iter()
-					.map(|path| {
-						let attachment = attachments.push_image(path);
-						let marker = match &attachment.content {
-							AttachmentContent::Image { dimensions, .. } => {
-								image_wire_marker(attachment.marker, *dimensions)
-							},
-							AttachmentContent::Text { .. } => unreachable!("push_image stages an image"),
+					.map(|(source, kind)| {
+						let attachment = match kind {
+							PastedPathKind::Image => attachments.push_image(source),
+							PastedPathKind::Video => attachments.push_video(source),
 						};
+						let marker = attachment
+							.wire_marker()
+							.expect("media attachments always have a wire marker");
 						(chip_label(&attachment, ec.ctx.charset).to_string(), marker.to_string())
 					})
 					.collect();
@@ -1775,7 +1800,7 @@ pub const fn attachment_color(marker: usize) -> Color {
 ///
 /// Hosts insert it as an atomic reference (see
 /// [`crate::EditBuffer::insert_reference`]); [`EditInput`] does so
-/// automatically for staged image path drops and large paste cards.
+/// automatically for staged media path drops and large paste cards.
 pub fn chip_label(attachment: &Attachment, charset: Charset) -> Str {
 	attachment.preview_names[charset_index(charset)].clone()
 }
@@ -1860,6 +1885,15 @@ fn overlay_chip_runs(
 	merged
 }
 
+fn attachment_source_path(path: &str) -> Option<Str> {
+	let Some(rest) = path.strip_prefix("~/") else {
+		return Some(Str::new(path));
+	};
+	#[allow(deprecated, reason = "the standard-library home lookup matches shell path expansion")]
+	let home = std::env::home_dir()?;
+	Some(sf!("{}/{}", home.display(), rest))
+}
+
 /// One staged composer attachment.
 #[derive(Clone)]
 pub struct Attachment {
@@ -1879,6 +1913,7 @@ impl Attachment {
 	pub fn new(content: AttachmentContent, marker: usize, color: Color) -> Self {
 		let icon = match &content {
 			AttachmentContent::Image { .. } => Icon::Image,
+			AttachmentContent::Video { .. } => Icon::Video,
 			AttachmentContent::Text { .. } => Icon::TextFile,
 		};
 		let preview_names = [
@@ -1890,23 +1925,25 @@ impl Attachment {
 			AttachmentContent::Image { dimensions, .. } => {
 				dimensions.map_or_else(Str::default, |(width, height)| sf!("{width}x{height}"))
 			},
+			AttachmentContent::Video { .. } => Str::default(),
 			AttachmentContent::Text { lines, .. } if *lines > 1 => sf!("+{lines} lines"),
 			AttachmentContent::Text { chars, .. } => sf!("{chars} chars"),
 		};
 		Self { content, marker, color, preview_names, size_label }
 	}
 
-	/// The submitted form of an image chip (pi `#insertPendingImage`):
-	/// `[Image #N, WxH]`, or `[Image #N]` when the header gave no
-	/// dimensions. The marker is positional — `#N` names the N-th image
-	/// handed to the host on submit. `None` for a collapsed text paste,
-	/// whose submitted form is the paste itself.
+	/// The submitted form of a media chip (pi `#insertPendingImage`):
+	/// `[Image #N, WxH]`, `[Image #N]`, or `[Video #N]`. The marker is
+	/// positional — `#N` names the N-th media source handed to the host on
+	/// submit. `None` for a collapsed text paste, whose submitted form is the
+	/// paste itself.
 	#[must_use]
 	pub fn wire_marker(&self) -> Option<Str> {
 		match &self.content {
 			AttachmentContent::Image { dimensions, .. } => {
 				Some(image_wire_marker(self.marker, *dimensions))
 			},
+			AttachmentContent::Video { .. } => Some(sf!("[Video #{}]", self.marker)),
 			AttachmentContent::Text { .. } => None,
 		}
 	}
@@ -1929,6 +1966,11 @@ pub enum AttachmentContent {
 		/// Pixel dimensions probed from the source header, when recognized.
 		dimensions: Option<(u32, u32)>,
 	},
+	/// A video staged from a file source.
+	Video {
+		/// Video source path.
+		source: Str,
+	},
 	/// Pasted text collapsed out of the composer.
 	Text {
 		/// Complete pasted text delivered to the composer host on submit.
@@ -1945,10 +1987,10 @@ pub enum AttachmentContent {
 /// Shared handle to the attachments staged on an [`EditorPane`] composer.
 ///
 /// The composer's owner keeps a clone (see [`EditorPane::attachments`]),
-/// stages images with [`Attachments::push_image`] and collapsed pastes with
-/// [`Attachments::push_text`], and drains the queue on submit with
-/// [`Attachments::take`]. The pane renders one framed card per visible
-/// attachment above the editable surface, tinted with the attachment's
+/// stages media with [`Attachments::push_image`] or [`Attachments::push_video`]
+/// and collapsed pastes with [`Attachments::push_text`], then drains the queue
+/// on submit with [`Attachments::take`]. The pane renders one framed card per
+/// visible attachment above the editable surface, tinted with the attachment's
 /// identity color and captioned with its `#N` marker plus pixel resolution or
 /// size.
 ///
@@ -1966,10 +2008,10 @@ pub struct Attachments {
 #[derive(Default)]
 struct AttachmentState {
 	staged:  Vec<Staged>,
-	/// Monotonic image marker source (pi `pendingImages.length`); survives
-	/// hides so numbers stay stable. Images and text pastes number
-	/// separately so `[Image #N]` stays positional over the images alone.
-	images:  usize,
+	/// Monotonic media marker source (pi `pendingImages.length`); survives
+	/// hides so numbers stay stable. Images/videos and text pastes number
+	/// separately so vision markers stay positional over media alone.
+	media:   usize,
 	/// Monotonic text-chip marker source (pi `#textAttachmentCounter`).
 	texts:   usize,
 	version: u64,
@@ -1992,6 +2034,11 @@ impl Attachments {
 		let source = source.into_str();
 		let dimensions = probe_dimensions(source.as_str());
 		self.stage(AttachmentContent::Image { source, dimensions })
+	}
+
+	/// Stages a video source and returns the staged descriptor.
+	pub fn push_video(&self, source: impl IntoStr) -> Attachment {
+		self.stage(AttachmentContent::Video { source: source.into_str() })
 	}
 
 	/// Stages pasted text collapsed out of the composer and returns the
@@ -2017,7 +2064,7 @@ impl Attachments {
 	fn stage(&self, content: AttachmentContent) -> Attachment {
 		let mut state = self.state.borrow_mut();
 		let counter = match content {
-			AttachmentContent::Image { .. } => &mut state.images,
+			AttachmentContent::Image { .. } | AttachmentContent::Video { .. } => &mut state.media,
 			AttachmentContent::Text { .. } => &mut state.texts,
 		};
 		*counter += 1;
@@ -2051,7 +2098,7 @@ impl Attachments {
 		if !state.staged.is_empty() {
 			state.version += 1;
 		}
-		state.images = 0;
+		state.media = 0;
 		state.texts = 0;
 		mem::take(&mut state.staged)
 			.into_iter()
@@ -2071,7 +2118,7 @@ impl Attachments {
 		let mut state = self.state.borrow_mut();
 		for attachment in attachments {
 			let counter = match attachment.content {
-				AttachmentContent::Image { .. } => &mut state.images,
+				AttachmentContent::Image { .. } | AttachmentContent::Video { .. } => &mut state.media,
 				AttachmentContent::Text { .. } => &mut state.texts,
 			};
 			*counter = (*counter).max(attachment.marker);
@@ -2323,6 +2370,24 @@ impl EditorPane {
 		self.input_mut().set_completion(completion);
 	}
 
+	/// Shows or replaces one volatile speech-recognition preview.
+	pub fn set_volatile_text(&mut self, text: &str) {
+		self.input_mut().set_volatile_text(text);
+		self.children[0].invalidate();
+	}
+
+	/// Discards the active volatile speech-recognition preview.
+	pub fn clear_volatile_text(&mut self) {
+		self.input_mut().clear_volatile_text();
+		self.children[0].invalidate();
+	}
+
+	/// Commits one finalized speech-recognition segment as an editor edit.
+	pub fn commit_volatile_text(&mut self, text: &str) {
+		self.input_mut().commit_volatile_text(text);
+		self.children[0].invalidate();
+	}
+
 	/// Moves the caret to the start or end of the whole draft (pi prompt
 	/// actions "Move cursor to message start/end").
 	pub fn move_to_message_edge(&mut self, end: bool) {
@@ -2465,6 +2530,18 @@ impl EditorPane {
 						}
 						image_child += 1;
 					}
+				},
+				AttachmentContent::Video { source } => {
+					let label = Path::new(source.as_str())
+						.file_name()
+						.and_then(|name| name.to_str())
+						.unwrap_or(source.as_str());
+					pc.frame.put(
+						x.saturating_add(1),
+						top.saturating_add(1),
+						&label[..byte_at_column(label, PREVIEW_COLS)],
+						snippet_style,
+					);
 				},
 				AttachmentContent::Text { snippet, .. } => {
 					for (offset, text) in snippet.as_str().split('\n').enumerate() {
@@ -4120,7 +4197,9 @@ mod tests {
 			.iter()
 			.map(|attachment| match &attachment.content {
 				AttachmentContent::Image { source, .. } => source.to_string(),
-				AttachmentContent::Text { .. } => unreachable!("image drop"),
+				AttachmentContent::Video { .. } | AttachmentContent::Text { .. } => {
+					unreachable!("image drop")
+				},
 			})
 			.collect::<Vec<_>>();
 		assert_eq!(sources, [first_text, second_text]);
@@ -4131,6 +4210,31 @@ mod tests {
 			"one undo removes every chip and suffix from one drop"
 		);
 		fs::remove_dir_all(first.parent().unwrap()).ok();
+	}
+
+	#[test]
+	fn mixed_image_video_drop_stages_classified_chips_in_source_order() {
+		let image = temp_drop_file("mixed-media", "first image.png", b"\x89PNG\r\n\x1a\n");
+		let video = temp_drop_file("mixed-media", "second video.mp4", b"video");
+		let pasted = format!("'{}' '{}'", image.display(), video.display());
+		let pane = EditorPane::new().with(Prop::Id, "composer");
+		let attachments = pane.attachments();
+		let mut ui = Ui::from_root(pane, 80, UiContext::default());
+		ui.focus_first();
+
+		ui.handle_paste(&pasted);
+
+		assert_eq!(editor_pane(&ui).buffer().expanded_text(), "[Image #1] [Video #2] ");
+		let staged = attachments.snapshot();
+		assert!(matches!(
+			&staged[0].content,
+			AttachmentContent::Image { source, .. } if source.as_str() == image.to_string_lossy().as_ref()
+		));
+		assert!(matches!(
+			&staged[1].content,
+			AttachmentContent::Video { source } if source.as_str() == video.to_string_lossy().as_ref()
+		));
+		fs::remove_dir_all(image.parent().unwrap()).ok();
 	}
 
 	#[test]

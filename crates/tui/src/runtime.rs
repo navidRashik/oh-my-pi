@@ -43,7 +43,7 @@ use crate::{
 	components,
 	components::ImgState,
 	debug, detect, imagereg, negotiate_async, paste,
-	paste::{Clipboard, ClipboardRead, Pasted, PastedImage},
+	paste::{Clipboard, ClipboardRead, ClipboardReadOutcome, Pasted, PastedImage},
 	pump::{DebugOp, DebugQuery, TerminalEvent},
 	test_support,
 };
@@ -63,9 +63,8 @@ pub enum Msg {
 	/// A finished off-thread decode for the `Img` at `slot`.
 	ImageDecoded { slot: Slot, state: ImgState },
 	/// A finished background system-clipboard read, tagged with its
-	/// [`ClipboardGate`] generation; `raw` requests verbatim insertion and
-	/// `None` means the clipboard was empty.
-	Pasted { generation: u64, raw: bool, clipboard: Option<Clipboard> },
+	/// [`ClipboardGate`] generation; `raw` requests verbatim insertion.
+	Pasted { generation: u64, raw: bool, outcome: ClipboardReadOutcome },
 }
 
 /// Ordering discipline for one in-flight background clipboard read.
@@ -707,11 +706,11 @@ impl App {
 				Wakeup::Message(Ok(Msg::ImageDecoded { slot, state })) => {
 					self.ui.deliver_image(slot, state);
 				},
-				Wakeup::Message(Ok(Msg::Pasted { generation, raw, clipboard })) => {
+				Wakeup::Message(Ok(Msg::Pasted { generation, raw, outcome })) => {
 					// A result from an expired or superseded read is dropped;
 					// its queued input already replayed without it.
 					if self.clipboard.settle(generation)
-						&& let Some(clipboard) = clipboard
+						&& let ClipboardReadOutcome::Payload(clipboard) = outcome
 						&& let Some(event) = self.deliver_clipboard(clipboard, raw)
 					{
 						return Ok(Some(event));
@@ -726,7 +725,7 @@ impl App {
 					TerminalEvent::Effect(_) => {},
 					// `Terminal::next` reports closure as an error.
 					TerminalEvent::Closed => return Ok(None),
-					TerminalEvent::Input(event) => {
+					TerminalEvent::Input(event) | TerminalEvent::InputWithMeta { event, .. } => {
 						let in_band_resize =
 							matches!(&event, InputEvent::Response(TerminalResponse::InBandResize { .. }));
 						if self
@@ -884,8 +883,9 @@ impl App {
 	/// The read rides [`crate::paste::spawn_clipboard_read`]'s detached
 	/// thread; a result arriving after the gate expired is dropped by
 	/// generation. A channel closed without a value (the reader thread
-	/// never spawned) settles the gate immediately so queued input is not
-	/// held until the deadline.
+	/// never spawned) becomes [`ClipboardReadOutcome::ReadFailure`] and
+	/// settles the gate immediately so queued input is not held until the
+	/// deadline.
 	fn begin_clipboard_read(&mut self, scope: ClipboardRead) {
 		let Some(generation) = self.clipboard.begin(Instant::now()) else {
 			return;
@@ -894,8 +894,8 @@ impl App {
 		let raw = scope == ClipboardRead::Text;
 		let tx = self.tx.clone();
 		tokio::spawn(async move {
-			let clipboard = rx.await.unwrap_or(None);
-			let _ = tx.send(Msg::Pasted { generation, raw, clipboard });
+			let outcome = rx.await.unwrap_or(ClipboardReadOutcome::ReadFailure);
+			let _ = tx.send(Msg::Pasted { generation, raw, outcome });
 		});
 	}
 

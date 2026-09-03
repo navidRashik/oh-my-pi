@@ -23,7 +23,7 @@ use crate::{
 	markdown::highlight::{self, HighlightStyles},
 	markup::Border,
 	props::{Prop, PropValue, Props},
-	rich::{CharWrap, Pipeline, Prefix, RichSink, RichText, width_config_epoch},
+	rich::{Pipeline, Prefix, RichSink, RichText, width_config_epoch},
 };
 
 /// Display cells one tab occupies, matching pi's `DEFAULT_TAB_WIDTH`.
@@ -280,6 +280,26 @@ struct Palette {
 	summary:    Style,
 }
 
+struct Continuation {
+	numbered: Prefix,
+	bare:     Prefix,
+}
+
+impl Continuation {
+	fn new(style: Style, gutter: usize) -> Self {
+		const SPACES: &str = "            ";
+		let mut numbered = Prefix::default();
+		numbered.push(style, &SPACES[..gutter + 2]);
+		let mut bare = Prefix::default();
+		bare.push(style, " ");
+		Self { numbered, bare }
+	}
+
+	fn for_row(&self, numbered: bool) -> &Prefix {
+		if numbered { &self.numbered } else { &self.bare }
+	}
+}
+
 /// Syntax-highlighted context rows, one [`RichText`] row per source line.
 struct Highlights {
 	rows:   RichText,
@@ -289,18 +309,22 @@ struct Highlights {
 
 /// Paints parsed rows into a [`RichText`] following pi's `renderDiff`.
 struct Painter {
-	width:         u16,
-	gutter:        usize,
-	bar:           char,
-	palette:       Palette,
-	tab_glyph:     &'static str,
-	space_glyph:   &'static str,
-	gap_glyph:     &'static str,
-	prev_number:   Option<u32>,
-	cont_numbered: Prefix,
-	cont_bare:     Prefix,
-	scratch:       String,
-	highlights:    Option<Highlights>,
+	width:           u16,
+	gutter:          usize,
+	bar:             char,
+	palette:         Palette,
+	tab_glyph:       &'static str,
+	space_glyph:     &'static str,
+	gap_glyph:       &'static str,
+	prev_number:     Option<u32>,
+	scratch:         String,
+	add_cont:        Continuation,
+	remove_cont:     Continuation,
+	context_cont:    Continuation,
+	header_cont:     Continuation,
+	diagnostic_cont: Continuation,
+	summary_cont:    Continuation,
+	highlights:      Option<Highlights>,
 }
 
 impl Painter {
@@ -312,18 +336,18 @@ impl Painter {
 		language: Option<&str>,
 	) -> Self {
 		let theme = &ctx.theme;
-		let (ok, err) = if colorblind {
+		let (add, remove) = if colorblind {
 			(theme.secondary, theme.accent)
 		} else {
-			(theme.ok, theme.err)
+			(theme.tool_diff_added, theme.tool_diff_removed)
 		};
 		let palette = Palette {
-			header:     Style::new().fg(theme.output),
-			context:    Style::new().fg(theme.output),
-			add:        Style::new().fg(if colorblind { ok } else { theme.info }),
-			remove:     Style::new().fg(err),
+			header:     Style::new().fg(theme.tool_diff_context),
+			context:    Style::new().fg(theme.tool_diff_context),
+			add:        Style::new().fg(add),
+			remove:     Style::new().fg(remove),
 			diagnostic: Style::new().fg(theme.warn),
-			summary:    Style::new().fg(theme.muted).italic(),
+			summary:    Style::new().fg(theme.tool_diff_context).italic(),
 		};
 		let gutter = lines
 			.iter()
@@ -332,9 +356,13 @@ impl Painter {
 			.max()
 			.unwrap_or(0)
 			.max(MIN_GUTTER_DIGITS);
-		let mut scratch = String::new();
-		let cont_numbered = spaces(&mut scratch, gutter + 2);
-		let cont_bare = spaces(&mut scratch, 1);
+		let scratch = String::new();
+		let add_cont = Continuation::new(palette.add, gutter);
+		let remove_cont = Continuation::new(palette.remove, gutter);
+		let context_cont = Continuation::new(palette.context, gutter);
+		let header_cont = Continuation::new(palette.header, gutter);
+		let diagnostic_cont = Continuation::new(palette.diagnostic, gutter);
+		let summary_cont = Continuation::new(palette.summary, gutter);
 		let highlights = language
 			.map(|language| highlight_context(lines, language, &HighlightStyles::from_theme(theme)));
 		Self {
@@ -346,9 +374,13 @@ impl Painter {
 			space_glyph: ctx.charset.icon(Icon::DiffIndentSpace),
 			gap_glyph: ctx.charset.icon(Icon::DiffGap),
 			prev_number: None,
-			cont_numbered,
-			cont_bare,
 			scratch,
+			add_cont,
+			remove_cont,
+			context_cont,
+			header_cont,
+			diagnostic_cont,
+			summary_cont,
 			highlights,
 		}
 	}
@@ -433,15 +465,6 @@ impl Painter {
 		true
 	}
 
-	fn row<'s>(&'s self, numbered: bool, out: &'s mut RichText) -> CharWrap<'s, &'s mut RichText> {
-		let cont = if numbered {
-			&self.cont_numbered
-		} else {
-			&self.cont_bare
-		};
-		out.wrap_chars_prefixed(self.width, Prefix::empty_ref(), cont)
-	}
-
 	/// Paints one added or removed row. `expand_tabs` mirrors pi's paired
 	/// path, where tabs become spaces before indentation is visualized, so a
 	/// leading tab reads as three dots instead of an arrow.
@@ -455,8 +478,13 @@ impl Painter {
 		out: &mut RichText,
 	) {
 		let numbered = self.gutter(marker, line.number);
-		let mut wrap = self.row(numbered, out);
-		wrap.run(if numbered { style.dim() } else { style }, &self.scratch);
+		let continuation = if style == self.palette.add {
+			self.add_cont.for_row(numbered)
+		} else {
+			self.remove_cont.for_row(numbered)
+		};
+		let mut wrap = out.wrap_chars_prefixed(self.width, Prefix::empty_ref(), continuation);
+		wrap.run(style, &self.scratch);
 		let content = line.text.as_str();
 		let indent = indent_len(content);
 		self.paint_indent(&mut wrap, style.dim(), &content[..indent], expand_tabs);
@@ -467,8 +495,9 @@ impl Painter {
 	fn paint_context(&mut self, line: &DiffLine, index: usize, out: &mut RichText) {
 		let numbered = self.gutter(' ', line.number);
 		let style = self.palette.context;
-		let mut wrap = self.row(numbered, out);
-		wrap.run(if numbered { style.dim() } else { style }, &self.scratch);
+		let continuation = self.context_cont.for_row(numbered);
+		let mut wrap = out.wrap_chars_prefixed(self.width, Prefix::empty_ref(), continuation);
+		wrap.run(style, &self.scratch);
 		let content = line.text.as_str();
 		match self.highlight_row(index) {
 			Some((rows, row)) => {
@@ -494,7 +523,8 @@ impl Painter {
 	fn paint_header(&mut self, line: &DiffLine, out: &mut RichText) {
 		self.prev_number = None;
 		let style = self.palette.header;
-		let mut wrap = self.row(false, out);
+		let mut wrap =
+			out.wrap_chars_prefixed(self.width, Prefix::empty_ref(), self.header_cont.for_row(false));
 		if line.text.is_empty() {
 			wrap.run(style, self.gap_glyph);
 		} else {
@@ -506,7 +536,11 @@ impl Painter {
 	fn paint_diagnostic(&mut self, line: &DiffLine, out: &mut RichText) {
 		self.prev_number = None;
 		let style = self.palette.diagnostic;
-		let mut wrap = self.row(false, out);
+		let mut wrap = out.wrap_chars_prefixed(
+			self.width,
+			Prefix::empty_ref(),
+			self.diagnostic_cont.for_row(false),
+		);
 		for (index, physical) in line.text.as_str().split('\n').enumerate() {
 			if index > 0 {
 				wrap.newline();
@@ -522,7 +556,8 @@ impl Painter {
 		self.scratch.clear();
 		let gap = self.gap_glyph;
 		let _ = write!(self.scratch, "{gap} {omitted} unchanged lines {gap}");
-		let mut wrap = self.row(false, out);
+		let mut wrap =
+			out.wrap_chars_prefixed(self.width, Prefix::empty_ref(), self.summary_cont.for_row(false));
 		wrap.run(self.palette.summary, &self.scratch);
 		wrap.newline();
 	}
@@ -544,14 +579,6 @@ impl Painter {
 			}
 		}
 	}
-}
-
-fn spaces(scratch: &mut String, count: usize) -> Prefix {
-	scratch.clear();
-	scratch.extend(iter::repeat_n(' ', count));
-	let mut prefix = Prefix::default();
-	prefix.push(Style::new(), scratch);
-	prefix
 }
 
 fn decimal_width(number: u32) -> usize {
@@ -631,18 +658,30 @@ fn paint_plain(sink: &mut dyn RichSink, style: Style, text: &str) {
 	}
 }
 
-/// Emits `text[start..]` in the semantic line style.
-///
-/// Pi computes word marks for change accounting but its terminal renderer does
-/// not invert changed words; the whole removed/added row carries one role.
+/// Emits `text[start..]` in the semantic line style, reversing only changed
+/// token ranges. Leading indentation remains uninverted.
 fn paint_marked(
 	sink: &mut dyn RichSink,
 	style: Style,
 	text: &str,
 	start: usize,
-	_marks: &[Range<usize>],
+	marks: &[Range<usize>],
 ) {
-	paint_plain(sink, style, &text[start..]);
+	let mut cursor = start;
+	for mark in marks {
+		let mark_start = mark.start.max(start);
+		let mark_end = mark.end.max(mark_start).min(text.len());
+		if mark_start > cursor {
+			paint_plain(sink, style, &text[cursor..mark_start]);
+		}
+		if mark_end > mark_start {
+			paint_plain(sink, style.reverse(), &text[mark_start..mark_end]);
+		}
+		cursor = cursor.max(mark_end);
+	}
+	if cursor < text.len() {
+		paint_plain(sink, style, &text[cursor..]);
+	}
 }
 
 type Marks = SmallVec<Range<usize>, 4>;

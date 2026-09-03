@@ -2276,11 +2276,7 @@ pub(crate) fn emit_cell_style(
 	*active_style = style;
 }
 
-pub(crate) fn close_active_link(
-	output: &mut String,
-	active_style: &mut Style,
-	hyperlinks: bool,
-) {
+pub(crate) fn close_active_link(output: &mut String, active_style: &mut Style, hyperlinks: bool) {
 	if hyperlinks && active_style.link.is_some() {
 		output.push_str(esc!(osc, "8;;", st));
 	}

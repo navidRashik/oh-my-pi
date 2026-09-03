@@ -77,7 +77,8 @@ async fn run<'a>(
 	loop {
 		tokio::select! {
 			event = terminal.next() => match event? {
-				TerminalEvent::Input(event) => {
+				TerminalEvent::Input(event)
+				| TerminalEvent::InputWithMeta { event, .. } => {
 					match event {
 						InputEvent::Key(key) => match key {
 							Key::Char('q') | Key::Esc | Key::Ctrl('c') => return Ok(()),

@@ -370,6 +370,64 @@ impl EditBuffer {
 		self.break_sequence();
 	}
 
+	/// Replaces a transient range without recording an undo snapshot.
+	///
+	/// Streaming speech previews use this to replace one volatile span while
+	/// preserving a caret before or after that span.
+	fn replace_transient_range(
+		&mut self,
+		range: ops::Range<usize>,
+		replacement: &str,
+	) -> ops::Range<usize> {
+		let range = if range.start <= range.end
+			&& range.end <= self.text.len()
+			&& self.text.is_char_boundary(range.start)
+			&& self.text.is_char_boundary(range.end)
+		{
+			range
+		} else {
+			self.cursor..self.cursor
+		};
+		let old_end = range.end;
+		let was_empty = range.is_empty();
+		let prior_cursor = self.cursor;
+		let replacement = sanitize_paste(replacement);
+		self.splice(range.clone(), &replacement);
+		let new_end = range.start + replacement.len();
+		self.cursor = if was_empty && prior_cursor == range.start {
+			new_end
+		} else if prior_cursor <= range.start {
+			prior_cursor
+		} else if prior_cursor >= old_end {
+			prior_cursor - (old_end - range.start) + replacement.len()
+		} else {
+			new_end
+		};
+		self.anchor = None;
+		self.desired = None;
+		self.break_sequence();
+		range.start..new_end
+	}
+
+	/// Replaces a volatile range with one undoable committed edit.
+	fn commit_transient_range(&mut self, range: ops::Range<usize>, replacement: &str) {
+		let start = range.start;
+		self.replace_transient_range(range, "");
+		let replacement = sanitize_paste(replacement);
+		if replacement.is_empty() {
+			return;
+		}
+		self.snapshot();
+		let prior_cursor = self.cursor;
+		self.splice(start..start, &replacement);
+		if prior_cursor >= start {
+			self.cursor = prior_cursor + replacement.len();
+		}
+		self.anchor = None;
+		self.desired = None;
+		self.break_sequence();
+	}
+
 	/// Widens `start..end` to whole-atom bounds for every atom it touches.
 	fn expand_to_atoms(&self, mut start: usize, mut end: usize) -> (usize, usize) {
 		for atom in &self.atoms {
@@ -1771,6 +1829,8 @@ pub struct Editor {
 	history_index:     Option<usize>,
 	history_draft:     Str,
 	history_query:     Option<Str>,
+	/// Volatile speech-preview range and exact text in the visible buffer.
+	volatile:          Option<(Range<usize>, Str)>,
 	last_layout_width: Cell<u16>,
 }
 
@@ -1789,6 +1849,7 @@ impl Editor {
 			history_index: None,
 			history_draft: Default::default(),
 			history_query: None,
+			volatile: None,
 			last_layout_width: Cell::new(80),
 		}
 	}
@@ -1805,6 +1866,7 @@ impl Editor {
 	pub fn set_text(&mut self, text: &str) {
 		self.history_index = None;
 		self.history_query = None;
+		self.volatile = None;
 		self.buffer.replace_external(text, false);
 		self.refresh();
 	}
@@ -2212,6 +2274,51 @@ impl Editor {
 		self.history_query = None;
 		self.buffer.replace_range(range, insert);
 		self.refresh();
+	}
+
+	/// Shows or replaces one volatile speech-recognition preview.
+	///
+	/// Replacements do not enter undo history. The caret stays synchronized
+	/// with its logical position around the span as its byte length changes.
+	pub fn set_volatile_text(&mut self, text: &str) {
+		self.history_index = None;
+		self.history_query = None;
+		let range = self
+			.volatile
+			.take()
+			.filter(|(range, expected)| {
+				self.buffer.text().get(range.clone()) == Some(expected.as_str())
+			})
+			.map_or_else(|| self.buffer.cursor()..self.buffer.cursor(), |(range, _)| range);
+		let range = self.buffer.replace_transient_range(range, text);
+		self.volatile =
+			(!range.is_empty()).then(|| (range.clone(), Str::new(&self.buffer.text()[range])));
+		self.refresh();
+	}
+
+	/// Discards the active volatile speech-recognition preview.
+	pub fn clear_volatile_text(&mut self) {
+		let Some((range, expected)) = self.volatile.take() else {
+			return;
+		};
+		if self.buffer.text().get(range.clone()) == Some(expected.as_str()) {
+			self.buffer.replace_transient_range(range, "");
+			self.refresh();
+		}
+	}
+
+	/// Replaces the volatile preview with one undoable finalized segment.
+	pub fn commit_volatile_text(&mut self, text: &str) {
+		self.history_index = None;
+		self.history_query = None;
+		if let Some((range, expected)) = self.volatile.take()
+			&& self.buffer.text().get(range.clone()) == Some(expected.as_str())
+		{
+			self.buffer.commit_transient_range(range, text);
+			self.refresh();
+		} else if matches!(self.buffer.insert_text(text), BufferOutcome::Changed) {
+			self.refresh();
+		}
 	}
 
 	/// Inserts sanitized text at the cursor (pastes, programmatic prefill).

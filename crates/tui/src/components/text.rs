@@ -13,7 +13,7 @@ use crate::{
 	markdown::highlight::{self, HighlightStyles},
 	markup::{Align, TextWrap, Truncate},
 	props::{Prop, PropValue, Props},
-	rich::{Pipeline, RichSink, RichText, cell_width},
+	rich::{Pipeline, RichSink, RichText, cell_width, decompose},
 };
 
 /// Wrapped or truncated text backing the `<text>` markup tag.
@@ -448,6 +448,8 @@ pub struct Pre {
 	max_width:       u16,
 	highlighted:     RichText,
 	highlighted_for: Option<(crate::Theme, Str)>,
+	authored:        RichText,
+	authored_ansi:   bool,
 }
 
 impl Pre {
@@ -461,6 +463,8 @@ impl Pre {
 			max_width:       0,
 			highlighted:     RichText::default(),
 			highlighted_for: None,
+			authored:        RichText::default(),
+			authored_ansi:   false,
 		}
 	}
 
@@ -488,18 +492,32 @@ impl Pre {
 	}
 
 	fn refresh_metrics(&mut self) {
-		let mut line_count = 0_u16;
-		let mut max_width = 0_u16;
-		for line in self.text.lines() {
-			line_count = line_count.saturating_add(1);
-			max_width = max_width.max(cell_width(line));
+		self.authored.clear();
+		self.authored_ansi = self.text.as_bytes().contains(&b'\x1b');
+		if self.authored_ansi {
+			decompose(&self.text, &mut self.authored);
+			self.line_count = RichText::rows(&self.authored);
+			self.max_width = (0..self.line_count)
+				.map(|row| self.authored.row_width(row))
+				.max()
+				.unwrap_or(0);
+		} else {
+			let mut line_count = 0_u16;
+			let mut max_width = 0_u16;
+			for line in self.text.lines() {
+				line_count = line_count.saturating_add(1);
+				max_width = max_width.max(cell_width(line));
+			}
+			self.line_count = line_count;
+			self.max_width = max_width;
 		}
-		self.line_count = line_count;
-		self.max_width = max_width;
 		self.highlighted_for = None;
 	}
 
 	fn syntax_token(&self) -> Option<&str> {
+		if self.authored_ansi {
+			return None;
+		}
 		let path = self.props.str_of(Prop::Path)?.as_str();
 		let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
 		let token = name
@@ -621,55 +639,82 @@ impl Component for Pre {
 		let gutter_style = Style::new().fg(pc.ctx.theme.muted);
 		let digits = gutter.saturating_sub(3) as usize;
 		let mut prefix_buffer = [0_u8; 32];
-		for (row, line) in self.text.lines().enumerate() {
-			let y = rect
-				.y
-				.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-			if y >= clip {
-				break;
-			}
-			if gutter > 0 {
-				let number = self
-					.start()
-					.saturating_add(u64::try_from(row).unwrap_or(u64::MAX));
-				let prefix =
-					line_number_prefix(number, digits, pc.ctx.charset.quote_rail(), &mut prefix_buffer);
-				put_clipped(pc.frame, x, y, content_x, &prefix, gutter_style);
-			}
-			if self.highlighted_for.is_some() {
-				let inline_number = line
-					.bytes()
-					.position(|byte| !byte.is_ascii_whitespace() && !byte.is_ascii_digit())
-					.and_then(|first| {
-						let prefix = &line[..first];
-						(prefix.bytes().any(|byte| byte.is_ascii_digit())).then_some(first)
-					})
-					.unwrap_or(0);
-				let mut run_x = content_x;
-				if inline_number > 0 {
-					run_x = put_clipped(
-						pc.frame,
-						run_x,
-						y,
-						right,
-						&line[..inline_number],
-						style.fg(pc.ctx.theme.muted),
+		if self.authored_ansi {
+			for row in 0..self.line_count {
+				let y = rect.y.saturating_add(row);
+				if y >= clip {
+					break;
+				}
+				if gutter > 0 {
+					let number = self.start().saturating_add(u64::from(row));
+					let prefix = line_number_prefix(
+						number,
+						digits,
+						pc.ctx.charset.quote_rail(),
+						&mut prefix_buffer,
 					);
+					put_clipped(pc.frame, x, y, content_x, prefix, gutter_style);
 				}
-				let mut skip = inline_number;
-				for (run_style, text) in self.highlighted.row_runs(row as u16) {
-					let text = if skip >= text.len() {
-						skip -= text.len();
-						continue;
-					} else {
-						let text = &text[skip..];
-						skip = 0;
-						text
-					};
-					run_x = put_clipped(pc.frame, run_x, y, right, text, style.inherit(run_style));
+				let mut run_x = content_x;
+				for (authored, text) in self.authored.row_runs(row) {
+					run_x = put_clipped(pc.frame, run_x, y, right, text, authored.inherit(style));
 				}
-			} else {
-				put_clipped(pc.frame, content_x, y, right, line, style);
+			}
+		} else {
+			for (row, line) in self.text.lines().enumerate() {
+				let y = rect
+					.y
+					.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
+				if y >= clip {
+					break;
+				}
+				if gutter > 0 {
+					let number = self
+						.start()
+						.saturating_add(u64::try_from(row).unwrap_or(u64::MAX));
+					let prefix = line_number_prefix(
+						number,
+						digits,
+						pc.ctx.charset.quote_rail(),
+						&mut prefix_buffer,
+					);
+					put_clipped(pc.frame, x, y, content_x, &prefix, gutter_style);
+				}
+				if self.highlighted_for.is_some() {
+					let inline_number = line
+						.bytes()
+						.position(|byte| !byte.is_ascii_whitespace() && !byte.is_ascii_digit())
+						.and_then(|first| {
+							let prefix = &line[..first];
+							(prefix.bytes().any(|byte| byte.is_ascii_digit())).then_some(first)
+						})
+						.unwrap_or(0);
+					let mut run_x = content_x;
+					if inline_number > 0 {
+						run_x = put_clipped(
+							pc.frame,
+							run_x,
+							y,
+							right,
+							&line[..inline_number],
+							style.fg(pc.ctx.theme.muted),
+						);
+					}
+					let mut skip = inline_number;
+					for (run_style, text) in self.highlighted.row_runs(row as u16) {
+						let text = if skip >= text.len() {
+							skip -= text.len();
+							continue;
+						} else {
+							let text = &text[skip..];
+							skip = 0;
+							text
+						};
+						run_x = put_clipped(pc.frame, run_x, y, right, text, style.inherit(run_style));
+					}
+				} else {
+					put_clipped(pc.frame, content_x, y, right, line, style);
+				}
 			}
 		}
 		if let Some(plan) = plan {
@@ -913,7 +958,7 @@ mod tests {
 		component::{Component, PaintCtx},
 		components::{Callout, Icon, Latex, Markdown},
 		context::Charset,
-		frame::{Frame, Rect, Size},
+		frame::{Color, Frame, Rect, Size},
 		test_support::frame_row_text,
 		ui::Ui,
 	};
@@ -994,6 +1039,22 @@ mod tests {
 		let frame = paint(&mut pre, 4, 2);
 		assert_eq!(frame_row_text(&frame, 0), "A");
 		assert_eq!(frame_row_text(&frame, 1), " B");
+	}
+
+	#[test]
+	fn pre_decomposes_authored_ansi_without_flattening_attributes() {
+		let ctx = UiContext::default();
+		let mut pre = Pre::new().text("\x1b[31;1;3mhot\x1b[0m plain");
+		assert_eq!(pre.measure(&ctx), (9, 9));
+		let frame = paint(&mut pre, 12, 1);
+		assert_eq!(frame_row_text(&frame, 0), "hot plain");
+		let authored = frame.cell(0, 0).style().spec();
+		assert_eq!(authored.foreground, Color::Indexed(1));
+		assert!(authored.bold);
+		assert!(authored.italic);
+		let plain = frame.cell(4, 0).style().spec();
+		assert!(!plain.bold);
+		assert!(!plain.italic);
 	}
 
 	#[test]

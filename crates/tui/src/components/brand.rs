@@ -13,12 +13,12 @@ use crate::{
 	props::{Prop, PropValue, Props},
 };
 
-/// Brand mark rows (pi `PI_LOGO`); `▒` cells paint muted instead of
-/// through the gradient.
+/// Brand mark rows (pi `PI_LOGO`); every non-space cell participates in the
+/// same diagonal gradient.
 const MARK: [&str; 5] =
 	["████████████", "   ██  ██   ", "   ██  ██   ", "   ▒▒  ██   ", "       ██   "];
 /// The same mark for a terminal that cannot show block elements
-/// ([`Charset::Ascii`]): `#` for the full cell, `:` for the muted cell.
+/// ([`Charset::Ascii`]): `#` for the full cell and `:` for the shaded cell.
 /// Glyph presentation resolves through the charset (ADR 0032), never by
 /// hand-emitting block characters.
 const MARK_ASCII: [&str; 5] =
@@ -32,11 +32,6 @@ const fn mark(charset: Charset) -> &'static [&'static str; ROWS] {
 		Charset::Ascii => &MARK_ASCII,
 		Charset::Unicode | Charset::NerdFont => &MARK,
 	}
-}
-
-/// Whether a mark cell paints muted instead of through the gradient.
-const fn is_muted(glyph: char) -> bool {
-	matches!(glyph, '▒' | ':')
 }
 
 /// The brand mark: a 12×5 block grid painted through [`Gradient`].
@@ -117,7 +112,6 @@ impl Brand {
 		// Terminals without truecolor run a quantized theme (every token
 		// indexed); the accent is the tell.
 		let truecolor = matches!(pc.ctx.theme.accent, Color::Rgb(..));
-		let muted = Style::new().fg(pc.ctx.theme.muted);
 		let mut utf8 = [0; 4];
 		for (row, line) in mark(pc.ctx.charset).iter().enumerate() {
 			let y = y.saturating_add(row as u16);
@@ -128,11 +122,8 @@ impl Brand {
 				if glyph == ' ' {
 					continue;
 				}
-				let style = if is_muted(glyph) {
-					muted
-				} else {
-					Style::new().fg(gradient.color(self.diagonal[row][column], shine, truecolor))
-				};
+				let style =
+					Style::new().fg(gradient.color(self.diagonal[row][column], shine, truecolor));
 				pc.frame
 					.put(x.saturating_add(column as u16), y, glyph.encode_utf8(&mut utf8), style);
 			}
@@ -198,7 +189,11 @@ mod tests {
 			fg(&ui, 8, 4),
 			Gradient::default().color(Gradient::diagonal(8, 4, 12, 5), None, true)
 		);
-		assert_eq!(fg(&ui, 3, 3), UiContext::default().theme.muted, "▒ cells stay muted");
+		assert_eq!(
+			fg(&ui, 3, 3),
+			Gradient::default().color(Gradient::diagonal(3, 3, 12, 5), None, true),
+			"shaded cells share the diagonal gradient",
+		);
 		assert_eq!(ui.next_wake(), None);
 	}
 
@@ -235,7 +230,11 @@ mod tests {
 		assert_eq!(frame_row_text(ui.frame(), 0), "############");
 		assert_eq!(frame_row_text(ui.frame(), 3), "   ::  ##");
 		assert_eq!(fg(&ui, 0, 0), Color::Rgb(248, 79, 204), "the gradient still paints the mark");
-		assert_eq!(fg(&ui, 3, 3), UiContext::default().theme.muted, "`:` cells stay muted");
+		assert_eq!(
+			fg(&ui, 3, 3),
+			Gradient::default().color(Gradient::diagonal(3, 3, 12, 5), None, true),
+			"ASCII shaded cells share the diagonal gradient",
+		);
 		for (unicode, ascii) in MARK.iter().zip(MARK_ASCII.iter()) {
 			assert_eq!(unicode.chars().count(), ascii.chars().count());
 			for (a, b) in unicode.chars().zip(ascii.chars()) {

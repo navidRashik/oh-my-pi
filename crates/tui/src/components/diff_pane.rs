@@ -165,12 +165,12 @@ impl Palette {
 		let strong = if dark { 0.42 } else { 0.48 };
 		let canvas = ctx.theme.panel;
 		Self {
-			add_soft:   canvas.mix(ctx.theme.ok, soft),
-			add_strong: canvas.mix(ctx.theme.ok, strong),
-			del_soft:   canvas.mix(ctx.theme.err, soft),
-			del_strong: canvas.mix(ctx.theme.err, strong),
-			fill_add:   canvas.mix(ctx.theme.ok, 0.07),
-			fill_del:   canvas.mix(ctx.theme.err, 0.07),
+			add_soft:   canvas.mix(ctx.theme.tool_diff_added, soft),
+			add_strong: canvas.mix(ctx.theme.tool_diff_added, strong),
+			del_soft:   canvas.mix(ctx.theme.tool_diff_removed, soft),
+			del_strong: canvas.mix(ctx.theme.tool_diff_removed, strong),
+			fill_add:   canvas.mix(ctx.theme.tool_diff_added, 0.07),
+			fill_del:   canvas.mix(ctx.theme.tool_diff_removed, 0.07),
 			selection:  canvas.mix(ctx.theme.fg, 0.14),
 		}
 	}
@@ -1254,12 +1254,12 @@ impl DiffPane {
 					Style::new()
 						.fg(if changed {
 							if old {
-								pc.ctx.theme.err
+								pc.ctx.theme.tool_diff_removed
 							} else {
-								pc.ctx.theme.ok
+								pc.ctx.theme.tool_diff_added
 							}
 						} else {
-							pc.ctx.theme.muted
+							pc.ctx.theme.tool_diff_context
 						})
 						.bg(bg),
 				);
@@ -1344,9 +1344,9 @@ impl DiffPane {
 					&old.gutter,
 					Style::new()
 						.fg(if is_del {
-							pc.ctx.theme.err
+							pc.ctx.theme.tool_diff_removed
 						} else {
-							pc.ctx.theme.muted
+							pc.ctx.theme.tool_diff_context
 						})
 						.bg(bg),
 				);
@@ -1360,9 +1360,9 @@ impl DiffPane {
 					&new.gutter,
 					Style::new()
 						.fg(if is_add {
-							pc.ctx.theme.ok
+							pc.ctx.theme.tool_diff_added
 						} else {
-							pc.ctx.theme.muted
+							pc.ctx.theme.tool_diff_context
 						})
 						.bg(bg),
 				);
@@ -1413,7 +1413,9 @@ impl DiffPane {
 			return;
 		}
 		let (primary_label, primary_action, primary_color) = match self.patch_target {
-			Some(DiffPatchTarget::Stage) => (" Stage Hunk ", DiffActionKind::Stage, pc.ctx.theme.ok),
+			Some(DiffPatchTarget::Stage) => {
+				(" Stage Hunk ", DiffActionKind::Stage, pc.ctx.theme.tool_diff_added)
+			},
 			Some(DiffPatchTarget::Unstage) => {
 				(" Unstage Hunk ", DiffActionKind::Unstage, pc.ctx.theme.warn)
 			},
@@ -1448,7 +1450,7 @@ impl DiffPane {
 				x,
 				y,
 				" Discard Hunk ",
-				pc.ctx.theme.err,
+				pc.ctx.theme.tool_diff_removed,
 				pc.ctx.theme.contrast,
 				caps,
 				selected,
@@ -1502,9 +1504,13 @@ impl DiffPane {
 			let bottom_band = top_band + 1;
 			let color = |kind: Option<MapKind>, band: usize| {
 				let base = match kind? {
-					MapKind::Del => pc.ctx.theme.err,
-					MapKind::Add => pc.ctx.theme.ok,
-					MapKind::Change => pc.ctx.theme.ok.mix(pc.ctx.theme.err, 0.5),
+					MapKind::Del => pc.ctx.theme.tool_diff_removed,
+					MapKind::Add => pc.ctx.theme.tool_diff_added,
+					MapKind::Change => pc
+						.ctx
+						.theme
+						.tool_diff_added
+						.mix(pc.ctx.theme.tool_diff_removed, 0.5),
 					MapKind::Hunk => pc.ctx.theme.accent,
 					MapKind::Context => pc.ctx.theme.panel.mix(pc.ctx.theme.fg, 0.2),
 				};

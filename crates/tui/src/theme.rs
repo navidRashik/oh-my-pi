@@ -35,25 +35,14 @@ pub struct JsonTheme {
 
 impl JsonTheme {
 	/// Parses either omp's compact semantic palette or the richer `colors`
-	/// palette. Rich component slots lower onto omp's semantic tokens once at
-	/// load time; code-fence borders that miss the contrast floor are blended
-	/// toward the theme's muted or foreground tier.
+	/// palette. Status, diff, and code-border slots remain independent so
+	/// unrelated rich-theme roles never overwrite their presentation colors.
 	pub fn parse(source: &str) -> Result<Self, ThemeError> {
 		let file: ThemeFile = serde_json::from_str(source).map_err(ThemeError::Json)?;
 		let (dark, light) = if let Some(colors) = &file.colors {
 			(
-				apply_rich(
-					colors,
-					&file.vars,
-					file.export.as_ref(),
-					Theme::for_appearance(Appearance::Dark),
-				)?,
-				apply_rich(
-					colors,
-					&file.vars,
-					file.export.as_ref(),
-					Theme::for_appearance(Appearance::Light),
-				)?,
+				apply_rich(colors, &file.vars, Theme::for_appearance(Appearance::Dark))?,
+				apply_rich(colors, &file.vars, Theme::for_appearance(Appearance::Light))?,
 			)
 		} else {
 			let dark = file.dark.apply(Theme::for_appearance(Appearance::Dark))?;
@@ -298,27 +287,45 @@ enum ColorValue {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ThemePatch {
-	fg:            Option<String>,
-	accent:        Option<String>,
-	info:          Option<String>,
-	ok:            Option<String>,
-	warn:          Option<String>,
-	err:           Option<String>,
-	muted:         Option<String>,
-	dim:           Option<String>,
-	output:        Option<String>,
-	border:        Option<String>,
-	code_border:   Option<String>,
-	surface:       Option<String>,
-	hover:         Option<String>,
-	selection:     Option<String>,
-	shadow:        Option<String>,
-	panel:         Option<String>,
-	error_surface: Option<String>,
-	secondary:     Option<String>,
-	python:        Option<String>,
-	status_rule:   Option<String>,
-	contrast:      Option<String>,
+	fg:                Option<String>,
+	accent:            Option<String>,
+	info:              Option<String>,
+	ok:                Option<String>,
+	warn:              Option<String>,
+	err:               Option<String>,
+	muted:             Option<String>,
+	dim:               Option<String>,
+	output:            Option<String>,
+	border:            Option<String>,
+	code_border:       Option<String>,
+	tool_diff_added:   Option<String>,
+	tool_diff_removed: Option<String>,
+	tool_diff_context: Option<String>,
+	surface:           Option<String>,
+	hover:             Option<String>,
+	selection:         Option<String>,
+	shadow:            Option<String>,
+	panel:             Option<String>,
+	error_surface:     Option<String>,
+	secondary:         Option<String>,
+	python:            Option<String>,
+	status_rule:       Option<String>,
+	border_muted:      Option<String>,
+	status_bg:         Option<String>,
+	status_sep:        Option<String>,
+	status_model:      Option<String>,
+	status_path:       Option<String>,
+	status_git_clean:  Option<String>,
+	status_git_dirty:  Option<String>,
+	status_context:    Option<String>,
+	status_spend:      Option<String>,
+	status_staged:     Option<String>,
+	status_dirty:      Option<String>,
+	status_untracked:  Option<String>,
+	status_output:     Option<String>,
+	status_cost:       Option<String>,
+	status_subagents:  Option<String>,
+	contrast:          Option<String>,
 }
 
 impl ThemePatch {
@@ -344,6 +351,9 @@ impl ThemePatch {
 		apply!(output);
 		apply!(border);
 		apply!(code_border);
+		apply!(tool_diff_added);
+		apply!(tool_diff_removed);
+		apply!(tool_diff_context);
 		apply!(surface);
 		apply!(hover);
 		apply!(selection);
@@ -353,6 +363,21 @@ impl ThemePatch {
 		apply!(secondary);
 		apply!(python);
 		apply!(status_rule);
+		apply!(border_muted);
+		apply!(status_bg);
+		apply!(status_sep);
+		apply!(status_model);
+		apply!(status_path);
+		apply!(status_git_clean);
+		apply!(status_git_dirty);
+		apply!(status_context);
+		apply!(status_spend);
+		apply!(status_staged);
+		apply!(status_dirty);
+		apply!(status_untracked);
+		apply!(status_output);
+		apply!(status_cost);
+		apply!(status_subagents);
 		apply!(contrast);
 		Ok(theme)
 	}
@@ -361,57 +386,50 @@ impl ThemePatch {
 fn apply_rich(
 	colors: &BTreeMap<String, ColorValue>,
 	vars: &BTreeMap<String, ColorValue>,
-	export: Option<&serde_json::Value>,
 	mut theme: Theme,
 ) -> Result<Theme, ThemeError> {
 	for (slot, value) in colors {
-		let Some(color) = resolve_color(slot, value, vars)? else {
-			continue;
-		};
+		let color = resolve_color(slot, value, vars)?.unwrap_or(Color::Default);
 		match slot.as_str() {
 			"text" => theme.fg = color,
-			"accent" | "borderAccent" | "mdLink" | "statusLineModel" => theme.accent = color,
-			"mdCodeBlock" | "bashMode" | "statusLinePath" => theme.info = color,
-			"success" | "toolDiffAdded" | "statusLineGitClean" => theme.ok = color,
-			"warning" | "statusLineGitDirty" | "statusLineDirty" => theme.warn = color,
-			"error" | "toolDiffRemoved" => theme.err = color,
+			"accent" => theme.accent = color,
+			"borderAccent" => theme.info = color,
+			"statusLineModel" => theme.status_model = color,
+			"mdCodeBlock" | "bashMode" => theme.info = color,
+			"statusLinePath" => theme.status_path = color,
+			"success" => theme.ok = color,
+			"toolDiffAdded" => theme.tool_diff_added = color,
+			"statusLineGitClean" => theme.status_git_clean = color,
+			"warning" => theme.warn = color,
+			"statusLineGitDirty" => theme.status_git_dirty = color,
+			"statusLineDirty" => theme.status_dirty = color,
+			"error" => theme.err = color,
+			"toolDiffRemoved" => theme.tool_diff_removed = color,
 			"toolErrorBg" => theme.error_surface = color,
-			"statusLineSep" => theme.status_rule = color,
+			"statusLineBg" => theme.status_bg = color,
+			"statusLineSep" => theme.status_sep = color,
 			"muted" => theme.muted = color,
 			"dim" => theme.dim = color,
-			"thinkingText" | "toolOutput" | "toolDiffContext" => theme.output = color,
+			"toolOutput" => theme.output = color,
+			"toolDiffContext" => theme.tool_diff_context = color,
 			"mdCodeBlockBorder" => theme.code_border = color,
-			"border" | "borderMuted" | "mdQuoteBorder" | "mdHr" => theme.border = color,
+			"border" => theme.border = color,
+			"borderMuted" => theme.border_muted = color,
 			"selectedBg" => theme.selection = color,
 			"toolPendingBg" => theme.surface = color,
-			"userMessageBg" | "customMessageBg" | "toolSuccessBg" | "statusLineBg" => {
-				theme.panel = color;
-			},
+			"userMessageBg" | "customMessageBg" | "toolSuccessBg" => theme.panel = color,
 			"pythonMode" => theme.python = color,
-			"customMessageLabel" | "statusLineSpend" | "statusLineCost" => {
-				theme.secondary = color;
-			},
+			"customMessageLabel" => theme.secondary = color,
+			"statusLineContext" => theme.status_context = color,
+			"statusLineSpend" => theme.status_spend = color,
+			"statusLineStaged" => theme.status_staged = color,
+			"statusLineUntracked" => theme.status_untracked = color,
+			"statusLineOutput" => theme.status_output = color,
+			"statusLineCost" => theme.status_cost = color,
+			"statusLineSubagents" => theme.status_subagents = color,
 			"userMessageText" | "customMessageText" => theme.contrast = color,
 			_ => {},
 		}
-	}
-	if let Some(background) = export
-		.and_then(|value| value.get("pageBg"))
-		.and_then(|value| match value {
-			serde_json::Value::String(source) => Some(ColorValue::Text(source.clone())),
-			serde_json::Value::Number(index) => index
-				.as_u64()
-				.and_then(|index| u16::try_from(index).ok())
-				.map(ColorValue::Index),
-			_ => None,
-		})
-		.as_ref()
-		.map(|value| resolve_color("pageBg", value, vars))
-		.transpose()?
-		.flatten()
-	{
-		theme.code_border =
-			legible_fence_border(theme.code_border, background, theme.muted, theme.fg);
 	}
 	Ok(theme)
 }
@@ -447,8 +465,10 @@ fn resolve_color(
 	Err(ThemeError::Color { token: Str::new(token), value: Str::new_static("variable cycle") })
 }
 
+#[cfg(test)]
 const MIN_FENCE_CONTRAST: f64 = 2.4;
 
+#[cfg(test)]
 fn color_contrast(left: Color, right: Color) -> Option<f64> {
 	let Color::Rgb(left_red, left_green, left_blue) = left else {
 		return None;
@@ -464,37 +484,6 @@ fn color_contrast(left: Color, right: Color) -> Option<f64> {
 		(right, left)
 	};
 	Some((lighter + 0.05) / (darker + 0.05))
-}
-
-fn legible_fence_border(
-	border: Color,
-	background: Color,
-	muted: Color,
-	foreground: Color,
-) -> Color {
-	if color_contrast(border, background).is_none_or(|ratio| ratio >= MIN_FENCE_CONTRAST) {
-		return border;
-	}
-	let target =
-		if color_contrast(muted, background).is_some_and(|ratio| ratio >= MIN_FENCE_CONTRAST) {
-			muted
-		} else {
-			foreground
-		};
-	let (Color::Rgb(red, green, blue), Color::Rgb(to_red, to_green, to_blue)) = (border, target)
-	else {
-		return target;
-	};
-	for step in 1_u16..=255 {
-		let blend = |from: u8, to: u8| {
-			((u16::from(from) * (255 - step) + u16::from(to) * step + 127) / 255) as u8
-		};
-		let candidate = Color::Rgb(blend(red, to_red), blend(green, to_green), blend(blue, to_blue));
-		if color_contrast(candidate, background).is_some_and(|ratio| ratio >= MIN_FENCE_CONTRAST) {
-			return candidate;
-		}
-	}
-	target
 }
 
 /// Derives a stable TrueColor accent from a session name and active theme.

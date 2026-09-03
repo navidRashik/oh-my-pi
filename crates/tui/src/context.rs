@@ -402,75 +402,89 @@ impl Appearance {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Theme {
 	/// Default foreground.
-	pub fg:            Color,
+	pub fg:                Color,
 	/// Primary interactive accent (focus, active controls, links).
-	pub accent:        Color,
+	pub accent:            Color,
 	/// Informational values.
-	pub info:          Color,
+	pub info:              Color,
 	/// Success / enabled.
-	pub ok:            Color,
+	pub ok:                Color,
 	/// Caution / modified.
-	pub warn:          Color,
+	pub warn:              Color,
 	/// Errors / destructive.
-	pub err:           Color,
+	pub err:               Color,
 	/// De-emphasized chrome and hints.
-	pub muted:         Color,
+	pub muted:             Color,
 	/// Secondary labels and gallery state chrome.
-	pub dim:           Color,
+	pub dim:               Color,
 	/// Tool output and private reasoning text.
-	pub output:        Color,
+	pub output:            Color,
 	/// Container borders and rules; dimmer than `fg`, brighter than `surface`.
-	pub border:        Color,
-	/// Markdown code-fence rows, kept legible against the theme page background.
-	pub code_border:   Color,
+	pub border:            Color,
+	/// Markdown code-fence rows.
+	pub code_border:       Color,
+	/// Added lines and gutters in tool diffs.
+	pub tool_diff_added:   Color,
+	/// Removed lines and gutters in tool diffs.
+	pub tool_diff_removed: Color,
+	/// Unchanged lines, metadata, and gap rows in tool diffs.
+	pub tool_diff_context: Color,
 	/// Neutral chip / button fill.
-	pub surface:       Color,
+	pub surface:           Color,
 	/// Hover row tint.
-	pub hover:         Color,
+	pub hover:             Color,
 	/// Text-selection background tint.
-	pub selection:     Color,
+	pub selection:         Color,
 	/// Drop-shadow tint painted under lifted (elevated) surfaces.
-	pub shadow:        Color,
+	pub shadow:            Color,
 	/// Elevated panel fill (composer, overlay cards); darker than `surface`.
-	pub panel:         Color,
+	pub panel:             Color,
 	/// Faulted tool-card surface.
-	pub error_surface: Color,
+	pub error_surface:     Color,
 	/// Secondary accent (cost figures, alternate roles); distinct from
 	/// `accent` without carrying ok/warn/err semantics.
-	pub secondary:     Color,
+	pub secondary:         Color,
 	/// Python language identity used by eval-cell chrome.
-	pub python:        Color,
+	pub python:            Color,
 	/// Inactive rule color inside the compact status-line context gauge.
-	pub status_rule:   Color,
+	pub status_rule:       Color,
+	/// Subdued structural border used by welcome/provider chrome.
+	pub border_muted:      Color,
+	/// Status-band background.
+	pub status_bg:         Color,
+	/// Status-band separator.
+	pub status_sep:        Color,
+	/// Status-band model label.
+	pub status_model:      Color,
+	/// Status-band path.
+	pub status_path:       Color,
+	/// Clean and dirty branch labels.
+	pub status_git_clean:  Color,
+	/// Dirty branch label.
+	pub status_git_dirty:  Color,
+	/// Context values.
+	pub status_context:    Color,
+	/// Input/cache spend counters.
+	pub status_spend:      Color,
+	/// Staged status count.
+	pub status_staged:     Color,
+	/// Unstaged status count.
+	pub status_dirty:      Color,
+	/// Untracked status count.
+	pub status_untracked:  Color,
+	/// Output/rate counters.
+	pub status_output:     Color,
+	/// Billing summary.
+	pub status_cost:       Color,
+	/// Subagent and job badges.
+	pub status_subagents:  Color,
 	/// Text painted on top of accent/warn fills.
-	pub contrast:      Color,
+	pub contrast:          Color,
 }
 
 impl Default for Theme {
 	fn default() -> Self {
-		Self {
-			fg:            Color::Rgb(0xe8, 0xec, 0xf4),
-			accent:        Color::Rgb(0x00, 0xb4, 0xff),
-			info:          Color::Rgb(0x4a, 0x9e, 0xff),
-			ok:            Color::Rgb(0x00, 0xff, 0x88),
-			warn:          Color::Rgb(0xff, 0xb3, 0x47),
-			err:           Color::Rgb(0xff, 0x47, 0x57),
-			muted:         Color::Rgb(0x6b, 0x72, 0x80),
-			dim:           Color::Rgb(0x6b, 0x72, 0x80),
-			output:        Color::Rgb(0x9c, 0xa3, 0xb0),
-			border:        Color::Rgb(0x1f, 0x25, 0x2d),
-			code_border:   Color::Rgb(0xd4, 0xc0, 0x90),
-			surface:       Color::Rgb(0x3a, 0x3f, 0x4b),
-			hover:         Color::Rgb(0x2c, 0x31, 0x3a),
-			selection:     Color::Rgb(0x36, 0x4c, 0x61),
-			shadow:        Color::Rgb(0x05, 0x07, 0x0c),
-			panel:         Color::Rgb(0x0f, 0x12, 0x16),
-			error_surface: Color::Rgb(0x1a, 0x0f, 0x10),
-			secondary:     Color::Rgb(0xab, 0x77, 0xe6),
-			python:        Color::Rgb(0x37, 0x76, 0xab),
-			status_rule:   Color::Rgb(0x2a, 0x30, 0x38),
-			contrast:      Color::Rgb(0x10, 0x12, 0x16),
-		}
+		Self::for_appearance(Appearance::Dark)
 	}
 }
 
@@ -491,27 +505,45 @@ impl Theme {
 	/// Quantizes every semantic token for terminals without truecolor.
 	pub const fn quantized_256(self) -> Self {
 		Self {
-			fg:            self.fg.quantized_256(),
-			accent:        self.accent.quantized_256(),
-			info:          self.info.quantized_256(),
-			ok:            self.ok.quantized_256(),
-			warn:          self.warn.quantized_256(),
-			err:           self.err.quantized_256(),
-			muted:         self.muted.quantized_256(),
-			dim:           self.dim.quantized_256(),
-			output:        self.output.quantized_256(),
-			border:        self.border.quantized_256(),
-			code_border:   self.code_border.quantized_256(),
-			surface:       self.surface.quantized_256(),
-			hover:         self.hover.quantized_256(),
-			selection:     self.selection.quantized_256(),
-			shadow:        self.shadow.quantized_256(),
-			panel:         self.panel.quantized_256(),
-			error_surface: self.error_surface.quantized_256(),
-			secondary:     self.secondary.quantized_256(),
-			python:        self.python.quantized_256(),
-			status_rule:   self.status_rule.quantized_256(),
-			contrast:      self.contrast.quantized_256(),
+			fg:                self.fg.quantized_256(),
+			accent:            self.accent.quantized_256(),
+			info:              self.info.quantized_256(),
+			ok:                self.ok.quantized_256(),
+			warn:              self.warn.quantized_256(),
+			err:               self.err.quantized_256(),
+			muted:             self.muted.quantized_256(),
+			dim:               self.dim.quantized_256(),
+			output:            self.output.quantized_256(),
+			border:            self.border.quantized_256(),
+			code_border:       self.code_border.quantized_256(),
+			tool_diff_added:   self.tool_diff_added.quantized_256(),
+			tool_diff_removed: self.tool_diff_removed.quantized_256(),
+			tool_diff_context: self.tool_diff_context.quantized_256(),
+			surface:           self.surface.quantized_256(),
+			hover:             self.hover.quantized_256(),
+			selection:         self.selection.quantized_256(),
+			shadow:            self.shadow.quantized_256(),
+			panel:             self.panel.quantized_256(),
+			error_surface:     self.error_surface.quantized_256(),
+			secondary:         self.secondary.quantized_256(),
+			python:            self.python.quantized_256(),
+			status_rule:       self.status_rule.quantized_256(),
+			border_muted:      self.border_muted.quantized_256(),
+			status_bg:         self.status_bg.quantized_256(),
+			status_sep:        self.status_sep.quantized_256(),
+			status_model:      self.status_model.quantized_256(),
+			status_path:       self.status_path.quantized_256(),
+			status_git_clean:  self.status_git_clean.quantized_256(),
+			status_git_dirty:  self.status_git_dirty.quantized_256(),
+			status_context:    self.status_context.quantized_256(),
+			status_spend:      self.status_spend.quantized_256(),
+			status_staged:     self.status_staged.quantized_256(),
+			status_dirty:      self.status_dirty.quantized_256(),
+			status_untracked:  self.status_untracked.quantized_256(),
+			status_output:     self.status_output.quantized_256(),
+			status_cost:       self.status_cost.quantized_256(),
+			status_subagents:  self.status_subagents.quantized_256(),
+			contrast:          self.contrast.quantized_256(),
 		}
 	}
 
@@ -519,50 +551,86 @@ impl Theme {
 	pub const fn for_appearance(appearance: Appearance) -> Self {
 		match appearance {
 			Appearance::Dark => Self {
-				fg:            Color::Rgb(0xe8, 0xec, 0xf4),
-				accent:        Color::Rgb(0x00, 0xb4, 0xff),
-				info:          Color::Rgb(0x4a, 0x9e, 0xff),
-				ok:            Color::Rgb(0x00, 0xff, 0x88),
-				warn:          Color::Rgb(0xff, 0xb3, 0x47),
-				err:           Color::Rgb(0xff, 0x47, 0x57),
-				muted:         Color::Rgb(0x6b, 0x72, 0x80),
-				dim:           Color::Rgb(0x6b, 0x72, 0x80),
-				output:        Color::Rgb(0x9c, 0xa3, 0xb0),
-				border:        Color::Rgb(0x1f, 0x25, 0x2d),
-				code_border:   Color::Rgb(0xd4, 0xc0, 0x90),
-				surface:       Color::Rgb(0x3a, 0x3f, 0x4b),
-				hover:         Color::Rgb(0x2c, 0x31, 0x3a),
-				selection:     Color::Rgb(0x36, 0x4c, 0x61),
-				shadow:        Color::Rgb(0x05, 0x07, 0x0c),
-				panel:         Color::Rgb(0x0f, 0x12, 0x16),
-				error_surface: Color::Rgb(0x1a, 0x0f, 0x10),
-				secondary:     Color::Rgb(0xab, 0x77, 0xe6),
-				python:        Color::Rgb(0x37, 0x76, 0xab),
-				status_rule:   Color::Rgb(0x2a, 0x30, 0x38),
-				contrast:      Color::Rgb(0x10, 0x12, 0x16),
+				fg:                Color::Default,
+				accent:            Color::Rgb(0xfe, 0xbc, 0x38),
+				info:              Color::Rgb(0x00, 0x88, 0xfa),
+				ok:                Color::Rgb(0x89, 0xd2, 0x81),
+				warn:              Color::Rgb(0xe4, 0xc0, 0x0f),
+				err:               Color::Rgb(0xfc, 0x3a, 0x4b),
+				muted:             Color::Rgb(0x77, 0x7d, 0x88),
+				dim:               Color::Rgb(0x5f, 0x66, 0x73),
+				output:            Color::Rgb(0x77, 0x7d, 0x88),
+				border:            Color::Rgb(0x17, 0x8f, 0xb9),
+				code_border:       Color::Rgb(0x77, 0x7d, 0x88),
+				tool_diff_added:   Color::Rgb(0x89, 0xd2, 0x81),
+				tool_diff_removed: Color::Rgb(0xfc, 0x3a, 0x4b),
+				tool_diff_context: Color::Rgb(0x77, 0x7d, 0x88),
+				surface:           Color::Rgb(0x22, 0x1d, 0x1a),
+				hover:             Color::Rgb(0x31, 0x36, 0x3f),
+				selection:         Color::Rgb(0x31, 0x36, 0x3f),
+				shadow:            Color::Rgb(0x12, 0x12, 0x12),
+				panel:             Color::Rgb(0x12, 0x12, 0x12),
+				error_surface:     Color::Rgb(0x29, 0x1d, 0x1d),
+				secondary:         Color::Rgb(0xb2, 0x81, 0xd6),
+				python:            Color::Rgb(0xe4, 0xc0, 0x0f),
+				status_rule:       Color::Rgb(0x17, 0x8f, 0xb9),
+				border_muted:      Color::Rgb(0x3d, 0x42, 0x4a),
+				status_bg:         Color::Rgb(0x12, 0x12, 0x12),
+				status_sep:        Color::Indexed(244),
+				status_model:      Color::Rgb(0xd7, 0x87, 0xaf),
+				status_path:       Color::Rgb(0x00, 0xaf, 0xaf),
+				status_git_clean:  Color::Rgb(0x5f, 0xaf, 0x5f),
+				status_git_dirty:  Color::Rgb(0xd7, 0xaf, 0x5f),
+				status_context:    Color::Rgb(0x87, 0x87, 0xaf),
+				status_spend:      Color::Rgb(0x5f, 0xaf, 0xaf),
+				status_staged:     Color::Indexed(70),
+				status_dirty:      Color::Indexed(178),
+				status_untracked:  Color::Indexed(39),
+				status_output:     Color::Indexed(205),
+				status_cost:       Color::Indexed(205),
+				status_subagents:  Color::Rgb(0xfe, 0xbc, 0x38),
+				contrast:          Color::Rgb(0x12, 0x12, 0x12),
 			},
 			Appearance::Light => Self {
-				fg:            Color::Rgb(0x24, 0x28, 0x30),
-				accent:        Color::Rgb(0x00, 0x5f, 0xaf),
-				info:          Color::Rgb(0x00, 0x72, 0x7d),
-				ok:            Color::Rgb(0x3f, 0x70, 0x19),
-				warn:          Color::Rgb(0x8a, 0x5a, 0x00),
-				err:           Color::Rgb(0xb0, 0x24, 0x32),
-				muted:         Color::Rgb(0x6b, 0x70, 0x78),
-				dim:           Color::Rgb(0x6b, 0x70, 0x78),
-				output:        Color::Rgb(0x4b, 0x52, 0x5d),
-				border:        Color::Rgb(0xd0, 0xd7, 0xde),
-				code_border:   Color::Rgb(0x6b, 0x70, 0x78),
-				surface:       Color::Rgb(0xe2, 0xe5, 0xea),
-				hover:         Color::Rgb(0xed, 0xef, 0xf2),
-				selection:     Color::Rgb(0xc2, 0xda, 0xed),
-				shadow:        Color::Rgb(0xb8, 0xbd, 0xc7),
-				panel:         Color::Rgb(0xee, 0xf0, 0xf3),
-				error_surface: Color::Rgb(0xff, 0xed, 0xee),
-				secondary:     Color::Rgb(0x6f, 0x42, 0xc1),
-				python:        Color::Rgb(0x37, 0x76, 0xab),
-				status_rule:   Color::Rgb(0xc8, 0xd0, 0xd8),
-				contrast:      Color::Rgb(0xff, 0xff, 0xff),
+				fg:                Color::Default,
+				accent:            Color::Rgb(0x5a, 0x80, 0x80),
+				info:              Color::Rgb(0x54, 0x7d, 0xa7),
+				ok:                Color::Rgb(0x58, 0x84, 0x58),
+				warn:              Color::Rgb(0x9a, 0x73, 0x26),
+				err:               Color::Rgb(0xaa, 0x55, 0x55),
+				muted:             Color::Rgb(0x6c, 0x6c, 0x6c),
+				dim:               Color::Rgb(0x76, 0x76, 0x76),
+				output:            Color::Rgb(0x6c, 0x6c, 0x6c),
+				border:            Color::Rgb(0x54, 0x7d, 0xa7),
+				code_border:       Color::Rgb(0x6c, 0x6c, 0x6c),
+				tool_diff_added:   Color::Rgb(0x58, 0x84, 0x58),
+				tool_diff_removed: Color::Rgb(0xaa, 0x55, 0x55),
+				tool_diff_context: Color::Rgb(0x6c, 0x6c, 0x6c),
+				surface:           Color::Rgb(0xe8, 0xe8, 0xe8),
+				hover:             Color::Rgb(0xd0, 0xd0, 0xe0),
+				selection:         Color::Rgb(0xd0, 0xd0, 0xe0),
+				shadow:            Color::Rgb(0xb0, 0xb0, 0xb0),
+				panel:             Color::Rgb(0xe0, 0xe0, 0xe0),
+				error_surface:     Color::Rgb(0xf0, 0xe8, 0xe8),
+				secondary:         Color::Rgb(0x7e, 0x57, 0xc2),
+				python:            Color::Rgb(0x9a, 0x73, 0x26),
+				status_rule:       Color::Rgb(0x54, 0x7d, 0xa7),
+				border_muted:      Color::Rgb(0xb0, 0xb0, 0xb0),
+				status_bg:         Color::Rgb(0xe0, 0xe0, 0xe0),
+				status_sep:        Color::Rgb(0x80, 0x80, 0x80),
+				status_model:      Color::Rgb(0x87, 0x5f, 0x87),
+				status_path:       Color::Rgb(0x00, 0x5f, 0x87),
+				status_git_clean:  Color::Rgb(0x00, 0x5f, 0x00),
+				status_git_dirty:  Color::Rgb(0xaf, 0x5f, 0x00),
+				status_context:    Color::Rgb(0x5f, 0x5f, 0x87),
+				status_spend:      Color::Rgb(0x00, 0x5f, 0x5f),
+				status_staged:     Color::Indexed(28),
+				status_dirty:      Color::Indexed(136),
+				status_untracked:  Color::Indexed(31),
+				status_output:     Color::Indexed(133),
+				status_cost:       Color::Indexed(133),
+				status_subagents:  Color::Rgb(0x5a, 0x80, 0x80),
+				contrast:          Color::Rgb(0xff, 0xff, 0xff),
 			},
 		}
 	}
@@ -581,6 +649,21 @@ impl Theme {
 			"secondary" => self.secondary,
 			"python" => self.python,
 			"status_rule" => self.status_rule,
+			"border_muted" => self.border_muted,
+			"status_bg" => self.status_bg,
+			"status_sep" => self.status_sep,
+			"status_model" => self.status_model,
+			"status_path" => self.status_path,
+			"status_git_clean" => self.status_git_clean,
+			"status_git_dirty" => self.status_git_dirty,
+			"status_context" => self.status_context,
+			"status_spend" => self.status_spend,
+			"status_staged" => self.status_staged,
+			"status_dirty" => self.status_dirty,
+			"status_untracked" => self.status_untracked,
+			"status_output" => self.status_output,
+			"status_cost" => self.status_cost,
+			"status_subagents" => self.status_subagents,
 			"ok" | "success" => self.ok,
 			"warn" | "warning" => self.warn,
 			"err" | "error" => self.err,
@@ -590,6 +673,9 @@ impl Theme {
 			"error_surface" => self.error_surface,
 			"border" => self.border,
 			"code_border" => self.code_border,
+			"tool_diff_added" => self.tool_diff_added,
+			"tool_diff_removed" => self.tool_diff_removed,
+			"tool_diff_context" => self.tool_diff_context,
 			"surface" => self.surface,
 			"hover" => self.hover,
 			"selection" => self.selection,
@@ -605,8 +691,7 @@ impl Theme {
 		matches!(
 			name,
 			"default"
-				| "fg"
-				| "accent"
+				| "fg" | "accent"
 				| "info" | "ok"
 				| "warn" | "err"
 				| "success"
@@ -620,8 +705,26 @@ impl Theme {
 				| "secondary"
 				| "python"
 				| "status_rule"
+				| "border_muted"
+				| "status_bg"
+				| "status_sep"
+				| "status_model"
+				| "status_path"
+				| "status_git_clean"
+				| "status_git_dirty"
+				| "status_context"
+				| "status_spend"
+				| "status_staged"
+				| "status_dirty"
+				| "status_untracked"
+				| "status_output"
+				| "status_cost"
+				| "status_subagents"
 				| "border"
 				| "code_border"
+				| "tool_diff_added"
+				| "tool_diff_removed"
+				| "tool_diff_context"
 				| "surface"
 				| "hover"
 				| "selection"

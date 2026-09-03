@@ -3,7 +3,10 @@
 use std::time::Duration;
 
 use omp_core::Str;
-use omp_tui::{Frame, Key, Layer, MouseReport, Size, paste::ClipboardRead};
+use omp_tui::{
+	Frame, Key, Layer, MouseReport, Size,
+	paste::{Clipboard, ClipboardRead, ClipboardReadOutcome},
+};
 use smallvec::SmallVec;
 
 /// What one paint of a scene looks like to the host.
@@ -35,7 +38,7 @@ pub enum Effect {
 	/// The application asked to exit.
 	Quit,
 	/// Read the system clipboard (images preferred, or text only) and
-	/// deliver the result to [`Scene::paste`].
+	/// deliver the typed result to [`Scene::clipboard`].
 	Clipboard(ClipboardRead),
 	/// Write text to the system clipboard; the host performs the write
 	/// detached so a slow CLI fallback never blocks the event loop.
@@ -61,6 +64,40 @@ pub trait Scene {
 	/// Routes clipboard text; `raw` inserts verbatim without attachment
 	/// staging or drop classification.
 	fn paste(&mut self, text: &str, raw: bool) -> Effect;
+
+	/// Routes one typed system-clipboard result.
+	///
+	/// Chat scenes override this to surface non-payload outcomes as notices.
+	/// The default preserves the generic scene host's image/file flattening.
+	fn clipboard(&mut self, outcome: ClipboardReadOutcome, raw: bool) -> Effect {
+		let text = match outcome {
+			ClipboardReadOutcome::Payload(Clipboard::Text(text)) => text,
+			ClipboardReadOutcome::Payload(Clipboard::Image(image)) => {
+				let Ok(path) = image.persist() else {
+					return Effect::Ignored;
+				};
+				path.display().to_string()
+			},
+			ClipboardReadOutcome::Payload(Clipboard::Paths(paths)) => {
+				let mut joined = String::new();
+				for path in &paths {
+					if !joined.is_empty() {
+						joined.push(' ');
+					}
+					joined.push('"');
+					joined.push_str(path);
+					joined.push('"');
+				}
+				joined
+			},
+			ClipboardReadOutcome::Empty
+			| ClipboardReadOutcome::PermissionDenied
+			| ClipboardReadOutcome::UnsupportedFormat
+			| ClipboardReadOutcome::ReadFailure => return Effect::Ignored,
+		};
+		self.paste(&text, raw)
+	}
+
 	/// Pumps host-external state before the next paint.
 	///
 	/// Channel-driven scenes use this to request repaint, clipboard, or exit

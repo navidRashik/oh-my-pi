@@ -35,7 +35,7 @@ use std::{
 use omp_tui::{
 	CellContent, Charset, DecorKind, Frame, Graphics, Key, Keymap, Mouse, MouseButton, MouseReport,
 	Size, Style, UiContext,
-	paste::{self, Clipboard, ClipboardRead},
+	paste::{self, ClipboardRead, ClipboardReadOutcome},
 };
 use smallvec::SmallVec;
 use winit::{
@@ -135,7 +135,7 @@ pub fn run<S: Scene>(config: HostConfig, build: impl Fn(&UiContext) -> S) {
 /// Host-spawned events riding the winit mailbox.
 enum UserEvent {
 	/// A background clipboard read completed for one window's pane.
-	Clipboard(WindowId, PaneId, Option<Clipboard>, ClipboardRead),
+	Clipboard(WindowId, PaneId, ClipboardReadOutcome, ClipboardRead),
 }
 
 /// One overlay band of the last paint, in viewport cells: `(x, y, w, rows)`.
@@ -1326,8 +1326,10 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 		let proxy = self.proxy.clone();
 		thread::spawn(move || {
 			let receiver = paste::spawn_clipboard_read(scope);
-			let clipboard = receiver.blocking_recv().ok().flatten();
-			let _ = proxy.send_event(UserEvent::Clipboard(window, pane, clipboard, scope));
+			let outcome = receiver
+				.blocking_recv()
+				.unwrap_or(ClipboardReadOutcome::ReadFailure);
+			let _ = proxy.send_event(UserEvent::Clipboard(window, pane, outcome, scope));
 		});
 	}
 
@@ -1892,26 +1894,24 @@ impl<S: Scene, F: Fn(&UiContext) -> S> ApplicationHandler<UserEvent> for Shell<S
 
 	fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
 		match event {
-			UserEvent::Clipboard(window, pane, clipboard, scope) => {
+			UserEvent::Clipboard(window, pane, outcome, scope) => {
 				let Some(widx) = self.window_index(window) else {
 					return;
 				};
 				let raw = matches!(scope, ClipboardRead::Text);
-				if let Some(text) = clipboard.and_then(clipboard_text) {
-					let effect = {
-						let win = &mut self.windows[widx];
-						let Some(target) = win
-							.tabs
-							.iter_mut()
-							.flat_map(|tab| tab.panes.iter_mut())
-							.find(|p| p.id == pane)
-						else {
-							return;
-						};
-						target.scene.paste(&text, raw)
+				let effect = {
+					let win = &mut self.windows[widx];
+					let Some(target) = win
+						.tabs
+						.iter_mut()
+						.flat_map(|tab| tab.panes.iter_mut())
+						.find(|p| p.id == pane)
+					else {
+						return;
 					};
-					self.handle_effect(el, window, pane, effect);
-				}
+					target.scene.clipboard(outcome, raw)
+				};
+				self.handle_effect(el, window, pane, effect);
 				if let Some(win) = self.windows.iter().find(|w| w.id == window) {
 					win.window.request_redraw();
 				}
@@ -1986,28 +1986,6 @@ fn write_clipboard_detached(text: String) {
 		.spawn(move || {
 			let _ = paste::write_clipboard_text(&text);
 		});
-}
-
-/// Flattens a clipboard read into paste text: images persist to a temp
-/// file whose path routes like a file drop, and copied file paths are
-/// quoted so spaces survive drop classification.
-fn clipboard_text(clipboard: Clipboard) -> Option<String> {
-	match clipboard {
-		Clipboard::Text(text) => Some(text),
-		Clipboard::Image(image) => Some(image.persist().ok()?.display().to_string()),
-		Clipboard::Paths(paths) => {
-			let mut joined = String::new();
-			for path in &paths {
-				if !joined.is_empty() {
-					joined.push(' ');
-				}
-				joined.push('"');
-				joined.push_str(path);
-				joined.push('"');
-			}
-			Some(joined)
-		},
-	}
 }
 
 #[cfg(test)]

@@ -172,6 +172,18 @@ impl ContextGauge {
 		window: Option<u64>,
 		boundaries: Option<CompactionBoundaries>,
 	) -> Self {
+		Self::plan_with_labels(width, tokens, window, boundaries, true)
+	}
+
+	/// Plans a gauge while allowing status presets to suppress the embedded
+	/// percent/window labels but retain proportional fill and boundary ticks.
+	pub fn plan_with_labels(
+		width: u16,
+		tokens: u64,
+		window: Option<u64>,
+		boundaries: Option<CompactionBoundaries>,
+		labels: bool,
+	) -> Self {
 		let mut gauge = Self {
 			width,
 			solid: true,
@@ -212,7 +224,8 @@ impl ContextGauge {
 
 		// Absorb both labels only when the line leaves fill on their flanks.
 		let mut scale = width;
-		if !percent_label.is_empty()
+		if labels
+			&& !percent_label.is_empty()
 			&& !window_label.is_empty()
 			&& width >= percent_label.width() + window_label.width() + 4
 		{
@@ -322,7 +335,7 @@ impl ContextGauge {
 /// Returns the themed accent shared by the compaction threshold marker and
 /// context-window usage labels.
 pub const fn compaction_threshold_color(theme: &Theme) -> Color {
-	theme.accent
+	theme.status_rule
 }
 /// Returns the dimmed accent painting compaction boundary ticks and the
 /// embedded window label; pi dims the session accent by HSV saturation ×0.7
