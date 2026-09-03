@@ -189,6 +189,8 @@ pub(crate) struct Launch {
 	/// Prompt templates (`/name` slash commands): the discovered directories
 	/// unless `--no-prompt-templates`, plus every `--prompt-template` path.
 	pub templates:     Arc<PromptTemplates>,
+	/// Discovered skill declarations shared with the kernel and slash console.
+	pub skills:        Arc<omp_driver::discovery::skills::ActiveSkills>,
 	/// The named theme the interactive host paints with: `cl_theme` resolved
 	/// against `--theme` paths and the theme directories; `None` is the stock
 	/// palette.
@@ -315,6 +317,12 @@ impl Launch {
 		for warning in &templates.warnings {
 			eprintln!("warning: {}: {}", warning.path.display(), warning.message);
 		}
+		let active_skills = Arc::new(
+			omp_driver::discovery::skills::ActiveSkills::discover(&ctx, &project).into_diagnostic()?,
+		);
+		for warning in &active_skills.warnings {
+			eprintln!("warning: {}: {}", warning.path.display(), warning.message);
+		}
 		let (theme, theme_catalog) = resolve_theme(&ctx, &theme, &config_root, &project)?;
 
 		let resuming = continue_session || resume.is_some() || fork.is_some();
@@ -417,6 +425,7 @@ impl Launch {
 			approval_mode: approval.map(Into::into),
 			model_override,
 			prompt: prompt_policy,
+			discovered_skills: Some(Arc::clone(&active_skills)),
 			extensions: driver_extension_policy(&extension_launch),
 			provider: provider
 				.as_ref()
@@ -431,6 +440,7 @@ impl Launch {
 			gateway,
 			sessions: Some(Arc::clone(&live_sessions)),
 			session_name: None,
+			parent_session: None,
 			tool_registry: None,
 			output_schema: None,
 			schema_mode: None,
@@ -457,11 +467,22 @@ impl Launch {
 			max_time: max_time.map(|duration| duration.0),
 			prompt,
 			templates: Arc::new(templates),
+			skills: active_skills,
 			theme,
 			theme_catalog,
 			live_sessions,
 			options,
 		})
+	}
+
+	/// A leading `/skill:<name>` launch prompt expanded through the same
+	/// discovered skill snapshot as the interactive console.
+	pub(crate) fn initial_skill_prompt(&self) -> Option<omp_journal::data::SkillPrompt> {
+		let command = self.prompt.first()?.strip_prefix("/skill:")?;
+		if command.is_empty() {
+			return None;
+		}
+		self.skills.prompt(command.as_str(), &self.prompt[1..])
 	}
 
 	/// The initial prompt words joined, with a leading `/template` expanded
@@ -587,14 +608,16 @@ fn resolve_theme(
 	Ok((selected, Arc::new(catalog)))
 }
 
-/// The launch's prompt templates as the chat console sees them
-/// ([`omp_chat::commands::prompts::PromptExpander`]).
-struct TemplateCommands(Arc<PromptTemplates>);
+/// The launch's prompt templates and skills as the chat console sees them.
+struct InteractivePrompts {
+	templates: Arc<PromptTemplates>,
+	skills:    Arc<omp_driver::discovery::skills::ActiveSkills>,
+}
 
-impl omp_chat::commands::prompts::PromptExpander for TemplateCommands {
+impl omp_chat::commands::prompts::PromptExpander for InteractivePrompts {
 	fn templates(&self) -> Vec<(Str, Str)> {
 		self
-			.0
+			.templates
 			.templates
 			.iter()
 			.map(|template| (template.name.clone(), template.description.clone()))
@@ -602,7 +625,22 @@ impl omp_chat::commands::prompts::PromptExpander for TemplateCommands {
 	}
 
 	fn expand(&self, name: &str, args: &[Str]) -> Option<Str> {
-		self.0.expand(name, args)
+		self.templates.expand(name, args)
+	}
+}
+
+impl omp_chat::commands::prompts::SkillExpander for InteractivePrompts {
+	fn skills(&self) -> Vec<(Str, Str)> {
+		self
+			.skills
+			.skills
+			.iter()
+			.map(|skill| (skill.name.clone(), skill.description.clone()))
+			.collect()
+	}
+
+	fn expand_skill(&self, name: &str, args: &[Str]) -> Option<omp_journal::data::SkillPrompt> {
+		self.skills.prompt(name, args)
 	}
 }
 
@@ -831,11 +869,17 @@ pub(crate) async fn run(
 	// Prompt templates are `/name` console commands (pi
 	// `promptTemplateCommands`); a template named like a built-in command
 	// is dropped, as pi drops reserved names.
-	for reserved in omp_chat::commands::prompts::register(
-		ctx,
-		Arc::new(TemplateCommands(Arc::clone(&launch.templates))),
-	) {
+	let interactive_prompts = Arc::new(InteractivePrompts {
+		templates: Arc::clone(&launch.templates),
+		skills:    Arc::clone(&launch.skills),
+	});
+	for reserved in omp_chat::commands::prompts::register(ctx, interactive_prompts.clone()) {
 		eprintln!("warning: prompt template `{reserved}` shadows a built-in command; skipped");
+	}
+	if omp_driver::pi_settings::SV_SKILLS_ENABLE_SKILL_COMMANDS.get(ctx) {
+		for reserved in omp_chat::commands::prompts::register_skills(ctx, interactive_prompts) {
+			eprintln!("warning: skill command `{reserved}` shadows a built-in command; skipped");
+		}
 	}
 	let (mut kernel, session) = launch.compose().await?;
 	let live_auth = kernel
@@ -1016,6 +1060,7 @@ pub(crate) async fn run(
 		mutations,
 		Arc::clone(&services),
 		collab,
+		Some(Arc::clone(catalog)),
 		env,
 		Arc::clone(&live_journal),
 		data_dir.clone(),
@@ -1042,7 +1087,11 @@ pub(crate) async fn run(
 		ui: omp_tui::UiContext::default().with_palette(launch.theme.clone()),
 		speech,
 	};
-	if let Some(text) = launch.initial_prompt() {
+	if let Some(prompt) = launch.initial_skill_prompt() {
+		commands
+			.send(omp_chat::HostCommand::SkillPrompt(prompt))
+			.into_diagnostic()?;
+	} else if let Some(text) = launch.initial_prompt() {
 		commands
 			.send(omp_chat::HostCommand::Submit(text))
 			.into_diagnostic()?;
@@ -1310,7 +1359,10 @@ mod tests {
 			.build();
 		let reserved = omp_chat::commands::prompts::register(
 			&ctx,
-			Arc::new(TemplateCommands(Arc::clone(&launch.templates))),
+			Arc::new(InteractivePrompts {
+				templates: Arc::clone(&launch.templates),
+				skills:    Arc::clone(&launch.skills),
+			}),
 		);
 		assert!(reserved.is_empty(), "{reserved:?}");
 		ctx.run("fix a b").unwrap();

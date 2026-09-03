@@ -22,8 +22,8 @@ use omp_gui::{Effect, HostConfig, Scene, SceneFrame};
 use omp_tui::{
 	Dim, InputEvent, Key, Layer, MouseReport, Notification, OverlayOptions, Size, TerminalEvent,
 	debug::{self, DebugRequest},
-	paste::ClipboardReadOutcome,
 	notify_desktop,
+	paste::{ClipboardReadOutcome, ClipboardWriteOutcome},
 };
 use smallvec::SmallVec;
 
@@ -490,6 +490,11 @@ impl Scene for GuiScene {
 
 	fn clipboard(&mut self, outcome: ClipboardReadOutcome, raw: bool) -> Effect {
 		let effect = self.host.deliver_clipboard(outcome, raw);
+		self.effect(Ok(effect))
+	}
+
+	fn clipboard_write(&mut self, outcome: ClipboardWriteOutcome) -> Effect {
+		let effect = self.host.deliver_clipboard_write(outcome);
 		self.effect(Ok(effect))
 	}
 

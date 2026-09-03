@@ -10,7 +10,7 @@ use std::{
 };
 
 use omp_chat::overlays::services::{ServiceError, ServiceResult, SideEvent, TreeEntry};
-use omp_core::Str;
+use omp_core::{Str, Ulid};
 use omp_dom::{Op, PropId, Txn, Value};
 use omp_journal::{Journal, kind};
 use omp_session::{ComponentRegistry, Session};
@@ -64,24 +64,37 @@ pub(super) fn rename(state: &ServiceState, id: &str, title: &str) -> ServiceResu
 	Ok(())
 }
 
-/// Deletes a stored session file (never the live one).
+/// Deletes a stored session file (never the live one) and its session-scoped
+/// `local://` tree. Content-addressed blobs are shared by all project
+/// sessions, so their roots are released here but physical reclamation remains
+/// the project-wide journal mark-and-sweep performed by `omp gc`.
 pub(super) fn delete(state: &ServiceState, id: &str) -> ServiceResult<()> {
 	let path = journal_path(state, id);
 	if path == *state.live_journal.read() {
 		return Err(ServiceError::Failed(Str::new_static("the live session is deleted with /drop")));
 	}
-	fs::remove_file(&path).map_err(|error| io(&error))
+	fs::remove_file(&path).map_err(|error| io(&error))?;
+	let local_session = path
+		.file_stem()
+		.filter(|stem| !stem.is_empty())
+		.map(|stem| path.with_file_name(stem));
+	if let Some(local_session) = local_session
+		&& let Err(error) = fs::remove_dir_all(&local_session)
+		&& error.kind() != std::io::ErrorKind::NotFound
+	{
+		return Err(io(&error));
+	}
+	Ok(())
 }
 
 /// Root of the live session's `local://` artifacts.
 fn local_root(state: &ServiceState) -> Option<PathBuf> {
-	let stem = state
-		.live_journal
-		.read()
+	let journal = state.live_journal.read();
+	let stem = journal
 		.file_stem()
 		.and_then(|stem| stem.to_str())
 		.map(str::to_owned)?;
-	Some(state.sessions_dir.join(stem).join("local"))
+	Some(journal.parent()?.join(stem).join("local"))
 }
 
 fn local_path(state: &ServiceState, url: &str) -> ServiceResult<PathBuf> {
@@ -115,9 +128,14 @@ pub(super) fn write_local(state: &ServiceState, name: &str, content: &str) -> Se
 	fs::create_dir_all(&root).map_err(|error| io(&error))?;
 	let path = root.join(name);
 	// Write beside, then rename: a reader never sees a half-written paste.
-	let staging = root.join(format!(".{name}.tmp"));
-	fs::write(&staging, content).map_err(|error| io(&error))?;
-	fs::rename(&staging, &path).map_err(|error| io(&error))?;
+	// Any ordinary error removes the stage immediately; process-crash debris is
+	// confined to the session tree and disappears with session deletion.
+	let staging = root.join(format!(".{name}.{}.tmp", Ulid::generate()));
+	let result = fs::write(&staging, content).and_then(|()| fs::rename(&staging, &path));
+	if let Err(error) = result {
+		let _ = fs::remove_file(&staging);
+		return Err(io(&error));
+	}
 	Ok(Str::new(format!("local://{name}")))
 }
 

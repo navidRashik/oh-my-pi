@@ -1,16 +1,19 @@
 //! Production debug operations behind the chat [`Services`] seam.
 
 use std::{
-	collections::BTreeSet,
 	fs, io,
 	path::{Path, PathBuf},
-	time::{Duration, SystemTime, UNIX_EPOCH},
+	time::{SystemTime, UNIX_EPOCH},
 };
 
 use omp_chat::overlays::services::{
 	DebugAction, DebugOutput, DebugRequest, DebugSseFrame, ServiceError, ServiceResult,
 };
 use omp_core::{Str, sf};
+use omp_journal::{
+	blob::{BlobRef, BlobStore, GcPolicy},
+	gc::{collect_blobs, journal_blob_roots},
+};
 
 use super::ServiceState;
 use crate::{
@@ -18,7 +21,6 @@ use crate::{
 	diagnostics::{self, BundleSpec, ProfilePayload, profile},
 };
 
-const ARTIFACT_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const SAMPLE_PNG: &[u8] = &[
 	137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
 	0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207, 192, 240, 31, 0, 5,
@@ -60,7 +62,13 @@ pub(super) fn dump_raw_sse(state: &ServiceState) -> ServiceResult<PathBuf> {
 }
 
 fn open_artifacts(state: &ServiceState) -> ServiceResult<DebugOutput> {
-	let path = state.state_dir.join("blobs");
+	let sessions = state
+		.live_journal
+		.read()
+		.parent()
+		.map(PathBuf::from)
+		.ok_or(ServiceError::Unavailable("session artifacts"))?;
+	let path = sessions.join("blobs");
 	fs::create_dir_all(&path).map_err(ServiceError::failed)?;
 	omp_core::open::open_path(path.to_string_lossy().as_ref());
 	Ok(report_output("Debug · artifacts", sf!("Opened `{}`", path.display())))
@@ -279,114 +287,70 @@ fn transcript(state: &ServiceState, text: &str) -> ServiceResult<DebugOutput> {
 }
 
 fn clear_cache(state: &ServiceState) -> ServiceResult<DebugOutput> {
-	let root = state.state_dir.join("blobs").join("blobs");
-	let (removed, bytes) =
-		clear_expired_artifacts(&root, &state.sessions_dir, ARTIFACT_MAX_AGE, SystemTime::now())
-			.map_err(ServiceError::failed)?;
+	let sessions = state
+		.live_journal
+		.read()
+		.parent()
+		.map(PathBuf::from)
+		.ok_or(ServiceError::Unavailable("session artifacts"))?;
+	let journals = project_journals(&sessions).map_err(ServiceError::failed)?;
+	let store = BlobStore::open(&sessions).map_err(ServiceError::failed)?;
+	let report =
+		collect_blobs(&store, &journals, GcPolicy::default()).map_err(ServiceError::failed)?;
 	Ok(report_output(
 		"Debug · artifact cache",
-		sf!("Removed {removed} expired unreferenced artifacts ({bytes} bytes)."),
+		sf!(
+			"Removed {} expired unreferenced artifacts ({} bytes) and {} stale staging items.",
+			report.storage.blobs_removed,
+			report.storage.blob_bytes_reclaimed,
+			report.storage.temporaries_removed
+		),
 	))
 }
 
-fn clear_expired_artifacts(
-	root: &Path,
-	sessions: &Path,
-	max_age: Duration,
-	now: SystemTime,
-) -> io::Result<(u64, u64)> {
-	let referenced = referenced_hashes(sessions);
-	let cutoff = now.checked_sub(max_age).unwrap_or(UNIX_EPOCH);
-	let mut removed = 0_u64;
-	let mut bytes = 0_u64;
-	for path in blob_files(root) {
-		let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-			continue;
-		};
-		if referenced.contains(name) {
-			continue;
-		}
-		let metadata = path.metadata()?;
-		if metadata.modified().is_ok_and(|modified| modified < cutoff) {
-			fs::remove_file(&path)?;
-			removed = removed.saturating_add(1);
-			bytes = bytes.saturating_add(metadata.len());
+fn project_journals(sessions: &Path) -> io::Result<Vec<PathBuf>> {
+	let entries = match fs::read_dir(sessions) {
+		Ok(entries) => entries,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) => return Err(error),
+	};
+	let mut paths = Vec::new();
+	for entry in entries {
+		let entry = entry?;
+		if entry.file_type()?.is_file()
+			&& entry
+				.path()
+				.extension()
+				.and_then(|extension| extension.to_str())
+				== Some(omp_journal::FILE_EXTENSION)
+		{
+			paths.push(entry.path());
 		}
 	}
-	Ok((removed, bytes))
-}
-
-fn referenced_hashes(sessions: &Path) -> BTreeSet<String> {
-	let mut hashes = BTreeSet::new();
-	let Ok(entries) = fs::read_dir(sessions) else {
-		return hashes;
-	};
-	for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
-		if path.extension().is_none_or(|extension| extension != "oms") {
-			continue;
-		}
-		hashes.extend(journal_hashes(&path));
-	}
-	hashes
-}
-
-fn journal_hashes(path: &Path) -> BTreeSet<String> {
-	let Ok(text) = fs::read_to_string(path) else {
-		return BTreeSet::new();
-	};
-	text
-		.split(|character: char| !character.is_ascii_hexdigit())
-		.filter(|word| word.len() == 64 && word.bytes().all(|byte| byte.is_ascii_hexdigit()))
-		.map(str::to_ascii_lowercase)
-		.collect()
+	paths.sort();
+	Ok(paths)
 }
 
 fn session_artifacts(state: &ServiceState) -> Vec<(String, PathBuf)> {
 	let journal = state.live_journal.read().clone();
-	journal_hashes(&journal)
+	let Ok(store) = BlobStore::open(journal.parent().unwrap_or_else(|| Path::new("."))) else {
+		return Vec::new();
+	};
+	let Ok(roots) = journal_blob_roots(std::slice::from_ref(&journal)) else {
+		return Vec::new();
+	};
+	let mut artifacts = roots
 		.into_iter()
 		.filter_map(|hash| {
-			let path = state
-				.state_dir
-				.join("blobs")
-				.join("blobs")
-				.join(&hash[..2])
-				.join(&hash[2..4])
-				.join(&hash);
-			path.is_file().then(|| (hash, path))
+			let reference = BlobRef { hash, size: 0 };
+			let path = store.path(&reference);
+			path
+				.is_file()
+				.then(|| (hash.to_hex().as_str().to_owned(), path))
 		})
-		.collect()
-}
-
-fn blob_files(root: &Path) -> Vec<PathBuf> {
-	let mut files = Vec::new();
-	let Ok(first) = fs::read_dir(root) else {
-		return files;
-	};
-	for one in first
-		.filter_map(Result::ok)
-		.map(|entry| entry.path())
-		.filter(|path| path.is_dir())
-	{
-		let Ok(second) = fs::read_dir(one) else {
-			continue;
-		};
-		for two in second
-			.filter_map(Result::ok)
-			.map(|entry| entry.path())
-			.filter(|path| path.is_dir())
-		{
-			if let Ok(entries) = fs::read_dir(two) {
-				files.extend(
-					entries
-						.filter_map(Result::ok)
-						.map(|entry| entry.path())
-						.filter(|path| path.is_file()),
-				);
-			}
-		}
-	}
-	files
+		.collect::<Vec<_>>();
+	artifacts.sort_by(|left, right| left.0.cmp(&right.0));
+	artifacts
 }
 
 fn log_files() -> Vec<PathBuf> {
@@ -445,29 +409,17 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn clear_cache_deletes_only_unreferenced_artifacts() {
+	fn project_journals_excludes_blob_and_local_storage() {
 		let directory = tempfile::tempdir().expect("temp directory");
-		let blobs = directory.path().join("blobs");
 		let sessions = directory.path().join("sessions");
-		let kept = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-		let removed = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-		let kept_path = blobs.join("aa").join("aa").join(kept);
-		let removed_path = blobs.join("bb").join("bb").join(removed);
-		write_private(&kept_path, b"keep").expect("kept artifact");
-		write_private(&removed_path, b"remove").expect("stale artifact");
-		fs::create_dir_all(&sessions).expect("sessions");
-		fs::write(
-			sessions.join("live.oms"),
-			format!("data: {{\"artifact\":\"artifact://sha256/{kept}\"}}\n"),
-		)
-		.expect("journal");
-		std::thread::sleep(Duration::from_millis(5));
-		let (count, bytes) =
-			clear_expired_artifacts(&blobs, &sessions, Duration::ZERO, SystemTime::now())
-				.expect("clear cache");
-		assert_eq!((count, bytes), (1, 6));
-		assert!(kept_path.is_file());
-		assert!(!removed_path.exists());
+		fs::create_dir_all(sessions.join("blobs/aa/bb")).expect("blob tree");
+		fs::create_dir_all(sessions.join("session/local")).expect("local tree");
+		fs::write(sessions.join("live.oms"), b"journal").expect("journal");
+		fs::write(sessions.join("blobs/aa/bb/not-a-journal.oms"), b"blob").expect("blob");
+
+		assert_eq!(project_journals(&sessions).expect("journal inventory"), vec![
+			sessions.join("live.oms")
+		]);
 	}
 
 	#[test]

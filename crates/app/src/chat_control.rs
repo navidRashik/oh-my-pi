@@ -18,8 +18,9 @@ use std::{
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_agent::{Kernel, KernelEvent, LifecycleHooks, TurnInput, TurnStop, Up};
+use omp_catalog::Catalog;
 use omp_chat::{
-	HostAction, HostCommand, HostMailbox,
+	HostAction, HostCommand, HostMailbox, ModelBadge,
 	commands::{CompactionMethod, ShakeMode, TodoOp},
 	host::SpawnKind,
 	overlays::{
@@ -33,13 +34,19 @@ use omp_chat::{
 		sessions::{ForeignSessionImportOutcome, SessionIndexOutcome},
 	},
 };
-use omp_collab::host::{AuthorizedMutation, RemoteOperation};
+use omp_collab::{
+	host::{AuthorizedMutation, RemoteOperation},
+	presence::{CollabRole as RuntimeCollabRole, ConnectionState, PresenceFacts},
+};
 use omp_con::{Ctx, Severity};
 use omp_core::{Str, Ulid};
 use omp_dom::{Event, Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_driver::headless::kernel::{ComposedInference, KernelOptions, SessionHome};
-use omp_journal::{EntryId, blob::BlobStore, data::Attachment};
-use omp_proto::toolhost::v1::HookEventId;
+use omp_journal::{EntryId, blob::BlobStore, data::Attachment, gc::copy_journal_blobs};
+use omp_proto::{
+	collab::v1::{ContextUsage, ModelMetadata, SessionStateUpdate},
+	toolhost::v1::HookEventId,
+};
 use omp_session::{AttachmentInput, Session, SessionError, components::jobs};
 use omp_voice::transport::{
 	LiveDelegationAdmission, LiveDelegationRequest, LiveDelegationTerminal,
@@ -136,7 +143,7 @@ enum Flow {
 	/// Keep waiting for commands.
 	Idle,
 	/// Run this turn.
-	Turn(TurnInput),
+	Turn(TurnRequest),
 	/// Run one provider-authenticated live delegation as an ordinary kernel
 	/// turn while retaining its transport correlation identity.
 	LiveTurn { id: Str, input: TurnInput },
@@ -148,6 +155,17 @@ enum Flow {
 	Quit,
 }
 
+enum TurnRequest {
+	User(TurnInput),
+	/// Host-authenticated collaboration prompt; `author` comes only from the
+	/// admitted principal and is journaled with the user insertion.
+	Authored {
+		input:  TurnInput,
+		author: Str,
+	},
+	Skill(omp_journal::data::SkillPrompt),
+}
+
 /// Builds the closed user-local execution request behind a `!` / `$`
 /// composer line. The kernel selects the executor and marks the durable
 /// element as local; the app cannot turn an arbitrary tool into a local run.
@@ -157,6 +175,180 @@ fn local_run(input: omp_chat::composer::LocalInput) -> omp_agent::LocalRun {
 		omp_chat::composer::PrefixMode::Eval => omp_agent::LocalRunKind::Eval,
 	};
 	omp_agent::LocalRun { kind, input: input.code, exclude: input.exclude }
+}
+
+fn model_metadata(ctx: &Ctx, fallback: &str, catalog: Option<&Catalog>) -> ModelMetadata {
+	let configured = omp_con::AI_MODEL.get(ctx);
+	let identifier = if configured.is_empty() {
+		fallback
+	} else {
+		configured.as_str()
+	};
+	let spec = catalog.and_then(|catalog| {
+		catalog
+			.model(&omp_catalog::ModelKey::from(identifier))
+			.or_else(|| catalog.resolve_alias(identifier))
+	});
+	match spec {
+		Some(spec) => ModelMetadata {
+			id:             spec.key.to_string(),
+			name:           spec.display_name.to_string(),
+			provider:       spec
+				.key
+				.as_str()
+				.split_once('/')
+				.map_or_else(String::new, |(provider, _)| provider.to_owned()),
+			context_window: spec
+				.limits
+				.context_window
+				.map_or(0, |window| u32::try_from(window).unwrap_or(u32::MAX)),
+		},
+		None => {
+			let (provider, _) = identifier.split_once('/').unwrap_or(("", identifier));
+			ModelMetadata {
+				id:             identifier.to_owned(),
+				name:           identifier.to_owned(),
+				provider:       provider.to_owned(),
+				context_window: 0,
+			}
+		},
+	}
+}
+
+fn session_state_update(
+	session: &Session,
+	home: &SessionHome,
+	ctx: &Ctx,
+	catalog: Option<&Catalog>,
+) -> SessionStateUpdate {
+	let status = omp_chat::status_line::StatusLine::from_dom(session.dom());
+	let fallback = if status.model.is_empty() {
+		home.model.as_str()
+	} else {
+		status.model.as_str()
+	};
+	let model = model_metadata(ctx, fallback, catalog);
+	let context_window = u64::from(model.context_window);
+	SessionStateUpdate {
+		session_name: status.name.unwrap_or_default().to_string(),
+		host_cwd: omp_chat::status_line::StatusLine::cwd(session.dom())
+			.unwrap_or_else(|| Str::new(home.project_root.to_string_lossy()))
+			.to_string(),
+		model: Some(model),
+		thinking_level: Some(omp_con::AI_THINKING.get(ctx).to_string())
+			.filter(|thinking| !thinking.is_empty()),
+		context_usage: Some(ContextUsage {
+			tokens: status.context,
+			context_window,
+			percent: if context_window == 0 {
+				0.0
+			} else {
+				status.context as f32 * 100.0 / context_window as f32
+			},
+		}),
+		..SessionStateUpdate::default()
+	}
+}
+
+fn collab_status(
+	presence: Option<PresenceFacts>,
+	state: Option<&SessionStateUpdate>,
+) -> Option<omp_chat::status_band::CollabStatus> {
+	let presence = presence.filter(|facts| facts.connection() != ConnectionState::Disconnected)?;
+	let participants = u32::try_from(presence.participant_count()).unwrap_or(u32::MAX);
+	match presence.role() {
+		RuntimeCollabRole::Host => Some(omp_chat::status_band::CollabStatus::host(participants)),
+		RuntimeCollabRole::Guest => {
+			let state = state.cloned().unwrap_or_default();
+			let mut badge = state.model.as_ref().map_or_else(
+				|| ModelBadge::from_identifier(""),
+				|model| {
+					let mut badge = ModelBadge::from_identifier(&model.id);
+					if !model.name.is_empty() {
+						badge.name = Str::new(&model.name);
+					}
+					badge
+				},
+			);
+			if badge.name.is_empty() {
+				badge.name = badge.identifier.clone();
+			}
+			let context_window = state
+				.context_usage
+				.as_ref()
+				.and_then(|usage| (usage.context_window != 0).then_some(usage.context_window))
+				.or_else(|| {
+					state.model.as_ref().and_then(|model| {
+						(model.context_window != 0).then_some(u64::from(model.context_window))
+					})
+				});
+			Some(omp_chat::status_band::CollabStatus::guest(
+				participants,
+				omp_chat::status_band::CollabHostSnapshot {
+					model: (!badge.name.is_empty()).then(|| badge.short_name()),
+					thinking: state
+						.thinking_level
+						.filter(|thinking| !thinking.is_empty())
+						.map(Str::new),
+					cwd: Str::new(state.host_cwd),
+					session_name: (!state.session_name.is_empty()).then(|| Str::new(state.session_name)),
+					tokens: state.context_usage.map(|usage| usage.tokens),
+					context_window,
+				},
+			))
+		},
+	}
+}
+
+fn spawn_collab_status(
+	collab: omp_driver::collab::session::CollabCommandHandle,
+	ctx: Arc<Ctx>,
+	catalog: Option<Arc<Catalog>>,
+	fallback_model: Str,
+) -> tokio::task::JoinHandle<()> {
+	let mut presence = collab.subscribe_presence();
+	let mut state = collab.subscribe_state();
+	let con_writes = ctx.subscribe_session_writes();
+	tokio::spawn(async move {
+		let mut last = None::<Option<omp_chat::status_band::CollabStatus>>;
+		loop {
+			let current = collab_status(*presence.borrow(), state.borrow().as_ref());
+			if last.as_ref() != Some(&current) {
+				if let Some(mailbox) = ctx.user::<HostMailbox>() {
+					mailbox.post(HostAction::CollabStatus(current.clone()));
+				}
+				last = Some(current);
+			}
+			tokio::select! {
+				changed = presence.changed() => {
+					if changed.is_err() {
+						break;
+					}
+				},
+				changed = state.changed() => {
+					if changed.is_err() {
+						break;
+					}
+				},
+				write = con_writes.recv_async() => {
+					if write.is_err() {
+						break;
+					}
+					if presence.borrow().is_some_and(|facts| facts.role() == RuntimeCollabRole::Host) {
+						let mut published = collab.published_state();
+						let model = model_metadata(&ctx, fallback_model.as_str(), catalog.as_deref());
+						published.model = Some(model);
+						published.thinking_level = Some(omp_con::AI_THINKING.get(&ctx).to_string())
+							.filter(|thinking| !thinking.is_empty());
+						collab.publish_state(published);
+					}
+				},
+			}
+		}
+		if let Some(mailbox) = ctx.user::<HostMailbox>() {
+			mailbox.post(HostAction::CollabStatus(None));
+		}
+	})
 }
 
 /// A background `/tan` child finished.
@@ -179,6 +371,10 @@ pub(crate) struct Controller<C = ComposedInference> {
 	services:       Arc<dyn Services>,
 	/// Collaboration relay and replica owner.
 	collab:         omp_driver::collab::session::CollabCommandHandle,
+	/// Catalog used to publish the host's current model metadata.
+	catalog:        Option<Arc<Catalog>>,
+	/// Continuous presence/session-state projection into the chat actor.
+	collab_status:  tokio::task::JoinHandle<()>,
 	/// Ordered events following the collaboration guest snapshot.
 	collab_replica: flume::Receiver<Event>,
 	/// Host-authenticated guest mutations.
@@ -217,6 +413,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 		mutations: Arc<dyn Mutations>,
 		services: Arc<dyn Services>,
 		collab: omp_driver::collab::session::CollabCommandHandle,
+		catalog: Option<Arc<Catalog>>,
 		env: omp_env::EnvClient,
 		live_journal: Arc<RwLock<PathBuf>>,
 		data_dir: PathBuf,
@@ -232,6 +429,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 		let session_id = display_name(&session);
 		let (snapshot, events) = session.subscribe();
 		let forwarder = Some(forward(events, relay.clone()));
+		collab.publish_state(session_state_update(&session, &home, &ctx, catalog.as_deref()));
+		let collab_status =
+			spawn_collab_status(collab.clone(), Arc::clone(&ctx), catalog.clone(), home.model.clone());
 		let (tan_tx, tan_rx) = flume::unbounded();
 		let controller = Self {
 			kernel,
@@ -244,6 +444,8 @@ impl<C: omp_agent::Inference> Controller<C> {
 			mutations,
 			services,
 			collab,
+			catalog,
+			collab_status,
 			collab_replica,
 			collab_remote,
 			env,
@@ -326,8 +528,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 				},
 				Flow::LiveTurn { id, input } => {
 					self.voice.delegation_started(&id, &self.ctx);
-					let quit = self.run_turn(Some(input), &command_rx, Some(id)).await?
-						|| self.after_turn(&command_rx).await?;
+					let quit = self
+						.run_turn(Some(TurnRequest::User(input)), &command_rx, Some(id))
+						.await? || self.after_turn(&command_rx).await?;
 					if quit {
 						self.shutdown()?;
 						return Ok(());
@@ -354,13 +557,15 @@ impl<C: omp_agent::Inference> Controller<C> {
 					return Ok(());
 				},
 			}
+			self.publish_collab_state();
 			// A queued prompt runs as soon as the controller is idle and
 			// not paused (pi `followUp`: "for when the agent yields").
 			if !self.is_paused()
 				&& let Some(input) = self.pop_queued()?
 			{
-				let quit = self.run_turn(Some(input), &command_rx, None).await?
-					|| self.after_turn(&command_rx).await?;
+				let quit = self
+					.run_turn(Some(TurnRequest::User(input)), &command_rx, None)
+					.await? || self.after_turn(&command_rx).await?;
 				if quit {
 					self.shutdown()?;
 					return Ok(());
@@ -396,6 +601,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 	/// Commits process exit before observers see the bounded shutdown edge.
 	fn shutdown(&mut self) -> miette::Result<()> {
 		let session = display_name(&self.session);
+		self.collab_status.abort();
+		if let Some(mailbox) = self.ctx.user::<HostMailbox>() {
+			mailbox.post(HostAction::CollabStatus(None));
+		}
 		self.voice.cancel(&self.ctx);
 		self.cancel_live_delegations();
 		self
@@ -428,6 +637,15 @@ impl<C: omp_agent::Inference> Controller<C> {
 		omp_agent::pause_state(self.session.dom()).active
 	}
 
+	fn publish_collab_state(&self) {
+		self.collab.publish_state(session_state_update(
+			&self.session,
+			&self.home,
+			&self.ctx,
+			self.catalog.as_deref(),
+		));
+	}
+
 	/// Applies one command while no turn is running.
 	async fn apply_idle(&mut self, command: HostCommand) -> miette::Result<Flow> {
 		if self
@@ -440,6 +658,15 @@ impl<C: omp_agent::Inference> Controller<C> {
 					self
 						.forward_guest(omp_driver::collab::session::CollabOwnerCommand::Prompt {
 							text,
+							images: Vec::new(),
+						})
+						.await;
+					return Ok(Flow::Idle);
+				},
+				HostCommand::SkillPrompt(prompt) => {
+					self
+						.forward_guest(omp_driver::collab::session::CollabOwnerCommand::Prompt {
+							text:   prompt.prompt_body,
 							images: Vec::new(),
 						})
 						.await;
@@ -511,7 +738,16 @@ impl<C: omp_agent::Inference> Controller<C> {
 					return Ok(Flow::Idle);
 				}
 				self.record_loop_prompt(&text)?;
-				Flow::Turn(TurnInput { text, attachments: Vec::new() })
+				Flow::Turn(TurnRequest::User(TurnInput { text, attachments: Vec::new() }))
+			},
+			HostCommand::SkillPrompt(prompt) => {
+				if self.is_paused() {
+					self.queue_prompt(prompt.prompt_body, Vec::new())?;
+					self.reply(Severity::Info, "Paused: skill prompt queued until you resume");
+					return Ok(Flow::Idle);
+				}
+				self.record_loop_prompt(&prompt.prompt_body)?;
+				Flow::Turn(TurnRequest::Skill(prompt))
 			},
 			HostCommand::SubmitWithAttachments { text, attachments } => {
 				// The same seam ACP image blocks take: content-address the
@@ -526,7 +762,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 					return Ok(Flow::Idle);
 				}
 				self.record_loop_prompt(&text)?;
-				Flow::Turn(TurnInput { text, attachments })
+				Flow::Turn(TurnRequest::User(TurnInput { text, attachments }))
 			},
 			HostCommand::Steer(text) => {
 				let _ = self.up.send(Up::Steer { text, attachments: Vec::new() });
@@ -606,6 +842,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 	}
 
 	async fn apply_remote_idle(&mut self, mutation: AuthorizedMutation) -> miette::Result<Flow> {
+		let author = Str::new(mutation.principal.display_name());
 		Ok(match mutation.operation {
 			RemoteOperation::Prompt(prompt) => {
 				let attachments: Vec<AttachmentInput> = prompt
@@ -617,8 +854,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 					.session
 					.store_attachments(attachments)
 					.into_diagnostic()?;
-				self.record_loop_prompt(&Str::new(&prompt.text))?;
-				Flow::Turn(TurnInput { text: Str::new(prompt.text), attachments })
+				let text = Str::new(prompt.text);
+				self.record_loop_prompt(&text)?;
+				Flow::Turn(TurnRequest::Authored { input: TurnInput { text, attachments }, author })
 			},
 			RemoteOperation::Abort(_) => {
 				let _ = self.up.send(Up::Interrupt);
@@ -656,7 +894,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 	/// journal head). Returns whether the host asked to quit.
 	async fn run_turn(
 		&mut self,
-		input: Option<TurnInput>,
+		input: Option<TurnRequest>,
 		command_rx: &flume::Receiver<HostCommand>,
 		live_id: Option<Str>,
 	) -> miette::Result<bool> {
@@ -673,16 +911,31 @@ impl<C: omp_agent::Inference> Controller<C> {
 		let blobs = self.session.blobs().clone();
 		let result = {
 			let control = omp_agent::RunControl::default();
-			let turn = match input {
-				Some(input) => futures::future::Either::Left(self.kernel.run_turn(
-					&mut self.session,
-					input,
-					control,
-				)),
-				None => futures::future::Either::Right(
-					self.kernel.retry_tool_tail(&mut self.session, control),
-				),
-			};
+			let turn =
+				match input {
+					Some(TurnRequest::User(input)) => {
+						futures::future::Either::Left(futures::future::Either::Left(
+							self.kernel.run_turn(&mut self.session, input, control),
+						))
+					},
+					Some(TurnRequest::Authored { input, author }) => {
+						futures::future::Either::Left(futures::future::Either::Right(
+							self
+								.kernel
+								.run_authored_turn(&mut self.session, input, author, control),
+						))
+					},
+					Some(TurnRequest::Skill(prompt)) => {
+						futures::future::Either::Right(futures::future::Either::Left(
+							self
+								.kernel
+								.run_skill_turn(&mut self.session, prompt, control),
+						))
+					},
+					None => futures::future::Either::Right(futures::future::Either::Right(
+						self.kernel.retry_tool_tail(&mut self.session, control),
+					)),
+				};
 			tokio::pin!(turn);
 			loop {
 				tokio::select! {
@@ -702,6 +955,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 					command = command_rx.recv_async() => match command {
 						Ok(HostCommand::Submit(text) | HostCommand::Steer(text)) => {
 							let _ = self.up.send(Up::Steer { text, attachments: Vec::new() });
+						},
+						Ok(HostCommand::SkillPrompt(prompt)) => {
+							let _ = self.up.send(Up::SkillPrompt(prompt));
 						},
 						Ok(HostCommand::SubmitWithAttachments { text, attachments }) => {
 							let stored = store_attachments(&blobs, attachments);
@@ -796,6 +1052,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 					},
 					remote = self.collab_remote.recv_async(), if self.collab.presence().is_some_and(|facts| facts.role() == omp_collab::presence::CollabRole::Host) => {
 						if let Ok(remote) = remote {
+							let author = Str::new(remote.principal.display_name());
 							match remote.operation {
 								RemoteOperation::Prompt(prompt) => {
 									let stored = store_attachments(
@@ -806,9 +1063,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 										}).collect(),
 									);
 									if let Ok(attachments) = stored {
-										let _ = self.up.send(Up::Steer {
+										let _ = self.up.send(Up::SteerAuthored {
 											text: Str::new(prompt.text),
 											attachments,
+											author,
 										});
 									}
 								},
@@ -912,7 +1170,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 			self.record_loop_prompt(&next.request)?;
 			if self
 				.run_turn(
-					Some(TurnInput { text: next.request, attachments: Vec::new() }),
+					Some(TurnRequest::User(TurnInput {
+						text:        next.request,
+						attachments: Vec::new(),
+					})),
 					command_rx,
 					Some(next.id),
 				)
@@ -983,6 +1244,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 				let next = self.home.create(None).map_err(|error| miette!(error))?;
 				self.switch_to(next, "new").await?;
 				let _ = fs::remove_file(&dropped);
+				remove_session_local_tree(&dropped);
 				if self.ephemeral.as_ref() == Some(&dropped) {
 					self.ephemeral = None;
 				}
@@ -1259,6 +1521,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 			// as a plain session command.
 			HostCommand::RunLocal { .. }
 			| HostCommand::Submit(_)
+			| HostCommand::SkillPrompt(_)
 			| HostCommand::SubmitWithAttachments { .. }
 			| HostCommand::Steer(_)
 			| HostCommand::Interrupt
@@ -1402,6 +1665,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 
 	async fn apply_collab(&mut self, op: CollabOp) {
 		use omp_driver::collab::session::CollabOwnerCommand;
+		if matches!(op, CollabOp::Start { .. }) {
+			self.publish_collab_state();
+		}
 		let request = match &op {
 			CollabOp::Start { relay, .. } => {
 				let origin = relay
@@ -1530,6 +1796,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 						},
 						Ok(HostCommand::Submit(text) | HostCommand::Steer(text)) => {
 							let _ = self.up.send(Up::Steer { text, attachments: Vec::new() });
+						},
+						Ok(HostCommand::SkillPrompt(prompt)) => {
+							let _ = self.up.send(Up::SkillPrompt(prompt));
 						},
 						Ok(HostCommand::SubmitWithAttachments { text, attachments }) => {
 							match store_attachments(&blobs, attachments) {
@@ -1690,8 +1959,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 		Ok(dropped)
 	}
 
-	/// pi `moveSession` + `setProjectDir`: copies the journal (and its blob
-	/// store) into `target`'s session bucket, opens the copy as the live
+	/// pi `moveSession` + `setProjectDir`: copies the journal, only the blobs
+	/// rooted by its selected branch, and its session-local files into
+	/// `target`'s session bucket, then opens the copy as the live
 	/// session, removes the old file, and moves the process working
 	/// directory. A failure before the switch leaves everything in place.
 	async fn relocate(&mut self, target: &std::path::Path) -> miette::Result<()> {
@@ -1711,12 +1981,29 @@ impl<C: omp_agent::Inference> Controller<C> {
 		if destination == source {
 			return Err(miette!("the session already lives in {}", target.display()));
 		}
-		if let Some(blobs) = source.parent().map(|dir| dir.join("blobs"))
-			&& blobs.is_dir()
-		{
-			copy_tree(&blobs, &sessions_dir.join("blobs")).into_diagnostic()?;
+		if destination.try_exists().into_diagnostic()? {
+			return Err(miette!("the destination already contains session {}", destination.display()));
 		}
-		fs::copy(&source, &destination).into_diagnostic()?;
+		copy_private_file(&source, &destination).into_diagnostic()?;
+		let staged = (|| -> miette::Result<()> {
+			let source_store =
+				BlobStore::open(source.parent().unwrap_or_else(|| Path::new("."))).into_diagnostic()?;
+			let destination_store = BlobStore::open(&sessions_dir).into_diagnostic()?;
+			copy_journal_blobs(&source_store, &destination_store, std::slice::from_ref(&source))
+				.into_diagnostic()?;
+			if let Some(local) = session_local_tree(&source)
+				&& local.is_dir()
+				&& let Some(destination_local) = session_local_tree(&destination)
+			{
+				copy_tree(&local, &destination_local).into_diagnostic()?;
+			}
+			Ok(())
+		})();
+		if let Err(error) = staged {
+			let _ = fs::remove_file(&destination);
+			remove_session_local_tree(&destination);
+			return Err(error);
+		}
 		let home = SessionHome {
 			sessions_dir,
 			project_root: target.clone(),
@@ -1724,18 +2011,21 @@ impl<C: omp_agent::Inference> Controller<C> {
 			prompt: self.home.prompt.clone(),
 			facts: self.home.facts.clone(),
 			live: Arc::clone(&self.home.live),
+			tools_enabled: self.home.tools_enabled,
 			up: self.home.up.clone(),
 		};
 		let next = match home.open(&destination) {
 			Ok(next) => next,
 			Err(error) => {
 				let _ = fs::remove_file(&destination);
+				remove_session_local_tree(&destination);
 				return Err(miette!(error));
 			},
 		};
 		self.switch_to(next, "handoff").await?;
 		self.home = home;
 		let _ = fs::remove_file(&source);
+		remove_session_local_tree(&source);
 		if self.ephemeral.as_ref() == Some(&source) {
 			self.ephemeral = Some(destination);
 		}
@@ -2563,16 +2853,53 @@ fn forward(
 	})
 }
 
-/// Copies every file under `from` into `to` (blob stores are flat,
-/// content-addressed, and idempotent to merge).
+fn session_local_tree(journal: &Path) -> Option<PathBuf> {
+	let stem = journal.file_stem().filter(|stem| !stem.is_empty())?;
+	Some(journal.with_file_name(stem))
+}
+
+fn remove_session_local_tree(journal: &Path) {
+	let Some(local) = session_local_tree(journal) else {
+		return;
+	};
+	if let Err(error) = fs::remove_dir_all(&local)
+		&& error.kind() != io::ErrorKind::NotFound
+	{
+		tracing::warn!(
+			session = %journal.display(),
+			local = %local.display(),
+			%error,
+			"session local artifact cleanup failed"
+		);
+	}
+}
+
+fn copy_private_file(source: &Path, destination: &Path) -> io::Result<()> {
+	let result = (|| {
+		let mut source = fs::File::open(source)?;
+		let mut destination = OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(destination)?;
+		io::copy(&mut source, &mut destination)?;
+		destination.sync_all()
+	})();
+	if result.is_err() {
+		let _ = fs::remove_file(destination);
+	}
+	result
+}
+
+/// Recursively copies one immutable file tree.
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
 	fs::create_dir_all(to)?;
 	for entry in fs::read_dir(from)? {
 		let entry = entry?;
 		let target = to.join(entry.file_name());
-		if entry.file_type()?.is_dir() {
+		let file_type = entry.file_type()?;
+		if file_type.is_dir() {
 			copy_tree(&entry.path(), &target)?;
-		} else if !target.exists() {
+		} else if file_type.is_file() && !target.exists() {
 			fs::copy(entry.path(), target)?;
 		}
 	}
@@ -3008,13 +3335,14 @@ mod tests {
 			let events = kernel.subscribe();
 			let live = Arc::new(omp_driver::sessions::SessionRegistry::new());
 			let home = SessionHome {
-				sessions_dir: dir.path().join("sessions"),
-				project_root: dir.path().to_path_buf(),
-				model:        Str::new_static("test/model"),
-				prompt:       omp_driver::headless::kernel::PromptOverrides::default(),
-				facts:        Default::default(),
-				live:         Arc::clone(&live),
-				up:           kernel.mailbox(),
+				sessions_dir:  dir.path().join("sessions"),
+				project_root:  dir.path().to_path_buf(),
+				model:         Str::new_static("test/model"),
+				prompt:        omp_driver::headless::kernel::PromptOverrides::default(),
+				facts:         Default::default(),
+				live:          Arc::clone(&live),
+				tools_enabled: true,
+				up:            kernel.mailbox(),
 			};
 			fs::create_dir_all(&home.sessions_dir).expect("sessions dir");
 			let mut session = home.create(None).expect("session");
@@ -3035,6 +3363,7 @@ mod tests {
 				Arc::new(omp_chat::overlays::services::NoMutations),
 				services,
 				collab,
+				None,
 				detached_env(),
 				live_journal,
 				dir.path().join("data"),
@@ -3176,13 +3505,14 @@ mod tests {
 		.with_hook_gate(Arc::clone(&gate))
 		.with_session_state_bridge(Arc::new(OrderBridge { order: order_tx.clone() }));
 		let home = SessionHome {
-			sessions_dir: dir.path().join("sessions"),
-			project_root: dir.path().to_path_buf(),
-			model:        Str::new_static("test/model"),
-			prompt:       omp_driver::headless::kernel::PromptOverrides::default(),
-			facts:        Default::default(),
-			live:         Arc::new(omp_driver::sessions::SessionRegistry::new()),
-			up:           kernel.mailbox(),
+			sessions_dir:  dir.path().join("sessions"),
+			project_root:  dir.path().to_path_buf(),
+			model:         Str::new_static("test/model"),
+			prompt:        omp_driver::headless::kernel::PromptOverrides::default(),
+			facts:         Default::default(),
+			live:          Arc::new(omp_driver::sessions::SessionRegistry::new()),
+			tools_enabled: true,
+			up:            kernel.mailbox(),
 		};
 		fs::create_dir_all(&home.sessions_dir).expect("sessions dir");
 		let session = home.create(None).expect("session");
@@ -3201,6 +3531,7 @@ mod tests {
 			Arc::new(omp_chat::overlays::services::NoMutations),
 			Arc::new(NoServices),
 			collab,
+			None,
 			detached_env(),
 			live_journal,
 			dir.path().to_path_buf(),
@@ -3549,10 +3880,13 @@ mod tests {
 		harness
 			.live
 			.register(Str::new_static("child"), omp_driver::sessions::KernelHandle {
-				id:       omp_driver::sessions::SessionId::new("child"),
-				name:     Str::new_static("child"),
-				up:       child_up,
-				snapshot: Arc::new(RwLock::new(omp_dom::Dom::new().snapshot())),
+				id:        omp_driver::sessions::SessionId::new("child"),
+				name:      Str::new_static("child"),
+				up:        child_up,
+				snapshot:  Arc::new(RwLock::new(omp_dom::Dom::new().snapshot())),
+				topology:  omp_agent::SessionTopology::main(Str::new_static("child")),
+				relay:     omp_driver::sessions::IrcRelayPolicy::default(),
+				autoreply: None,
 			});
 		harness
 			.commands
@@ -3682,10 +4016,13 @@ mod tests {
 		harness
 			.live
 			.register(Str::new_static("child"), omp_driver::sessions::KernelHandle {
-				id:       omp_driver::sessions::SessionId::new("child"),
-				name:     Str::new_static("child"),
-				up:       child_up,
-				snapshot: Arc::new(RwLock::new(omp_dom::Dom::new().snapshot())),
+				id:        omp_driver::sessions::SessionId::new("child"),
+				name:      Str::new_static("child"),
+				up:        child_up,
+				snapshot:  Arc::new(RwLock::new(omp_dom::Dom::new().snapshot())),
+				topology:  omp_agent::SessionTopology::main(Str::new_static("child")),
+				relay:     omp_driver::sessions::IrcRelayPolicy::default(),
+				autoreply: None,
 			});
 		let mailbox = harness.mailbox();
 

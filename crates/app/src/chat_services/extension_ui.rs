@@ -14,12 +14,13 @@ use std::{sync::Arc, task::Poll};
 
 use async_trait::async_trait;
 use omp_chat::{
-	ExtensionStatusEvent, HostAction, HostMailbox, status_text_from_tml,
+	ExtensionStatusEvent, HostAction, HostMailbox,
 	overlays::{
 		PanelCall, PanelEvent, PanelOpener,
 		ask::AskDialog,
 		ext_input::{FIELD, InputDialog, InputSpec},
 	},
+	status_text_from_tml,
 };
 use omp_con::{Ctx, RegItem};
 use omp_core::{Str, Ulid};
@@ -400,7 +401,9 @@ impl UiControlOwner for ChatUiOwner {
 					.get("key")
 					.and_then(Value::as_str)
 					.filter(|key| !key.is_empty())
-					.ok_or_else(|| protocol("invalid_effect", "set_status requires a non-empty body.key"))?;
+					.ok_or_else(|| {
+						protocol("invalid_effect", "set_status requires a non-empty body.key")
+					})?;
 				let event = match body.get("content") {
 					Some(Value::Null) => ExtensionStatusEvent::Clear { key: Str::new(key) },
 					Some(Value::Object(content)) => {
@@ -978,7 +981,11 @@ mod tests {
 			)
 			.await
 			.expect("clear status");
-		let actions = ctx.user::<HostMailbox>().expect("mailbox").drain().collect::<Vec<_>>();
+		let actions = ctx
+			.user::<HostMailbox>()
+			.expect("mailbox")
+			.drain()
+			.collect::<Vec<_>>();
 		assert!(matches!(
 			actions.first(),
 			Some(HostAction::ExtensionStatus(ExtensionStatusEvent::Set { key, text }))

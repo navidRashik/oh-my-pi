@@ -118,13 +118,24 @@ impl AppServices {
 	/// store.
 	#[must_use]
 	pub fn new(state: ServiceState) -> Self {
-		if let Ok(blobs) = omp_journal::blob::BlobStore::open(state.state_dir.join("blobs")) {
+		let live_journal = Arc::clone(&state.live_journal);
+		let root = live_journal.read().parent().map(PathBuf::from);
+		if let Some(root) = root
+			&& let Ok(blobs) = omp_journal::blob::BlobStore::open(&root)
+		{
+			let cache = parking_lot::Mutex::new((root, blobs));
 			omp_tui::register_image_scheme(
 				"artifact",
 				Arc::new(move |source: &str| {
 					let hex = source.strip_prefix("artifact://sha256/")?;
 					let reference = omp_journal::blob::BlobRef::parse_hex(hex, 0).ok()?;
-					Some(blobs.path(&reference))
+					let journal = live_journal.read();
+					let root = journal.parent()?;
+					let mut cache = cache.lock();
+					if cache.0 != root {
+						*cache = (root.to_path_buf(), omp_journal::blob::BlobStore::open(root).ok()?);
+					}
+					Some(cache.1.path(&reference))
 				}),
 			);
 		}

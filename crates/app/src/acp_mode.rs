@@ -59,10 +59,7 @@ async fn run_inner(args: ChatArgs) -> miette::Result<()> {
 	serve_acp_state(kernel, session, home, input, output, true, terminal_auth).await
 }
 
-async fn initialize_transport<R, W>(
-	input: &mut R,
-	output: &mut W,
-) -> miette::Result<Option<bool>>
+async fn initialize_transport<R, W>(input: &mut R, output: &mut W) -> miette::Result<Option<bool>>
 where
 	R: AsyncBufRead + Unpin,
 	W: AsyncWrite + Unpin,
@@ -97,9 +94,8 @@ where
 		let params = frame.get("params").and_then(Value::as_object);
 		let version = params
 			.and_then(|params| params.get("protocolVersion"))
-			.and_then(Value::as_u64)
-			.unwrap_or(1);
-		if version != 1 {
+			.and_then(Value::as_u64);
+		if version != Some(1) {
 			if let Some(id) = id {
 				write_frame(output, &error(id, -32602, "unsupported ACP protocol version")).await?;
 			}
@@ -117,10 +113,7 @@ where
 	}
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(
-	output: &mut W,
-	value: &Value,
-) -> miette::Result<()> {
+async fn write_frame<W: AsyncWrite + Unpin>(output: &mut W, value: &Value) -> miette::Result<()> {
 	let mut bytes = serde_json::to_vec(value).into_diagnostic()?;
 	bytes.push(b'\n');
 	output.write_all(&bytes).await.into_diagnostic()?;
@@ -202,11 +195,8 @@ where
 	// option answers the prompt (`session/approve` remains for clients that
 	// answer by prompt id).
 	let permission_session = Arc::new(parking_lot::RwLock::new(session_id.clone()));
-	let permission_requests = request_permissions(
-		kernel.subscribe(),
-		output_tx.clone(),
-		Arc::clone(&permission_session),
-	);
+	let permission_requests =
+		request_permissions(kernel.subscribe(), output_tx.clone(), Arc::clone(&permission_session));
 	let mut controller = Some((kernel, session));
 	let mut active: Option<tokio::task::JoinHandle<TurnCompletion<C>>> = None;
 	let mut closed = false;
@@ -298,15 +288,12 @@ where
 		}
 		let result = match method {
 			"initialize" => {
-				let version = params
-					.get("protocolVersion")
-					.and_then(Value::as_u64)
-					.unwrap_or(1);
-				if version != 1 {
+				let version = params.get("protocolVersion").and_then(Value::as_u64);
+				if version != Some(1) {
 					Err((-32602, "unsupported ACP protocol version"))
 				} else {
 					initialized = true;
-					terminal_auth = params
+					terminal_auth = serde_json::Value::Object(params.clone())
 						.pointer("/clientCapabilities/auth/terminal")
 						.and_then(Value::as_bool)
 						.unwrap_or(false);
@@ -328,29 +315,30 @@ where
 				if let Err(message) = validate_session_cwd(&home, &params) {
 					Err((-32602, message))
 				} else {
-				let next = match home.create(None) {
-					Ok(next) => next,
-					Err(source) => {
-						if let Some(id) = id {
-							output_tx
-								.send(error(id, -32000, &source.to_string()))
-								.into_diagnostic()?;
-						}
-						continue;
-					},
-				};
-				switch_session(
-					&mut controller,
-					next,
-					&home,
-					&output_tx,
-					&mut forwarder,
-					&mut session_id,
-					&permission_session,
-				)
-				.await?;
-				closed = false;
-				Ok(new_session_descriptor(session_id.as_str(), home.model.as_str()))
+					let next = match home.create(None) {
+						Ok(next) => next,
+						Err(source) => {
+							if let Some(id) = id {
+								output_tx
+									.send(error(id, -32000, &source.to_string()))
+									.into_diagnostic()?;
+							}
+							continue;
+						},
+					};
+					switch_session(
+						&mut controller,
+						next,
+						&home,
+						&output_tx,
+						&mut forwarder,
+						&mut session_id,
+						&permission_session,
+						false,
+					)
+					.await?;
+					closed = false;
+					Ok(new_session_descriptor(session_id.as_str(), home.model.as_str()))
 				}
 			},
 			"session/load" | "session/resume" if active.is_some() => {
@@ -360,40 +348,42 @@ where
 				if let Err(message) = validate_session_cwd(&home, &params) {
 					Err((-32602, message))
 				} else {
-				let selector = match requested_session(&params) {
-					Ok(selector) => selector,
-					Err(message) => {
-						if let Some(id) = id {
-							output_tx
-								.send(error(id, -32602, message))
-								.into_diagnostic()?;
-						}
-						continue;
-					},
-				};
-				let next = match home.open(Path::new(selector)) {
-					Ok(next) => next,
-					Err(source) => {
-						if let Some(id) = id {
-							output_tx
-								.send(error(id, -32000, &source.to_string()))
-								.into_diagnostic()?;
-						}
-						continue;
-					},
-				};
-				switch_session(
-					&mut controller,
-					next,
-					&home,
-					&output_tx,
-					&mut forwarder,
-					&mut session_id,
-					&permission_session,
-				)
-				.await?;
-				closed = false;
-				Ok(session_state(home.model.as_str()))
+					let selector = match requested_session(&params) {
+						Ok(selector) => selector,
+						Err(message) => {
+							if let Some(id) = id {
+								output_tx
+									.send(error(id, -32602, message))
+									.into_diagnostic()?;
+							}
+							continue;
+						},
+					};
+					let replay = method == "session/load";
+					let next = match home.open(Path::new(selector)) {
+						Ok(next) => next,
+						Err(source) => {
+							if let Some(id) = id {
+								output_tx
+									.send(error(id, -32000, &source.to_string()))
+									.into_diagnostic()?;
+							}
+							continue;
+						},
+					};
+					switch_session(
+						&mut controller,
+						next,
+						&home,
+						&output_tx,
+						&mut forwarder,
+						&mut session_id,
+						&permission_session,
+						replay,
+					)
+					.await?;
+					closed = false;
+					Ok(session_state(home.model.as_str()))
 				}
 			},
 			// pi `listSessions`: stored sessions newest first, paged by an
@@ -411,40 +401,82 @@ where
 				if let Err(message) = validate_session_cwd(&home, &params) {
 					Err((-32602, message))
 				} else {
-				let selector = match requested_session(&params) {
-					Ok(selector) => selector,
-					Err(message) => {
-						if let Some(id) = id {
-							output_tx
-								.send(error(id, -32602, message))
-								.into_diagnostic()?;
-						}
-						continue;
-					},
-				};
-				let next = match home.fork(Path::new(selector)) {
-					Ok(next) => next,
-					Err(source) => {
-						if let Some(id) = id {
-							output_tx
-								.send(error(id, -32000, &source.to_string()))
-								.into_diagnostic()?;
-						}
-						continue;
-					},
-				};
-				switch_session(
-					&mut controller,
-					next,
-					&home,
-					&output_tx,
-					&mut forwarder,
-					&mut session_id,
-					&permission_session,
-				)
-				.await?;
-				closed = false;
-				Ok(new_session_descriptor(session_id.as_str(), home.model.as_str()))
+					let selector = match requested_session(&params) {
+						Ok(selector) => selector,
+						Err(message) => {
+							if let Some(id) = id {
+								output_tx
+									.send(error(id, -32602, message))
+									.into_diagnostic()?;
+							}
+							continue;
+						},
+					};
+					let next = match home.fork(Path::new(selector)) {
+						Ok(next) => next,
+						Err(source) => {
+							if let Some(id) = id {
+								output_tx
+									.send(error(id, -32000, &source.to_string()))
+									.into_diagnostic()?;
+							}
+							continue;
+						},
+					};
+					switch_session(
+						&mut controller,
+						next,
+						&home,
+						&output_tx,
+						&mut forwarder,
+						&mut session_id,
+						&permission_session,
+						false,
+					)
+					.await?;
+					closed = false;
+					Ok(new_session_descriptor(session_id.as_str(), home.model.as_str()))
+				}
+			},
+			"session/set_mode" if !targets_session(&params, session_id.as_str()) => {
+				Err((-32000, "unsupported ACP session"))
+			},
+			"session/set_mode" => {
+				if params.get("modeId").and_then(Value::as_str) != Some("default") {
+					Err((-32602, "unsupported ACP session mode"))
+				} else {
+					output_tx
+						.send(session_update(
+							session_id.as_str(),
+							json!({
+								"sessionUpdate": "current_mode_update",
+								"currentModeId": "default",
+							}),
+						))
+						.into_diagnostic()?;
+					Ok(json!({}))
+				}
+			},
+			"session/set_config_option" if !targets_session(&params, session_id.as_str()) => {
+				Err((-32000, "unsupported ACP session"))
+			},
+			"session/set_config_option" => {
+				let valid = params.get("configId").and_then(Value::as_str) == Some("model")
+					&& params.get("value").and_then(Value::as_str) == Some(home.model.as_str());
+				if !valid {
+					Err((-32602, "unsupported ACP session config option"))
+				} else {
+					let state = session_state(home.model.as_str());
+					output_tx
+						.send(session_update(
+							session_id.as_str(),
+							json!({
+								"sessionUpdate": "config_option_update",
+								"configOptions": state["configOptions"].clone(),
+							}),
+						))
+						.into_diagnostic()?;
+					Ok(json!({"configOptions": state["configOptions"].clone()}))
 				}
 			},
 			"session/prompt" if closed => Err((-32000, "ACP session is closed")),
@@ -557,16 +589,9 @@ where
 			};
 			output_tx.send(response).into_diagnostic()?;
 			if succeeded
-				&& matches!(
-					method,
-					"session/new" | "session/load" | "session/resume" | "session/fork"
-				)
+				&& matches!(method, "session/new" | "session/load" | "session/resume" | "session/fork")
 			{
-				schedule_bootstrap_updates(
-					output_tx.clone(),
-					session_id.clone(),
-					home.model.clone(),
-				);
+				schedule_bootstrap_updates(output_tx.clone(), session_id.clone(), home.model.clone());
 			}
 		}
 	}
@@ -723,7 +748,10 @@ async fn start_forwarder(
 		let mut mapper = AcpEventMapper::new(&snapshot, cwd, blobs);
 		if replay {
 			for update in mapper.replay_updates().into_diagnostic()? {
-				if output.send(session_update(session_id.as_str(), update)).is_err() {
+				if output
+					.send(session_update(session_id.as_str(), update))
+					.is_err()
+				{
 					let _ = ready_tx.send(());
 					return Ok(());
 				}
@@ -790,6 +818,7 @@ async fn switch_session<C>(
 	forwarder: &mut Option<EventForwarder>,
 	session_id: &mut Str,
 	permission_session: &parking_lot::RwLock<Str>,
+	replay: bool,
 ) -> miette::Result<()> {
 	let (kernel, mut previous) = controller
 		.take()
@@ -813,7 +842,7 @@ async fn switch_session<C>(
 			session_id.clone(),
 			home.project_root.clone(),
 			next.blobs().clone(),
-			true,
+			replay,
 		)
 		.await?,
 	);
@@ -939,7 +968,10 @@ fn schedule_bootstrap_updates(output: flume::Sender<Value>, session_id: Str, mod
 				"updatedAt": jiff::Timestamp::now().to_string(),
 			}),
 		] {
-			if output.send(session_update(session_id.as_str(), update)).is_err() {
+			if output
+				.send(session_update(session_id.as_str(), update))
+				.is_err()
+			{
 				break;
 			}
 		}
@@ -1021,6 +1053,7 @@ fn prompt_response(session: &Session, outcome: &omp_agent::TurnOutcome) -> Value
 			.and_then(omp_dom::Value::as_str)
 			.map(|reason| match reason {
 				"length" => "max_tokens",
+				"max_requests" | "max_turn_requests" => "max_turn_requests",
 				"aborted" | "cancelled" => "cancelled",
 				"refusal" | "content_filter" => "refusal",
 				_ => "end_turn",
@@ -1182,7 +1215,11 @@ fn approval(params: &Map<String, Value>) -> Result<(Str, ApprovalDecision), &'st
 		.get("approved")
 		.and_then(Value::as_bool)
 		.unwrap_or(false);
-	let scope = match params.get("scope").and_then(Value::as_str).unwrap_or("once") {
+	let scope = match params
+		.get("scope")
+		.and_then(Value::as_str)
+		.unwrap_or("once")
+	{
 		"once" => ApprovalScope::Once,
 		"call" => ApprovalScope::Call,
 		"session" | "always" => ApprovalScope::Session,

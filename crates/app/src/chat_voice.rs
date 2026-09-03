@@ -9,7 +9,9 @@
 #[cfg(feature = "local-stt")]
 use std::sync::atomic::AtomicUsize;
 use std::{
+	env,
 	future::Future,
+	net::{IpAddr, UdpSocket},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicU8, Ordering},
@@ -25,7 +27,7 @@ use omp_chat::{
 	},
 };
 use omp_con::Ctx;
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use omp_inference::{
 	answer::{RealtimeEvent, RealtimePhase},
 	auth::{AuthManager, CodexLiveCredentialError},
@@ -39,20 +41,23 @@ use omp_voice::{
 		self, AudioDevice, DeviceSnapshot, DeviceWatcher,
 		MicrophonePermission as DeviceMicrophonePermission,
 	},
-	live::{LiveCallbacks, LiveMediaSession},
+	live::{LiveCallbacks, LiveMediaFailure, LiveMediaSession},
 	transport::{
-		DirectSidebandConnector, EventDeduplicator, LiveClientMessage, LiveDelegationAdmission,
-		LiveDelegationBridge, LiveDelegationSettlement, LiveDelegationTerminal, LiveOAuthAccess,
+		EventDeduplicator, LiveClientMessage, LiveDelegationAdmission, LiveDelegationBridge,
+		LiveDelegationSettlement, LiveDelegationTerminal, LiveOAuthAccess, LiveProxy, LiveProxyError,
 		LiveServerEvent, LiveSignalingClient, LiveSignalingRequest, LiveSignalingResponse,
-		LiveTransportOptions, LiveTurnRole, complete_live_transport, parse_live_server_event,
-		receive_sideband, send_sideband,
+		LiveTransportError, LiveTransportOptions, LiveTurnRole, ProxySidebandConnector,
+		ProxySidebandError, SIGNALING_URL, SidebandFailureLayer, complete_live_transport,
+		parse_live_server_event, receive_sideband, send_sideband,
 	},
 };
 use parking_lot::Mutex;
 use thiserror::Error;
+use url::Url;
 
 use crate::{
 	audio_coordinator::InteractiveAudioController,
+	live_reachability::{LiveFailureClass, diagnose_live_failure},
 	voice::settings::{
 		CL_LIVE_INPUT_DEVICE, CL_LIVE_OUTPUT_DEVICE, CL_LIVE_VOICE, CL_STT_LANGUAGE, CL_STT_MODEL,
 		CL_STT_SUBMIT_TRIGGER, CL_VOICE_STT_ENABLED, LiveVoice, SttModel, SttSubmitTrigger,
@@ -72,8 +77,13 @@ const MAX_STT_SAMPLES: usize = SAMPLE_RATE as usize * 60 * 5;
 const STT_STATE_SETUP: u8 = 0;
 const STT_STATE_RECORDING: u8 = 1;
 const STT_STATE_TRANSCRIBING: u8 = 2;
+const STT_STATE_TERMINAL: u8 = 3;
 const MAX_LIVE_SDP_BYTES: usize = 1024 * 1024;
 const LIVE_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
+const LIVE_RECONNECT_ATTEMPTS: u8 = 5;
+const LIVE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(250);
+const LIVE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+const LIVE_NETWORK_POLL: Duration = Duration::from_millis(250);
 const LIVE_INSTRUCTIONS: &str = "You are omp Live, the realtime voice surface of one unified \
                                  coding assistant. Respond directly, briefly, conversationally, \
                                  and without markdown. Delegate repository work, coding, tools, \
@@ -178,18 +188,87 @@ enum SttRuntimeCommand {
 	Cancel,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SttEventPhase {
+	Setup,
+	Recording,
+	Transcribing,
+	Terminal,
+}
+
+struct SttEventSink {
+	mailbox: Arc<HostMailbox>,
+	phase:   Mutex<SttEventPhase>,
+	state:   AtomicU8,
+}
+
+impl SttEventSink {
+	fn new(mailbox: Arc<HostMailbox>) -> Self {
+		Self {
+			mailbox,
+			phase: Mutex::new(SttEventPhase::Setup),
+			state: AtomicU8::new(STT_STATE_SETUP),
+		}
+	}
+
+	fn post(&self, event: SttUiEvent) -> bool {
+		let mut phase = self.phase.lock();
+		let next = match &event {
+			SttUiEvent::SetupProgress { .. } if *phase == SttEventPhase::Setup => None,
+			SttUiEvent::Recording if *phase == SttEventPhase::Setup => Some(SttEventPhase::Recording),
+			SttUiEvent::Transcribing
+				if matches!(*phase, SttEventPhase::Setup | SttEventPhase::Recording) =>
+			{
+				Some(SttEventPhase::Transcribing)
+			},
+			SttUiEvent::Partial(_) | SttUiEvent::Segment(_)
+				if matches!(*phase, SttEventPhase::Recording | SttEventPhase::Transcribing) =>
+			{
+				None
+			},
+			SttUiEvent::Finished { .. } if *phase == SttEventPhase::Transcribing => {
+				Some(SttEventPhase::Terminal)
+			},
+			SttUiEvent::Cancelled | SttUiEvent::Failed { .. } if *phase != SttEventPhase::Terminal => {
+				Some(SttEventPhase::Terminal)
+			},
+			_ => return false,
+		};
+		if let Some(next) = next {
+			*phase = next;
+			self.state.store(
+				match next {
+					SttEventPhase::Setup => STT_STATE_SETUP,
+					SttEventPhase::Recording => STT_STATE_RECORDING,
+					SttEventPhase::Transcribing => STT_STATE_TRANSCRIBING,
+					SttEventPhase::Terminal => STT_STATE_TERMINAL,
+				},
+				Ordering::Release,
+			);
+		}
+		self.mailbox.post(HostAction::SttEvent(event));
+		true
+	}
+
+	fn terminal(&self) -> bool {
+		self.state.load(Ordering::Acquire) == STT_STATE_TERMINAL
+	}
+}
+
 struct SttRuntime {
 	commands: flume::Sender<SttRuntimeCommand>,
 	task:     tokio::task::JoinHandle<()>,
 	cancel:   tokio_util::sync::CancellationToken,
 	capture:  Arc<Mutex<Option<CaptureStream>>>,
-	state:    Arc<AtomicU8>,
+	events:   Arc<SttEventSink>,
 	audio:    InteractiveAudioController,
 }
 
 impl SttRuntime {
 	fn stop(&self) {
-		self.state.store(STT_STATE_TRANSCRIBING, Ordering::Release);
+		if !self.events.post(SttUiEvent::Transcribing) {
+			return;
+		}
 		let capture_error = stop_capture(&self.capture).err();
 		self.audio.stop_stt();
 		let _ = self
@@ -202,6 +281,7 @@ impl SttRuntime {
 		let _ = self.commands.send(SttRuntimeCommand::Cancel);
 		let _ = stop_capture(&self.capture);
 		self.audio.stop_stt();
+		self.events.post(SttUiEvent::Cancelled);
 	}
 }
 
@@ -225,7 +305,7 @@ enum LiveRuntimeEvent {
 	DataChannel(Str),
 	InputLevel(f64),
 	OutputLevel(f64),
-	Failure(Str),
+	Failure(LiveMediaFailure),
 }
 
 struct LiveRuntime {
@@ -375,6 +455,9 @@ impl PushToTalk {
 	/// switch. The old transport is closed because it was authenticated for
 	/// the previous session.
 	pub fn switch_session(&mut self, session_id: Str) -> Option<Str> {
+		if let Some(runtime) = self.stt.take() {
+			runtime.cancel();
+		}
 		let active = self.delegation.cancel_all();
 		if let Some(live) = self.live.take() {
 			live.close();
@@ -387,7 +470,8 @@ impl PushToTalk {
 	#[must_use]
 	pub fn recording(&self) -> bool {
 		self.stt.as_ref().is_some_and(|runtime| {
-			!runtime.task.is_finished() && runtime.state.load(Ordering::Acquire) == STT_STATE_RECORDING
+			!runtime.task.is_finished()
+				&& runtime.events.state.load(Ordering::Acquire) == STT_STATE_RECORDING
 		})
 	}
 
@@ -396,7 +480,7 @@ impl PushToTalk {
 		if self
 			.stt
 			.as_ref()
-			.is_some_and(|runtime| runtime.task.is_finished())
+			.is_some_and(|runtime| runtime.task.is_finished() || runtime.events.terminal())
 		{
 			self.stt.take();
 		}
@@ -408,16 +492,13 @@ impl PushToTalk {
 				});
 				return;
 			}
-			if self.stt.is_some() {
-				post_stt(ctx, SttUiEvent::Transcribing);
-				return;
-			}
-			if let Err(error) = self.start(ctx) {
-				post_stt_error(ctx, error);
+			if self.stt.is_none() {
+				if let Err(error) = self.start(ctx) {
+					post_stt_error(ctx, error);
+				}
 			}
 		} else if let Some(runtime) = &self.stt {
 			runtime.stop();
-			post_stt(ctx, SttUiEvent::Transcribing);
 		}
 	}
 
@@ -425,12 +506,11 @@ impl PushToTalk {
 	///
 	/// Session switching and controller teardown call this before replacing
 	/// controller state, so microphone ownership never leaks across sessions.
-	pub fn cancel(&mut self, ctx: &Ctx) {
+	pub fn cancel(&mut self, _ctx: &Ctx) {
 		let Some(runtime) = self.stt.take() else {
 			return;
 		};
 		runtime.cancel();
-		post_stt(ctx, SttUiEvent::Cancelled);
 	}
 
 	/// Applies one typed `/live` control request to the production transport.
@@ -568,17 +648,21 @@ impl PushToTalk {
 			Ok(snapshot) => snapshot,
 			Err(error) => {
 				post_live(ctx, LiveUiEvent::Error {
-					message: Str::new(format!("Could not enumerate audio devices: {error}")),
+					message:     Str::new(format!("Could not enumerate audio devices: {error}")),
 					recoverable: true,
 				});
 				return;
 			},
 		};
-		let devices = if input { &snapshot.input } else { &snapshot.output };
+		let devices = if input {
+			&snapshot.input
+		} else {
+			&snapshot.output
+		};
 		if !selected.is_empty() && !devices.iter().any(|device| device.id == selected) {
 			let direction = if input { "microphone" } else { "speaker" };
 			post_live(ctx, LiveUiEvent::Error {
-				message: Str::new(format!(
+				message:     Str::new(format!(
 					"The selected {direction} is no longer available ({selected})."
 				)),
 				recoverable: true,
@@ -601,19 +685,15 @@ impl PushToTalk {
 		if let Err(error) = result {
 			let direction = if input { "microphone" } else { "speaker" };
 			post_live(ctx, LiveUiEvent::Error {
-				message: Str::new(format!("Could not save the {direction} selection: {error}")),
+				message:     Str::new(format!("Could not save the {direction} selection: {error}")),
 				recoverable: true,
 			});
 			return;
 		}
-		post_device_snapshot(
-			ctx.user::<HostMailbox>().as_deref(),
-			&snapshot,
-			&LiveDeviceSelection {
-				input:  CL_LIVE_INPUT_DEVICE.get(ctx),
-				output: CL_LIVE_OUTPUT_DEVICE.get(ctx),
-			},
-		);
+		post_device_snapshot(ctx.user::<HostMailbox>().as_deref(), &snapshot, &LiveDeviceSelection {
+			input:  CL_LIVE_INPUT_DEVICE.get(ctx),
+			output: CL_LIVE_OUTPUT_DEVICE.get(ctx),
+		});
 	}
 
 	fn start(&mut self, ctx: &Ctx) -> Result<(), SttError> {
@@ -627,20 +707,19 @@ impl PushToTalk {
 		let audio = self.audio.clone();
 		let capture = Arc::new(Mutex::new(None));
 		let cancel = tokio_util::sync::CancellationToken::new();
-		let state = Arc::new(AtomicU8::new(STT_STATE_SETUP));
+		let events = Arc::new(SttEventSink::new(mailbox));
 		let (commands, command_rx) = flume::unbounded();
 		let task = tokio::spawn(run_stt(
 			audio.clone(),
 			model,
 			language,
 			trigger,
-			Arc::clone(&mailbox),
+			Arc::clone(&events),
 			command_rx,
 			cancel.clone(),
 			Arc::clone(&capture),
-			Arc::clone(&state),
 		));
-		self.stt = Some(SttRuntime { commands, task, cancel, capture, state, audio });
+		self.stt = Some(SttRuntime { commands, task, cancel, capture, events, audio });
 		Ok(())
 	}
 }
@@ -680,6 +759,14 @@ fn post_stt_error(ctx: &Ctx, error: SttError) {
 }
 
 fn post_stt_error_mailbox(mailbox: &HostMailbox, error: SttError) {
+	post_stt_mailbox(mailbox, stt_error_event(error));
+}
+
+fn post_stt_runtime_error(events: &SttEventSink, error: SttError) {
+	events.post(stt_error_event(error));
+}
+
+fn stt_error_event(error: SttError) -> SttUiEvent {
 	use std::{error::Error as _, fmt::Write as _};
 
 	let kind = error.kind();
@@ -687,13 +774,13 @@ fn post_stt_error_mailbox(mailbox: &HostMailbox, error: SttError) {
 	if let Some(source) = error.source() {
 		let _ = write!(message, ": {source}");
 	}
-	post_stt_mailbox(mailbox, SttUiEvent::Failed { kind, message: Str::new(message) });
+	SttUiEvent::Failed { kind, message: Str::new(message) }
 }
 
 #[cfg(feature = "local-stt")]
 async fn prepare_stt(
 	model: SttModel,
-	mailbox: Arc<HostMailbox>,
+	events: Arc<SttEventSink>,
 	cancel: tokio_util::sync::CancellationToken,
 ) -> Result<omp_inference::local::stt::SpeechToTextAdapter, SttError> {
 	use omp_inference::local::{
@@ -717,7 +804,7 @@ async fn prepare_stt(
 		let progress_model = Str::from(<&'static str>::from(model));
 		store
 			.acquire(manifest, &SystemArtifactFetcher::new(), &cancel, |progress| {
-				post_stt_mailbox(&mailbox, SttUiEvent::SetupProgress {
+				events.post(SttUiEvent::SetupProgress {
 					model:            progress_model.clone(),
 					downloaded_bytes: progress.downloaded_bytes,
 					total_bytes:      progress.total_bytes,
@@ -793,7 +880,7 @@ fn decode_stt_stream(
 	adapter: omp_inference::local::stt::SpeechToTextAdapter,
 	language: Str,
 	trigger: SttSubmitTrigger,
-	mailbox: Arc<HostMailbox>,
+	events: Arc<SttEventSink>,
 	commands: flume::Receiver<SttRuntimeCommand>,
 	audio: flume::Receiver<Vec<f32>>,
 	cancel: tokio_util::sync::CancellationToken,
@@ -817,17 +904,17 @@ fn decode_stt_stream(
 			EndpointerEvent::Partial(samples) => {
 				let text = decode_stt_audio(&adapter, &samples, &language, &cancel)?;
 				let preview = normalize_stt_text(text.as_str(), committed);
-				post_stt_mailbox(&mailbox, SttUiEvent::Partial(preview));
+				events.post(SttUiEvent::Partial(preview));
 			},
 			EndpointerEvent::Segment(samples) => {
 				let text = decode_stt_audio(&adapter, &samples, &language, &cancel)?;
 				let segment = normalize_stt_text(text.as_str(), committed);
 				if segment.is_empty() {
-					post_stt_mailbox(&mailbox, SttUiEvent::Partial(Str::default()));
+					events.post(SttUiEvent::Partial(Str::default()));
 				} else {
 					utterance.push_str(segment.as_str());
 					committed = true;
-					post_stt_mailbox(&mailbox, SttUiEvent::Segment(segment));
+					events.post(SttUiEvent::Segment(segment));
 				}
 			},
 		}
@@ -893,24 +980,23 @@ async fn run_stt(
 	model: SttModel,
 	language: Str,
 	trigger: SttSubmitTrigger,
-	mailbox: Arc<HostMailbox>,
+	events: Arc<SttEventSink>,
 	commands: flume::Receiver<SttRuntimeCommand>,
 	cancel: tokio_util::sync::CancellationToken,
 	capture_owner: Arc<Mutex<Option<CaptureStream>>>,
-	state: Arc<AtomicU8>,
 ) {
-	let adapter = match prepare_stt(model, Arc::clone(&mailbox), cancel.clone()).await {
+	let adapter = match prepare_stt(model, Arc::clone(&events), cancel.clone()).await {
 		Ok(adapter) => adapter,
 		Err(_) if cancel.is_cancelled() => return,
 		Err(error) => {
-			post_stt_error_mailbox(&mailbox, error);
+			post_stt_runtime_error(&events, error);
 			return;
 		},
 	};
 	match commands.try_recv() {
 		Ok(SttRuntimeCommand::Cancel) => return,
 		Ok(SttRuntimeCommand::Stop { .. }) => {
-			post_stt_mailbox(&mailbox, SttUiEvent::Finished {
+			events.post(SttUiEvent::Finished {
 				had_speech:    false,
 				trim_trailing: 0,
 				submit:        false,
@@ -920,7 +1006,7 @@ async fn run_stt(
 		Err(_) => {},
 	}
 	if let Err(source) = audio_owner.start_stt() {
-		post_stt_error_mailbox(&mailbox, SttError::MicrophoneLease { source });
+		post_stt_runtime_error(&events, SttError::MicrophoneLease { source });
 		return;
 	}
 	match commands.try_recv() {
@@ -931,9 +1017,9 @@ async fn run_stt(
 		Ok(SttRuntimeCommand::Stop { capture_error }) => {
 			audio_owner.stop_stt();
 			if let Some(source) = capture_error {
-				post_stt_error_mailbox(&mailbox, SttError::CaptureStop { source });
+				post_stt_runtime_error(&events, SttError::CaptureStop { source });
 			} else {
-				post_stt_mailbox(&mailbox, SttUiEvent::Finished {
+				events.post(SttUiEvent::Finished {
 					had_speech:    false,
 					trim_trailing: 0,
 					submit:        false,
@@ -945,7 +1031,7 @@ async fn run_stt(
 	}
 	let (audio_tx, audio_rx) = flume::bounded(STT_AUDIO_QUEUE_DEPTH);
 	let callback_cancel = cancel.clone();
-	let callback_mailbox = Arc::clone(&mailbox);
+	let callback_events = Arc::clone(&events);
 	let captured = Arc::new(AtomicUsize::new(0));
 	let failed = Arc::new(AtomicBool::new(false));
 	let callback_failed = Arc::clone(&failed);
@@ -959,7 +1045,7 @@ async fn run_stt(
 			None
 		};
 		if let Some(error) = failure.filter(|_| !callback_failed.swap(true, Ordering::AcqRel)) {
-			post_stt_error_mailbox(&callback_mailbox, error);
+			post_stt_runtime_error(&callback_events, error);
 			callback_cancel.cancel();
 		}
 	});
@@ -967,18 +1053,17 @@ async fn run_stt(
 		Ok(capture) => capture,
 		Err(source) => {
 			audio_owner.stop_stt();
-			post_stt_error_mailbox(&mailbox, SttError::Capture { source });
+			post_stt_runtime_error(&events, SttError::Capture { source });
 			return;
 		},
 	};
 	*capture_owner.lock() = Some(capture);
-	state.store(STT_STATE_RECORDING, Ordering::Release);
-	post_stt_mailbox(&mailbox, SttUiEvent::Recording);
+	events.post(SttUiEvent::Recording);
 
 	let result = tokio::task::spawn_blocking({
-		let mailbox = Arc::clone(&mailbox);
+		let events = Arc::clone(&events);
 		let cancel = cancel.clone();
-		move || decode_stt_stream(adapter, language, trigger, mailbox, commands, audio_rx, cancel)
+		move || decode_stt_stream(adapter, language, trigger, events, commands, audio_rx, cancel)
 	})
 	.await;
 	let capture_error = stop_capture(&capture_owner).err();
@@ -987,20 +1072,24 @@ async fn run_stt(
 		return;
 	}
 	if let Some(source) = capture_error {
-		post_stt_error_mailbox(&mailbox, SttError::CaptureStop { source });
+		post_stt_runtime_error(&events, SttError::CaptureStop { source });
 		return;
 	}
 	match result {
 		Ok(Ok(Some((had_speech, trim_trailing, submit)))) => {
-			post_stt_mailbox(&mailbox, SttUiEvent::Finished { had_speech, trim_trailing, submit })
+			events.post(SttUiEvent::Finished { had_speech, trim_trailing, submit });
 		},
 		Ok(Ok(None)) => {
 			if !cancel.is_cancelled() {
-				post_stt_mailbox(&mailbox, SttUiEvent::Cancelled);
+				events.post(SttUiEvent::Cancelled);
 			}
 		},
-		Ok(Err(error)) => post_stt_error_mailbox(&mailbox, error),
-		Err(source) => post_stt_error_mailbox(&mailbox, SttError::Worker { source }),
+		Ok(Err(error)) => {
+			post_stt_runtime_error(&events, error);
+		},
+		Err(source) => {
+			post_stt_runtime_error(&events, SttError::Worker { source });
+		},
 	}
 }
 
@@ -1010,13 +1099,12 @@ async fn run_stt(
 	_model: SttModel,
 	_language: Str,
 	_trigger: SttSubmitTrigger,
-	mailbox: Arc<HostMailbox>,
+	events: Arc<SttEventSink>,
 	_commands: flume::Receiver<SttRuntimeCommand>,
 	_cancel: tokio_util::sync::CancellationToken,
 	_capture_owner: Arc<Mutex<Option<CaptureStream>>>,
-	_state: Arc<AtomicU8>,
 ) {
-	post_stt_error_mailbox(&mailbox, SttError::NotBuilt);
+	post_stt_runtime_error(&events, SttError::NotBuilt);
 }
 
 #[derive(Debug, Error)]
@@ -1027,6 +1115,16 @@ enum CodexSignalingError {
 	Header {
 		#[source]
 		source: reqwest::header::InvalidHeaderName,
+	},
+	#[error("Codex live signaling proxy configuration failed")]
+	Proxy {
+		#[source]
+		source: reqwest::Error,
+	},
+	#[error("Codex live signaling HTTP request through the proxy failed")]
+	ProxyHttp {
+		#[source]
+		source: reqwest::Error,
 	},
 	#[error("Codex live signaling HTTP request failed")]
 	Http {
@@ -1052,8 +1150,12 @@ struct CodexSignalingClient {
 }
 
 impl CodexSignalingClient {
-	fn new(auth: AuthManager) -> Self {
-		Self { auth, http: reqwest::Client::new() }
+	fn new(auth: AuthManager) -> Result<Self, CodexSignalingError> {
+		let http = reqwest::Client::builder()
+			.no_proxy()
+			.build()
+			.map_err(|source| CodexSignalingError::Proxy { source })?;
+		Ok(Self { auth, http })
 	}
 }
 
@@ -1065,14 +1167,18 @@ impl LiveSignalingClient for CodexSignalingClient {
 		request: LiveSignalingRequest,
 	) -> impl Future<Output = Result<LiveSignalingResponse, Self::Error>> + Send {
 		async move {
+			let proxy_configured = request.proxy.is_some();
 			let http = if let Some(proxy) = request.proxy.as_ref() {
+				let mut configured = reqwest::Proxy::all(proxy.endpoint().as_str())
+					.map_err(|source| CodexSignalingError::Proxy { source })?;
+				if let Some(authorization) = proxy.authorization() {
+					configured = configured.custom_http_auth(authorization.clone());
+				}
 				reqwest::Client::builder()
-					.proxy(
-						reqwest::Proxy::all(proxy.as_str())
-							.map_err(|source| CodexSignalingError::Http { source })?,
-					)
+					.no_proxy()
+					.proxy(configured)
 					.build()
-					.map_err(|source| CodexSignalingError::Http { source })?
+					.map_err(|source| CodexSignalingError::Proxy { source })?
 			} else {
 				self.http.clone()
 			};
@@ -1088,10 +1194,13 @@ impl LiveSignalingClient for CodexSignalingClient {
 						.map_err(|source| CodexSignalingError::Header { source })?;
 					builder = builder.header(name, value.clone());
 				}
-				let mut response = builder
-					.send()
-					.await
-					.map_err(|source| CodexSignalingError::Http { source })?;
+				let mut response = builder.send().await.map_err(|source| {
+					if proxy_configured {
+						CodexSignalingError::ProxyHttp { source }
+					} else {
+						CodexSignalingError::Http { source }
+					}
+				})?;
 				let status = response.status();
 				let location = response
 					.headers()
@@ -1149,12 +1258,251 @@ impl LiveSignalingClient for CodexSignalingClient {
 	}
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveAttemptFailure {
+	class:  LiveFailureClass,
+	detail: Str,
+}
+
+impl LiveAttemptFailure {
+	fn new(class: LiveFailureClass, detail: impl Into<Str>) -> Self {
+		Self { class, detail: detail.into() }
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiveReconnectSchedule {
+	attempt: u8,
+	delay:   Duration,
+}
+
+#[derive(Default)]
+struct LiveReconnectPolicy {
+	attempts: u8,
+}
+
+impl LiveReconnectPolicy {
+	fn reset(&mut self) {
+		self.attempts = 0;
+	}
+
+	fn schedule(
+		&mut self,
+		failure: &LiveAttemptFailure,
+		entropy: u32,
+	) -> Option<LiveReconnectSchedule> {
+		if !failure.class.automatic_retry() || self.attempts >= LIVE_RECONNECT_ATTEMPTS {
+			return None;
+		}
+		self.attempts += 1;
+		let shift = u32::from(self.attempts.saturating_sub(1));
+		let nominal =
+			LIVE_RECONNECT_BASE_DELAY.saturating_mul(1_u32.checked_shl(shift).unwrap_or(u32::MAX));
+		let jitter_per_mille = 750 + entropy % 501;
+		let delay = nominal
+			.saturating_mul(jitter_per_mille)
+			.checked_div(1_000)
+			.unwrap_or(LIVE_RECONNECT_MAX_DELAY)
+			.min(LIVE_RECONNECT_MAX_DELAY);
+		Some(LiveReconnectSchedule { attempt: self.attempts, delay })
+	}
+}
+
+const LIVE_PROVIDER_PROXY_ENV: &str = "OMP_PROXY_OPENAI_CODEX";
+const LIVE_PROXY_ENV: &str = "OMP_PROXY";
+
+#[derive(Debug, Error)]
+enum LiveProxyDiscoveryError {
+	#[error(transparent)]
+	Environment(#[from] omp_inference::transport::proxy::ProxyEnvironmentError),
+	#[error("the live sideband cannot use proxy scheme {scheme}")]
+	UnsupportedScheme { scheme: Str },
+	#[error("the live proxy credentials are invalid")]
+	Credentials(#[from] LiveProxyError),
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct LiveNetworkSignature {
+	ipv4:  Option<IpAddr>,
+	ipv6:  Option<IpAddr>,
+	proxy: [Option<Hash32>; 8],
+}
+
+impl LiveNetworkSignature {
+	fn capture() -> Self {
+		Self {
+			ipv4:  route_local_address("1.1.1.1:443"),
+			ipv6:  route_local_address("[2606:4700:4700::1111]:443"),
+			proxy: [
+				proxy_env_digest(LIVE_PROVIDER_PROXY_ENV),
+				proxy_env_digest(LIVE_PROXY_ENV),
+				proxy_env_digest("HTTPS_PROXY"),
+				proxy_env_digest("https_proxy"),
+				proxy_env_digest("ALL_PROXY"),
+				proxy_env_digest("all_proxy"),
+				proxy_env_digest("NO_PROXY"),
+				proxy_env_digest("no_proxy"),
+			],
+		}
+	}
+}
+
+fn proxy_env_digest(variable: &str) -> Option<Hash32> {
+	env::var_os(variable).map(|value| Hash32::sum(value.as_encoded_bytes()))
+}
+
+fn route_local_address(target: &str) -> Option<IpAddr> {
+	let bind = if target.starts_with('[') {
+		"[::]:0"
+	} else {
+		"0.0.0.0:0"
+	};
+	let socket = UdpSocket::bind(bind).ok()?;
+	socket.connect(target).ok()?;
+	socket.local_addr().ok().map(|address| address.ip())
+}
+
+fn environment_proxy_for(url: &Url) -> Result<Option<LiveProxy>, LiveProxyDiscoveryError> {
+	let Some(proxy) =
+		omp_inference::transport::proxy::for_provider_url(url, LIVE_PROVIDER_PROXY_ENV)?
+	else {
+		return Ok(None);
+	};
+	prepare_live_proxy(proxy).map(Some)
+}
+
+fn classify_proxy_discovery_failure(error: &LiveProxyDiscoveryError) -> LiveFailureClass {
+	match error {
+		LiveProxyDiscoveryError::Environment(_) | LiveProxyDiscoveryError::Credentials(_) => {
+			LiveFailureClass::Proxy
+		},
+		LiveProxyDiscoveryError::UnsupportedScheme { .. } => LiveFailureClass::Configuration,
+	}
+}
+
+fn prepare_live_proxy(proxy: Url) -> Result<LiveProxy, LiveProxyDiscoveryError> {
+	if proxy.scheme() != "http" {
+		return Err(LiveProxyDiscoveryError::UnsupportedScheme { scheme: Str::from(proxy.scheme()) });
+	}
+	LiveProxy::from_url(proxy).map_err(LiveProxyDiscoveryError::from)
+}
+
+fn classify_transport_failure(
+	error: &LiveTransportError<CodexSignalingError, ProxySidebandError>,
+) -> LiveFailureClass {
+	match error {
+		LiveTransportError::Media { source } => classify_voice_failure(source),
+		LiveTransportError::Signaling { source } => classify_signaling_failure(source),
+		LiveTransportError::SidebandTimeout => LiveFailureClass::Timeout,
+		LiveTransportError::Sideband { source } => classify_sideband_failure(source),
+		LiveTransportError::MissingCallId
+		| LiveTransportError::Payload { .. }
+		| LiveTransportError::Header => LiveFailureClass::Protocol,
+	}
+}
+
+fn classify_voice_failure(error: &VoiceError) -> LiveFailureClass {
+	match error {
+		VoiceError::LiveMedia { source } => classify_media_failure(source),
+		VoiceError::DeviceUnavailable { .. }
+		| VoiceError::Backend { .. }
+		| VoiceError::PlaybackClosed
+		| VoiceError::PlaybackBackpressure { .. } => LiveFailureClass::Media,
+		VoiceError::RealtimeTransport { .. } => LiveFailureClass::WebRtc,
+		VoiceError::Coordinator { .. }
+		| VoiceError::UnsupportedPlatform { .. }
+		| VoiceError::UnsupportedSampleRate { .. }
+		| VoiceError::NonFiniteGain => LiveFailureClass::Configuration,
+	}
+}
+
+const fn classify_media_failure(failure: &LiveMediaFailure) -> LiveFailureClass {
+	match failure {
+		LiveMediaFailure::Ice => LiveFailureClass::Ice,
+		LiveMediaFailure::WebRtc => LiveFailureClass::WebRtc,
+		LiveMediaFailure::DataChannel => LiveFailureClass::Sideband,
+		LiveMediaFailure::Codec | LiveMediaFailure::Audio => LiveFailureClass::Media,
+	}
+}
+
+fn classify_signaling_failure(error: &CodexSignalingError) -> LiveFailureClass {
+	match error {
+		CodexSignalingError::Http { source } | CodexSignalingError::ProxyHttp { source }
+			if source.is_timeout() =>
+		{
+			LiveFailureClass::Timeout
+		},
+		CodexSignalingError::Http { .. } => LiveFailureClass::Tcp,
+		CodexSignalingError::Proxy { .. } | CodexSignalingError::ProxyHttp { .. } => {
+			LiveFailureClass::Proxy
+		},
+		CodexSignalingError::Rejected { status }
+			if matches!(status.as_u16(), 408 | 425 | 429 | 500..=599) =>
+		{
+			LiveFailureClass::Service
+		},
+		CodexSignalingError::Rejected { status }
+			if status.as_u16() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() =>
+		{
+			LiveFailureClass::Proxy
+		},
+		CodexSignalingError::Rejected { status } if matches!(status.as_u16(), 401 | 403) => {
+			LiveFailureClass::Authentication
+		},
+		CodexSignalingError::Credential(_) => LiveFailureClass::Authentication,
+		CodexSignalingError::Rejected { .. }
+		| CodexSignalingError::Header { .. }
+		| CodexSignalingError::EmptyAnswer
+		| CodexSignalingError::OversizedAnswer
+		| CodexSignalingError::InvalidAnswer { .. } => LiveFailureClass::Protocol,
+	}
+}
+
+fn classify_sideband_failure(error: &ProxySidebandError) -> LiveFailureClass {
+	match error {
+		ProxySidebandError::ProxyConnect { source } | ProxySidebandError::ProxyIo { source }
+			if matches!(
+				source.kind(),
+				std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+			) =>
+		{
+			LiveFailureClass::Timeout
+		},
+		ProxySidebandError::ProxyRejected { status: Some(408 | 425 | 429 | 500..=599) } => {
+			LiveFailureClass::Service
+		},
+		_ => match error.layer() {
+			SidebandFailureLayer::Tcp => LiveFailureClass::Tcp,
+			SidebandFailureLayer::Tls => LiveFailureClass::Tls,
+			SidebandFailureLayer::Proxy => LiveFailureClass::Proxy,
+			SidebandFailureLayer::WebSocket => LiveFailureClass::Sideband,
+			SidebandFailureLayer::Configuration => LiveFailureClass::Configuration,
+		},
+	}
+}
+
+fn post_live_failure(mailbox: &HostMailbox, failure: &LiveAttemptFailure, exhausted: Option<u8>) {
+	let class: &'static str = failure.class.into();
+	let message = exhausted.map_or_else(
+		|| Str::new(format!("Live voice {class} failure: {}", failure.detail)),
+		|attempts| {
+			Str::new(format!(
+				"Live voice reconnect exhausted after {attempts} attempts ({class}): {}",
+				failure.detail
+			))
+		},
+	);
+	post_mailbox(mailbox, LiveUiEvent::Error {
+		message,
+		recoverable: failure.class.user_recoverable(),
+	});
+}
+
 enum LiveAttemptExit {
 	Close,
 	Reconnect,
 	RestartDevices,
-	Failed,
+	Failed(LiveAttemptFailure),
 }
 
 #[derive(Clone, Copy)]
@@ -1206,13 +1554,10 @@ fn post_device_snapshot(
 	let Some(mailbox) = mailbox else {
 		return;
 	};
-	post_mailbox(
-		mailbox,
-		LiveUiEvent::Devices {
-			input:  projected_devices(&snapshot.input, selected.input.as_str()),
-			output: projected_devices(&snapshot.output, selected.output.as_str()),
-		},
-	);
+	post_mailbox(mailbox, LiveUiEvent::Devices {
+		input:  projected_devices(&snapshot.input, selected.input.as_str()),
+		output: projected_devices(&snapshot.output, selected.output.as_str()),
+	});
 }
 
 fn resolved_device_id(devices: &[AudioDevice], selected: &str) -> Option<Str> {
@@ -1242,18 +1587,19 @@ fn post_device_loss(
 	previous: &DeviceSnapshot,
 	input: bool,
 ) {
-	let devices = if input { &previous.input } else { &previous.output };
+	let devices = if input {
+		&previous.input
+	} else {
+		&previous.output
+	};
 	let label = device_description(devices, id);
-	post_mailbox(
-		mailbox,
-		LiveUiEvent::Error {
-			message: Str::new(format!(
-				"The live {direction} was disconnected: {label} ({id}). Reconnecting with an \
-				 available device."
-			)),
-			recoverable: true,
-		},
-	);
+	post_mailbox(mailbox, LiveUiEvent::Error {
+		message:     Str::new(format!(
+			"The live {direction} was disconnected: {label} ({id}). Reconnecting with an available \
+			 device."
+		)),
+		recoverable: true,
+	});
 }
 
 fn refresh_device_selection(
@@ -1264,22 +1610,19 @@ fn refresh_device_selection(
 	active_input: Option<&Str>,
 	active_output: Option<&Str>,
 ) -> (DeviceSnapshot, bool) {
-	let input_missing = active_input
-		.is_some_and(|id| !next.input.iter().any(|device| device.id == *id));
-	let output_missing = active_output
-		.is_some_and(|id| !next.output.iter().any(|device| device.id == *id));
+	let input_missing =
+		active_input.is_some_and(|id| !next.input.iter().any(|device| device.id == *id));
+	let output_missing =
+		active_output.is_some_and(|id| !next.output.iter().any(|device| device.id == *id));
 	if input_missing || output_missing {
 		match device::snapshot() {
 			Ok(refreshed) => next = refreshed,
-			Err(error) => post_mailbox(
-				mailbox,
-				LiveUiEvent::Error {
-					message: Str::new(format!(
-						"Could not refresh audio devices after a device change: {error}"
-					)),
-					recoverable: true,
-				},
-			),
+			Err(error) => post_mailbox(mailbox, LiveUiEvent::Error {
+				message:     Str::new(format!(
+					"Could not refresh audio devices after a device change: {error}"
+				)),
+				recoverable: true,
+			}),
 		}
 	}
 
@@ -1289,8 +1632,8 @@ fn refresh_device_selection(
 			.input
 			.iter()
 			.any(|device| device.id.as_str() == id.as_str());
-		let default_changed = selected.input.is_empty()
-			&& resolved_device_id(&next.input, "").as_ref() != Some(id);
+		let default_changed =
+			selected.input.is_empty() && resolved_device_id(&next.input, "").as_ref() != Some(id);
 		if input_missing || !still_present {
 			post_device_loss(mailbox, "microphone", id, previous, true);
 			if !still_present && selected.input.as_str() == id.as_str() {
@@ -1306,8 +1649,8 @@ fn refresh_device_selection(
 			.output
 			.iter()
 			.any(|device| device.id.as_str() == id.as_str());
-		let default_changed = selected.output.is_empty()
-			&& resolved_device_id(&next.output, "").as_ref() != Some(id);
+		let default_changed =
+			selected.output.is_empty() && resolved_device_id(&next.output, "").as_ref() != Some(id);
 		if output_missing || !still_present {
 			post_device_loss(mailbox, "speaker", id, previous, false);
 			if !still_present && selected.output.as_str() == id.as_str() {
@@ -1344,15 +1687,12 @@ async fn authorize_live_microphone(
 			match device::request_microphone_permission().await {
 				Ok(permission) => permission,
 				Err(error) => {
-					post_mailbox(
-						mailbox,
-						LiveUiEvent::Error {
-							message: Str::new(format!(
-								"Could not request microphone permission: {error}"
-							)),
-							recoverable: true,
-						},
-					);
+					post_mailbox(mailbox, LiveUiEvent::Error {
+						message:     Str::new(format!(
+							"Could not request microphone permission: {error}"
+						)),
+						recoverable: true,
+					});
 					return LiveAuthorization::Recoverable;
 				},
 			}
@@ -1366,39 +1706,30 @@ async fn authorize_live_microphone(
 		},
 		DeviceMicrophonePermission::Denied => LiveAuthorization::Recoverable,
 		DeviceMicrophonePermission::Restricted => {
-			post_mailbox(
-				mailbox,
-				LiveUiEvent::Error {
-					message: Str::new_static(
-						"Microphone access is restricted by system policy and cannot be requested.",
-					),
-					recoverable: false,
-				},
-			);
+			post_mailbox(mailbox, LiveUiEvent::Error {
+				message:     Str::new_static(
+					"Microphone access is restricted by system policy and cannot be requested.",
+				),
+				recoverable: false,
+			});
 			LiveAuthorization::Terminal
 		},
 		DeviceMicrophonePermission::Unavailable => {
-			post_mailbox(
-				mailbox,
-				LiveUiEvent::Error {
-					message: Str::new_static(
-						"Native microphone capture is unavailable on this platform.",
-					),
-					recoverable: false,
-				},
-			);
+			post_mailbox(mailbox, LiveUiEvent::Error {
+				message:     Str::new_static(
+					"Native microphone capture is unavailable on this platform.",
+				),
+				recoverable: false,
+			});
 			LiveAuthorization::Terminal
 		},
 		DeviceMicrophonePermission::Requesting => {
-			post_mailbox(
-				mailbox,
-				LiveUiEvent::Error {
-					message: Str::new_static(
-						"Microphone permission did not reach a final operating-system decision.",
-					),
-					recoverable: true,
-				},
-			);
+			post_mailbox(mailbox, LiveUiEvent::Error {
+				message:     Str::new_static(
+					"Microphone permission did not reach a final operating-system decision.",
+				),
+				recoverable: true,
+			});
 			LiveAuthorization::Recoverable
 		},
 	}
@@ -1415,39 +1746,30 @@ fn active_live_permission(
 		},
 		DeviceMicrophonePermission::Denied => LiveAuthorization::Recoverable,
 		DeviceMicrophonePermission::Restricted => {
-			post_mailbox(
-				mailbox,
-				LiveUiEvent::Error {
-					message: Str::new_static(
-						"Microphone access was revoked by system policy during the live session.",
-					),
-					recoverable: false,
-				},
-			);
+			post_mailbox(mailbox, LiveUiEvent::Error {
+				message:     Str::new_static(
+					"Microphone access was revoked by system policy during the live session.",
+				),
+				recoverable: false,
+			});
 			LiveAuthorization::Terminal
 		},
 		DeviceMicrophonePermission::Unavailable => {
-			post_mailbox(
-				mailbox,
-				LiveUiEvent::Error {
-					message: Str::new_static(
-						"Native microphone capture became unavailable during the live session.",
-					),
-					recoverable: false,
-				},
-			);
+			post_mailbox(mailbox, LiveUiEvent::Error {
+				message:     Str::new_static(
+					"Native microphone capture became unavailable during the live session.",
+				),
+				recoverable: false,
+			});
 			LiveAuthorization::Terminal
 		},
 		DeviceMicrophonePermission::Requesting => {
-			post_mailbox(
-				mailbox,
-				LiveUiEvent::Error {
-					message: Str::new_static(
-						"Microphone permission became unsettled during the live session.",
-					),
-					recoverable: true,
-				},
-			);
+			post_mailbox(mailbox, LiveUiEvent::Error {
+				message:     Str::new_static(
+					"Microphone permission became unsettled during the live session.",
+				),
+				recoverable: true,
+			});
 			LiveAuthorization::Recoverable
 		},
 	}
@@ -1459,18 +1781,18 @@ fn normalize_live_selection(
 	selected: &mut LiveDeviceSelection,
 ) {
 	if !selected.input.is_empty()
-		&& !snapshot.input.iter().any(|device| device.id == selected.input)
+		&& !snapshot
+			.input
+			.iter()
+			.any(|device| device.id == selected.input)
 	{
 		let missing = std::mem::take(&mut selected.input);
-		post_mailbox(
-			mailbox,
-			LiveUiEvent::Error {
-				message: Str::new(format!(
-					"The selected microphone is unavailable ({missing}); using the system default."
-				)),
-				recoverable: true,
-			},
-		);
+		post_mailbox(mailbox, LiveUiEvent::Error {
+			message:     Str::new(format!(
+				"The selected microphone is unavailable ({missing}); using the system default."
+			)),
+			recoverable: true,
+		});
 	}
 	if !selected.output.is_empty()
 		&& !snapshot
@@ -1479,40 +1801,27 @@ fn normalize_live_selection(
 			.any(|device| device.id == selected.output)
 	{
 		let missing = std::mem::take(&mut selected.output);
-		post_mailbox(
-			mailbox,
-			LiveUiEvent::Error {
-				message: Str::new(format!(
-					"The selected speaker is unavailable ({missing}); using the system default."
-				)),
-				recoverable: true,
-			},
-		);
+		post_mailbox(mailbox, LiveUiEvent::Error {
+			message:     Str::new(format!(
+				"The selected speaker is unavailable ({missing}); using the system default."
+			)),
+			recoverable: true,
+		});
 	}
 }
 
-fn persist_live_selection(
-	ctx: &Ctx,
-	mailbox: &HostMailbox,
-	selected: &LiveDeviceSelection,
-) {
+fn persist_live_selection(ctx: &Ctx, mailbox: &HostMailbox, selected: &LiveDeviceSelection) {
 	if let Err(error) = CL_LIVE_INPUT_DEVICE.set(ctx, selected.input.clone()) {
-		post_mailbox(
-			mailbox,
-			LiveUiEvent::Error {
-				message: Str::new(format!("Could not save the microphone selection: {error}")),
-				recoverable: true,
-			},
-		);
+		post_mailbox(mailbox, LiveUiEvent::Error {
+			message:     Str::new(format!("Could not save the microphone selection: {error}")),
+			recoverable: true,
+		});
 	}
 	if let Err(error) = CL_LIVE_OUTPUT_DEVICE.set(ctx, selected.output.clone()) {
-		post_mailbox(
-			mailbox,
-			LiveUiEvent::Error {
-				message: Str::new(format!("Could not save the speaker selection: {error}")),
-				recoverable: true,
-			},
-		);
+		post_mailbox(mailbox, LiveUiEvent::Error {
+			message:     Str::new(format!("Could not save the speaker selection: {error}")),
+			recoverable: true,
+		});
 	}
 }
 
@@ -1525,20 +1834,21 @@ fn validate_selected_device(
 	if selected.is_empty() {
 		return true;
 	}
-	let devices = if input { &snapshot.input } else { &snapshot.output };
+	let devices = if input {
+		&snapshot.input
+	} else {
+		&snapshot.output
+	};
 	if devices.iter().any(|device| device.id == selected) {
 		return true;
 	}
 	let direction = if input { "microphone" } else { "speaker" };
-	post_mailbox(
-		mailbox,
-		LiveUiEvent::Error {
-			message: Str::new(format!(
-				"The selected {direction} is no longer available ({selected})."
-			)),
-			recoverable: true,
-		},
-	);
+	post_mailbox(mailbox, LiveUiEvent::Error {
+		message:     Str::new(format!(
+			"The selected {direction} is no longer available ({selected})."
+		)),
+		recoverable: true,
+	});
 	false
 }
 
@@ -1586,6 +1896,23 @@ impl LiveTranscripts {
 	}
 }
 
+fn schedule_live_reconnect(
+	mailbox: &HostMailbox,
+	policy: &mut LiveReconnectPolicy,
+	failure: &LiveAttemptFailure,
+	eligible: bool,
+) -> Option<LiveReconnectSchedule> {
+	if !eligible {
+		return None;
+	}
+	let schedule = policy.schedule(failure, rand::random())?;
+	post_mailbox(mailbox, LiveUiEvent::Reconnect {
+		attempt: schedule.attempt,
+		maximum: LIVE_RECONNECT_ATTEMPTS,
+	});
+	Some(schedule)
+}
+
 async fn run_live_transport(
 	audio: InteractiveAudioController,
 	con: Arc<Ctx>,
@@ -1599,55 +1926,151 @@ async fn run_live_transport(
 	speaking: Arc<AtomicBool>,
 ) {
 	let mut selected = LiveDeviceSelection { input: selected_input, output: selected_output };
-	let mut committed = selected.clone();
+	#[allow(
+		unused_assignments,
+		reason = "the first attempt establishes the rollback baseline before device-change input \
+		          exists"
+	)]
+	let mut committed: Option<LiveDeviceSelection> = None;
 	let mut rollback_selection = None;
-	let mut snapshot = match device::snapshot() {
-		Ok(snapshot) => snapshot,
-		Err(error) => {
-			post_mailbox(
-				&mailbox,
-				LiveUiEvent::Error {
-					message: Str::new(format!("Could not enumerate audio devices: {error}")),
-					recoverable: true,
-				},
-			);
-			return;
-		},
-	};
-	post_device_snapshot(Some(&mailbox), &snapshot, &selected);
-	match authorize_live_microphone(&mailbox, snapshot.microphone_permission).await {
-		LiveAuthorization::Granted => {
-			post_mailbox(&mailbox, LiveUiEvent::Phase(LivePhase::Connecting));
-		},
-		LiveAuthorization::Recoverable => return,
-		LiveAuthorization::Terminal => {
-			post_mailbox(&mailbox, LiveUiEvent::Closed);
-			return;
-		},
-	}
-	let mut watcher: DeviceWatcher = match device::watch() {
-		Ok(watcher) => watcher,
-		Err(error) => {
-			post_mailbox(
-				&mailbox,
-				LiveUiEvent::Error {
-					message: Str::new(format!("Could not monitor audio devices: {error}")),
-					recoverable: true,
-				},
-			);
-			return;
-		},
-	};
-	normalize_live_selection(&mailbox, &snapshot, &mut selected);
-	post_device_snapshot(Some(&mailbox), &snapshot, &selected);
 	let _logical_tts = audio.begin_live_restart_scope();
 	let coordinator = audio.coordinator();
 	let mut muted = false;
 	let mut pending_outbound = Vec::new();
 	let mut dedup = EventDeduplicator::default();
 	let mut transcripts = LiveTranscripts::default();
+	let mut reconnect = LiveReconnectPolicy::default();
+	let mut pending_retry: Option<LiveReconnectSchedule> = None;
+	let mut ever_established = false;
+
 	loop {
 		speaking.store(false, Ordering::Release);
+		if let Some(schedule) = pending_retry.take() {
+			let baseline = LiveNetworkSignature::capture();
+			let deadline = tokio::time::Instant::now() + schedule.delay;
+			let sleep = tokio::time::sleep_until(deadline);
+			tokio::pin!(sleep);
+			let mut network_poll = tokio::time::interval(LIVE_NETWORK_POLL);
+			network_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			'retry_wait: loop {
+				tokio::select! {
+					() = &mut sleep => break 'retry_wait,
+					_ = network_poll.tick() => {
+						if LiveNetworkSignature::capture() != baseline {
+							break 'retry_wait;
+						}
+					},
+					command = commands.recv_async() => match command {
+						Ok(LiveRuntimeCommand::SetMuted(next)) => muted = next,
+						Ok(LiveRuntimeCommand::Send(frames)) => pending_outbound.extend(frames),
+						Ok(LiveRuntimeCommand::SelectInputDevice(next)) => {
+							rollback_selection = committed.clone();
+							selected.input = next;
+							break 'retry_wait;
+						},
+						Ok(LiveRuntimeCommand::SelectOutputDevice(next)) => {
+							rollback_selection = committed.clone();
+							selected.output = next;
+							break 'retry_wait;
+						},
+						Ok(LiveRuntimeCommand::Reconnect) => break 'retry_wait,
+						Ok(LiveRuntimeCommand::Close) | Err(_) => {
+							post_mailbox(&mailbox, LiveUiEvent::Closed);
+							return;
+						},
+					},
+				}
+			}
+		}
+
+		if rollback_selection.is_none() {
+			selected.input = CL_LIVE_INPUT_DEVICE.get(&con);
+			selected.output = CL_LIVE_OUTPUT_DEVICE.get(&con);
+		}
+		let mut snapshot = match device::snapshot() {
+			Ok(snapshot) => snapshot,
+			Err(error) => {
+				let failure = LiveAttemptFailure::new(
+					LiveFailureClass::Media,
+					Str::new(format!("could not enumerate audio devices: {error}")),
+				);
+				if let Some(schedule) =
+					schedule_live_reconnect(&mailbox, &mut reconnect, &failure, ever_established)
+				{
+					pending_retry = Some(schedule);
+					continue;
+				}
+				post_live_failure(
+					&mailbox,
+					&failure,
+					(ever_established && failure.class.automatic_retry()).then_some(reconnect.attempts),
+				);
+				return;
+			},
+		};
+		post_device_snapshot(Some(&mailbox), &snapshot, &selected);
+		match authorize_live_microphone(&mailbox, snapshot.microphone_permission).await {
+			LiveAuthorization::Granted => {},
+			LiveAuthorization::Recoverable => {
+				post_live_failure(
+					&mailbox,
+					&LiveAttemptFailure::new(
+						LiveFailureClass::Permission,
+						"microphone permission is not currently granted",
+					),
+					None,
+				);
+				return;
+			},
+			LiveAuthorization::Terminal => {
+				post_mailbox(&mailbox, LiveUiEvent::Closed);
+				return;
+			},
+		}
+		snapshot = match device::snapshot() {
+			Ok(snapshot) => snapshot,
+			Err(error) => {
+				post_live_failure(
+					&mailbox,
+					&LiveAttemptFailure::new(
+						LiveFailureClass::Media,
+						Str::new(format!(
+							"could not refresh audio devices after permission acquisition: {error}"
+						)),
+					),
+					None,
+				);
+				return;
+			},
+		};
+		let mut watcher: DeviceWatcher = match device::watch() {
+			Ok(watcher) => watcher,
+			Err(error) => {
+				let failure = LiveAttemptFailure::new(
+					LiveFailureClass::Media,
+					Str::new(format!("could not monitor audio devices: {error}")),
+				);
+				if let Some(schedule) =
+					schedule_live_reconnect(&mailbox, &mut reconnect, &failure, ever_established)
+				{
+					pending_retry = Some(schedule);
+					continue;
+				}
+				post_live_failure(&mailbox, &failure, None);
+				return;
+			},
+		};
+		normalize_live_selection(&mailbox, &snapshot, &mut selected);
+		post_device_snapshot(Some(&mailbox), &snapshot, &selected);
+		post_mailbox(
+			&mailbox,
+			LiveUiEvent::Phase(if ever_established {
+				LivePhase::Reconnecting
+			} else {
+				LivePhase::Connecting
+			}),
+		);
+
 		let (events, event_rx) = flume::unbounded();
 		let event_tx = events.clone();
 		let input_tx = events.clone();
@@ -1663,16 +2086,35 @@ async fn run_live_transport(
 			output_level: Box::new(move |level| {
 				let _ = output_tx.send(LiveRuntimeEvent::OutputLevel(level));
 			}),
-			failure:      Box::new(move |message| {
-				let _ = failure_tx.send(LiveRuntimeEvent::Failure(Str::from(message)));
+			failure:      Box::new(move |failure| {
+				let _ = failure_tx.send(LiveRuntimeEvent::Failure(failure));
 			}),
 		};
-		let options = LiveTransportOptions::new(
+		let mut options = LiveTransportOptions::new(
 			session_id.clone(),
 			Str::new_static(LIVE_INSTRUCTIONS),
 			voice.clone(),
 			Str::new_static(omp_inference::codec::openai_codex::CODEX_CLIENT_VERSION),
 		);
+		let destination =
+			Url::parse(SIGNALING_URL).expect("the fixed live signaling URL must remain valid");
+		options.proxy = match environment_proxy_for(&destination) {
+			Ok(proxy) => proxy,
+			Err(error) => {
+				post_live_failure(
+					&mailbox,
+					&LiveAttemptFailure::new(
+						classify_proxy_discovery_failure(&error),
+						Str::new(format!("could not resolve live proxy policy: {error}")),
+					),
+					None,
+				);
+				return;
+			},
+		};
+		let network_signature = LiveNetworkSignature::capture();
+		let mut network_poll = tokio::time::interval(LIVE_NETWORK_POLL);
+		network_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 		let active_input = resolved_device_id(&snapshot.input, selected.input.as_str());
 		let active_output = resolved_device_id(&snapshot.output, selected.output.as_str());
 		let (media, offer) = match LiveMediaSession::start_on(
@@ -1685,27 +2127,57 @@ async fn run_live_transport(
 		{
 			Ok(started) => started,
 			Err(error) => {
-				post_mailbox(&mailbox, LiveUiEvent::Error {
-					message:     Str::new(format!("Could not start live audio: {error}")),
-					recoverable: true,
-				});
 				if let Some(previous) = rollback_selection.take() {
 					selected = previous;
 					post_device_snapshot(Some(&mailbox), &snapshot, &selected);
-					post_mailbox(&mailbox, LiveUiEvent::Phase(LivePhase::Reconnecting));
+					reconnect.reset();
+					reconnect.attempts = 1;
+					post_mailbox(&mailbox, LiveUiEvent::Reconnect {
+						attempt: 1,
+						maximum: LIVE_RECONNECT_ATTEMPTS,
+					});
 					continue;
 				}
-				break;
+				let class = classify_voice_failure(&error);
+				let diagnostic =
+					diagnose_live_failure(&destination, options.proxy.as_ref(), class).await;
+				let failure = LiveAttemptFailure::new(diagnostic.class, diagnostic.message);
+				if let Some(schedule) =
+					schedule_live_reconnect(&mailbox, &mut reconnect, &failure, ever_established)
+				{
+					pending_retry = Some(schedule);
+					continue;
+				}
+				post_live_failure(
+					&mailbox,
+					&failure,
+					(ever_established && failure.class.automatic_retry()).then_some(reconnect.attempts),
+				);
+				return;
 			},
 		};
 		persist_live_selection(&con, &mailbox, &selected);
-		committed = LiveDeviceSelection {
+		committed = Some(LiveDeviceSelection {
 			input:  CL_LIVE_INPUT_DEVICE.get(&con),
 			output: CL_LIVE_OUTPUT_DEVICE.get(&con),
-		};
+		});
 		rollback_selection = None;
-		let mut signaling = CodexSignalingClient::new(auth.clone());
-		let mut connector = DirectSidebandConnector;
+		let mut signaling = match CodexSignalingClient::new(auth.clone()) {
+			Ok(signaling) => signaling,
+			Err(error) => {
+				media.close().await;
+				let class = classify_signaling_failure(&error);
+				let diagnostic =
+					diagnose_live_failure(&destination, options.proxy.as_ref(), class).await;
+				post_live_failure(
+					&mailbox,
+					&LiveAttemptFailure::new(diagnostic.class, diagnostic.message),
+					None,
+				);
+				return;
+			},
+		};
+		let mut connector = ProxySidebandConnector;
 		let mut establishing = Box::pin(complete_live_transport(
 			Arc::clone(&media),
 			offer,
@@ -1714,8 +2186,10 @@ async fn run_live_transport(
 			&mut connector,
 		));
 		let mut close_requested = false;
-		let mut recoverable_exit = false;
+		let mut manual_reconnect = false;
+		let mut setup_failure = None;
 		let mut device_restart_requested = false;
+		let mut network_reconnect_requested = false;
 		let established = loop {
 			tokio::select! {
 				result = &mut establishing => break Some(result),
@@ -1726,7 +2200,7 @@ async fn run_live_transport(
 						if next != selected.input
 							&& validate_selected_device(&mailbox, &snapshot, next.as_str(), true)
 						{
-							rollback_selection = Some(committed.clone());
+							rollback_selection = committed.clone();
 							selected.input = next;
 							device_restart_requested = true;
 							break None;
@@ -1736,17 +2210,26 @@ async fn run_live_transport(
 						if next != selected.output
 							&& validate_selected_device(&mailbox, &snapshot, next.as_str(), false)
 						{
-							rollback_selection = Some(committed.clone());
+							rollback_selection = committed.clone();
 							selected.output = next;
 							device_restart_requested = true;
 							break None;
 						}
 					},
-					Ok(LiveRuntimeCommand::Reconnect) => break None,
+					Ok(LiveRuntimeCommand::Reconnect) => {
+						manual_reconnect = true;
+						break None;
+					},
 					Ok(LiveRuntimeCommand::Close) | Err(_) => {
 						close_requested = true;
 						break None;
 					},
+				},
+				_ = network_poll.tick() => {
+					if LiveNetworkSignature::capture() != network_signature {
+						network_reconnect_requested = true;
+						break None;
+					}
 				},
 				changed = watcher.changed() => match changed {
 					Some(Ok(next)) if next != snapshot => {
@@ -1764,7 +2247,10 @@ async fn run_live_transport(
 							match active_live_permission(&mailbox, snapshot.microphone_permission) {
 								LiveAuthorization::Granted => {},
 								LiveAuthorization::Recoverable => {
-									recoverable_exit = true;
+									setup_failure = Some(LiveAttemptFailure::new(
+										LiveFailureClass::Permission,
+										"microphone permission was revoked",
+									));
 									break None;
 								},
 								LiveAuthorization::Terminal => {
@@ -1780,51 +2266,77 @@ async fn run_live_transport(
 						}
 					},
 					Some(Ok(_)) => {},
-					Some(Err(error)) => post_mailbox(
-						&mailbox,
-						LiveUiEvent::Error {
-							message: Str::new(format!("Could not refresh audio devices: {error}")),
-							recoverable: true,
-						},
-					),
+					Some(Err(error)) => {
+						setup_failure = Some(LiveAttemptFailure::new(
+							LiveFailureClass::Media,
+							Str::new(format!("audio device monitoring failed: {error}")),
+						));
+						break None;
+					},
 					None => {
-						post_mailbox(
-							&mailbox,
-							LiveUiEvent::Error {
-								message: Str::new_static("Audio device monitoring stopped unexpectedly."),
-								recoverable: true,
-							},
-						);
-						recoverable_exit = true;
+						setup_failure = Some(LiveAttemptFailure::new(
+							LiveFailureClass::Media,
+							"audio device monitoring stopped unexpectedly",
+						));
 						break None;
 					},
 				},
 			}
 		};
 		drop(establishing);
-		if close_requested || recoverable_exit {
+		if close_requested {
 			media.close().await;
-			if close_requested {
-				post_mailbox(&mailbox, LiveUiEvent::Closed);
+			post_mailbox(&mailbox, LiveUiEvent::Closed);
+			return;
+		}
+		if let Some(failure) = setup_failure {
+			media.close().await;
+			if let Some(schedule) =
+				schedule_live_reconnect(&mailbox, &mut reconnect, &failure, ever_established)
+			{
+				pending_retry = Some(schedule);
+				continue;
 			}
+			post_live_failure(&mailbox, &failure, None);
 			return;
 		}
 		let Some(established) = established else {
 			media.close().await;
-			post_mailbox(&mailbox, LiveUiEvent::Phase(LivePhase::Reconnecting));
+			if manual_reconnect || device_restart_requested || network_reconnect_requested {
+				reconnect.reset();
+				reconnect.attempts = 1;
+				post_mailbox(&mailbox, LiveUiEvent::Reconnect {
+					attempt: 1,
+					maximum: LIVE_RECONNECT_ATTEMPTS,
+				});
+			}
 			if device_restart_requested {
 				post_device_snapshot(Some(&mailbox), &snapshot, &selected);
 			}
 			continue;
 		};
 		let mut transport = match established {
-			Ok(transport) => transport,
+			Ok(transport) => {
+				ever_established = true;
+				transport
+			},
 			Err(error) => {
-				post_mailbox(&mailbox, LiveUiEvent::Error {
-					message:     Str::new(format!("Could not connect live voice: {error}")),
-					recoverable: true,
-				});
-				break;
+				let class = classify_transport_failure(&error);
+				let diagnostic =
+					diagnose_live_failure(&destination, options.proxy.as_ref(), class).await;
+				let failure = LiveAttemptFailure::new(diagnostic.class, diagnostic.message);
+				if let Some(schedule) =
+					schedule_live_reconnect(&mailbox, &mut reconnect, &failure, ever_established)
+				{
+					pending_retry = Some(schedule);
+					continue;
+				}
+				post_live_failure(
+					&mailbox,
+					&failure,
+					(ever_established && failure.class.automatic_retry()).then_some(reconnect.attempts),
+				);
+				return;
 			},
 		};
 		if muted {
@@ -1840,12 +2352,11 @@ async fn run_live_transport(
 				break;
 			}
 		}
-		let exit = if let Some(error) = initial_send_error {
-			post_mailbox(&mailbox, LiveUiEvent::Error {
-				message:     Str::new(format!("Codex live sideband send failed: {error}")),
-				recoverable: true,
-			});
-			LiveAttemptExit::Failed
+		let exit = if initial_send_error.is_some() {
+			LiveAttemptExit::Failed(LiveAttemptFailure::new(
+				LiveFailureClass::Sideband,
+				"the authenticated live sideband could not send data",
+			))
 		} else {
 			loop {
 				tokio::select! {
@@ -1862,26 +2373,25 @@ async fn run_live_transport(
 							}
 						},
 						Ok(LiveRuntimeCommand::Send(frames)) => {
-							let mut failed = false;
+							let mut failure = None;
 							for frame in frames {
-								if let Err(error) = send_sideband(transport.sideband_mut(), &frame).await {
-									post_mailbox(&mailbox, LiveUiEvent::Error {
-										message: Str::new(format!("Codex live sideband send failed: {error}")),
-										recoverable: true,
-									});
-									failed = true;
+								if send_sideband(transport.sideband_mut(), &frame).await.is_err() {
+									failure = Some(LiveAttemptFailure::new(
+										LiveFailureClass::Sideband,
+										"the authenticated live sideband could not send data",
+									));
 									break;
 								}
 							}
-							if failed {
-								break LiveAttemptExit::Failed;
+							if let Some(failure) = failure {
+								break LiveAttemptExit::Failed(failure);
 							}
 						},
 						Ok(LiveRuntimeCommand::SelectInputDevice(next)) => {
 							if next != selected.input
 								&& validate_selected_device(&mailbox, &snapshot, next.as_str(), true)
 							{
-								rollback_selection = Some(committed.clone());
+								rollback_selection = committed.clone();
 								selected.input = next;
 								break LiveAttemptExit::RestartDevices;
 							}
@@ -1890,13 +2400,18 @@ async fn run_live_transport(
 							if next != selected.output
 								&& validate_selected_device(&mailbox, &snapshot, next.as_str(), false)
 							{
-								rollback_selection = Some(committed.clone());
+								rollback_selection = committed.clone();
 								selected.output = next;
 								break LiveAttemptExit::RestartDevices;
 							}
 						},
 						Ok(LiveRuntimeCommand::Reconnect) => break LiveAttemptExit::Reconnect,
 						Ok(LiveRuntimeCommand::Close) | Err(_) => break LiveAttemptExit::Close,
+					},
+					_ = network_poll.tick() => {
+						if LiveNetworkSignature::capture() != network_signature {
+							break LiveAttemptExit::Reconnect;
+						}
 					},
 					changed = watcher.changed() => match changed {
 						Some(Ok(next)) if next != snapshot => {
@@ -1917,7 +2432,10 @@ async fn run_live_transport(
 								) {
 									LiveAuthorization::Granted => {},
 									LiveAuthorization::Recoverable => {
-										break LiveAttemptExit::Failed;
+										break LiveAttemptExit::Failed(LiveAttemptFailure::new(
+											LiveFailureClass::Permission,
+											"microphone permission was revoked",
+										));
 									},
 									LiveAuthorization::Terminal => break LiveAttemptExit::Close,
 								}
@@ -1928,27 +2446,23 @@ async fn run_live_transport(
 							}
 						},
 						Some(Ok(_)) => {},
-						Some(Err(error)) => post_mailbox(
-							&mailbox,
-							LiveUiEvent::Error {
-								message: Str::new(format!("Could not refresh audio devices: {error}")),
-								recoverable: true,
-							},
-						),
+						Some(Err(error)) => {
+							break LiveAttemptExit::Failed(LiveAttemptFailure::new(
+								LiveFailureClass::Media,
+								Str::new(format!("audio device monitoring failed: {error}")),
+							));
+						},
 						None => {
-							post_mailbox(
-								&mailbox,
-								LiveUiEvent::Error {
-									message: Str::new_static("Audio device monitoring stopped unexpectedly."),
-									recoverable: true,
-								},
-							);
-							break LiveAttemptExit::Failed;
+							break LiveAttemptExit::Failed(LiveAttemptFailure::new(
+								LiveFailureClass::Media,
+								"audio device monitoring stopped unexpectedly",
+							));
 						},
 					},
 					event = event_rx.recv_async() => match event {
 						Ok(LiveRuntimeEvent::DataChannel(payload)) => {
-							if !apply_live_payload(
+							let was_ready = ready;
+							if let Err(failure) = apply_live_payload(
 								&mailbox,
 								&mut transcripts,
 								&mut dedup,
@@ -1956,7 +2470,10 @@ async fn run_live_transport(
 								muted,
 								payload.as_str(),
 							) {
-								break LiveAttemptExit::Failed;
+								break LiveAttemptExit::Failed(failure);
+							}
+							if !was_ready && ready {
+								reconnect.reset();
 							}
 						},
 						Ok(LiveRuntimeEvent::InputLevel(level)) => {
@@ -1983,18 +2500,23 @@ async fn run_live_transport(
 								}));
 							}
 						},
-						Ok(LiveRuntimeEvent::Failure(message)) => {
-							post_mailbox(&mailbox, LiveUiEvent::Error {
-								message,
-								recoverable: true,
-							});
-							break LiveAttemptExit::Failed;
+						Ok(LiveRuntimeEvent::Failure(failure)) => {
+							break LiveAttemptExit::Failed(LiveAttemptFailure::new(
+								classify_media_failure(&failure),
+								"the native live media path failed",
+							));
 						},
-						Err(_) => break LiveAttemptExit::Failed,
+						Err(_) => {
+							break LiveAttemptExit::Failed(LiveAttemptFailure::new(
+								LiveFailureClass::Media,
+								"live media event stream stopped unexpectedly",
+							));
+						},
 					},
 					sideband = receive_sideband(transport.sideband_mut()) => match sideband {
 						Ok(Some(payload)) => {
-							if !apply_live_payload(
+							let was_ready = ready;
+							if let Err(failure) = apply_live_payload(
 								&mailbox,
 								&mut transcripts,
 								&mut dedup,
@@ -2002,28 +2524,29 @@ async fn run_live_transport(
 								muted,
 								payload.as_str(),
 							) {
-								break LiveAttemptExit::Failed;
+								break LiveAttemptExit::Failed(failure);
+							}
+							if !was_ready && ready {
+								reconnect.reset();
 							}
 						},
 						Ok(None) => {
-							post_mailbox(&mailbox, LiveUiEvent::Error {
-								message: Str::new_static("Codex closed the live sideband."),
-								recoverable: true,
-							});
-							break LiveAttemptExit::Failed;
+							break LiveAttemptExit::Failed(LiveAttemptFailure::new(
+								LiveFailureClass::Sideband,
+								"the authenticated live sideband closed unexpectedly",
+							));
 						},
-						Err(error) => {
-							post_mailbox(&mailbox, LiveUiEvent::Error {
-								message: Str::new(format!("Codex live sideband failed: {error}")),
-								recoverable: true,
-							});
-							break LiveAttemptExit::Failed;
+						Err(_) => {
+							break LiveAttemptExit::Failed(LiveAttemptFailure::new(
+								LiveFailureClass::Sideband,
+								"the authenticated live sideband failed",
+							));
 						},
 					},
 				}
 			}
 		};
-		if matches!(exit, LiveAttemptExit::Close) {
+		if matches!(&exit, LiveAttemptExit::Close) {
 			let _ = tokio::time::timeout(
 				LIVE_CLOSE_TIMEOUT,
 				send_sideband(
@@ -2036,17 +2559,44 @@ async fn run_live_transport(
 		let _ = tokio::time::timeout(LIVE_CLOSE_TIMEOUT, transport.sideband_mut().close(None)).await;
 		transport.close().await;
 		match exit {
-			LiveAttemptExit::Reconnect | LiveAttemptExit::RestartDevices => {
-				post_mailbox(&mailbox, LiveUiEvent::Phase(LivePhase::Reconnecting));
-				if matches!(exit, LiveAttemptExit::RestartDevices) {
-					post_device_snapshot(Some(&mailbox), &snapshot, &selected);
-				}
+			LiveAttemptExit::Reconnect => {
+				reconnect.reset();
+				reconnect.attempts = 1;
+				post_mailbox(&mailbox, LiveUiEvent::Reconnect {
+					attempt: 1,
+					maximum: LIVE_RECONNECT_ATTEMPTS,
+				});
+			},
+			LiveAttemptExit::RestartDevices => {
+				reconnect.reset();
+				reconnect.attempts = 1;
+				post_mailbox(&mailbox, LiveUiEvent::Reconnect {
+					attempt: 1,
+					maximum: LIVE_RECONNECT_ATTEMPTS,
+				});
+				post_device_snapshot(Some(&mailbox), &snapshot, &selected);
 			},
 			LiveAttemptExit::Close => {
 				post_mailbox(&mailbox, LiveUiEvent::Closed);
 				return;
 			},
-			LiveAttemptExit::Failed => return,
+			LiveAttemptExit::Failed(failure) => {
+				let diagnostic =
+					diagnose_live_failure(&destination, options.proxy.as_ref(), failure.class).await;
+				let failure = LiveAttemptFailure::new(diagnostic.class, diagnostic.message);
+				if let Some(schedule) =
+					schedule_live_reconnect(&mailbox, &mut reconnect, &failure, ever_established)
+				{
+					pending_retry = Some(schedule);
+					continue;
+				}
+				post_live_failure(
+					&mailbox,
+					&failure,
+					(failure.class.automatic_retry()).then_some(reconnect.attempts),
+				);
+				return;
+			},
 		}
 	}
 }
@@ -2058,29 +2608,27 @@ fn apply_live_payload(
 	ready: &mut bool,
 	muted: bool,
 	payload: &str,
-) -> bool {
+) -> Result<(), LiveAttemptFailure> {
 	if !dedup.admit(payload) {
-		return true;
+		return Ok(());
 	}
 	let Some(event) = parse_live_server_event(payload) else {
-		return true;
+		return Ok(());
 	};
 	let started = matches!(&event, LiveServerEvent::SessionStarted { .. });
 	*ready |= started;
-	if !apply_live_wire(mailbox, transcripts, event) {
-		return false;
-	}
+	apply_live_wire(mailbox, transcripts, event)?;
 	if started && muted {
 		post_mailbox(mailbox, LiveUiEvent::Muted(true));
 	}
-	true
+	Ok(())
 }
 
 fn apply_live_wire(
 	mailbox: &HostMailbox,
 	transcripts: &mut LiveTranscripts,
 	event: LiveServerEvent,
-) -> bool {
+) -> Result<(), LiveAttemptFailure> {
 	match event {
 		LiveServerEvent::SessionStarted { .. } => {
 			post_realtime(mailbox, RealtimeEvent::Ready);
@@ -2115,11 +2663,10 @@ fn apply_live_wire(
 			}
 		},
 		LiveServerEvent::Error(message) => {
-			post_mailbox(mailbox, LiveUiEvent::Error { message, recoverable: true });
-			return false;
+			return Err(LiveAttemptFailure::new(LiveFailureClass::Service, message));
 		},
 	}
-	true
+	Ok(())
 }
 
 fn post_realtime(mailbox: &HostMailbox, event: RealtimeEvent) {
@@ -2184,6 +2731,107 @@ mod tests {
 	fn streaming_failures_keep_stable_typed_categories() {
 		assert_eq!(SttError::AudioLimit.kind(), SttFailureKind::AudioLimit);
 		assert_eq!(SttError::Backpressure.kind(), SttFailureKind::Backpressure);
+	}
+
+	#[test]
+	fn reconnect_policy_is_typed_jittered_and_exhaustive() {
+		let retryable = LiveAttemptFailure::new(LiveFailureClass::Tcp, "connection reset");
+		let low = LiveReconnectPolicy::default()
+			.schedule(&retryable, 0)
+			.expect("low jitter")
+			.delay;
+		let high = LiveReconnectPolicy::default()
+			.schedule(&retryable, 500)
+			.expect("high jitter")
+			.delay;
+		assert!(low < high);
+
+		let mut policy = LiveReconnectPolicy::default();
+		for attempt in 1..=LIVE_RECONNECT_ATTEMPTS {
+			let schedule = policy
+				.schedule(&retryable, u32::from(attempt) * 97)
+				.expect("retry budget");
+			assert_eq!(schedule.attempt, attempt);
+			assert!(schedule.delay <= LIVE_RECONNECT_MAX_DELAY);
+			assert!(!schedule.delay.is_zero());
+		}
+		assert!(policy.schedule(&retryable, 0).is_none());
+
+		let terminal = LiveAttemptFailure::new(LiveFailureClass::Authentication, "expired grant");
+		policy.reset();
+		assert!(policy.schedule(&terminal, 0).is_none());
+		assert_eq!(policy.attempts, 0);
+	}
+
+	#[test]
+	fn signaling_statuses_have_stable_retry_classes() {
+		assert_eq!(
+			classify_signaling_failure(&CodexSignalingError::Rejected {
+				status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+			}),
+			LiveFailureClass::Service
+		);
+		assert_eq!(
+			classify_signaling_failure(&CodexSignalingError::Rejected {
+				status: reqwest::StatusCode::UNAUTHORIZED,
+			}),
+			LiveFailureClass::Authentication
+		);
+		assert_eq!(
+			classify_signaling_failure(&CodexSignalingError::Rejected {
+				status: reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+			}),
+			LiveFailureClass::Proxy
+		);
+		assert_eq!(
+			classify_signaling_failure(&CodexSignalingError::EmptyAnswer),
+			LiveFailureClass::Protocol
+		);
+		assert_eq!(
+			classify_sideband_failure(&ProxySidebandError::ProxyRejected { status: Some(407) }),
+			LiveFailureClass::Proxy
+		);
+		assert_eq!(classify_media_failure(&LiveMediaFailure::Ice), LiveFailureClass::Ice);
+		assert_eq!(classify_media_failure(&LiveMediaFailure::WebRtc), LiveFailureClass::WebRtc);
+		assert_eq!(
+			classify_media_failure(&LiveMediaFailure::DataChannel),
+			LiveFailureClass::Sideband
+		);
+	}
+
+	#[test]
+	fn mutable_proxy_discovery_failures_remain_manually_recoverable() {
+		let error = LiveProxyDiscoveryError::Credentials(LiveProxyError::InvalidCredentials);
+		let class = classify_proxy_discovery_failure(&error);
+		assert_eq!(class, LiveFailureClass::Proxy);
+		assert!(class.user_recoverable());
+		assert!(!class.automatic_retry());
+
+		let unsupported =
+			LiveProxyDiscoveryError::UnsupportedScheme { scheme: Str::new_static("socks5") };
+		assert_eq!(classify_proxy_discovery_failure(&unsupported), LiveFailureClass::Configuration);
+		assert!(!LiveFailureClass::Configuration.user_recoverable());
+	}
+
+	#[test]
+	fn live_proxy_preparation_redacts_credentials_and_rejects_unsupported_schemes() {
+		let proxy = prepare_live_proxy(
+			Url::parse("http://employee:secret@proxy.example:8443").expect("proxy URL"),
+		)
+		.expect("supported proxy");
+		assert_eq!(proxy.endpoint().as_str(), "http://proxy.example:8443/");
+		let debug = format!("{proxy:?}");
+		assert!(!debug.contains("employee"));
+		assert!(!debug.contains("secret"));
+
+		let error = prepare_live_proxy(
+			Url::parse("socks5://employee:secret@proxy.example:1080").expect("proxy URL"),
+		)
+		.expect_err("unsupported proxy");
+		assert!(matches!(error, LiveProxyDiscoveryError::UnsupportedScheme { .. }));
+		let display = error.to_string();
+		assert!(!display.contains("employee"));
+		assert!(!display.contains("secret"));
 	}
 
 	#[test]
