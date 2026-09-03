@@ -5,6 +5,7 @@ use std::{
 	env,
 	ffi::CString,
 	fmt,
+	fs::File,
 	io::{self, Read, Write},
 	iter, mem,
 	num::NonZeroUsize,
@@ -31,6 +32,7 @@ use omp_core::{
 	RestartReason, Str, sf,
 };
 use omp_inference::recovery::tools::{ToolAssemblyLimits, validate_schema};
+use omp_journal::blob::BlobStage;
 use omp_proto::{
 	env::v1::{ArgText, ArgsCommitted, Interrupt},
 	inference::v1::{ToolDef, Value, ValueMap, tool_def, value},
@@ -46,13 +48,13 @@ use omp_proto::{
 			InvokeTool, JournalHostEnvelope, LifecycleHostEnvelope, OutcomeKind, Ping, Pong,
 			PreludeParam, PreludeParamKind, PrincipalRef, PromptContribution, ProtocolError,
 			ProtocolErrorCode, PullReply, PullRequest, QuotaDrop, QuotaStatus, RegisterTools,
-			ResourceUpdate, RestartReason as WireRestartReason,
+			ResourceUpdate, RestartReason as WireRestartReason, ResultWorkerEnvelope,
 			ServiceDispatch as WireServiceDispatch, ServiceReply, ServiceResult, ToolAborted,
-			ToolArgs, ToolComplete, ToolDecl, ToolUpdate, UiHostEnvelope, UiWorkerEnvelope,
-			WorkerFrame, WorkerHello, activation_cli_value, argument_host_envelope,
-			argument_worker_envelope, context_host_envelope, context_worker_envelope, host_frame,
-			lifecycle_host_envelope, lifecycle_worker_envelope, ui_host_envelope, ui_worker_envelope,
-			worker_frame,
+			ToolArgs, ToolDecl, ToolResultChunk, ToolResultComplete, ToolResultStart, ToolUpdate,
+			UiHostEnvelope, UiWorkerEnvelope, WorkerFrame, WorkerHello, activation_cli_value,
+			argument_host_envelope, argument_worker_envelope, context_host_envelope,
+			context_worker_envelope, host_frame, lifecycle_host_envelope, lifecycle_worker_envelope,
+			result_worker_envelope, ui_host_envelope, ui_worker_envelope, worker_frame,
 		},
 	},
 	ui::v1::{
@@ -61,7 +63,7 @@ use omp_proto::{
 		command_dispatch_result, ui_dispatch, ui_dispatch_result,
 	},
 };
-use omp_tool::{Rev, ToolIdentity};
+use omp_tool::{Abort, CallOutcome, Rev, ToolIdentity};
 use omp_tools::read::resolver::SchemeSnapshot;
 use parking_lot::{Mutex, RwLock};
 use pyo3::{
@@ -71,7 +73,7 @@ use pyo3::{
 	types::{PyBytes, PyDict, PyIterator, PyList, PyModule, PyString},
 	wrap_pyfunction,
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::IgnoredAny};
 use thiserror::Error;
 use tokio::{
 	io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -85,7 +87,11 @@ use url::Url;
 #[cfg(windows)]
 use windows_sys::Win32::System::Console;
 
-use super::exthost::{DispatchError, control::ControlRuntimeError};
+use super::{
+	blobs::{BlobError, BlobHost},
+	exthost::{DispatchError, control::ControlRuntimeError},
+	worker_pool::SpillDiverter,
+};
 use crate::{
 	exthost::{
 		ActivationCause, ActivationEvent, ActivationTrigger, AvailabilityBatch, AvailabilitySink,
@@ -503,6 +509,8 @@ pub struct ExtHostConfig {
 	pub scheme_snapshot:    Option<SchemeSnapshot>,
 	/// Shared DATA authorization table owned by the Environment.
 	pub data_authority:     Option<Arc<AuthorityTable>>,
+	/// Environment-owned CAS receiving incremental worker result payloads.
+	result_store:           Option<SpillDiverter>,
 	/// CONTROL routing to the serialized Agent Journal and external storage
 	/// backends.
 	pub journal:            Option<JournalRuntime>,
@@ -541,6 +549,7 @@ impl ExtHostConfig {
 			ping_interval: Duration::from_secs(15),
 			interrupt_grace: omp_tool::DEFAULT_INTERRUPT_GRACE,
 			data_authority: None,
+			result_store: None,
 			journal: None,
 			control_authorities: None,
 			registry_control: None,
@@ -563,6 +572,11 @@ impl ExtHostConfig {
 	/// Binds placed worker processes to the Environment's workspace root.
 	pub fn bind_workspace_root(&mut self, root: &Path) {
 		self.workspace_root = Some(root.to_path_buf());
+	}
+
+	/// Binds worker result streaming to the Environment's sole blob authority.
+	pub fn bind_result_store(&mut self, host: BlobHost) {
+		self.result_store = Some(SpillDiverter::new(host));
 	}
 
 	/// Installs authenticated journal and scoped-state CONTROL routing.
@@ -682,9 +696,10 @@ pub struct WorkerCompletion {
 	pub kind:         WorkerOutcomeKind,
 	/// Model-facing result parts, each with a present discriminator.
 	pub parts:        Vec<Part>,
-	/// Inline structured details when the worker did not spill them.
+	/// Inline structured details for in-process CONTROL completions.
 	pub details_json: Option<Bytes>,
-	/// Spilled structured details when the worker did not send them inline.
+	/// Complete serialized [`CallOutcome`] staged by the Environment CAS for a
+	/// process-worker result stream.
 	pub details_blob: Option<Blob>,
 	/// Structured argument issue, present only for
 	/// [`WorkerOutcomeKind::ArgsRejected`].
@@ -1437,6 +1452,9 @@ impl ExtHostSupervisor {
 	/// # Errors
 	/// Returns a startup, identity, registration, or handshake error.
 	pub async fn spawn(config: ExtHostConfig) -> Result<Self, WorkerError> {
+		if !config.extensions.is_empty() && config.result_store.is_none() {
+			return Err(WorkerError::ResultStoreUnavailable);
+		}
 		let control_authorities = config.control_authorities.clone();
 		let registry_control = config.registry_control.clone();
 		let hook_control = config.hook_control.clone();
@@ -2918,6 +2936,16 @@ pub enum WorkerError {
 	/// An encoded frame violated extension-host allocation bounds.
 	#[error("python tool worker frame bounds violation: {0}")]
 	FrameBounds(#[from] omp_proto::bounds::FrameBoundsError),
+	/// The environment did not bind its result CAS before starting workers.
+	#[error("python tool worker result CAS is unavailable")]
+	ResultStoreUnavailable,
+	/// The environment result CAS failed while staging or retaining a worker
+	/// payload.
+	#[error("python tool worker result CAS failed")]
+	ResultStore(#[from] BlobError),
+	/// A streamed worker result payload was not one complete JSON value.
+	#[error("python tool worker result payload is invalid JSON")]
+	ResultJson(#[from] serde_json::Error),
 	/// The worker did not complete a health operation in time.
 	#[error("python tool worker health check timed out")]
 	HealthTimeout,
@@ -3084,6 +3112,7 @@ struct ProcessConfig {
 	healthy_reset:        Duration,
 	session_generation:   u64,
 	scheme_snapshot:      Option<SchemeSnapshot>,
+	result_store:         Option<SpillDiverter>,
 	journal:              Arc<Mutex<JournalRuntimeSlot>>,
 	resources:            Arc<Mutex<ControlQuotaLedger>>,
 	availability_sink:    Arc<Mutex<Option<Arc<dyn AvailabilitySink>>>>,
@@ -3209,6 +3238,7 @@ impl ProcessConfig {
 			healthy_reset: root.healthy_reset,
 			session_generation: root.session_generation,
 			scheme_snapshot: root.scheme_snapshot.clone(),
+			result_store: root.result_store.clone(),
 			journal,
 			resources,
 			availability_sink: Arc::clone(&root.availability_sink),
@@ -6146,6 +6176,8 @@ async fn run_invocation(
 
 	let deadline = Instant::now() + invocation.call.deadline;
 	let mut pull_open = false;
+	let mut result_start: Option<ToolResultStart> = None;
+	let mut result_stage: Option<BlobStage> = None;
 	loop {
 		tokio::select! {
 			frame = read_async_frame::<_, WorkerFrame>(&mut process.stdout, config.max_frame_bytes, &mut process.read_scratch) => {
@@ -6268,17 +6300,72 @@ async fn run_invocation(
 							return InvocationAction::ReplaceWorker(RestartReason::CancelEscalation);
 						}
 					},
-					Some(omp_proto::toolhost::v1::worker_frame::Body::ToolComplete(complete)) if complete.call_id == call_id.as_str() => {
-						let Ok(complete) = WorkerCompletion::try_from(complete) else {
-							send_abort(
-								&invocation,
-								WorkerAbortKind::Crashed,
-								"worker sent an invalid ToolComplete",
-							);
+					Some(omp_proto::toolhost::v1::worker_frame::Body::Result(result)) => match result.body {
+						Some(result_worker_envelope::Body::Start(start))
+							if start.call_id == call_id.as_str()
+								&& result_start.is_none()
+								&& result_stage.is_none() =>
+						{
+							let Some(store) = config.result_store.as_ref() else {
+								cancel_worker(process, config, request_id, &call_id, "worker result CAS is unavailable").await;
+								send_abort(&invocation, WorkerAbortKind::Crashed, "worker result CAS is unavailable");
+								return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
+							};
+							match store.begin_verdict() {
+								Ok(stage) => {
+									result_start = Some(start);
+									result_stage = Some(stage);
+								},
+								Err(_) => {
+									cancel_worker(process, config, request_id, &call_id, "worker result CAS could not start").await;
+									send_abort(&invocation, WorkerAbortKind::Crashed, "worker result CAS could not start");
+									return InvocationAction::ReplaceWorker(RestartReason::CancelEscalation);
+								},
+							}
+						},
+						Some(result_worker_envelope::Body::Chunk(chunk))
+							if chunk.call_id == call_id.as_str()
+								&& !chunk.data.is_empty()
+								&& result_start.is_some() =>
+						{
+							let Some(stage) = result_stage.as_mut() else {
+								send_abort(&invocation, WorkerAbortKind::Crashed, "worker result chunk arrived before start");
+								return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
+							};
+							if stage.write_all(&chunk.data).is_err() {
+								cancel_worker(process, config, request_id, &call_id, "worker result CAS write failed").await;
+								send_abort(&invocation, WorkerAbortKind::Crashed, "worker result CAS write failed");
+								return InvocationAction::ReplaceWorker(RestartReason::CancelEscalation);
+							}
+						},
+						Some(result_worker_envelope::Body::Complete(complete))
+							if complete.call_id == call_id.as_str() =>
+						{
+							let Some(store) = config.result_store.as_ref() else {
+								cancel_worker(process, config, request_id, &call_id, "worker result CAS is unavailable").await;
+								send_abort(&invocation, WorkerAbortKind::Crashed, "worker result CAS is unavailable");
+								return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
+							};
+							let (Some(start), Some(stage)) = (result_start.take(), result_stage.take()) else {
+								send_abort(&invocation, WorkerAbortKind::Crashed, "worker completed without result payload");
+								return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
+							};
+							let complete = match finish_result_stage(store, stage, start.kind)
+								.and_then(|blob| WorkerCompletion::from_streamed_result(start, blob))
+							{
+								Ok(complete) => complete,
+								Err(_) => {
+									send_abort(&invocation, WorkerAbortKind::Crashed, "worker result payload was invalid");
+									return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
+								},
+							};
+							let _ = invocation.events.send(WorkerEvent::Complete(complete));
+							return InvocationAction::KeepWorker;
+						},
+						_ => {
+							send_host_protocol_error(&invocation, ProtocolErrorCode::InvalidArgument, "stale or invalid worker result stream");
 							return InvocationAction::ReplaceWorker(RestartReason::ProtocolError);
-						};
-						let _ = invocation.events.send(WorkerEvent::Complete(complete));
-						return InvocationAction::KeepWorker;
+						},
 					},
 					Some(omp_proto::toolhost::v1::worker_frame::Body::Arguments(arguments)) => match arguments.body {
 						Some(omp_proto::toolhost::v1::argument_worker_envelope::Body::PullRequest(pull)) => {
@@ -6732,25 +6819,28 @@ fn abort_queued_invocations(
 		send_abort(&invocation, WorkerAbortKind::Crashed, reason);
 	}
 }
-impl TryFrom<ToolComplete> for WorkerCompletion {
-	type Error = WorkerError;
-
-	fn try_from(complete: ToolComplete) -> Result<Self, Self::Error> {
+impl WorkerCompletion {
+	/// Combines transport-independent terminal metadata with the CAS reference
+	/// minted from the preceding result chunks.
+	///
+	/// # Errors
+	///
+	/// Returns a protocol error when the terminal branch is unspecified, a
+	/// projected part lacks its discriminator, or argument-issue presence does
+	/// not match the branch.
+	pub fn from_streamed_result(
+		complete: ToolResultStart,
+		details_blob: Blob,
+	) -> Result<Self, WorkerError> {
 		if complete.parts.iter().any(|part| part.kind.is_none()) {
 			return Err(WorkerError::Protocol(sf!(
-				"ToolComplete contains a part without its presence discriminator",
-			)));
-		}
-		let has_json = !complete.details_json.is_empty();
-		let has_blob = complete.details_blob.is_some();
-		if has_json == has_blob {
-			return Err(WorkerError::Protocol(sf!(
-				"ToolComplete must carry exactly one of details_json or details_blob",
+				"ToolResultStart contains a part without its presence discriminator",
 			)));
 		}
 		let kind = match OutcomeKind::try_from(complete.kind).unwrap_or(OutcomeKind::Unspecified) {
-			OutcomeKind::Unspecified if complete.is_error => WorkerOutcomeKind::Faulted,
-			OutcomeKind::Unspecified => WorkerOutcomeKind::Ok,
+			OutcomeKind::Unspecified => {
+				return Err(WorkerError::Protocol(sf!("ToolResultStart omitted its outcome kind",)));
+			},
 			OutcomeKind::Ok => WorkerOutcomeKind::Ok,
 			OutcomeKind::Faulted => WorkerOutcomeKind::Faulted,
 			OutcomeKind::ArgsRejected => WorkerOutcomeKind::ArgsRejected,
@@ -6758,20 +6848,49 @@ impl TryFrom<ToolComplete> for WorkerCompletion {
 		};
 		if matches!(kind, WorkerOutcomeKind::ArgsRejected) != complete.args_issue.is_some() {
 			return Err(WorkerError::Protocol(sf!(
-				"ToolComplete args_issue presence does not match ArgsRejected",
+				"ToolResultStart args_issue presence does not match ArgsRejected",
 			)));
 		}
 		Ok(Self {
 			call_id: Str::from(complete.call_id),
 			kind,
 			parts: complete.parts,
-			details_json: has_json.then_some(complete.details_json),
-			details_blob: complete.details_blob,
+			details_json: None,
+			details_blob: Some(details_blob),
 			args_issue: complete.args_issue,
 			useless: complete.useless,
 			terminate: complete.terminate.unwrap_or(false),
 		})
 	}
+}
+
+fn finish_result_stage(
+	store: &SpillDiverter,
+	stage: BlobStage,
+	expected_kind: i32,
+) -> Result<Blob, WorkerError> {
+	let blob = store.finish_verdict(stage)?;
+	let hash: [u8; 32] = blob
+		.hash
+		.as_ref()
+		.try_into()
+		.map_err(|_| WorkerError::Protocol(sf!("worker result CAS returned an invalid hash")))?;
+	let reference =
+		omp_journal::blob::BlobRef { hash: omp_core::Hash32::new(hash), size: blob.size };
+	let file = File::open(store.store().path(&reference))?;
+	let outcome = serde_json::from_reader::<_, CallOutcome<IgnoredAny, IgnoredAny>>(file)?;
+	let actual_kind = match outcome {
+		CallOutcome::Ok(_) => OutcomeKind::Ok,
+		CallOutcome::Faulted(_) => OutcomeKind::Faulted,
+		CallOutcome::ArgsRejected(_) => OutcomeKind::ArgsRejected,
+		CallOutcome::Aborted { .. } => OutcomeKind::Aborted,
+	};
+	if OutcomeKind::try_from(expected_kind).ok() != Some(actual_kind) {
+		return Err(WorkerError::Protocol(sf!(
+			"worker result metadata does not match its streamed outcome",
+		)));
+	}
+	Ok(Blob { mime: "application/json".into(), ..blob })
 }
 
 fn validate_registrations(tools: &[ToolDecl]) -> Result<(), WorkerError> {
@@ -8477,33 +8596,143 @@ fn serve_invocation<W: Write>(
 		},
 	};
 	let PythonCompletion { parts, details_json, kind, args_issue, terminate } = completion;
-	let body = if let Some(issue) = args_issue {
-		worker_frame::Body::Arguments(ArgumentWorkerEnvelope {
-			body:  Some(argument_worker_envelope::Body::ToolArgs(ToolArgs {
-				call_id,
-				issue: Some(issue),
+	if let Some(issue) = args_issue {
+		return write_sync_frame(
+			writer,
+			&WorkerFrame {
+				request_id,
+				body: Some(worker_frame::Body::Arguments(ArgumentWorkerEnvelope {
+					body:  Some(argument_worker_envelope::Body::ToolArgs(ToolArgs {
+						call_id,
+						issue: Some(issue),
+						props: None,
+					})),
+					props: None,
+				})),
+				props: None,
+			},
+			limit,
+			scratch,
+		);
+	}
+	write_sync_frame(
+		writer,
+		&WorkerFrame {
+			request_id,
+			body: Some(worker_frame::Body::Result(ResultWorkerEnvelope {
+				body:  Some(result_worker_envelope::Body::Start(ToolResultStart {
+					call_id: call_id.clone(),
+					parts,
+					useless: false,
+					args_issue: None,
+					terminate: terminate.then_some(true),
+					props: None,
+					kind: kind.into(),
+				})),
 				props: None,
 			})),
 			props: None,
-		})
-	} else {
-		worker_frame::Body::ToolComplete(ToolComplete {
-			call_id,
-			parts,
-			details_json,
-			is_error: matches!(kind, OutcomeKind::Faulted),
-			kind: kind.into(),
-			terminate: terminate.then_some(true),
-			props: None,
-			..Default::default()
-		})
-	};
+		},
+		limit,
+		scratch,
+	)?;
+	write_result_outcome(writer, request_id, call_id.as_str(), kind, &details_json, limit, scratch)?;
 	write_sync_frame(
 		writer,
-		&WorkerFrame { request_id, body: Some(body), props: None },
+		&WorkerFrame {
+			request_id,
+			body: Some(worker_frame::Body::Result(ResultWorkerEnvelope {
+				body:  Some(result_worker_envelope::Body::Complete(ToolResultComplete {
+					call_id,
+					props: None,
+				})),
+				props: None,
+			})),
+			props: None,
+		},
 		limit,
 		scratch,
 	)
+}
+
+fn write_result_outcome<W: Write>(
+	writer: &mut W,
+	request_id: u64,
+	call_id: &str,
+	kind: OutcomeKind,
+	details: &Bytes,
+	limit: NonZeroUsize,
+	scratch: &mut BytesMut,
+) -> Result<(), WorkerError> {
+	match kind {
+		OutcomeKind::Ok | OutcomeKind::Faulted => {
+			serde_json::from_slice::<IgnoredAny>(details)?;
+			let prefix = if kind == OutcomeKind::Faulted {
+				Bytes::from_static(br#"{"kind":"faulted","value":"#)
+			} else {
+				Bytes::from_static(br#"{"kind":"ok","value":"#)
+			};
+			write_result_payload(writer, request_id, call_id, &prefix, limit, scratch)?;
+			write_result_payload(writer, request_id, call_id, details, limit, scratch)?;
+			write_result_payload(
+				writer,
+				request_id,
+				call_id,
+				&Bytes::from_static(b"}"),
+				limit,
+				scratch,
+			)
+		},
+		OutcomeKind::Aborted => {
+			let abort: Abort = serde_json::from_slice(details)?;
+			let outcome = serde_json::to_vec(
+				&CallOutcome::<serde_json::Value, serde_json::Value>::aborted(abort),
+			)
+			.map(Bytes::from)?;
+			write_result_payload(writer, request_id, call_id, &outcome, limit, scratch)
+		},
+		OutcomeKind::ArgsRejected | OutcomeKind::Unspecified => Err(WorkerError::Protocol(sf!(
+			"worker result payload has no streamable terminal outcome",
+		))),
+	}
+}
+
+fn write_result_payload<W: Write>(
+	writer: &mut W,
+	request_id: u64,
+	call_id: &str,
+	payload: &Bytes,
+	limit: NonZeroUsize,
+	scratch: &mut BytesMut,
+) -> Result<(), WorkerError> {
+	if payload.is_empty() {
+		return Err(WorkerError::Protocol(sf!("worker result payload must contain one JSON value",)));
+	}
+	let chunk_bytes =
+		omp_proto::bounds::RESULT_CHUNK_MAX_BYTES.min(limit.get().saturating_sub(1_024).max(1));
+	let mut offset = 0;
+	while offset < payload.len() {
+		let end = offset.saturating_add(chunk_bytes).min(payload.len());
+		write_sync_frame(
+			writer,
+			&WorkerFrame {
+				request_id,
+				body: Some(worker_frame::Body::Result(ResultWorkerEnvelope {
+					body:  Some(result_worker_envelope::Body::Chunk(ToolResultChunk {
+						call_id: call_id.to_owned(),
+						data:    payload.slice(offset..end),
+						props:   None,
+					})),
+					props: None,
+				})),
+				props: None,
+			},
+			limit,
+			scratch,
+		)?;
+		offset = end;
+	}
+	Ok(())
 }
 
 struct PythonCompletion {
@@ -8911,6 +9140,39 @@ mod tests {
 	use super::*;
 	use crate::tools::python_engine;
 
+	fn read_streamed_result(
+		reader: &mut io::Cursor<Vec<u8>>,
+		limit: NonZeroUsize,
+		scratch: &mut BytesMut,
+	) -> (ToolResultStart, Bytes, ToolResultComplete) {
+		let mut start = None;
+		let mut payload = BytesMut::new();
+		loop {
+			let frame = read_sync_frame::<_, WorkerFrame>(reader, limit, scratch)
+				.expect("decode worker result frame")
+				.expect("worker result frame");
+			let Some(worker_frame::Body::Result(result)) = frame.body else {
+				panic!("expected worker result frame");
+			};
+			match result.body {
+				Some(result_worker_envelope::Body::Start(value)) if start.is_none() => {
+					start = Some(value);
+				},
+				Some(result_worker_envelope::Body::Chunk(chunk)) if start.is_some() => {
+					payload.extend_from_slice(&chunk.data);
+				},
+				Some(result_worker_envelope::Body::Complete(complete)) => {
+					return (
+						start.expect("result start precedes completion"),
+						payload.freeze(),
+						complete,
+					);
+				},
+				_ => panic!("invalid worker result frame sequence"),
+			}
+		}
+	}
+
 	#[test]
 	fn mcp_hook_filter_verification_is_byte_exact() {
 		let filter = omp_ext::config::HookDeclarationFilter {
@@ -9054,14 +9316,20 @@ assert loads(b'{"reason":"no"}', Failure) == Failure("no")
 			.expect("lower Python completion");
 		assert!(completion.terminate);
 
-		let wire = ToolComplete {
+		let wire = ToolResultStart {
 			call_id: "terminate".to_owned(),
-			details_json: completion.details_json,
+			kind: OutcomeKind::Ok.into(),
 			terminate: completion.terminate.then_some(true),
-			..ToolComplete::default()
+			..ToolResultStart::default()
+		};
+		let blob = Blob {
+			hash: Bytes::from_static(&[7; 32]),
+			mime: "application/json".into(),
+			size: completion.details_json.len() as u64,
+			..Blob::default()
 		};
 		assert!(
-			WorkerCompletion::try_from(wire)
+			WorkerCompletion::from_streamed_result(wire, blob)
 				.expect("decode terminal frame")
 				.terminate
 		);
@@ -9190,10 +9458,10 @@ async def handler(params, ctx):
 			serde_json::from_slice::<serde_json::Value>(&update.json).expect("update JSON"),
 			serde_json::json!({"step": 2})
 		);
-		let complete = read_sync_frame::<_, WorkerFrame>(&mut cursor, limit, &mut scratch)
-			.expect("decode completion frame")
-			.expect("completion frame");
-		assert!(matches!(complete.body, Some(worker_frame::Body::ToolComplete(_))));
+		let (start, payload, complete) = read_streamed_result(&mut cursor, limit, &mut scratch);
+		assert_eq!(start.call_id, "ctx-call");
+		assert_eq!(complete.call_id, "ctx-call");
+		assert!(serde_json::from_slice::<serde_json::Value>(&payload).is_ok());
 	}
 
 	#[test]
@@ -9319,21 +9587,19 @@ async def worker_prelude_round_trip(patches, *, strategy: str = "sequential"):
 		.expect("invoke prelude helper");
 		let mut reader = io::Cursor::new(encoded);
 		let mut read_scratch = BytesMut::new();
-		let frame = read_sync_frame::<_, WorkerFrame>(&mut reader, limit, &mut read_scratch)
-			.expect("decode worker frame")
-			.expect("worker frame");
-		let Some(worker_frame::Body::ToolComplete(complete)) = frame.body else {
-			panic!("prelude invocation did not complete");
-		};
-		assert_eq!(complete.kind, OutcomeKind::Ok as i32);
+		let (start, payload, complete) = read_streamed_result(&mut reader, limit, &mut read_scratch);
+		assert_eq!(start.kind, OutcomeKind::Ok as i32);
 		assert_eq!(
-			serde_json::from_slice::<serde_json::Value>(&complete.details_json)
-				.expect("valid helper result"),
+			serde_json::from_slice::<serde_json::Value>(&payload).expect("valid helper result"),
 			serde_json::json!({
-				"patches": ["first", "second"],
-				"strategy": "parallel",
+				"kind": "ok",
+				"value": {
+					"patches": ["first", "second"],
+					"strategy": "parallel",
+				},
 			})
 		);
+		assert_eq!(complete.call_id, "prelude-call");
 	}
 
 	#[tokio::test]

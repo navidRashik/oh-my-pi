@@ -105,7 +105,9 @@ use super::{
 		manager::{McpHookNotification, McpManager, McpNotificationSink},
 	},
 	media_devices,
+	media_tts::{SpeechConfig, SpeechPreference},
 	memory::ReflectionBridgeHost,
+	report_issue,
 	search_backend::SearchBridgeHost,
 	security_scan::SecurityScanService,
 	ssh::{HostPaths, HostStore, SshService},
@@ -132,6 +134,7 @@ use crate::{
 tokio::task_local! {
 	static PTY_DENIED: bool;
 	static INVOCATION_SESSION_ID: Option<Str>;
+	static OUTPUT_REQUEST: omp_tool::OutputRequest;
 	static EDIT_REPAIR_CONTEXT: InvocationEditRepairContext;
 	static ACP_BACKENDS: InvocationAcpBackends;
 }
@@ -3220,6 +3223,17 @@ pub(super) async fn with_invocation_scope<T>(
 	PTY_DENIED.scope(pty_denied, future).await
 }
 
+/// Runs one native tool stream with its caller-selected output policy.
+///
+/// The value is intent only: host implementations always retain their fixed
+/// security ceiling.
+pub(super) async fn with_output_request_scope<T>(
+	request: omp_tool::OutputRequest,
+	future: impl Future<Output = T>,
+) -> T {
+	OUTPUT_REQUEST.scope(request, future).await
+}
+
 /// Runs one native registry stream with its authenticated durable session
 /// principal. `None` deliberately represents an invocation without a principal.
 pub(super) async fn with_invocation_session_scope<T>(
@@ -3259,6 +3273,13 @@ pub(super) fn invocation_acp_exec() -> Option<Arc<dyn super::tool_shell::AcpExec
 		.ok()
 		.flatten()
 }
+/// Returns the caller-selected output policy for the current invocation.
+pub(super) fn invocation_output_request() -> omp_tool::OutputRequest {
+	OUTPUT_REQUEST
+		.try_with(|request| *request)
+		.unwrap_or(omp_tool::OutputRequest::Bounded)
+}
+
 /// Returns the durable session principal for the current native invocation.
 pub(super) fn invocation_session_id() -> Option<Str> {
 	INVOCATION_SESSION_ID.try_with(Clone::clone).ok().flatten()
@@ -3310,6 +3331,22 @@ fn configured_model_identity(ctx: &Ctx) -> Option<Str> {
 		.role_selector("default")
 		.cloned()
 }
+
+fn speech_config(ctx: &Ctx) -> SpeechConfig {
+	use omp_inference::speech_settings::{AI_TTS_PROVIDER, CL_TTS_MODEL, CL_TTS_VOICE, TtsProvider};
+	let preference = match AI_TTS_PROVIDER.get(ctx) {
+		TtsProvider::Auto => SpeechPreference::Auto,
+		TtsProvider::Local => SpeechPreference::Local,
+		TtsProvider::Xai => SpeechPreference::Xai,
+		TtsProvider::Deepinfra => SpeechPreference::Deepinfra,
+	};
+	SpeechConfig {
+		preference,
+		local_model: Str::new(<&'static str>::from(CL_TTS_MODEL.get(ctx))),
+		local_voice: Str::new(<&'static str>::from(CL_TTS_VOICE.get(ctx))),
+	}
+}
+
 fn prepare_registry(registry: &mut Registry) -> Result<(), EnvdError> {
 	registry.protect_core_claims([
 		"read",
@@ -3388,6 +3425,7 @@ fn register_session_base(
 	state_dir: &Path,
 	telemetry: &Arc<TelemetryIndex>,
 	tool_settings: &ToolSettings,
+	speech_config: SpeechConfig,
 	policy: ToolsPolicy,
 ) -> Result<SessionBaseOutput, EnvdError> {
 	for dynamic in dynamic_tools {
@@ -3397,6 +3435,7 @@ fn register_session_base(
 		factory.register(registry)?;
 	}
 	let search_bridge = Arc::new(SearchBridgeHost::new(search));
+	let github_credentials = Arc::new(GithubCredentialBridge::new());
 	let ask_presenter = PresenterSlot::new(
 		ask_presenter.unwrap_or_else(|| Arc::new(omp_tools::ask::HeadlessPresenter)),
 	);
@@ -3406,7 +3445,13 @@ fn register_session_base(
 			blobs.clone(),
 			project_root.to_path_buf(),
 		),
-		media_devices::tts(Arc::clone(&search_bridge), blobs.clone(), project_root.to_path_buf()),
+		media_devices::tts_with_config(
+			Arc::clone(&search_bridge),
+			Arc::clone(&github_credentials),
+			speech_config,
+			blobs.clone(),
+			project_root.to_path_buf(),
+		),
 	] {
 		register_instrumented(
 			registry,
@@ -3417,11 +3462,10 @@ fn register_session_base(
 	}
 	register_instrumented(
 		registry,
-		media_devices::report_issue(Arc::clone(telemetry)),
+		report_issue::tool(Arc::clone(telemetry)),
 		long_tail_presentation(policy),
 		builtin_device_claims(),
 	)?;
-	let github_credentials = Arc::new(GithubCredentialBridge::new());
 	let github =
 		GithubService::new(project_root.to_path_buf(), state_dir, Arc::clone(&github_credentials));
 	if let Some(upload) = telemetry_upload {
@@ -3852,6 +3896,7 @@ pub(crate) fn session_registry(
 	state_dir: &Path,
 	telemetry: &Arc<TelemetryIndex>,
 	workers: &ExtHostSupervisor,
+	con: &Ctx,
 	policy: ToolsPolicy,
 	tool_settings: &ToolSettings,
 	browser_settings: &BrowserSettings,
@@ -3880,6 +3925,7 @@ pub(crate) fn session_registry(
 		state_dir,
 		telemetry,
 		tool_settings,
+		speech_config(con),
 		policy,
 	)?;
 	let mut declarations = environment.clone();
@@ -4021,6 +4067,7 @@ pub(crate) fn production_registry<
 			state_dir,
 			telemetry,
 			tool_settings,
+			speech_config(con),
 			policy,
 		)?;
 	if browser_settings.enabled && tool_settings.enabled("browser") {
@@ -4387,14 +4434,13 @@ pub(crate) fn production_registry<
 	);
 	let grep = omp_tools::grep::tool(
 		search.clone(),
-		read_blobs.clone(),
 		u32::from(tool_settings.grep_context_before),
 		u32::from(tool_settings.grep_context_after),
 	);
 	if tool_settings.enabled("grep") {
 		environment_registry(&mut registry, grep, essential_presentation(policy), core_claims())?;
 	}
-	let glob = omp_tools::glob::tool(search, read_blobs);
+	let glob = omp_tools::glob::tool(search);
 	if tool_settings.enabled("glob") {
 		environment_registry(&mut registry, glob, essential_presentation(policy), core_claims())?;
 	}

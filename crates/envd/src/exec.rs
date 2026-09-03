@@ -77,6 +77,8 @@ const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 const OUTPUT_EVENT_CAPACITY: usize = 8;
 const LIVE_OUTPUT_BYTES: usize = 64 * 1024;
 const LIVE_OUTPUT_FRAMES: usize = 64;
+const COMPLETE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const COMPLETE_OUTPUT_FRAMES: usize = COMPLETE_OUTPUT_BYTES / OUTPUT_CHUNK_BYTES;
 const RESTART_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
 const RESTART_MAX_DELAY: Duration = Duration::from_secs(30);
 const RESTART_BASE_DELAY: Duration = Duration::from_secs(1);
@@ -935,8 +937,16 @@ impl ExecHost {
 		// streams the complete byte sequence to the artifact store.
 		let (events_tx, events) = flume::bounded(OUTPUT_EVENT_CAPACITY);
 		let events = Arc::new(events);
-		let output =
-			Arc::new(Mutex::new(OutputCapture::new(self.inner.output_store.lock().as_ref())?));
+		let output_request = match v1::OutputRequest::try_from(request.output_request) {
+			Ok(v1::OutputRequest::Complete) => omp_tool::OutputRequest::Complete,
+			Ok(v1::OutputRequest::Bounded | v1::OutputRequest::Unspecified) | Err(_) => {
+				omp_tool::OutputRequest::Bounded
+			},
+		};
+		let output = Arc::new(Mutex::new(OutputCapture::new_with_request(
+			self.inner.output_store.lock().as_ref(),
+			output_request,
+		)?));
 		let (cancel_tx, cancel_rx) = flume::bounded(1);
 		let control = Arc::new(RunControl {
 			cancel_tx,
@@ -1105,9 +1115,10 @@ impl ExecHost {
 		let executed = self
 			.exec(
 				ExecRequest {
-					session: private_session.clone(),
-					source:  spec.source.clone(),
-					props:   Default::default(),
+					session:        private_session.clone(),
+					source:         spec.source.clone(),
+					output_request: v1::OutputRequest::Bounded as i32,
+					props:          Default::default(),
 				},
 				timeout,
 			)
@@ -2369,17 +2380,11 @@ fn finish_session_command(
 	working_dir: &Path,
 ) {
 	command.control.finished.store(true, Ordering::Release);
-	let spilled_output = match command.output.lock().finish() {
-		Ok(reference) => reference.map(|reference| WireBlob {
-			hash:   Bytes::copy_from_slice(&reference.hash.into_bytes()),
-			mime:   String::from("application/octet-stream"),
-			size:   reference.size,
-			inline: Bytes::new(),
-			detail: Default::default(),
-		}),
+	let (spilled_output, projection) = match command.output.lock().finish_with_projection() {
+		Ok((spilled, projection)) => (spilled.as_ref().map(wire_blob), Some(projection)),
 		Err(_) => {
 			result = RunTerminal::Failed;
-			None
+			(None, None)
 		},
 	};
 	let (final_cwd_uri, final_cwd_revision) = command.host.upgrade().map_or_else(
@@ -2418,7 +2423,7 @@ fn finish_session_command(
 	}
 	let event = ExecEvent::Exit(ExitEvent {
 		exec: command.exec.clone(),
-		status: Some(result.status(elapsed, spilled_output)),
+		status: Some(result.status_with_projection(elapsed, spilled_output, projection)),
 		final_cwd_uri,
 		final_cwd_revision,
 		props: Default::default(),
@@ -2435,8 +2440,27 @@ enum RunTerminal {
 	Denied { exit_code: Option<i32>, fact: SandboxDenialFact },
 }
 
+fn wire_blob(reference: &omp_journal::blob::BlobRef) -> WireBlob {
+	WireBlob {
+		hash:   Bytes::copy_from_slice(reference.hash.as_bytes()),
+		mime:   String::from("application/octet-stream"),
+		size:   reference.size,
+		inline: Bytes::new(),
+		detail: Default::default(),
+	}
+}
+
 impl RunTerminal {
 	fn status(self, elapsed: Duration, spilled_output: Option<WireBlob>) -> ExecStatusMsg {
+		self.status_with_projection(elapsed, spilled_output, None)
+	}
+
+	fn status_with_projection(
+		self,
+		elapsed: Duration,
+		spilled_output: Option<WireBlob>,
+		projection: Option<v1::OutputProjection>,
+	) -> ExecStatusMsg {
 		let props = match &self {
 			Self::Denied { fact, .. } => Some(WireValueMap {
 				fields: BTreeMap::from([(SANDBOX_DENIED_PATH_PROP.to_owned(), WireValue {
@@ -2460,6 +2484,7 @@ impl RunTerminal {
 			wall_clock_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
 			spilled_output,
 			aborted,
+			projection,
 			props,
 		}
 	}
@@ -2700,6 +2725,10 @@ fn setup_io(
 
 struct OutputCapture {
 	stage:             Option<BlobStage>,
+	request:           omp_tool::OutputRequest,
+	inline_limit:      usize,
+	frame_limit:       usize,
+	source_bytes:      u64,
 	projected_bytes:   usize,
 	projected_frames:  usize,
 	projection_closed: bool,
@@ -2708,30 +2737,43 @@ struct OutputCapture {
 }
 
 impl OutputCapture {
-	fn new(store: Option<&BlobStore>) -> Result<Self, ExecError> {
+	fn new_with_request(
+		store: Option<&BlobStore>,
+		request: omp_tool::OutputRequest,
+	) -> Result<Self, ExecError> {
+		let (inline_limit, frame_limit) = match request {
+			omp_tool::OutputRequest::Bounded => (LIVE_OUTPUT_BYTES, LIVE_OUTPUT_FRAMES),
+			omp_tool::OutputRequest::Complete => (COMPLETE_OUTPUT_BYTES, COMPLETE_OUTPUT_FRAMES),
+		};
 		Ok(Self {
-			stage:             store.map(BlobStore::begin_put).transpose()?,
-			projected_bytes:   0,
-			projected_frames:  0,
+			stage: store.map(BlobStore::begin_put).transpose()?,
+			request,
+			inline_limit,
+			frame_limit,
+			source_bytes: 0,
+			projected_bytes: 0,
+			projected_frames: 0,
 			projection_closed: false,
-			spilled:           false,
-			error:             None,
+			spilled: false,
+			error: None,
 		})
 	}
 
 	fn project(&mut self, data: &[u8]) -> Option<Bytes> {
-		let Some(stage) = self.stage.as_mut() else {
-			return Some(Bytes::copy_from_slice(data));
-		};
-		if let Err(error) = stage.write_all(data) {
+		self.source_bytes = self
+			.source_bytes
+			.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+		if let Some(stage) = self.stage.as_mut()
+			&& let Err(error) = stage.write_all(data)
+		{
 			self.error = Some(error);
 		}
 		if self.projection_closed {
 			self.spilled = true;
 			return None;
 		}
-		let remaining = LIVE_OUTPUT_BYTES.saturating_sub(self.projected_bytes);
-		let projected = if self.projected_frames < LIVE_OUTPUT_FRAMES {
+		let remaining = self.inline_limit.saturating_sub(self.projected_bytes);
+		let projected = if self.projected_frames < self.frame_limit {
 			remaining.min(data.len())
 		} else {
 			0
@@ -2747,19 +2789,26 @@ impl OutputCapture {
 		self.spilled = true;
 	}
 
-	fn finish(&mut self) -> Result<Option<omp_journal::blob::BlobRef>, omp_journal::blob::Error> {
+	fn finish_with_projection(
+		&mut self,
+	) -> Result<(Option<omp_journal::blob::BlobRef>, v1::OutputProjection), omp_journal::blob::Error>
+	{
 		if let Some(error) = self.error.take() {
 			self.stage.take();
 			return Err(error.into());
 		}
-		let Some(stage) = self.stage.take() else {
-			return Ok(None);
+		let artifact = self.stage.take().map(BlobStage::finish).transpose()?;
+		let projection = v1::OutputProjection {
+			request:      match self.request {
+				omp_tool::OutputRequest::Bounded => v1::OutputRequest::Bounded as i32,
+				omp_tool::OutputRequest::Complete => v1::OutputRequest::Complete as i32,
+			},
+			source_bytes: self.source_bytes,
+			inline_bytes: u64::try_from(self.projected_bytes).unwrap_or(u64::MAX),
+			omitted:      self.spilled,
+			artifact:     artifact.as_ref().map(wire_blob),
 		};
-		if self.spilled {
-			stage.finish().map(Some)
-		} else {
-			Ok(None)
-		}
+		Ok((self.spilled.then_some(artifact).flatten(), projection))
 	}
 }
 
@@ -4241,7 +4290,9 @@ mod tests {
 	fn tiny_output_frames_are_count_bounded_and_spilled_whole() {
 		let root = tempfile::tempdir().expect("temporary artifact root");
 		let store = BlobStore::open(root.path().join("artifacts")).expect("artifact store");
-		let mut capture = OutputCapture::new(Some(&store)).expect("output capture");
+		let mut capture =
+			OutputCapture::new_with_request(Some(&store), omp_tool::OutputRequest::Bounded)
+				.expect("output capture");
 		let mut projected = Vec::new();
 		for _ in 0..(LIVE_OUTPUT_FRAMES + 17) {
 			if let Some(frame) = capture.project(b"x") {
@@ -4250,8 +4301,9 @@ mod tests {
 		}
 		assert_eq!(projected, vec![b'x'; LIVE_OUTPUT_FRAMES]);
 		let reference = capture
-			.finish()
+			.finish_with_projection()
 			.expect("capture finalizes")
+			.0
 			.expect("frame overflow spills");
 		let expected = vec![b'x'; LIVE_OUTPUT_FRAMES + 17];
 		assert_eq!(

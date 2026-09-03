@@ -26,8 +26,9 @@ pub use client::{
 	DocumentRead, EnvClient, ExecEvent, ExecRun, ExtensionEnvClient, InProcessEnvTransport,
 	Invocation, InvocationEvent, InvocationGrant, InvocationPrincipal, LspEvents, LspStreamEvent,
 	McpSubscription, McpSubscriptionEvent, ProcessAttachment, ProcessAttachmentEvent, RequestStream,
-	ResourceCompletionEvent, ResourceCompletionStream, SearchEvent, SearchStream, StreamLost,
-	TransactionId, TransactionOutcome, WalkEvent, WalkStream, WorkerEnvClient,
+	ResourceCompletionEvent, ResourceCompletionStream, ResumableBlobTransfer, SearchEvent,
+	SearchStream, StreamLost, TransactionId, TransactionOutcome, VerifiedBlobTransfer, WalkEvent,
+	WalkStream, WorkerEnvClient,
 };
 pub use guard::{RunGuard, WorkerLease};
 /// Generated blob protocol messages accepted by scoped blob operations.

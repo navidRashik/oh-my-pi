@@ -14,7 +14,7 @@ use bytes::Bytes;
 #[cfg(unix)]
 use bytes::BytesMut;
 use flume::{Receiver, Sender};
-use omp_core::{EnvPath, Str, sf};
+use omp_core::{EnvPath, Hash32, Str, hash32::Hasher, sf};
 #[cfg(unix)]
 use omp_proto::prost::Message as _;
 use omp_proto::{
@@ -103,6 +103,52 @@ pub enum ClientError {
 	UnexpectedResponse {
 		/// The response body expected by the operation.
 		expected: &'static str,
+	},
+	/// A blob digest did not contain exactly 32 raw SHA-256 bytes.
+	#[error("environment blob digest has {actual} bytes; expected 32")]
+	InvalidBlobDigest {
+		/// Observed digest width.
+		actual: usize,
+	},
+	/// A declared blob is larger than the caller's total transfer bound.
+	#[error("environment blob is {size} bytes; transfer limit is {limit} bytes")]
+	BlobTooLarge {
+		/// Complete size declared by the content reference.
+		size:  u64,
+		/// Maximum accepted total size.
+		limit: u64,
+	},
+	/// A resumed range did not begin at the next verified byte.
+	#[error("environment blob resume offset mismatch: expected {expected}, requested {actual}")]
+	BlobResumeOffsetMismatch {
+		/// Next byte required by the retained transfer state.
+		expected: u64,
+		/// Byte offset requested from the environment.
+		actual:   u64,
+	},
+	/// The blob stream omitted or repeated first-chunk provenance metadata.
+	#[error("environment blob stream metadata is invalid")]
+	InvalidBlobMetadata,
+	/// Blob stream provenance disagreed with the requested content reference.
+	#[error("environment blob stream digest does not match the requested reference")]
+	BlobDigestMismatch,
+	/// Blob stream size metadata disagreed with the requested content reference.
+	#[error("environment blob stream size mismatch: expected {expected} bytes, got {actual}")]
+	BlobSizeMismatch {
+		/// Size declared by the requested content reference.
+		expected: u64,
+		/// Size observed in metadata or transferred bytes.
+		actual:   u64,
+	},
+	/// The blob stream ended without its successful completion marker.
+	#[error("environment blob stream ended before completion")]
+	IncompleteBlob,
+	/// The destination rejected bytes from a verified blob transfer.
+	#[error("failed to persist environment blob")]
+	BlobWrite {
+		/// Destination write failure.
+		#[source]
+		source: io::Error,
 	},
 }
 
@@ -535,9 +581,13 @@ pub enum ProcessAttachmentEvent {
 }
 
 /// A streaming blob download.
+///
+/// Unlike a detached raw request stream, dropping an incomplete blob download
+/// cancels its server-side transfer.
 #[derive(Debug)]
 pub struct BlobDownload {
-	stream: RequestStream,
+	request: GetRequest,
+	stream:  RequestStream,
 }
 
 /// One event from a blob download.
@@ -547,6 +597,75 @@ pub enum BlobDownloadEvent {
 	Chunk(Chunk),
 	/// The successful terminal download marker.
 	Complete(BlobGetComplete),
+}
+
+/// Provenance verified after a complete bounded blob download.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedBlobTransfer {
+	/// SHA-256 digest declared by the caller and recomputed over transferred
+	/// bytes.
+	pub hash: Hash32,
+	/// Exact complete blob size.
+	pub size: u64,
+}
+
+/// Stateful verifier for a bounded download that may cross connections.
+///
+/// The state advances only after the destination accepts a complete chunk. If
+/// a stream is cancelled or disconnected, [`Self::request`] produces the exact
+/// next range request for any replacement environment client. Digest
+/// verification spans all resumed segments rather than trusting
+/// per-connection metadata alone.
+pub struct ResumableBlobTransfer {
+	hash:        Hash32,
+	size:        u64,
+	max_bytes:   u64,
+	next_offset: u64,
+	hasher:      Hasher,
+}
+
+impl ResumableBlobTransfer {
+	/// Starts a whole-blob transfer under a caller-owned total byte bound.
+	///
+	/// # Errors
+	///
+	/// Returns [`ClientError::BlobTooLarge`] before any request when the
+	/// declared complete size exceeds `max_bytes`.
+	pub fn new(hash: Hash32, size: u64, max_bytes: u64) -> Result<Self, ClientError> {
+		if size > max_bytes {
+			return Err(ClientError::BlobTooLarge { size, limit: max_bytes });
+		}
+		Ok(Self { hash, size, max_bytes, next_offset: 0, hasher: Hasher::new() })
+	}
+
+	/// Builds a request for the complete remainder, suitable for a newly
+	/// connected client.
+	pub fn request(&self) -> GetRequest {
+		self.request_range(0)
+	}
+
+	/// Builds the next contiguous bounded range request.
+	///
+	/// `length` follows the wire convention: zero selects the complete
+	/// remainder, while a nonzero value caps this request without changing the
+	/// complete transfer's digest or size provenance.
+	pub fn request_range(&self, length: u64) -> GetRequest {
+		GetRequest {
+			hash: Bytes::copy_from_slice(self.hash.as_bytes()),
+			offset: self.next_offset,
+			length,
+		}
+	}
+
+	/// Returns the first byte not yet persisted and verified.
+	pub const fn next_offset(&self) -> u64 {
+		self.next_offset
+	}
+
+	/// Returns whether all declared bytes have been persisted.
+	pub const fn is_complete(&self) -> bool {
+		self.next_offset == self.size
+	}
 }
 
 /// A streaming, correlated blob upload.
@@ -1936,9 +2055,9 @@ impl EnvClient {
 	/// Starts a streaming blob download.
 	pub async fn blob_get(&self, request: GetRequest) -> Result<BlobDownload, ClientError> {
 		let stream = self
-			.open(client_frame::Body::BlobGet(request), None)
+			.open(client_frame::Body::BlobGet(request.clone()), None)
 			.await?;
-		Ok(BlobDownload { stream })
+		Ok(BlobDownload { request, stream })
 	}
 
 	/// Starts a streaming blob upload.
@@ -2973,9 +3092,9 @@ impl WorkerEnvClient {
 	pub async fn blob_get(&self, request: GetRequest) -> Result<BlobDownload, ClientError> {
 		let stream = self
 			.client
-			.open(client_frame::Body::BlobGet(request), Some(&self.scope))
+			.open(client_frame::Body::BlobGet(request.clone()), Some(&self.scope))
 			.await?;
-		Ok(BlobDownload { stream })
+		Ok(BlobDownload { request, stream })
 	}
 
 	/// Starts a scoped streaming blob upload.
@@ -3125,6 +3244,14 @@ impl RequestStream {
 	/// keeps the stream returned by detached work safe to discard; callers that
 	/// own an ordinary long-lived request can cancel it explicitly here.
 	pub fn cancel(mut self) {
+		self.request_cancel();
+		self.finish();
+	}
+
+	fn request_cancel(&mut self) {
+		if self.finished {
+			return;
+		}
 		if let Some(client) = self.client.upgrade() {
 			let scope = client.request_scopes.lock().get(&self.request_id).cloned();
 			let _ = client.outgoing.try_send(ClientFrame {
@@ -3137,7 +3264,6 @@ impl RequestStream {
 				..ClientFrame::default()
 			});
 		}
-		self.finish();
 	}
 
 	fn finish(&mut self) {
@@ -3762,6 +3888,7 @@ impl BlobDownload {
 		let body = match response_body(frame) {
 			Ok(body) => body,
 			Err(error) => {
+				self.stream.request_cancel();
 				self.stream.finish();
 				return Err(error);
 			},
@@ -3774,20 +3901,177 @@ impl BlobDownload {
 			},
 			server_frame::Body::EventStreamError(event) => {
 				let error = stream_lost(event);
+				self.stream.request_cancel();
 				self.stream.finish();
 				Err(error)
 			},
 			_ => {
+				self.stream.request_cancel();
 				self.stream.finish();
 				Err(ClientError::UnexpectedResponse { expected: "blob chunk or completion" })
 			},
 		}
 	}
 
-	/// Stops this download before its completion marker.
-	pub fn cancel(self) {
-		self.stream.cancel();
+	/// Streams a complete blob into `destination` under a caller-owned total
+	/// bound while verifying first-chunk metadata, the completion marker,
+	/// transferred length, and the SHA-256 digest.
+	///
+	/// This single-request convenience delegates to
+	/// [`ResumableBlobTransfer::receive`], keeping verdict consumers and generic
+	/// blob consumers on one verifier. Use [`ResumableBlobTransfer`] directly
+	/// when a replacement connection must continue after interruption.
+	pub async fn write_verified(
+		self,
+		expected_hash: Hash32,
+		expected_size: u64,
+		max_bytes: u64,
+		destination: &mut (impl io::Write + Send),
+	) -> Result<VerifiedBlobTransfer, ClientError> {
+		let mut transfer = ResumableBlobTransfer::new(expected_hash, expected_size, max_bytes)?;
+		transfer
+			.receive(self, destination)
+			.await?
+			.ok_or(ClientError::IncompleteBlob)
 	}
+
+	/// Stops this download before its completion marker.
+	pub fn cancel(mut self) {
+		self.stream.request_cancel();
+		self.stream.finish();
+	}
+}
+
+impl Drop for BlobDownload {
+	fn drop(&mut self) {
+		if !self.stream.finished {
+			self.stream.request_cancel();
+			self.stream.finish();
+		}
+	}
+}
+
+impl ResumableBlobTransfer {
+	/// Consumes one requested range and advances durable transfer progress.
+	///
+	/// Each chunk is written before the next frame is requested, preserving
+	/// destination backpressure. On transport loss or cancellation, fully
+	/// written chunks remain represented by [`Self::next_offset`]; the caller
+	/// may open a replacement client with [`Self::request`] and call `receive`
+	/// again.
+	/// A destination write error is terminal because `std::io::Write` cannot
+	/// report how much of a failed `write_all` reached the destination.
+	///
+	/// # Errors
+	///
+	/// Returns a typed [`ClientError`] for mismatched range position,
+	/// provenance, size, digest, destination failure, or transport loss.
+	pub async fn receive(
+		&mut self,
+		mut download: BlobDownload,
+		destination: &mut (impl io::Write + Send),
+	) -> Result<Option<VerifiedBlobTransfer>, ClientError> {
+		let requested_hash = parse_blob_hash(&download.request.hash)?;
+		if requested_hash != self.hash {
+			return Err(ClientError::BlobDigestMismatch);
+		}
+		if download.request.offset != self.next_offset {
+			return Err(ClientError::BlobResumeOffsetMismatch {
+				expected: self.next_offset,
+				actual:   download.request.offset,
+			});
+		}
+
+		let available = self.size - self.next_offset;
+		let expected_segment = if download.request.length == 0 {
+			available
+		} else {
+			download.request.length.min(available)
+		};
+		let segment_start = self.next_offset;
+		let mut first = true;
+
+		loop {
+			match download.next_event().await? {
+				Some(BlobDownloadEvent::Chunk(chunk)) => {
+					if first {
+						let hash = parse_blob_hash(&chunk.hash)?;
+						if hash != self.hash {
+							return Err(ClientError::BlobDigestMismatch);
+						}
+						let size = chunk.size.ok_or(ClientError::InvalidBlobMetadata)?;
+						if size != self.size {
+							return Err(ClientError::BlobSizeMismatch {
+								expected: self.size,
+								actual:   size,
+							});
+						}
+						first = false;
+					} else if !chunk.hash.is_empty() || chunk.size.is_some() {
+						return Err(ClientError::InvalidBlobMetadata);
+					}
+
+					let chunk_len = u64::try_from(chunk.data.len()).unwrap_or(u64::MAX);
+					let segment_received = self.next_offset - segment_start;
+					if chunk_len == 0 && segment_received < expected_segment {
+						return Err(ClientError::InvalidBlobMetadata);
+					}
+					let next_segment = segment_received
+						.checked_add(chunk_len)
+						.ok_or(ClientError::BlobTooLarge { size: u64::MAX, limit: self.max_bytes })?;
+					let next_offset = self
+						.next_offset
+						.checked_add(chunk_len)
+						.ok_or(ClientError::BlobTooLarge { size: u64::MAX, limit: self.max_bytes })?;
+					if next_segment > expected_segment
+						|| next_offset > self.size
+						|| next_offset > self.max_bytes
+					{
+						return Err(ClientError::BlobSizeMismatch {
+							expected: expected_segment,
+							actual:   next_segment,
+						});
+					}
+
+					io::Write::write_all(destination, &chunk.data)
+						.map_err(|source| ClientError::BlobWrite { source })?;
+					self.hasher.update(&chunk.data);
+					self.next_offset = next_offset;
+				},
+				Some(BlobDownloadEvent::Complete(complete)) => {
+					if first {
+						return Err(ClientError::InvalidBlobMetadata);
+					}
+					let hash = parse_blob_hash(&complete.hash)?;
+					if hash != self.hash {
+						return Err(ClientError::BlobDigestMismatch);
+					}
+					let segment_received = self.next_offset - segment_start;
+					if complete.bytes_sent != segment_received || segment_received != expected_segment {
+						return Err(ClientError::BlobSizeMismatch {
+							expected: expected_segment,
+							actual:   segment_received,
+						});
+					}
+					if self.is_complete() {
+						if self.hasher.finalize() != self.hash {
+							return Err(ClientError::BlobDigestMismatch);
+						}
+						return Ok(Some(VerifiedBlobTransfer { hash: self.hash, size: self.size }));
+					}
+					return Ok(None);
+				},
+				None => return Err(ClientError::IncompleteBlob),
+			}
+		}
+	}
+}
+
+fn parse_blob_hash(bytes: &[u8]) -> Result<Hash32, ClientError> {
+	let hash: [u8; 32] = bytes
+		.try_into()
+		.map_err(|_| ClientError::InvalidBlobDigest { actual: bytes.len() })?;
+	Ok(Hash32::new(hash))
 }
 
 impl BlobUpload {

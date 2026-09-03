@@ -13,7 +13,9 @@ package omp.blob.v1;
 service Blob {
   // Checks whether a digest is present without transferring its content.
   rpc Stat(StatRequest) returns (StatResponse);
-  // Streams all or a requested byte range of the identified content.
+  // Streams all or a requested byte range of the identified content. After an
+  // interrupted stream, clients resume by issuing Get with the same hash and
+  // the offset advanced only by bytes already persisted.
   rpc Get(GetRequest) returns (stream Chunk);
   // Stores one ordered stream of blob bytes. The server hashes bytes as they
   // arrive. Put is idempotent: content addressing makes re-putting existing
@@ -53,11 +55,12 @@ message Chunk {
   // Blob bytes. For Put, concatenating data from the stream in arrival order
   // yields the complete blob that the server hashes while receiving.
   bytes data = 1;
-  // Optional expected digest on the first Put chunk. On Get, the first chunk
-  // carries the stored digest.
+  // Optional expected digest on the first Put chunk. On every Get request,
+  // including resumed ranges, the first chunk carries the complete stored
+  // blob's digest.
   bytes hash = 2;
-  // Optional expected total size on the first Put chunk. On Get, the first
-  // chunk carries the full stored size, even for ranged reads.
+  // Optional expected total size on the first Put chunk. On every Get request,
+  // the first chunk carries the complete stored size, even for ranged reads.
   optional uint64 size = 3;
 }
 

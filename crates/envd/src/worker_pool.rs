@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use flume::{Receiver, Sender};
 use omp_core::{CowBytes, Str, encoding::hex};
 use omp_env::WorkerLease;
-use omp_journal::blob::{self, BlobStore};
+use omp_journal::blob::{self, BlobStage, BlobStore};
 use omp_proto::{env::v1::WorkerData, thread::v1};
 use omp_tools::edit::SnapshotFault;
 use parking_lot::Mutex;
@@ -24,9 +24,12 @@ use thiserror::Error;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::exthost::control::{
-	ControlAuthority, ControlConnectionIdentity, ControlEffect, ControlProtocolError,
-	ControlRequestContext,
+use super::{
+	blobs::{BlobError, BlobHost},
+	exthost::control::{
+		ControlAuthority, ControlConnectionIdentity, ControlEffect, ControlProtocolError,
+		ControlRequestContext,
+	},
 };
 
 /// Largest tunnel header accepted before any buffer allocation.
@@ -118,11 +121,12 @@ impl TunnelFrame {
 }
 /// The sole environment-side minting authority for spilled worker payloads.
 ///
-/// Both remote-frame diversion and verdict spilling enter through
-/// [`Self::put_reader`], which delegates directly to [`BlobStore::put_reader`].
+/// Remote-frame diversion uses [`Self::put_reader`]; streamed verdicts use
+/// [`Self::begin_verdict`] and [`Self::finish_verdict`]. Both paths delegate to
+/// the same [`BlobHost`] authority.
 #[derive(Clone, Debug)]
 pub struct SpillDiverter {
-	store: Arc<BlobStore>,
+	host: BlobHost,
 }
 
 /// A value that can spill a verdict through the environment blob authority.
@@ -136,8 +140,31 @@ pub trait VerdictSpill {
 
 impl SpillDiverter {
 	/// Binds the diverter to the Environment's unique blob store.
-	pub const fn new(store: Arc<BlobStore>) -> Self {
-		Self { store }
+	pub const fn new(host: BlobHost) -> Self {
+		Self { host }
+	}
+
+	/// Opens the single staged writer used for an incremental worker verdict.
+	///
+	/// # Errors
+	/// Returns the blob-host error if the temporary stage cannot be created.
+	pub fn begin_verdict(&self) -> Result<BlobStage, BlobError> {
+		self.host.begin_worker_verdict()
+	}
+
+	/// Finishes a staged worker verdict and returns its hash-only wire identity.
+	///
+	/// # Errors
+	/// Returns the blob-host error if synchronization, retention, or atomic
+	/// placement fails.
+	pub fn finish_verdict(&self, stage: BlobStage) -> Result<v1::Blob, BlobError> {
+		let id = self.host.finish_worker_verdict(stage)?;
+		Ok(v1::Blob { hash: id.hash.to_vec().into(), size: id.size, ..v1::Blob::default() })
+	}
+
+	/// Borrows the underlying store for validation reads after staged placement.
+	pub(crate) fn store(&self) -> &BlobStore {
+		self.host.worker_verdict_store()
 	}
 
 	/// Streams one out-of-band buffer into the blob store without rebuilding it.
@@ -145,7 +172,7 @@ impl SpillDiverter {
 	/// # Errors
 	/// Returns the blob-store error if durable placement fails.
 	pub fn put_reader(&self, reader: impl Read) -> Result<v1::Blob, blob::Error> {
-		let reference = self.store.put_reader(reader)?;
+		let reference = self.host.store().put_reader(reader)?;
 		Ok(v1::Blob {
 			hash: reference.hash.as_bytes().to_vec().into(),
 			size: reference.size,

@@ -28,6 +28,8 @@ mod managed_skills;
 pub mod managed_skills_domain;
 pub mod mcp;
 mod media_devices;
+mod media_tts;
+mod report_issue;
 pub mod memory;
 /// Additional literal pi environment-setting convars.
 pub mod pi_settings;
@@ -1898,6 +1900,7 @@ fn acp_exec_body(
 					wall_clock_ms: status.wall_clock_ms,
 					spilled_output,
 					aborted: status.aborted,
+					projection: None,
 					props: Some(acp_bool_props([("acp/effects-unknown", status.effects_unknown)])),
 				}),
 				final_cwd_uri,

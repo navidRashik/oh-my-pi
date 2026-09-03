@@ -97,16 +97,34 @@ impl WorkspaceSearch for WorkspaceSearchAdapter {
 		}
 	}
 
+	fn stage_snapshots(&self, snapshots: Vec<SearchSnapshot>) -> Result<(), grep::Fault> {
+		let mut store = self.documents.snapshot_store().lock();
+		for snapshot in snapshots {
+			store
+				.record(
+					snapshot.source_key,
+					RevisionToken::new(&snapshot.revision),
+					snapshot.bytes,
+					std::iter::empty(),
+				)
+				.map_err(grep_workspace_message)?;
+		}
+		Ok(())
+	}
+
 	fn record_snapshots(&self, records: Vec<grep::SnapshotRecord>) -> Result<(), grep::Fault> {
 		let mut store = self.documents.snapshot_store().lock();
 		for record in records {
+			let revision = RevisionToken::new(&record.revision);
+			let Some(snapshot) = store.by_revision(&record.source_key, &revision) else {
+				return Err(grep::Fault::Workspace {
+					message: Str::new_static(
+						"grep snapshot revision expired before visibility authorization",
+					),
+				});
+			};
 			store
-				.record(
-					record.source_key,
-					RevisionToken::new(&record.revision),
-					record.bytes,
-					record.seen_lines,
-				)
+				.record(record.source_key, revision, snapshot.bytes().clone(), record.seen_lines)
 				.map_err(grep_workspace_message)?;
 		}
 		Ok(())
@@ -1507,10 +1525,20 @@ mod tests {
 		let [snapshot] = result.snapshots.as_slice() else {
 			panic!("one editable snapshot candidate expected: {:?}", result.snapshots);
 		};
+		WorkspaceSearch::stage_snapshots(&adapter, vec![snapshot.clone()])
+			.expect("stage exact snapshot without visibility");
+		assert!(
+			adapter
+				.documents
+				.snapshot_store()
+				.lock()
+				.head(source_key.as_str())
+				.is_some_and(|snapshot| snapshot.seen_lines().is_empty()),
+			"staging bytes must not authorize any source line"
+		);
 		WorkspaceSearch::record_snapshots(&adapter, vec![grep::SnapshotRecord {
 			source_key: snapshot.source_key.clone(),
 			revision:   snapshot.revision.clone(),
-			bytes:      snapshot.bytes.clone(),
 			seen_lines: vec![2],
 		}])
 		.expect("record final visible line");

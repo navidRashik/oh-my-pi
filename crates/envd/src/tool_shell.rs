@@ -650,6 +650,10 @@ impl ShellExec for ShellExecHost {
 		let mut exec_request = ExecRequest {
 			session: session.id.clone(),
 			source: Some(Script { text: command.to_string(), ..Default::default() }),
+			output_request: match tools::invocation_output_request() {
+				omp_tool::OutputRequest::Bounded => v1::OutputRequest::Bounded as i32,
+				omp_tool::OutputRequest::Complete => v1::OutputRequest::Complete as i32,
+			},
 			..Default::default()
 		};
 		super::exec::set_run_environment(&mut exec_request, environment);

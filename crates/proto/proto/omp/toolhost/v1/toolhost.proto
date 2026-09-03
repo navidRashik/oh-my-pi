@@ -19,7 +19,7 @@ import "omp/ui/v1/ui.proto";
 //   - Receivers skip unknown fields and enum values.
 //   - Experimental extensions use a namespaced ValueMap at tag 15.
 //   - Field numbers are never reused; removed fields are reserved.
-//   - A terminal ToolComplete, ToolArgs, or ToolAborted fuses an invocation.
+//   - A terminal ToolResultComplete, ToolArgs, or ToolAborted fuses an invocation.
 //   - New domains use nested envelopes; the original direct arms remain fixed.
 message WorkerHello {
   uint32 schema_rev = 1;
@@ -184,18 +184,36 @@ enum OutcomeKind {
   OUTCOME_KIND_ARGS_REJECTED = 3;
   OUTCOME_KIND_ABORTED = 4;
 }
-message ToolComplete {
+// One result stream is Start, one or more non-empty Chunk frames, then
+// Complete. The host stages chunks directly into its CAS before accepting the
+// completion; the worker never mints artifact identities.
+message ToolResultStart {
   string call_id = 1;
   repeated omp.thread.v1.Part parts = 2;
-  bytes details_json = 3;
-  bool is_error = 4;
-  bool useless = 5;
-  optional ArgIssue args_issue = 6;
-  optional omp.thread.v1.Blob details_blob = 7;
+  bool useless = 3;
+  optional ArgIssue args_issue = 4;
   // Suppress the automatic model follow-up only when every result in the batch opts in.
-  optional bool terminate = 8;
+  optional bool terminate = 5;
   omp.inference.v1.ValueMap props = 15;
   OutcomeKind kind = 16;
+}
+// data is bounded to RESULT_CHUNK_MAX_BYTES by the host preflight.
+message ToolResultChunk {
+  string call_id = 1;
+  bytes data = 2;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ToolResultComplete {
+  string call_id = 1;
+  omp.inference.v1.ValueMap props = 15;
+}
+message ResultWorkerEnvelope {
+  oneof body {
+    ToolResultStart start = 1;
+    ToolResultChunk chunk = 2;
+    ToolResultComplete complete = 3;
+  }
+  omp.inference.v1.ValueMap props = 15;
 }
 message ToolArgs {
   string call_id = 1;
@@ -1597,12 +1615,14 @@ message HostFrame {
 }
 
 message WorkerFrame {
+  reserved 5;
+  reserved "tool_complete";
+
   uint64 request_id = 1;
   oneof body {
     WorkerHello hello = 2;
     RegisterTools register_tools = 3;
     ToolUpdate tool_update = 4;
-    ToolComplete tool_complete = 5;
     ToolAborted tool_aborted = 6;
     Pong pong = 7;
     Ping ping = 8;
@@ -1618,6 +1638,7 @@ message WorkerFrame {
     InferenceWorkerEnvelope inference = 19;
     TelemetryWorkerEnvelope telemetry = 20;
     RegimeWorkerEnvelope regimes = 21;
+    ResultWorkerEnvelope result = 22;
   }
   omp.inference.v1.ValueMap props = 15;
 }

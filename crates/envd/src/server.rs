@@ -85,7 +85,7 @@ use url::Url;
 
 use super::{
 	admission::{AdmissionDecision, AdmissionGate, ApprovalPolicy, effects_narrow_or_refuse},
-	blobs::{BlobError, BlobHost, BlobRead},
+	blobs::{BlobError, BlobHost, BlobId, BlobRead},
 	browser_daemon::BrowserSettings,
 	docs::{
 		AcpDocumentBackend, DapRegistryEvent, DocumentError, DocumentEvents, DocumentHost,
@@ -129,11 +129,11 @@ use super::{
 		AgentCheckpointControl, InvocationAcpBackends, InvocationEditRepairContext,
 		SessionRegistryBridges, build_environment_declaration_inputs, production_registry,
 		session_registry, with_acp_scope, with_edit_repair_scope, with_invocation_scope,
-		with_invocation_session_scope,
+		with_invocation_session_scope, with_output_request_scope,
 	},
 	vcs::{self, RepositoryAvailability},
 	worker::{
-		DomainControlSlot, ExtHostConfig, ExtHostSpec, ExtHostSupervisor,
+		DEFAULT_MAX_FRAME_BYTES, DomainControlSlot, ExtHostConfig, ExtHostSpec, ExtHostSupervisor,
 		ExternalControlAuthorityBinding, ExternalDomainControlBinding,
 		ExternalDomainControlFactories, HostKey, JournalRuntime, OpenToolCall, PY_EVAL_MODULE,
 		SealedRegistryEvidence, WorkerCompletion, WorkerError, WorkerEvent, WorkerInvocation,
@@ -613,11 +613,12 @@ impl Drop for DocumentAuthority {
 #[derive(Clone)]
 struct WorkerDeviceInvoker {
 	hosts: Arc<ExtHostSupervisor>,
+	blobs: BlobHost,
 }
 
 impl WorkerDeviceInvoker {
-	const fn new(hosts: Arc<ExtHostSupervisor>) -> Self {
-		Self { hosts }
+	const fn new(hosts: Arc<ExtHostSupervisor>, blobs: BlobHost) -> Self {
+		Self { hosts, blobs }
 	}
 }
 
@@ -632,6 +633,7 @@ fn internal_worker_authorization() -> (Bytes, u64) {
 impl DeviceInvoker for WorkerDeviceInvoker {
 	async fn invoke(&self, request: DeviceInvokeRequest) -> omp_tool::ErasedStream<'static> {
 		let hosts = Arc::clone(&self.hosts);
+		let blobs = self.blobs.clone();
 		Box::pin(async_stream::stream! {
 			let deadline = match request.deadline.to_std() {
 				Ok(deadline) => deadline,
@@ -668,8 +670,8 @@ impl DeviceInvoker for WorkerDeviceInvoker {
 			while let Ok(event) = invocation.next().await {
 				match event {
 					WorkerEvent::Update(update) => yield Ok(ErasedEv::Update(Bytes::from(update.encode_to_vec()))),
-					WorkerEvent::Complete(complete) => match worker_completion_json(&complete) {
-						Ok((verdict, _, _)) => {
+					WorkerEvent::Complete(complete) => match materialize_worker_completion(&blobs, &complete) {
+						Ok(verdict) => {
 							yield Ok(ErasedEv::Done(ErasedOutcome::Done {
 								verdict,
 								useless: complete.useless,
@@ -698,11 +700,12 @@ impl DeviceInvoker for WorkerDeviceInvoker {
 #[derive(Clone)]
 struct PreludeBridgeInvoker {
 	hosts: Arc<ExtHostSupervisor>,
+	blobs: BlobHost,
 }
 
 impl PreludeBridgeInvoker {
-	const fn new(hosts: Arc<ExtHostSupervisor>) -> Self {
-		Self { hosts }
+	const fn new(hosts: Arc<ExtHostSupervisor>, blobs: BlobHost) -> Self {
+		Self { hosts, blobs }
 	}
 }
 
@@ -748,19 +751,15 @@ impl PreludeInvoker for PreludeBridgeInvoker {
 			match event {
 				WorkerEvent::Update(_) => {},
 				WorkerEvent::Complete(complete) => {
-					if complete.details_blob.is_some() {
-						return Err(BridgeHostError::message(
-							"prelude helper result was spilled to a blob and is not supported",
-						));
-					}
+					let details = materialize_worker_details(&self.blobs, &complete).map_err(|_| {
+						BridgeHostError::message(
+							"prelude helper result artifact is unavailable or exceeds the bounded \
+							 projection",
+						)
+					})?;
 					match complete.kind {
 						WorkerOutcomeKind::Ok => {
-							let details = complete.details_json.as_deref().ok_or_else(|| {
-								BridgeHostError::message(
-									"prelude helper completion omitted structured details",
-								)
-							})?;
-							return serde_json::from_slice(details).map_err(|error| {
+							return serde_json::from_slice(&details).map_err(|error| {
 								BridgeHostError::message(sf!(
 									"prelude helper returned invalid JSON: {error}"
 								))
@@ -789,14 +788,9 @@ impl PreludeInvoker for PreludeBridgeInvoker {
 							} else {
 								"aborted"
 							};
-							let details = complete.details_json.as_deref().ok_or_else(|| {
-								BridgeHostError::message(sf!(
-									"prelude helper {kind} without structured details"
-								))
-							})?;
-							let detail = match serde_json::from_slice::<serde_json::Value>(details) {
+							let detail = match serde_json::from_slice::<serde_json::Value>(&details) {
 								Ok(serde_json::Value::String(detail)) => Str::from(detail),
-								Ok(_) => Str::from_utf8(details).map_err(|_| {
+								Ok(_) => Str::from_utf8(&details).map_err(|_| {
 									BridgeHostError::message(sf!(
 										"prelude helper {kind} with invalid UTF-8 details"
 									))
@@ -2412,7 +2406,8 @@ impl EnvServer {
 			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
 				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
-		let blobs = BlobHost::open(state_dir.join("blobs"))?;
+		let blobs = BlobHost::open_managed(state_dir.join("blobs"), state_dir.join("sessions"))?;
+		ext_host_config.bind_result_store(blobs.clone());
 		let exec = ExecHost::new()
 			.with_process_store(ProcessStore::new(state_dir.join("processes").join("meta.json")))?
 			.with_github_cache(Arc::clone(&github_cache))
@@ -2513,8 +2508,8 @@ impl EnvServer {
 			acp_exec.clone(),
 			&host_settings.autolearn,
 			control_bindings.hooks.admission_gate(),
-			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
-			PreludeBridgeInvoker::new(Arc::clone(&ext_hosts)),
+			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts), blobs.clone()),
+			PreludeBridgeInvoker::new(Arc::clone(&ext_hosts), blobs.clone()),
 			omp_tool::ToolsPolicy::Auto,
 			registry,
 			bridges,
@@ -2678,7 +2673,8 @@ impl EnvServer {
 			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
 				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
-		let blobs = BlobHost::open(state_dir.join("blobs"))?;
+		let blobs = BlobHost::open_managed(state_dir.join("blobs"), state_dir.join("sessions"))?;
+		ext_host_config.bind_result_store(blobs.clone());
 		let exec = if doc_connections.is_some() {
 			ExecHost::new()
 				.with_process_store(ProcessStore::new(state_dir.join("processes").join("meta.json")))?
@@ -2786,8 +2782,8 @@ impl EnvServer {
 			acp_exec.clone(),
 			&host_settings.autolearn,
 			control_bindings.hooks.admission_gate(),
-			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts)),
-			PreludeBridgeInvoker::new(Arc::clone(&ext_hosts)),
+			WorkerDeviceInvoker::new(Arc::clone(&ext_hosts), blobs.clone()),
+			PreludeBridgeInvoker::new(Arc::clone(&ext_hosts), blobs.clone()),
 			omp_tool::ToolsPolicy::Auto,
 			registry,
 			bridges,
@@ -2881,7 +2877,8 @@ impl EnvServer {
 			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
 				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
-		let blobs = BlobHost::open(state_dir.join("blobs"))?;
+		let blobs = BlobHost::open_managed(state_dir.join("blobs"), state_dir.join("sessions"))?;
+		ext_host_config.bind_result_store(blobs.clone());
 		let exec = ExecHost::new()
 			.with_github_cache(Arc::clone(&github_cache))
 			.with_output_store(blobs.store().clone());
@@ -2978,6 +2975,7 @@ impl EnvServer {
 			state_dir,
 			&telemetry,
 			ext_hosts.as_ref(),
+			con,
 			omp_tool::ToolsPolicy::Auto,
 			&host_settings.tools,
 			&browser_settings,
@@ -5073,6 +5071,7 @@ impl EnvServer {
 							cancel,
 							responses.clone(),
 							finished.clone(),
+							self.blobs.clone(),
 						);
 					},
 					Err(error) => {
@@ -7224,6 +7223,12 @@ impl EnvServer {
 		} else {
 			Duration::from_millis(request.deadline_ms)
 		};
+		let output_request = match pb::OutputRequest::try_from(request.output_request) {
+			Ok(pb::OutputRequest::Complete) => omp_tool::OutputRequest::Complete,
+			Ok(pb::OutputRequest::Bounded | pb::OutputRequest::Unspecified) | Err(_) => {
+				omp_tool::OutputRequest::Bounded
+			},
+		};
 		let maximum_effects = registry
 			.effects(&request.name)
 			.expect("a routed tool has a declared effect envelope")
@@ -7328,10 +7333,12 @@ impl EnvServer {
 				acp_context,
 				feed,
 				deadline,
+				output_request,
 				params,
 				Arc::clone(&registry),
 				lifecycle,
 				cancel,
+				self.blobs.clone(),
 				responses.clone(),
 				finished.clone(),
 			)
@@ -7388,6 +7395,7 @@ impl EnvServer {
 					maximum_effects,
 					execution,
 					request_scope: scope.map(|scope| scope.pty_denied),
+					output_request,
 					interrupt,
 					interrupts: Some(interrupts),
 					cancel,
@@ -7564,6 +7572,7 @@ impl EnvServer {
 				committed,
 				cancel,
 				interrupts,
+				output_request,
 				..
 			}) => {
 				if *committed {
@@ -7614,8 +7623,10 @@ impl EnvServer {
 					invocation,
 					cancel.clone(),
 					interrupts,
+					*output_request,
 					responses.clone(),
 					finished.clone(),
+					self.blobs.clone(),
 				);
 			},
 			Err((code, message)) => send_error(responses, request_id, code, message).await,
@@ -8183,6 +8194,7 @@ enum InvocationState {
 		maximum_effects: Effects,
 		execution:       InvocationExecutionPolicy,
 		request_scope:   Option<bool>,
+		output_request:  omp_tool::OutputRequest,
 		interrupt:       flume::Sender<pb::Interrupt>,
 		interrupts:      Option<Receiver<pb::Interrupt>>,
 		cancel:          CancellationToken,
@@ -8953,173 +8965,256 @@ async fn spawn_native_invocation(
 	acp: InvocationAcpBackends,
 	feed: omp_tool::InvocationFeed,
 	deadline: Duration,
+	output_request: omp_tool::OutputRequest,
 	params: IncomingParams<'static>,
 	registry: Arc<Registry>,
 	lifecycle: Arc<NativeLifecycle>,
 	cancel: CancellationToken,
+	blobs: BlobHost,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
 ) {
 	let (started, start) = flume::bounded(1);
 	tokio::spawn(with_invocation_scope(
 		pty_denied,
-		with_invocation_session_scope(
-			session_id,
-			with_edit_repair_scope(
-				edit_repair,
-				with_acp_scope(acp, async move {
-					let result = registry.invoke(&name, params);
-					let _ = started.send(());
-					match result {
-						Ok(mut stream) => {
-							let mut deadline = Box::pin(time::sleep(deadline));
-							let mut cancel_grace: Option<pin::Pin<Box<Sleep>>> = None;
-							let mut timed_out = false;
-							let mut grace_expired = false;
-							loop {
-								if lifecycle.is_terminal() {
-									break;
-								}
-								if let Some(grace) = cancel_grace.as_mut() {
-									tokio::select! {
-										biased;
-										() = grace.as_mut() => {
-											grace_expired = true;
-											break;
-										},
-										event = stream.next() => {
-											let reason = if timed_out {
-												"native invocation ended without reporting timeout truth"
-											} else {
-												"native invocation ended without reporting cancellation truth"
-											};
-											if matches!(
-												forward_native_event(
+		with_output_request_scope(
+			output_request,
+			with_invocation_session_scope(
+				session_id,
+				with_edit_repair_scope(
+					edit_repair,
+					with_acp_scope(acp, async move {
+						let result = registry.invoke(&name, params);
+						let _ = started.send(());
+						match result {
+							Ok(mut stream) => {
+								let mut deadline = Box::pin(time::sleep(deadline));
+								let mut cancel_grace: Option<pin::Pin<Box<Sleep>>> = None;
+								let mut timed_out = false;
+								let mut grace_expired = false;
+								loop {
+									if lifecycle.is_terminal() {
+										break;
+									}
+									if let Some(grace) = cancel_grace.as_mut() {
+										tokio::select! {
+											biased;
+											() = grace.as_mut() => {
+												grace_expired = true;
+												break;
+											},
+											event = stream.next() => {
+												let reason = if timed_out {
+													"native invocation ended without reporting timeout truth"
+												} else {
+													"native invocation ended without reporting cancellation truth"
+												};
+												if matches!(
+													forward_native_event(
+														event,
+														true,
+														reason,
+														request_id,
+														&invocation_id,
+														&lifecycle,
+														output_request,
+														&blobs,
+														&responses,
+													)
+													.await,
+													NativeForward::Terminal
+												) {
+													break;
+												}
+											},
+										}
+									} else {
+										tokio::select! {
+											biased;
+											() = deadline.as_mut() => {
+												let reason = sf!("native invocation deadline exceeded");
+												let _ = feed.interrupt(Interrupt {
+													class: sf!("deadline"),
+													reason: reason.clone(),
+												});
+												if lifecycle.is_committed() {
+													timed_out = true;
+													cancel_grace = Some(Box::pin(time::sleep(
+														NATIVE_CANCEL_GRACE,
+													)));
+												} else if lifecycle.claim_precommit_terminal() {
+													send_abort_verdict(
+														&responses,
+														request_id,
+														&invocation_id,
+														omp_tool::Abort::Interrupted { reason },
+													)
+													.await;
+													break;
+												} else {
+													break;
+												}
+											},
+											() = cancel.cancelled() => {
+												if lifecycle.is_committed() {
+													cancel_grace = Some(Box::pin(time::sleep(
+														NATIVE_CANCEL_GRACE,
+													)));
+												} else {
+													break;
+												}
+											},
+											event = stream.next() => {
+												match forward_native_event(
 													event,
-													true,
-													reason,
+													false,
+													"",
 													request_id,
 													&invocation_id,
 													&lifecycle,
+													output_request,
+													&blobs,
 													&responses,
 												)
-												.await,
-												NativeForward::Terminal
-											) {
-												break;
-											}
-										},
-									}
-								} else {
-									tokio::select! {
-										biased;
-										() = deadline.as_mut() => {
-											let reason = sf!("native invocation deadline exceeded");
-											let _ = feed.interrupt(Interrupt {
-												class: sf!("deadline"),
-												reason: reason.clone(),
-											});
-											if lifecycle.is_committed() {
-												timed_out = true;
-												cancel_grace = Some(Box::pin(time::sleep(
-													NATIVE_CANCEL_GRACE,
-												)));
-											} else if lifecycle.claim_precommit_terminal() {
-												send_abort_verdict(
-													&responses,
-													request_id,
-													&invocation_id,
-													omp_tool::Abort::Interrupted { reason },
-												)
-												.await;
-												break;
-											} else {
-												break;
-											}
-										},
-										() = cancel.cancelled() => {
-											if lifecycle.is_committed() {
-												cancel_grace = Some(Box::pin(time::sleep(
-													NATIVE_CANCEL_GRACE,
-												)));
-											} else {
-												break;
-											}
-										},
-										event = stream.next() => {
-											match forward_native_event(
-												event,
-												false,
-												"",
-												request_id,
-												&invocation_id,
-												&lifecycle,
-												&responses,
-											)
-											.await
-											{
-												NativeForward::Continue => {},
-												NativeForward::Terminal => break,
-												NativeForward::Backpressure => {
-													let _ = feed.interrupt(Interrupt {
-														class: sf!("backpressure"),
-														reason: sf!(
-															"invocation response consumer stopped reading",
-														),
-													});
-													if lifecycle.is_committed() {
-														cancel_grace = Some(Box::pin(time::sleep(
-															NATIVE_CANCEL_GRACE,
-														)));
-													} else {
-														lifecycle.claim_terminal();
-														break;
-													}
-												},
-											}
-										},
+												.await
+												{
+													NativeForward::Continue => {},
+													NativeForward::Terminal => break,
+													NativeForward::Backpressure => {
+														let _ = feed.interrupt(Interrupt {
+															class: sf!("backpressure"),
+															reason: sf!(
+																"invocation response consumer stopped reading",
+															),
+														});
+														if lifecycle.is_committed() {
+															cancel_grace = Some(Box::pin(time::sleep(
+																NATIVE_CANCEL_GRACE,
+															)));
+														} else {
+															lifecycle.claim_terminal();
+															break;
+														}
+													},
+												}
+											},
+										}
 									}
 								}
-							}
-							if grace_expired && lifecycle.is_committed() && lifecycle.claim_terminal() {
-								drop(stream);
-								let reason = if timed_out {
-									sf!(
-										"native invocation exceeded its deadline and did not stop within \
-										 grace",
+								if grace_expired && lifecycle.is_committed() && lifecycle.claim_terminal() {
+									drop(stream);
+									let reason = if timed_out {
+										sf!(
+											"native invocation exceeded its deadline and did not stop within \
+											 grace",
+										)
+									} else {
+										sf!("native invocation did not stop within cancellation grace")
+									};
+									send_abort_verdict(
+										&responses,
+										request_id,
+										&invocation_id,
+										omp_tool::Abort::EffectsUnknown { reason },
 									)
-								} else {
-									sf!("native invocation did not stop within cancellation grace")
-								};
-								send_abort_verdict(
-									&responses,
-									request_id,
-									&invocation_id,
-									omp_tool::Abort::EffectsUnknown { reason },
-								)
-								.await;
-							}
-						},
-						Err(error) => {
-							if lifecycle.claim_terminal() {
-								let _ = send_invocation_error(
-									&responses,
-									request_id,
-									pb::ProtocolErrorCode::NotFound,
-									&error.to_string(),
-								)
-								.await;
-							}
-						},
-					}
-					let _ = finished
-						.send_async(Finished { request_id, invocation_id: Some(invocation_id) })
-						.await;
-				}),
+									.await;
+								}
+							},
+							Err(error) => {
+								if lifecycle.claim_terminal() {
+									let _ = send_invocation_error(
+										&responses,
+										request_id,
+										pb::ProtocolErrorCode::NotFound,
+										&error.to_string(),
+									)
+									.await;
+								}
+							},
+						}
+						let _ = finished
+							.send_async(Finished { request_id, invocation_id: Some(invocation_id) })
+							.await;
+					}),
+				),
 			),
 		),
 	));
 	let _ = start.recv_async().await;
+}
+
+const DEFAULT_RESULT_PROJECTION_BYTES: usize = 64 * 1024;
+const COMPLETE_RESULT_PROJECTION_BYTES: usize = 8 * 1024 * 1024;
+
+fn utf8_projection_prefix(text: &str, maximum: usize) -> usize {
+	let mut end = maximum.min(text.len());
+	while end > 0 && !text.is_char_boundary(end) {
+		end -= 1;
+	}
+	end
+}
+
+fn project_wire_parts(
+	parts: &mut Vec<thread_pb::Part>,
+	request: omp_tool::OutputRequest,
+) -> (u64, u64, bool) {
+	let limit = match request {
+		omp_tool::OutputRequest::Bounded => DEFAULT_RESULT_PROJECTION_BYTES,
+		omp_tool::OutputRequest::Complete => COMPLETE_RESULT_PROJECTION_BYTES,
+	};
+	let mut source_bytes = 0_u64;
+	let mut inline_bytes = 0_u64;
+	let mut remaining = limit;
+	let mut omitted = false;
+	parts.retain_mut(|part| {
+		let original = part.encoded_len();
+		source_bytes = source_bytes.saturating_add(u64::try_from(original).unwrap_or(u64::MAX));
+		if original <= remaining {
+			remaining -= original;
+			inline_bytes = inline_bytes.saturating_add(u64::try_from(original).unwrap_or(u64::MAX));
+			return true;
+		}
+		let text = match part.kind.as_mut() {
+			Some(thread_pb::part::Kind::Text(text)) => Some(text),
+			Some(thread_pb::part::Kind::Thinking(thinking)) => Some(&mut thinking.text),
+			_ => None,
+		};
+		let Some(text) = text else {
+			omitted = true;
+			return false;
+		};
+		let overhead = original.saturating_sub(text.len());
+		let keep = utf8_projection_prefix(text, remaining.saturating_sub(overhead));
+		text.truncate(keep);
+		let projected = part.encoded_len();
+		omitted = true;
+		if projected == 0 || projected > remaining {
+			return false;
+		}
+		remaining -= projected;
+		inline_bytes = inline_bytes.saturating_add(u64::try_from(projected).unwrap_or(u64::MAX));
+		true
+	});
+	(source_bytes, inline_bytes, omitted)
+}
+
+fn output_projection(
+	request: omp_tool::OutputRequest,
+	source_bytes: u64,
+	inline_bytes: u64,
+	omitted: bool,
+	artifact: Option<thread_pb::Blob>,
+) -> pb::OutputProjection {
+	pb::OutputProjection {
+		request: match request {
+			omp_tool::OutputRequest::Bounded => pb::OutputRequest::Bounded as i32,
+			omp_tool::OutputRequest::Complete => pb::OutputRequest::Complete as i32,
+		},
+		source_bytes,
+		inline_bytes,
+		omitted,
+		artifact,
+	}
 }
 
 async fn forward_native_event(
@@ -9129,6 +9224,8 @@ async fn forward_native_event(
 	request_id: u64,
 	invocation_id: &Str,
 	lifecycle: &NativeLifecycle,
+	output_request: omp_tool::OutputRequest,
+	blobs: &BlobHost,
 	responses: &flume::Sender<pb::ServerFrame>,
 ) -> NativeForward {
 	match event {
@@ -9154,17 +9251,38 @@ async fn forward_native_event(
 		Some(Ok(ErasedEv::Done(outcome))) => {
 			if lifecycle.claim_terminal() {
 				let (json, is_error, useless) = erased_outcome_wire(outcome);
+				let details_blob = match blobs.put_verdict_bytes(invocation_id, &json) {
+					Ok(reference) => reference,
+					Err(error) => {
+						tracing::error!(
+							%error,
+							invocation_id = %invocation_id,
+							"could not retain native verdict before publication"
+						);
+						let _ = send_invocation_error(
+							responses,
+							request_id,
+							pb::ProtocolErrorCode::Internal,
+							"native verdict could not be retained",
+						)
+						.await;
+						return NativeForward::Terminal;
+					},
+				};
+				let projection =
+					output_projection(output_request, 0, 0, false, Some(details_blob.clone()));
 				send_invocation_terminal_body(
 					responses,
 					request_id,
 					server_frame::Body::Verdict(pb::Verdict {
 						invocation_id: invocation_id.to_string(),
-						json,
-						details_blob: None,
+						json: Bytes::new(),
+						details_blob: Some(details_blob),
 						parts: Vec::new(),
 						is_error,
 						useless,
 						terminate: None,
+						projection: Some(projection),
 						props: Default::default(),
 					}),
 				)
@@ -9217,8 +9335,10 @@ fn spawn_worker_invocation(
 	mut invocation: WorkerInvocation,
 	cancel: CancellationToken,
 	interrupts: Receiver<pb::Interrupt>,
+	output_request: omp_tool::OutputRequest,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
+	blobs: BlobHost,
 ) {
 	tokio::spawn(async move {
 		let mut cancel_requested = false;
@@ -9295,17 +9415,64 @@ fn spawn_worker_invocation(
 							break;
 						},
 					};
+					if let Some(details) = details_blob.as_ref() {
+						let hash: [u8; 32] = match details.hash.as_ref().try_into() {
+							Ok(hash) => hash,
+							Err(_) => {
+								send_abort_verdict(
+									&responses,
+									request_id,
+									&invocation_id,
+									omp_tool::Abort::EffectsUnknown {
+										reason: sf!("worker verdict CAS returned an invalid hash"),
+									},
+								)
+								.await;
+								break;
+							},
+						};
+						if let Err(error) = blobs
+							.retain_verdict(invocation_id.as_str(), BlobId { hash, size: details.size })
+						{
+							tracing::error!(
+								%error,
+								invocation_id = %invocation_id,
+								"could not durably retain worker verdict before publication"
+							);
+							send_abort_verdict(
+								&responses,
+								request_id,
+								&invocation_id,
+								omp_tool::Abort::EffectsUnknown {
+									reason: sf!("worker verdict could not be retained"),
+								},
+							)
+							.await;
+							break;
+						}
+					}
+					let mut parts = complete.parts;
+					let (source_bytes, inline_bytes, omitted) =
+						project_wire_parts(&mut parts, output_request);
+					let projection = output_projection(
+						output_request,
+						source_bytes,
+						inline_bytes,
+						omitted,
+						details_blob.clone(),
+					);
 					send_invocation_terminal_body(
 						&responses,
 						request_id,
 						server_frame::Body::Verdict(pb::Verdict {
 							invocation_id: invocation_id.to_string(),
 							json,
-							parts: complete.parts,
+							parts,
 							details_blob,
 							is_error,
 							useless: complete.useless,
 							terminate: complete.terminate.then_some(true),
+							projection: Some(projection),
 							props: Default::default(),
 						}),
 					)
@@ -9372,6 +9539,7 @@ async fn send_abort_verdict(
 			is_error:      true,
 			useless:       false,
 			terminate:     None,
+			projection:    None,
 			props:         Default::default(),
 		}),
 	)
@@ -9429,6 +9597,7 @@ async fn send_policy_denied_verdict(
 			is_error:      true,
 			useless:       false,
 			terminate:     None,
+			projection:    None,
 			props:         Default::default(),
 		}),
 	)
@@ -10296,61 +10465,151 @@ fn spawn_blob_get(
 	cancel: CancellationToken,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
+	blobs: BlobHost,
 ) {
 	tokio::spawn(async move {
-		if read.data.is_empty() {
-			let send = send_body(
-				&responses,
+		let id = read.id();
+		let range_offset = read.offset();
+		let range_length = read.len();
+		let mut file = tokio::fs::File::from_std(read.into_file());
+		let mut sent = 0_u64;
+		let mut complete = true;
+
+		if range_length == 0 {
+			let send = responses.send_async(checked_server_frame(
 				request_id,
 				server_frame::Body::BlobChunk(blob_pb::Chunk {
 					data: Bytes::new(),
-					hash: Bytes::copy_from_slice(&read.id.hash),
-					size: Some(read.id.size),
+					hash: Bytes::copy_from_slice(&id.hash),
+					size: Some(id.size),
 				}),
-			);
+			));
 			tokio::select! {
 				() = cancel.cancelled() => {},
-				() = send => {},
+				result = send => complete = result.is_ok(),
 			}
 		}
-		let mut offset = 0;
-		while offset < read.data.len() {
-			let first = offset == 0;
-			let end = (offset + BLOB_CHUNK_BYTES).min(read.data.len());
-			let send = send_body(
-				&responses,
+
+		let mut buffer = vec![0_u8; BLOB_CHUNK_BYTES].into_boxed_slice();
+		while sent < range_length {
+			let remaining = range_length - sent;
+			let wanted = usize::try_from(remaining.min(BLOB_CHUNK_BYTES as u64))
+				.expect("blob chunk bound fits usize");
+			let read_result = tokio::select! {
+				() = cancel.cancelled() => break,
+				result = file.read(&mut buffer[..wanted]) => result,
+			};
+			let count = match read_result {
+				Ok(0) => {
+					let error = BlobError::ReadTruncated { expected: range_length, actual: sent };
+					send_blob_error(&responses, request_id, &error).await;
+					complete = false;
+					break;
+				},
+				Ok(count) => count,
+				Err(source) => {
+					let error = BlobError::Store(source.into());
+					send_blob_error(&responses, request_id, &error).await;
+					complete = false;
+					break;
+				},
+			};
+			let first = sent == 0;
+			let send = responses.send_async(checked_server_frame(
 				request_id,
 				server_frame::Body::BlobChunk(blob_pb::Chunk {
-					data: read.data.slice(offset..end),
+					data: Bytes::copy_from_slice(&buffer[..count]),
 					hash: if first {
-						Bytes::copy_from_slice(&read.id.hash)
+						Bytes::copy_from_slice(&id.hash)
 					} else {
 						Bytes::new()
 					},
-					size: first.then_some(read.id.size),
+					size: first.then_some(id.size),
 				}),
-			);
+			));
 			tokio::select! {
 				() = cancel.cancelled() => break,
-				() = send => offset = end,
+				result = send => {
+					if result.is_err() {
+						complete = false;
+						break;
+					}
+					sent += u64::try_from(count).expect("blob chunk count fits u64");
+				},
 			}
 		}
-		if !cancel.is_cancelled() {
+
+		if complete && !cancel.is_cancelled() && sent == range_length {
 			send_body(
 				&responses,
 				request_id,
 				server_frame::Body::BlobGetComplete(pb::BlobGetComplete {
-					hash:       Bytes::copy_from_slice(&read.id.hash),
-					bytes_sent: read.data.len() as u64,
+					hash:       Bytes::copy_from_slice(&id.hash),
+					bytes_sent: sent,
 					props:      Default::default(),
 				}),
 			)
 			.await;
+			if range_offset == 0
+				&& sent == id.size
+				&& let Err(error) = blobs.verdict_downloaded(id)
+			{
+				tracing::warn!(
+					%error,
+					hash = %Hash32::new(id.hash),
+					"could not release completed verdict download lease"
+				);
+			}
 		}
 		let _ = finished
 			.send_async(Finished { request_id, invocation_id: None })
 			.await;
 	});
+}
+
+fn materialize_worker_outcome(blobs: &BlobHost, complete: &WorkerCompletion) -> Result<Bytes, Str> {
+	let Some(blob) = complete.details_blob.as_ref() else {
+		return worker_completion_json(complete).map(|(json, ..)| json);
+	};
+	if blob.size > u64::try_from(DEFAULT_MAX_FRAME_BYTES).expect("frame bound fits u64") {
+		return Err(sf!(
+			"dynamic worker result exceeds the bounded inline projection; read its artifact instead"
+		));
+	}
+	let hash: [u8; 32] = blob
+		.hash
+		.as_ref()
+		.try_into()
+		.map_err(|_| sf!("worker result blob hash is invalid"))?;
+	blobs
+		.get(BlobId { hash, size: blob.size })
+		.map_err(|_| sf!("worker result blob is unavailable"))
+}
+
+fn materialize_worker_details(blobs: &BlobHost, complete: &WorkerCompletion) -> Result<Bytes, Str> {
+	if complete.details_blob.is_none() {
+		return complete
+			.details_json
+			.clone()
+			.ok_or_else(|| sf!("worker completion omitted structured details"));
+	}
+	let outcome = materialize_worker_outcome(blobs, complete)?;
+	let mut outcome = serde_json::from_slice::<serde_json::Value>(&outcome)
+		.map_err(|_| sf!("worker result artifact is invalid"))?;
+	let value = outcome
+		.as_object_mut()
+		.and_then(|outcome| outcome.remove("value"))
+		.ok_or_else(|| sf!("worker result artifact omitted its value"))?;
+	serde_json::to_vec(&value)
+		.map(Bytes::from)
+		.map_err(|_| sf!("worker result value could not be encoded"))
+}
+
+fn materialize_worker_completion(
+	blobs: &BlobHost,
+	complete: &WorkerCompletion,
+) -> Result<Bytes, Str> {
+	materialize_worker_outcome(blobs, complete)
 }
 
 fn worker_completion_json(
@@ -10656,13 +10915,18 @@ async fn send_blob_error(
 		BlobError::InvalidHash
 		| BlobError::HashMismatch
 		| BlobError::SizeMismatch { .. }
-		| BlobError::InvalidRange
+		| BlobError::InvalidRange { .. }
 		| BlobError::LengthOverflow => pb::ProtocolErrorCode::InvalidArgument,
 		BlobError::Store(blob::Error::NotFound) => pb::ProtocolErrorCode::NotFound,
+		BlobError::VerdictPinned => pb::ProtocolErrorCode::PreconditionFailed,
 		BlobError::Store(_)
 		| BlobError::Remove(_)
+		| BlobError::ReadTruncated { .. }
 		| BlobError::FinalizeTask(_)
 		| BlobError::ArtifactMetadata(_)
+		| BlobError::JournalScan { .. }
+		| BlobError::UnsupportedJournalResult { .. }
+		| BlobError::JournalResult { .. }
 		| BlobError::ArtifactClock => pb::ProtocolErrorCode::Internal,
 	};
 	send_error(responses, request_id, code, &error.to_string()).await;

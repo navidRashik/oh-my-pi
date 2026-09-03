@@ -372,8 +372,8 @@ fn project_result(
 	verdict: &[u8],
 ) -> Result<DynOutput, DynFault> {
 	let caps = PromptCaps {
-		maximum_parts:      16,
-		maximum_text_bytes: 262_144,
+		maximum_parts:      u16::MAX,
+		maximum_text_bytes: u32::MAX,
 		media:              true,
 		dialect:            Default::default(),
 		model_class:        Default::default(),

@@ -9,6 +9,10 @@ repository.workspace = true
 description = "Project environment daemon: filesystem, process, document, tool, and extension-host authority for OMP"
 readme = "README.md"
 
+[features]
+default = []
+local-tts = ["omp-inference/local-tts"]
+
 [dependencies]
 async-stream.workspace = true
 async-trait.workspace = true

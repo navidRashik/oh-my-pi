@@ -74,6 +74,14 @@ pub enum ExtensionConvarError {
 		/// Manifest setting key.
 		key:       Str,
 	},
+	/// Curated UI metadata was not safe to expose in the product settings panel.
+	#[error("extension {extension} setting {key} has invalid settings UI metadata")]
+	InvalidUi {
+		/// Extension identity.
+		extension: Str,
+		/// Manifest setting key.
+		key:       Str,
+	},
 	/// The control plane rejected a dynamic declaration or effective value.
 	#[error("extension {extension} setting {key} could not be installed")]
 	Control {
@@ -138,6 +146,24 @@ pub fn register_extension_setting_convars(
 				},
 			}
 		});
+		if let Some(ui) = &ui
+			&& (!ui.is_valid(name.as_str())
+				|| match &ui.widget {
+					DynamicUiWidget::Submenu(options) | DynamicUiWidget::MultiSelect { options, .. } => {
+						options.iter().enumerate().any(|(index, option)| {
+							option.label.trim().is_empty()
+								|| options[..index]
+									.iter()
+									.any(|previous| previous.value == option.value)
+						})
+					},
+					DynamicUiWidget::Auto => false,
+				}) {
+			return Err(ExtensionConvarError::InvalidUi {
+				extension: Str::new(extension),
+				key:       key.clone(),
+			});
+		}
 		ctx.register_dynamic_var(DynamicVarSpec {
 			name: name.clone(),
 			desc: schema

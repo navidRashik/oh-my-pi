@@ -227,7 +227,7 @@ use std::{env, io, iter, mem};
 use async_trait::async_trait;
 use omp_con::{
 	Ctx, DynamicUiOption, DynamicUiSpec, DynamicUiWidget, DynamicVarSpec, SettingTab, TypeSpec,
-	Value as ConValue, VarFlags,
+	Value as ConValue, ValueKind, VarFlags,
 };
 use omp_core::{
 	Hash32, InvocationPhase, LifecyclePhase, Principal, Provenance, Str, encoding::hex, sf,
@@ -1643,7 +1643,7 @@ impl ConvarControlAuthority {
 				.with(VarFlags::SESSION)
 				.with(VarFlags::REPLICATED),
 			default,
-			ui: declaration_ui(arguments)?,
+			ui: declaration_ui(arguments, name.as_str(), ty)?,
 		};
 		if let Some(existing) = self.ctx.dynamic_var_spec(name.as_str()) {
 			if existing != spec {
@@ -1717,6 +1717,8 @@ fn required_convar_argument<'a>(
 
 fn declaration_ui(
 	arguments: &serde_json::Map<String, Value>,
+	convar: &str,
+	ty: &TypeSpec,
 ) -> Result<Option<DynamicUiSpec>, ControlProtocolError> {
 	let Some(value) = arguments.get("ui") else {
 		return Ok(None);
@@ -1767,18 +1769,44 @@ fn declaration_ui(
 			})
 			.collect::<Result<Vec<_>, ControlProtocolError>>()
 	})?;
-	Ok(Some(DynamicUiSpec {
-		tab,
-		group,
-		label,
-		description,
-		warning,
-		widget: if options.is_empty() {
-			DynamicUiWidget::Auto
-		} else {
-			DynamicUiWidget::Submenu(options)
-		},
-	}))
+	if options.iter().enumerate().any(|(index, option)| {
+		option.label.trim().is_empty()
+			|| options[..index]
+				.iter()
+				.any(|previous| previous.value == option.value)
+	}) {
+		return Err(ControlProtocolError::new(
+			"InvalidConvarDeclaration",
+			"extension convar ui options require non-empty labels and unique values",
+		));
+	}
+	let widget = if options.is_empty() {
+		if ty.kind == ValueKind::List {
+			return Err(ControlProtocolError::new(
+				"InvalidConvarDeclaration",
+				"list convar ui metadata requires finite options",
+			));
+		}
+		DynamicUiWidget::Auto
+	} else if ty.kind == ValueKind::List {
+		DynamicUiWidget::MultiSelect {
+			options,
+			ordered: object
+				.get("ordered")
+				.and_then(Value::as_bool)
+				.unwrap_or(false),
+		}
+	} else {
+		DynamicUiWidget::Submenu(options)
+	};
+	let ui = DynamicUiSpec { tab, group, label, description, warning, widget };
+	if !ui.is_valid(convar) {
+		return Err(ControlProtocolError::new(
+			"InvalidConvarDeclaration",
+			"extension convar ui metadata requires a curated label and a valid tab section",
+		));
+	}
+	Ok(Some(ui))
 }
 
 fn declaration_value(
@@ -1805,6 +1833,19 @@ fn declaration_value(
 			.as_str()
 			.map(|value| (TypeSpec::STR, ConValue::Str(Str::new(value))))
 			.ok_or_else(invalid),
+		"array" => {
+			let values = default.as_array().ok_or_else(invalid)?;
+			let values = values
+				.iter()
+				.map(|value| {
+					value
+						.as_str()
+						.map(|value| ConValue::Str(Str::new(value)))
+						.ok_or_else(invalid)
+				})
+				.collect::<Result<Vec<_>, _>>()?;
+			Ok((<Vec<Str> as omp_con::ConType>::SPEC, ConValue::List(values)))
+		},
 		"enum" => {
 			let default = default.as_str().ok_or_else(invalid)?;
 			let values = values.and_then(Value::as_array).ok_or_else(|| {

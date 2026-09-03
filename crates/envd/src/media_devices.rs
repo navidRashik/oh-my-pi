@@ -1,22 +1,19 @@
-//! Harness-owned dynamic devices for media generation and `AutoQA` reports.
+//! Harness-owned dynamic devices for media generation.
 
 use std::{
-	collections::BTreeMap,
 	fs::{self, OpenOptions},
 	io::{self, Read as _},
 	path::{Component, Path, PathBuf},
 	sync::Arc,
-	time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
-use omp_cache::telemetry_cache::{StoredIssue, TelemetryIndex};
 use omp_core::{ArtifactUrl, Str, sf};
 use omp_proto::{
-	inference::v1::{self as inference_pb, generate_image_request, value},
+	inference::v1::{self as inference_pb, generate_image_request},
 	thread::v1::{self as thread_pb, blob},
 };
 use omp_tool::{
@@ -34,6 +31,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
 	blobs::{BlobError, BlobHost},
+	github_url::GithubCredentialBridge,
+	media_tts::{SpeechConfig, SpeechInput, SpeechOutput, SpeechProducer},
 	search_backend::SearchBridgeHost,
 };
 
@@ -191,6 +190,21 @@ pub struct MediaPayload {
 	/// Durable bytes exposed to dynamic callers without erasing media typing.
 	#[serde(default)]
 	pub blob:        Option<omp_tool::BlobRef>,
+	/// Exact byte length for generated speech.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub bytes:       Option<u64>,
+	/// Voice identity selected by the serving backend.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub voice_id:    Option<Str>,
+	/// Effective audio codec.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub codec:       Option<Str>,
+	/// Effective speech backend.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub backend:     Option<Str>,
+	/// Effective sample rate when known.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub sample_rate: Option<u32>,
 }
 
 /// Stable structured media backend failure.
@@ -205,9 +219,18 @@ pub struct MediaFault {
 	pub message: Str,
 }
 
-/// Media devices do not currently stream previews.
+/// Incremental media production state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum MediaUpdate {}
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MediaUpdate {
+	/// Cumulative audio received or synthesized so far.
+	Audio {
+		/// Number of producer chunks observed.
+		chunks: u64,
+		/// Cumulative encoded or PCM-projected bytes.
+		bytes:  u64,
+	},
+}
 
 #[derive(Clone, Copy)]
 enum MediaKind {
@@ -220,6 +243,7 @@ pub struct MediaDevice {
 	spec:    ToolSpec,
 	kind:    MediaKind,
 	backend: Arc<SearchBridgeHost>,
+	speech:  Option<Arc<SpeechProducer>>,
 	blobs:   BlobHost,
 	root:    PathBuf,
 }
@@ -232,21 +256,48 @@ pub fn image_gen(backend: Arc<SearchBridgeHost>, blobs: BlobHost, root: PathBuf)
 		 `input` accepts contained workspace paths or base64 PNG/JPEG/GIF/WebP images up to 35 MiB; \
 		 `output_path` additionally writes the result atomically inside the workspace.",
 		MediaKind::Image,
+		3,
 		backend,
+		None,
 		blobs,
 		root,
 	)
 }
 
-/// Creates the `tts@3` dynamic device.
+/// Creates the `tts@4` dynamic device with default auto/local settings.
+#[cfg(test)]
 pub fn tts(backend: Arc<SearchBridgeHost>, blobs: BlobHost, root: PathBuf) -> MediaDevice {
+	tts_with_config(
+		backend,
+		Arc::new(GithubCredentialBridge::new()),
+		SpeechConfig::default(),
+		blobs,
+		root,
+	)
+}
+
+/// Creates the `tts@4` dynamic device with session-derived provider and local
+/// voice settings plus the production credential authority.
+pub(crate) fn tts_with_config(
+	backend: Arc<SearchBridgeHost>,
+	credentials: Arc<GithubCredentialBridge>,
+	config: SpeechConfig,
+	blobs: BlobHost,
+	root: PathBuf,
+) -> MediaDevice {
+	let speech = Arc::new(SpeechProducer::new(config, credentials));
 	media_device(
 		"tts",
-		"Synthesizes speech with local Kokoro or a configured remote voice backend. `text` is \
-		 1–15000 characters and `output_path` is required: the audio is written there atomically \
-		 inside the workspace and also retained as an artifact.",
+		"Synthesizes speech with auto, local Kokoro, xAI, or DeepInfra selection. `text` is 1–15000 \
+		 characters; `language` defaults to en; hosted `voice_id` is optional (xAI built-ins: ara, \
+		 eve, leo, rex, sal; custom and DeepInfra model voices are accepted), while local synthesis \
+		 uses `cl_tts_voice`. `output_path` selects WAV only when it ends in .wav and MP3 \
+		 otherwise. Local synthesis always writes a sibling WAV. The audio is written atomically \
+		 inside the workspace and retained as an artifact.",
 		MediaKind::Speech,
+		4,
 		backend,
+		Some(speech),
 		blobs,
 		root,
 	)
@@ -256,14 +307,16 @@ fn media_device(
 	name: &'static str,
 	description: &'static str,
 	kind: MediaKind,
+	rev: u16,
 	backend: Arc<SearchBridgeHost>,
+	speech: Option<Arc<SpeechProducer>>,
 	blobs: BlobHost,
 	root: PathBuf,
 ) -> MediaDevice {
 	MediaDevice {
 		spec: ToolSpec {
 			name:            sf!(name),
-			rev:             Rev { family: Default::default(), n: 3 },
+			rev:             Rev { family: Default::default(), n: rev },
 			description:     sf!(description),
 			schema:          media_schema(kind),
 			constraint:      Constraint::Schema {
@@ -280,12 +333,16 @@ fn media_device(
 			projection_code: omp_tool::native_projection_code(
 				env!("CARGO_PKG_NAME"),
 				env!("CARGO_PKG_VERSION"),
-				include_bytes!("media_devices.rs"),
+				match kind {
+					MediaKind::Image => include_bytes!("media_devices.rs"),
+					MediaKind::Speech => include_bytes!("media_tts.rs"),
+				},
 			)
 			.into_bytes(),
 		},
 		kind,
 		backend,
+		speech,
 		blobs,
 		root,
 	}
@@ -325,6 +382,13 @@ fn media_schema(kind: MediaKind) -> Bytes {
 		},
 	};
 	properties.retain(|name, _| allowed.contains(&name.as_str()));
+	if matches!(kind, MediaKind::Speech)
+		&& let Some(language) = properties
+			.get_mut("language")
+			.and_then(Value::as_object_mut)
+	{
+		language.insert("default".to_owned(), Value::String("en".to_owned()));
+	}
 	object.insert("required".to_owned(), match kind {
 		MediaKind::Image => serde_json::json!(["i", "subject"]),
 		MediaKind::Speech => serde_json::json!(["i", "text", "output_path"]),
@@ -351,58 +415,25 @@ impl MediaDevice {
 		finish_image(&self.blobs, output.as_ref(), &image)
 	}
 
-	async fn synthesize_speech(&self, params: &MediaParams) -> Result<MediaPayload, MediaFault> {
-		let output = OutputTarget::resolve(
-			&self.root,
-			params
+	fn speech_input(params: &MediaParams) -> SpeechInput {
+		SpeechInput {
+			text:        params.text.clone().expect("validated speech text"),
+			voice_id:    params.voice_id.clone(),
+			language:    params.language.clone().unwrap_or_else(|| sf!("en")),
+			output_path: params
 				.output_path
-				.as_deref()
+				.clone()
 				.expect("validated speech output path"),
-		)?;
-		let format = speech_format(
-			params
-				.output_path
-				.as_deref()
-				.expect("validated speech output path"),
-		)?;
-		let request = inference_pb::SpeakRequest {
-			model:          "kokoro".to_owned(),
-			text:           params
-				.text
-				.as_deref()
-				.expect("validated speech text")
-				.to_owned(),
-			voice:          params.voice_id.as_deref().unwrap_or("af_heart").to_owned(),
-			encoding:       audio_encoding(format)?,
-			sample_rate_hz: params.sample_rate,
-			speed:          None,
-			instructions:   params
-				.language
-				.as_deref()
-				.map_or_else(String::new, |language| format!("Speak in {language}.")),
-			clone:          None,
-			props:          params.bit_rate.map(|bit_rate| inference_pb::ValueMap {
-				fields: BTreeMap::from([("audio/bit_rate".to_owned(), inference_pb::Value {
-					kind: Some(value::Kind::Uint(u64::from(bit_rate))),
-				})]),
-			}),
-		};
-		let audio = self
-			.backend
-			.speak(request)
-			.await
-			.map_err(media_backend_fault)?;
-		let id = self.blobs.put(&audio).map_err(media_blob_fault)?;
-		let output_path = Some(output.write(&audio)?);
-		let media_type = Str::new(match format {
-			"mp3" => "audio/mpeg",
-			"wav" => "audio/wav",
-			"pcm16" => "audio/L16",
-			"opus" => "audio/opus",
-			"aac" => "audio/aac",
-			"flac" => "audio/flac",
-			_ => unreachable!("validated audio format"),
-		});
+			sample_rate: params.sample_rate,
+			bit_rate:    params.bit_rate,
+		}
+	}
+
+	fn finish_speech(&self, speech: SpeechOutput) -> Result<MediaPayload, MediaFault> {
+		let output = OutputTarget::resolve(&self.root, &speech.output_path)?;
+		let id = self.blobs.put(&speech.audio).map_err(media_blob_fault)?;
+		let output_path = Some(output.write(&speech.audio)?);
+		let media_type = Str::new_static(speech.media_type);
 		Ok(MediaPayload {
 			artifact_id: Str::new(ArtifactUrl::from_digest(id.hash).as_str()),
 			media_type: media_type.clone(),
@@ -412,6 +443,11 @@ impl MediaDevice {
 				media_type,
 				byte_len: id.size,
 			}),
+			bytes: Some(id.size),
+			voice_id: Some(speech.voice_id),
+			codec: Some(Str::new_static(speech.codec)),
+			backend: Some(Str::new_static(speech.backend)),
+			sample_rate: speech.sample_rate,
 		})
 	}
 }
@@ -445,7 +481,7 @@ fn validate_speech_params(params: &MediaParams) -> Result<(), MediaFault> {
 	if text.trim().is_empty() {
 		return Err(media_fault("invalid_media_request", "none", "text must not be empty"));
 	}
-	if text.chars().count() > MAX_SPEECH_CHARS {
+	if text.encode_utf16().count() > MAX_SPEECH_CHARS {
 		return Err(media_fault(
 			"text_too_long",
 			"none",
@@ -616,6 +652,11 @@ fn finish_image(
 		}),
 		output_path,
 		blob,
+		bytes: None,
+		voice_id: None,
+		codec: None,
+		backend: None,
+		sample_rate: None,
 	})
 }
 
@@ -804,20 +845,78 @@ impl Tool for MediaDevice {
 				yield media_done(Err(fault));
 				return;
 			}
+			if matches!(self.kind, MediaKind::Speech)
+				&& let Err(fault) = OutputTarget::resolve(
+					&self.root,
+					params
+						.output_path
+						.as_deref()
+						.expect("validated speech output path"),
+				)
+			{
+				yield media_done(Err(fault));
+				return;
+			}
 			if let Err(error) = incoming.interruptable().committed().await {
 				yield media_commit_event(error);
 				return;
 			}
-			let result = match self.kind {
-				MediaKind::Image => self.generate_image(&params).await,
-				MediaKind::Speech => self.synthesize_speech(&params).await,
-			};
-			yield media_done(result);
+			match self.kind {
+				MediaKind::Image => {
+					yield media_done(self.generate_image(&params).await);
+				},
+				MediaKind::Speech => {
+					let producer = self
+						.speech
+						.as_ref()
+						.expect("speech devices carry a producer");
+					let cancellation = CancellationToken::new();
+					let (updates_tx, updates_rx) = flume::bounded(8);
+					let mut synthesis = Box::pin(producer.synthesize(
+						Self::speech_input(&params),
+						cancellation.clone(),
+						updates_tx,
+					));
+					let mut updates_open = true;
+					loop {
+						tokio::select! {
+							biased;
+							interrupt = incoming.next_interrupt() => {
+								cancellation.cancel();
+								match interrupt {
+									Ok(interrupt) => yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason }),
+									Err(omp_tool::InterruptWaitError::Closed) => yield Ev::Aborted(Abort::InputDropped),
+									Err(omp_tool::InterruptWaitError::Protocol(message)) => {
+										yield Ev::Args(protocol_issue(message));
+									},
+								}
+								return;
+							},
+							update = updates_rx.recv_async(), if updates_open => match update {
+								Ok(update) => yield Ev::Update(MediaUpdate::Audio {
+									chunks: update.chunks,
+									bytes: update.bytes,
+								}),
+								Err(_) => updates_open = false,
+							},
+							result = &mut synthesis => {
+								yield media_done(result.and_then(|speech| self.finish_speech(speech)));
+								return;
+							},
+						}
+					}
+				},
+			}
 		}
 	}
 
 	fn prompt(&self, view: Result<&MediaPayload, &MediaFault>, _: &PromptCaps) -> Vec<Part> {
 		match view {
+			Ok(payload) if matches!(self.kind, MediaKind::Speech) => vec![Part::Json {
+				json: Bytes::from(
+					serde_json::to_vec(payload).expect("speech payload serialization is infallible"),
+				),
+			}],
 			Ok(payload) => payload.blob.clone().map_or_else(
 				|| {
 					vec![Part::Text {
@@ -838,7 +937,11 @@ impl Tool for MediaDevice {
 	}
 
 	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
-		if !from.family.is_empty() || !matches!(from.n, 1 | 2) {
+		let supported = match self.kind {
+			MediaKind::Image => matches!(from.n, 1 | 2),
+			MediaKind::Speech => matches!(from.n, 1 | 2 | 3),
+		};
+		if !from.family.is_empty() || !supported {
 			return None;
 		}
 		let mut arguments: Value = serde_json::from_slice(call.raw_args).ok()?;
@@ -890,33 +993,6 @@ fn aspect_ratio(value: Option<&str>) -> Result<i32, MediaFault> {
 
 const fn image_format() -> i32 {
 	generate_image_request::Format::Png as i32
-}
-
-fn speech_format(output_path: &str) -> Result<&'static str, MediaFault> {
-	match Path::new(output_path)
-		.extension()
-		.and_then(|extension| extension.to_str())
-		.map(str::to_ascii_lowercase)
-		.as_deref()
-	{
-		Some("mp3") => Ok("mp3"),
-		Some("wav") => Ok("wav"),
-		_ => {
-			Err(media_fault("invalid_audio_format", "speech", "output_path must end in .mp3 or .wav"))
-		},
-	}
-}
-
-fn audio_encoding(value: &str) -> Result<i32, MediaFault> {
-	Ok(match value {
-		"mp3" => inference_pb::AudioEncoding::Mp3 as i32,
-		"pcm16" => inference_pb::AudioEncoding::Pcm16 as i32,
-		"wav" => inference_pb::AudioEncoding::Wav as i32,
-		"opus" => inference_pb::AudioEncoding::Opus as i32,
-		"aac" => inference_pb::AudioEncoding::Aac as i32,
-		"flac" => inference_pb::AudioEncoding::Flac as i32,
-		_ => return Err(media_fault("invalid_audio_format", "speech", "unsupported audio format")),
-	})
 }
 
 fn store_blob(
@@ -973,216 +1049,15 @@ fn media_io_fault(error: io::Error) -> MediaFault {
 	}
 }
 
-/// Arguments accepted by `report_issue@1`.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReportParams {
-	/// Session filing the report.
-	pub session_id: Str,
-	/// Device whose structured result was inconsistent.
-	pub device:     Str,
-	/// Observed device revision, required for exact `name@rev` attribution.
-	pub rev:        Str,
-	/// Structured verdict over the device result.
-	pub verdict:    Value,
-}
-
-/// Durable `AutoQA` filing result.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ReportPayload {
-	/// Stable issue identifier.
-	pub issue_id: Str,
-	/// Exact reported `name@rev` identity.
-	pub target:   Str,
-	/// Exact target revision fenced by a later consent decision.
-	pub revision: Str,
-	/// Redacted summary suitable for an explicit consent surface.
-	pub summary:  Str,
-	/// Firehose event kind written beside the issue.
-	pub kind:     Str,
-}
-
-/// Dyn-mounted `AutoQA` issue recorder.
-pub struct ReportIssue {
-	spec:  ToolSpec,
-	store: Arc<TelemetryIndex>,
-}
-
-/// Creates `report_issue@1` over the project `AutoQA` store.
-pub fn report_issue(store: Arc<TelemetryIndex>) -> ReportIssue {
-	ReportIssue {
-		spec: ToolSpec {
-			name:            sf!("report_issue"),
-			rev:             Rev { family: Default::default(), n: 1 },
-			description:     sf!(
-				"Records a structured AutoQA verdict against an exact device revision in the durable \
-				 local issue store.",
-			),
-			schema:          omp_tool::schema::<ReportParams>(),
-			constraint:      Constraint::Schema {
-				priority:       255,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects::empty(),
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("media_devices.rs"),
-			)
-			.into_bytes(),
-		},
-		store,
-	}
-}
-
-impl Tool for ReportIssue {
-	type Fault = MediaFault;
-	type Params = ReportParams;
-	type Payload = ReportPayload;
-	type Update = MediaUpdate;
-
-	fn spec(&self) -> &ToolSpec {
-		&self.spec
-	}
-
-	fn call<'c>(
-		&'c self,
-		mut incoming: IncomingParams<'c>,
-	) -> impl Stream<Item = Ev<MediaUpdate, ReportPayload, MediaFault>> + Send + 'c {
-		stream! {
-			let params = match incoming.whole::<ReportParams>().await {
-				Ok(params) => params,
-				Err(error) => { yield report_param_event(error); return; },
-			};
-			if params.session_id.trim().is_empty() || params.device.trim().is_empty() || params.rev.trim().is_empty() || !params.verdict.is_object() {
-				yield report_done(Err(MediaFault { code: sf!("invalid_issue_report"), backend: sf!("autoqa"), message: sf!("session_id, device, and rev are required and verdict must be an object") }));
-				return;
-			}
-			if let Err(error) = incoming.interruptable().committed().await {
-				yield report_commit_event(error);
-				return;
-			}
-			let now = now_ms();
-			let fingerprint = serde_json::json!({
-				"session_id": params.session_id,
-				"device": params.device,
-				"rev": params.rev,
-				"verdict": params.verdict,
-			})
-			.to_string();
-			let issue_id = sf!(
-				"qa-{}",
-				omp_core::Hash32::sum(fingerprint.as_bytes()).to_hex()
-			);
-			let encoded = serde_json::json!({
-				"issue_id": issue_id,
-				"device": params.device,
-				"rev": params.rev,
-				"verdict": params.verdict,
-			});
-			let redacted = omp_observability::redact::redact_sensitive_credentials(&encoded.to_string());
-			let payload_len = match u32::try_from(redacted.len()) {
-				Ok(length) => length,
-				Err(_) => {
-					yield report_done(Err(MediaFault {
-						code: sf!("autoqa_payload_too_large"),
-						backend: sf!("autoqa"),
-						message: sf!("AutoQA payload exceeds the durable frame limit"),
-					}));
-					return;
-				},
-			};
-			let payload_offset = match self.store.append(
-				params.session_id.as_str(),
-				"issue_report",
-				now,
-				redacted.as_bytes(),
-			) {
-				Ok(offset) => offset.0,
-				Err(error) => {
-					yield report_done(Err(store_fault(error.to_string())));
-					return;
-				},
-			};
-			let issue = StoredIssue {
-				id: issue_id.clone(),
-				session_id: params.session_id.clone(),
-				device: params.device.clone(),
-				rev: Some(params.rev.clone()),
-				consent: sf!("local_only"),
-				created_at_ms: now,
-				payload_offset,
-				payload_len,
-				consent_revision: None,
-				attempt_count: 0,
-				next_attempt_at_ms: 0,
-				terminal: false,
-				remote_ack: None,
-			};
-			if let Err(error) = self.store.store_issue(&issue) {
-				yield report_done(Err(store_fault(error.to_string())));
-				return;
-			}
-			let target = format!("{}@{}", issue.device, params.rev);
-			yield report_done(Ok(ReportPayload {
-				issue_id,
-				target: Str::from(target),
-				revision: params.rev,
-				summary: sf!("A redacted AutoQA report is ready for optional delivery."),
-				kind: sf!("issue_report"),
-			}));
-		}
-	}
-
-	fn prompt(&self, view: Result<&ReportPayload, &MediaFault>, _: &PromptCaps) -> Vec<Part> {
-		vec![Part::Text {
-			text: match view {
-				Ok(payload) => {
-					Str::from(format!("Filed AutoQA issue {} for {}.", payload.issue_id, payload.target))
-				},
-				Err(fault) => {
-					Str::from(serde_json::to_string(fault).unwrap_or_else(|_| fault.to_string()))
-				},
-			},
-		}]
-	}
-}
-
-fn now_ms() -> u64 {
-	SystemTime::now()
-		.duration_since(UNIX_EPOCH)
-		.unwrap_or_default()
-		.as_millis()
-		.try_into()
-		.unwrap_or(u64::MAX)
-}
-fn store_fault(message: String) -> MediaFault {
-	MediaFault {
-		code:    sf!("autoqa_store_failed"),
-		backend: sf!("sqlite"),
-		message: Str::from(message),
-	}
-}
 const fn media_done(
 	result: Result<MediaPayload, MediaFault>,
 ) -> Ev<MediaUpdate, MediaPayload, MediaFault> {
 	Ev::Done(ToolTerminal::Done { result, useless: false })
 }
-const fn report_done(
-	result: Result<ReportPayload, MediaFault>,
-) -> Ev<MediaUpdate, ReportPayload, MediaFault> {
-	Ev::Done(ToolTerminal::Done { result, useless: false })
-}
 fn media_param_event(error: ParamError) -> Ev<MediaUpdate, MediaPayload, MediaFault> {
 	map_param(error)
 }
-fn report_param_event(error: ParamError) -> Ev<MediaUpdate, ReportPayload, MediaFault> {
-	map_param(error)
-}
 fn media_commit_event(error: CommitError) -> Ev<MediaUpdate, MediaPayload, MediaFault> {
-	map_commit(error)
-}
-fn report_commit_event(error: CommitError) -> Ev<MediaUpdate, ReportPayload, MediaFault> {
 	map_commit(error)
 }
 fn map_param<U, P, F>(error: ParamError) -> Ev<U, P, F> {
@@ -1498,44 +1373,5 @@ mod tests {
 			fs::read(root.path().join("out/speech.wav")).expect("replacement read"),
 			b"second"
 		);
-	}
-
-	#[test]
-	fn report_schema_is_closed_and_accepts_structured_verdicts() {
-		assert!(
-			serde_json::from_value::<ReportParams>(
-				serde_json::json!({"session_id":"s","device":"read","rev":"2","verdict":{"ok":false}})
-			)
-			.is_ok()
-		);
-		assert!(
-			serde_json::from_value::<ReportParams>(
-				serde_json::json!({"session_id":"s","device":"read","rev":"2","verdict":{},"extra":true})
-			)
-			.is_err()
-		);
-	}
-
-	#[test]
-	fn report_store_round_trips_issue_rows() {
-		let root = tempdir().unwrap();
-		let store = TelemetryIndex::open(root.path(), &root.path().join("telemetry.sqlite")).unwrap();
-		let issue = StoredIssue {
-			id:                 sf!("i"),
-			session_id:         sf!("s"),
-			device:             sf!("read"),
-			rev:                Some(sf!("2")),
-			consent:            sf!("local_only"),
-			created_at_ms:      1,
-			payload_offset:     0,
-			payload_len:        0,
-			consent_revision:   None,
-			attempt_count:      0,
-			next_attempt_at_ms: 0,
-			terminal:           false,
-			remote_ack:         None,
-		};
-		store.store_issue(&issue).unwrap();
-		assert_eq!(store.issue("i").unwrap(), Some(issue));
 	}
 }

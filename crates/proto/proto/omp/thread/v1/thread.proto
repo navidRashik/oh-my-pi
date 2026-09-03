@@ -124,7 +124,7 @@ message ServerTool {
 // resolves hashes against the daemon blob store, so media are never
 // re-uploaded turn after turn.
 message Blob {
-  // BLAKE3-256 of the content.
+  // SHA-256 of the content.
   bytes hash = 1;
   string mime = 2;
   uint64 size = 3;
