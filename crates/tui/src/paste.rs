@@ -718,6 +718,34 @@ pub enum ClipboardReadOutcome {
 	ReadFailure,
 }
 
+/// Typed result of writing the system clipboard.
+///
+/// Write outcomes remain distinct through detached host workers so the actor
+/// can acknowledge a completed copy or explain why it did not land.
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipboardWriteOutcome {
+	/// A native or platform clipboard backend accepted the text.
+	Success,
+	/// The operating system refused clipboard access.
+	PermissionDenied,
+	/// No clipboard backend is available in this environment.
+	Unavailable,
+	/// An available backend failed to write the text.
+	WriteFailure,
+}
+
+impl ClipboardWriteOutcome {
+	fn fallback(self, next: Self) -> Self {
+		match (self, next) {
+			(Self::Success, _) | (_, Self::Success) => Self::Success,
+			(Self::PermissionDenied, _) | (_, Self::PermissionDenied) => Self::PermissionDenied,
+			(Self::WriteFailure, _) | (_, Self::WriteFailure) => Self::WriteFailure,
+			(Self::Unavailable, Self::Unavailable) => Self::Unavailable,
+		}
+	}
+}
+
 /// Reads smart clipboard content, preferring previewable file paths, then image
 /// data, remaining file paths, and text.
 ///
@@ -728,10 +756,8 @@ pub enum ClipboardReadOutcome {
 /// pasteboards and non-media file URLs still fall through to the image path.
 /// [`read_file_urls`] is a no-op off Darwin.
 pub fn read_clipboard() -> ClipboardReadOutcome {
-	smart_clipboard(read_file_urls(), read_clipboard_image, read_clipboard_text).map_or_else(
-		|| classify_clipboard_miss(ClipboardRead::Smart),
-		ClipboardReadOutcome::Payload,
-	)
+	smart_clipboard(read_file_urls(), read_clipboard_image, read_clipboard_text)
+		.map_or_else(|| classify_clipboard_miss(ClipboardRead::Smart), ClipboardReadOutcome::Payload)
 }
 
 /// Pure ordering core of [`read_clipboard`], separated for tests.
@@ -861,34 +887,56 @@ pub fn read_clipboard_text() -> Option<String> {
 	None
 }
 
-/// Writes clipboard text, native backend first with CLI bridges as fallback.
-pub fn write_clipboard_text(text: &str) -> bool {
+/// Writes clipboard text, native backend first with platform CLI bridges as
+/// fallback.
+pub fn write_clipboard_text(text: &str) -> ClipboardWriteOutcome {
 	let bytes = Some(text.as_bytes());
-	if env::var_os("TERMUX_VERSION").is_some()
-		&& run_capture(&["termux-clipboard-set"], bytes, CLI_TIMEOUT).is_some()
-	{
-		return true;
+	let mut outcome = ClipboardWriteOutcome::Unavailable;
+	if env::var_os("TERMUX_VERSION").is_some() {
+		outcome = outcome.fallback(write_capture(&["termux-clipboard-set"], bytes));
+		if outcome == ClipboardWriteOutcome::Success {
+			return outcome;
+		}
 	}
-	if native_write_text(text) {
-		return true;
+	outcome = outcome.fallback(native_write_text(text));
+	if outcome == ClipboardWriteOutcome::Success {
+		return outcome;
 	}
 	if cfg!(target_os = "macos") {
-		return run_capture(&["pbcopy"], bytes, CLI_TIMEOUT).is_some();
+		return outcome.fallback(write_capture(&["pbcopy"], bytes));
 	}
 	if cfg!(windows) {
-		return run_capture(&["clip.exe"], bytes, CLI_TIMEOUT).is_some();
+		return outcome.fallback(write_capture(&["clip.exe"], bytes));
 	}
-	if env::var_os("WAYLAND_DISPLAY").is_some()
-		&& run_capture(&["wl-copy"], bytes, CLI_TIMEOUT).is_some()
-	{
-		return true;
+	if env::var_os("WAYLAND_DISPLAY").is_some() {
+		outcome = outcome.fallback(write_capture(&["wl-copy"], bytes));
+		if outcome == ClipboardWriteOutcome::Success {
+			return outcome;
+		}
 	}
 	if env::var_os("DISPLAY").is_some() {
-		return run_capture(&["xclip", "-selection", "clipboard", "-i"], bytes, CLI_TIMEOUT)
-			.is_some()
-			|| run_capture(&["xsel", "--clipboard", "--input"], bytes, CLI_TIMEOUT).is_some();
+		outcome = outcome.fallback(write_capture(&["xclip", "-selection", "clipboard", "-i"], bytes));
+		if outcome != ClipboardWriteOutcome::Success {
+			outcome = outcome.fallback(write_capture(&["xsel", "--clipboard", "--input"], bytes));
+		}
 	}
-	false
+	outcome
+}
+
+/// Starts one background clipboard write, delivering its typed outcome through
+/// the returned one-shot channel.
+///
+/// A channel closed without a value means the writer thread could not be
+/// spawned; callers classify that transport failure as
+/// [`ClipboardWriteOutcome::WriteFailure`].
+pub fn spawn_clipboard_write(text: Str) -> Receiver<ClipboardWriteOutcome> {
+	let (tx, rx) = oneshot::channel();
+	let _ = thread::Builder::new()
+		.name("omp-tui-clipboard-write".into())
+		.spawn(move || {
+			let _ = tx.send(write_clipboard_text(&text));
+		});
+	rx
 }
 
 fn read_clipboard_image() -> Option<PastedImage> {
@@ -944,42 +992,42 @@ fn classify_clipboard_miss(scope: ClipboardRead) -> ClipboardReadOutcome {
 	let probe = if cfg!(target_os = "macos") {
 		probe_clipboard_command(&["osascript", "-e", "clipboard info"], scope)
 	} else if cfg!(windows) {
-		probe_clipboard_command(&[
-			"powershell.exe",
-			"-NoProfile",
-			"-NonInteractive",
-			"-Sta",
-			"-Command",
-			POWERSHELL_CLIPBOARD_STATE_SCRIPT,
-		], scope)
+		probe_clipboard_command(
+			&[
+				"powershell.exe",
+				"-NoProfile",
+				"-NonInteractive",
+				"-Sta",
+				"-Command",
+				POWERSHELL_CLIPBOARD_STATE_SCRIPT,
+			],
+			scope,
+		)
 	} else if env::var_os("TERMUX_VERSION").is_some() {
 		probe_clipboard_command(&["termux-clipboard-get"], scope)
 	} else if is_wsl() {
-		probe_clipboard_command(&[
-			"powershell.exe",
-			"-NoProfile",
-			"-NonInteractive",
-			"-Sta",
-			"-Command",
-			POWERSHELL_CLIPBOARD_STATE_SCRIPT,
-		], scope)
+		probe_clipboard_command(
+			&[
+				"powershell.exe",
+				"-NoProfile",
+				"-NonInteractive",
+				"-Sta",
+				"-Command",
+				POWERSHELL_CLIPBOARD_STATE_SCRIPT,
+			],
+			scope,
+		)
 	} else if env::var_os("WAYLAND_DISPLAY").is_some() {
 		probe_clipboard_command(&["wl-paste", "--list-types"], scope)
 	} else if env::var_os("DISPLAY").is_some() {
-		probe_clipboard_command(
-			&["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
-			scope,
-		)
+		probe_clipboard_command(&["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"], scope)
 	} else {
 		None
 	};
 	probe.unwrap_or_else(probe_native_clipboard)
 }
 
-fn probe_clipboard_command(
-	argv: &[&str],
-	scope: ClipboardRead,
-) -> Option<ClipboardReadOutcome> {
+fn probe_clipboard_command(argv: &[&str], scope: ClipboardRead) -> Option<ClipboardReadOutcome> {
 	Some(match run_capture_outcome(argv, None, CLI_TIMEOUT) {
 		CaptureOutcome::Output(bytes) => {
 			let output = String::from_utf8_lossy(&bytes);
@@ -1086,7 +1134,7 @@ fn is_empty_diagnostic(message: &str) -> bool {
 /// does — a transient handle would empty the selection the moment it drops.
 /// One process-lifetime instance keeps that owner thread serving.
 #[cfg(target_os = "linux")]
-fn native_write_text(text: &str) -> bool {
+fn native_write_text(text: &str) -> ClipboardWriteOutcome {
 	use std::sync::LazyLock;
 
 	use parking_lot::Mutex;
@@ -1095,11 +1143,19 @@ fn native_write_text(text: &str) -> bool {
 		LazyLock::new(|| Mutex::new(None));
 	let mut guard = CLIPBOARD.lock();
 	if guard.is_none() {
-		*guard = arboard::Clipboard::new().ok();
+		match arboard::Clipboard::new() {
+			Ok(clipboard) => *guard = Some(clipboard),
+			Err(error) => return classify_arboard_write_error(&error),
+		}
 	}
 	guard
 		.as_mut()
-		.is_some_and(|clipboard| clipboard.set_text(text).is_ok())
+		.map_or(ClipboardWriteOutcome::Unavailable, |clipboard| {
+			clipboard.set_text(text).map_or_else(
+				|error| classify_arboard_write_error(&error),
+				|()| ClipboardWriteOutcome::Success,
+			)
+		})
 }
 
 /// Writes text through a transient arboard handle.
@@ -1107,10 +1163,41 @@ fn native_write_text(text: &str) -> bool {
 /// macOS and Windows retain clipboard contents after the writer exits, so
 /// no owner handle needs to outlive the call.
 #[cfg(not(target_os = "linux"))]
-fn native_write_text(text: &str) -> bool {
-	arboard::Clipboard::new()
-		.and_then(|mut clipboard| clipboard.set_text(text))
-		.is_ok()
+fn native_write_text(text: &str) -> ClipboardWriteOutcome {
+	let mut clipboard = match arboard::Clipboard::new() {
+		Ok(clipboard) => clipboard,
+		Err(error) => return classify_arboard_write_error(&error),
+	};
+	clipboard.set_text(text).map_or_else(
+		|error| classify_arboard_write_error(&error),
+		|()| ClipboardWriteOutcome::Success,
+	)
+}
+
+fn classify_arboard_write_error(error: &arboard::Error) -> ClipboardWriteOutcome {
+	match error {
+		arboard::Error::Unknown { description } if is_permission_diagnostic(description) => {
+			ClipboardWriteOutcome::PermissionDenied
+		},
+		arboard::Error::Unknown { description } if is_unavailable_diagnostic(description) => {
+			ClipboardWriteOutcome::Unavailable
+		},
+		_ => ClipboardWriteOutcome::WriteFailure,
+	}
+}
+
+fn is_unavailable_diagnostic(message: &str) -> bool {
+	let message = message.to_ascii_lowercase();
+	[
+		"no display",
+		"display not set",
+		"couldn't connect to display",
+		"could not connect to display",
+		"wayland connection",
+		"x11 connection",
+	]
+	.iter()
+	.any(|needle| message.contains(needle))
 }
 
 /// Encodes an arboard RGBA payload as a PNG [`PastedImage`].
@@ -1219,11 +1306,16 @@ fn run_capture(argv: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> Option
 	}
 }
 
-fn run_capture_outcome(
-	argv: &[&str],
-	stdin: Option<&[u8]>,
-	timeout: Duration,
-) -> CaptureOutcome {
+fn write_capture(argv: &[&str], stdin: Option<&[u8]>) -> ClipboardWriteOutcome {
+	match run_capture_outcome(argv, stdin, CLI_TIMEOUT) {
+		CaptureOutcome::Output(_) => ClipboardWriteOutcome::Success,
+		CaptureOutcome::PermissionDenied => ClipboardWriteOutcome::PermissionDenied,
+		CaptureOutcome::Unavailable => ClipboardWriteOutcome::Unavailable,
+		CaptureOutcome::Empty | CaptureOutcome::Failed => ClipboardWriteOutcome::WriteFailure,
+	}
+}
+
+fn run_capture_outcome(argv: &[&str], stdin: Option<&[u8]>, timeout: Duration) -> CaptureOutcome {
 	let Some((program, args)) = argv.split_first() else {
 		return CaptureOutcome::Failed;
 	};
@@ -1378,6 +1470,17 @@ mod tests {
 
 	fn b64(text: &str) -> String {
 		base64::encode(text.as_bytes()).into_string()
+	}
+
+	#[test]
+	fn clipboard_write_fallback_retains_the_most_actionable_outcome() {
+		use ClipboardWriteOutcome::{PermissionDenied, Success, Unavailable, WriteFailure};
+
+		assert_eq!(Unavailable.fallback(Unavailable), Unavailable);
+		assert_eq!(Unavailable.fallback(WriteFailure), WriteFailure);
+		assert_eq!(WriteFailure.fallback(PermissionDenied), PermissionDenied);
+		assert_eq!(PermissionDenied.fallback(Success), Success);
+		assert_eq!(Success.fallback(WriteFailure), Success);
 	}
 
 	fn offer(events: &mut PasteEvents, mime: &str) {
@@ -1738,29 +1841,17 @@ mod tests {
 			assert!(advertised_format_is_supported(text, ClipboardRead::Smart), "{text}");
 		}
 		for media in ["image/png", "Bitmap", "FileDrop", "public.file-url"] {
-			assert!(
-				advertised_format_is_supported(media, ClipboardRead::Smart),
-				"{media}"
-			);
-			assert!(
-				!advertised_format_is_supported(media, ClipboardRead::Text),
-				"{media}"
-			);
+			assert!(advertised_format_is_supported(media, ClipboardRead::Smart), "{media}");
+			assert!(!advertised_format_is_supported(media, ClipboardRead::Text), "{media}");
 		}
-		assert!(!advertised_format_is_supported(
-			"application/pdf",
-			ClipboardRead::Smart
-		));
+		assert!(!advertised_format_is_supported("application/pdf", ClipboardRead::Smart));
 	}
 
 	#[test]
 	fn backend_diagnostics_classify_permission_and_empty_without_overlap() {
-		for denied in [
-			"Permission denied",
-			"Operation not permitted",
-			"Access is denied",
-			"not authorized",
-		] {
+		for denied in
+			["Permission denied", "Operation not permitted", "Access is denied", "not authorized"]
+		{
 			assert!(is_permission_diagnostic(denied), "{denied}");
 			assert!(!is_empty_diagnostic(denied), "{denied}");
 		}

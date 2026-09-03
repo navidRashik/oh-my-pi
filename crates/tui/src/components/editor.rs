@@ -24,6 +24,7 @@ use crate::{
 		Cached, Component, EventCtx, Flow, Hit, HitTag, IntoComponent, PaintCtx, Slot, next_slot,
 	},
 	context::{Charset, UiContext},
+	editcore::{code_ranges, xml_ranges},
 	frame::{Color, Frame, Rect, Style},
 	imagefmt::dimensions,
 	input::{Key, Mouse, UiEvent, byte_at_column, sanitize_paste},
@@ -514,6 +515,7 @@ impl EditInput {
 				.map(|(start, end)| start..end),
 		);
 		self.spelling_mask.extend(code_ranges(self.editor.text()));
+		self.spelling_mask.extend(xml_ranges(self.editor.text()));
 		if features.typo_detection {
 			self.spelling.check(self.editor.text(), &self.spelling_mask);
 		}
@@ -933,30 +935,6 @@ fn prefix_byte_at_width(text: &str, width: u16) -> usize {
 	}
 	text.len()
 }
-fn code_ranges(text: &str) -> SmallVec<Range<usize>, 8> {
-	let mut ranges = SmallVec::new();
-	let bytes = text.as_bytes();
-	let mut at = 0;
-	while at < bytes.len() {
-		if bytes[at..].starts_with(b"```") {
-			let end = text[at + 3..]
-				.find("```")
-				.map_or(bytes.len(), |offset| at + 3 + offset + 3);
-			ranges.push(at..end);
-			at = end;
-		} else if bytes[at] == b'`' {
-			let end = text[at + 1..]
-				.find('`')
-				.map_or(bytes.len(), |offset| at + 1 + offset + 1);
-			ranges.push(at..end);
-			at = end;
-		} else {
-			at += 1;
-		}
-	}
-	ranges
-}
-
 fn word_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
 	if cursor > text.len() || !text.is_char_boundary(cursor) {
 		return None;
@@ -1307,6 +1285,7 @@ impl Component for EditInput {
 			}
 		}
 		let buffer_start = text.as_ptr() as usize;
+		let xml = self.editor.options().xml;
 		let mut scanned = 0;
 		let mut in_comment = false;
 		for (row, content) in rows.iter().enumerate() {
@@ -1317,9 +1296,22 @@ impl Component for EditInput {
 			let start = (content.text.as_ptr() as usize)
 				.saturating_sub(buffer_start)
 				.min(text.len());
-			in_comment = xml_comment_state(&text[scanned..start], in_comment);
-			let (runs, next_comment) = highlight_xml(content.text, &pc.ctx.theme, in_comment);
-			in_comment = next_comment;
+			let mut runs = if xml {
+				in_comment = xml_comment_state(&text[scanned..start], in_comment);
+				let (runs, next_comment) = highlight_xml(content.text, &pc.ctx.theme, in_comment);
+				in_comment = next_comment;
+				runs
+			} else {
+				let mut runs = SmallVec::new();
+				if !content.text.is_empty() {
+					runs.push(SyntaxRun {
+						start: 0,
+						end:   content.text.len(),
+						style: Style::new().fg(pc.ctx.theme.fg),
+					});
+				}
+				runs
+			};
 			scanned = start.saturating_add(content.text.len()).min(text.len());
 			let mut chips: SmallVec<(usize, usize, Style), 4> = SmallVec::new();
 			for &(atom_start, atom_end) in &atoms {
@@ -1331,7 +1323,7 @@ impl Component for EditInput {
 					chips.push((from - start, to - start, style));
 				}
 			}
-			let mut runs = overlay_chip_runs(&runs, &chips, content.text.len());
+			runs = overlay_chip_runs(&runs, &chips, content.text.len());
 			let mut typo_runs: SmallVec<(usize, usize, Style), 8> = SmallVec::new();
 			let typos: &[TypoRange] = if self.spelling_features.typo_detection {
 				self.spelling.typo_ranges()

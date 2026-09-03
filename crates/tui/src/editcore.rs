@@ -87,9 +87,19 @@ pub struct VisualRow<'a> {
 
 #[derive(Clone, Copy, Debug)]
 struct Segment {
-	start: usize,
-	end:   usize,
-	last:  bool,
+	/// Source span owned by this row, including whitespace hidden at a wrap.
+	source_start: usize,
+	source_end:   usize,
+	/// Visible contiguous slice within the source span.
+	start:        usize,
+	end:          usize,
+	last:         bool,
+}
+
+#[derive(Clone, Debug)]
+struct KillEntry {
+	text:  String,
+	atoms: Vector<Atom>,
 }
 
 /// Shared flat text editing model used by the widget and chat editors.
@@ -100,14 +110,14 @@ pub struct EditBuffer {
 	anchor:        Option<usize>,
 	copied:        Option<Str>,
 	desired:       Option<u16>,
-	kill_ring:     Vec<String>,
+	kill_ring:     Vec<KillEntry>,
 	kill_index:    usize,
 	last_yank:     Option<(usize, usize)>,
 	last_action:   Action,
 	undo:          Vec<(String, usize, Vector<Atom>)>,
 	atoms:         Vector<Atom>,
 	jump:          Option<Jump>,
-	layout_width:  u16,
+	layout_width:  Cell<u16>,
 	xml:           bool,
 	view_offset:   Cell<usize>,
 	manual_scroll: Cell<bool>,
@@ -137,7 +147,7 @@ impl EditBuffer {
 			undo: Vec::new(),
 			atoms: Vector::new(),
 			jump: None,
-			layout_width: 80,
+			layout_width: Cell::new(80),
 			view_offset: Cell::new(0),
 			manual_scroll: Cell::new(false),
 			xml: true,
@@ -245,6 +255,8 @@ impl EditBuffer {
 		self.undo.clear();
 		self.anchor = None;
 		self.desired = None;
+		self.view_offset.set(0);
+		self.manual_scroll.set(false);
 		self.break_sequence();
 	}
 
@@ -254,6 +266,7 @@ impl EditBuffer {
 		let at = if end { self.text.len() } else { 0 };
 		self.anchor = None;
 		self.desired = None;
+		self.manual_scroll.set(false);
 		self.move_to(at)
 	}
 
@@ -295,29 +308,35 @@ impl EditBuffer {
 		self.cursor = self.snap_position(at, at >= self.cursor);
 		self.anchor = None;
 		self.desired = None;
+		self.manual_scroll.set(false);
 		self.break_sequence();
 	}
 
 	/// Places the cursor on a visible visual row and cell column.
 	pub fn set_cursor_visual_row(&mut self, row: usize, column: u16, width_limit: u16) {
+		self.layout_width.set(width_limit.max(1));
 		let at = self.visual_position(row, column, width_limit);
 		self.cursor = self.snap_position(at, at >= self.cursor);
 		self.anchor = None;
 		self.desired = None;
+		self.manual_scroll.set(false);
 		self.break_sequence();
 	}
 
 	/// Extends the selection to a visible visual row and cell column.
 	pub fn extend_selection_visual_row(&mut self, row: usize, column: u16, width_limit: u16) {
+		self.layout_width.set(width_limit.max(1));
 		let anchor = *self.anchor.get_or_insert(self.cursor);
 		let at = self.visual_position(row, column, width_limit);
 		self.cursor = self.snap_position(at, at >= anchor);
 		self.desired = None;
+		self.manual_scroll.set(false);
 		self.break_sequence();
 	}
 
 	/// Selects the coarse word around a position on a visible visual row.
 	pub fn select_word_visual_row(&mut self, row: usize, column: u16, width_limit: u16) {
+		self.layout_width.set(width_limit.max(1));
 		let at = self.visual_position(row, column, width_limit);
 		let (seed_start, seed_end) = if let Some(grapheme) = self.text[at..].graphemes().next() {
 			(at, at + grapheme.len())
@@ -350,6 +369,7 @@ impl EditBuffer {
 		self.anchor = Some(start);
 		self.cursor = end;
 		self.desired = None;
+		self.manual_scroll.set(false);
 		self.break_sequence();
 	}
 
@@ -572,13 +592,15 @@ impl EditBuffer {
 		self.desired = None;
 		self.undo.clear();
 		self.atoms.clear();
+		self.view_offset.set(0);
+		self.manual_scroll.set(false);
 		self.break_sequence();
 		result
 	}
 
 	/// Applies a decoded editor key at the given layout width.
 	pub fn handle(&mut self, key: Key, width: u16, page_rows: usize) -> BufferOutcome {
-		self.layout_width = width.max(1);
+		self.layout_width.set(width.max(1));
 		// The copy stash lives exactly one key: hosts drain it right after
 		// the `Copy`/`Cut` that filled it, and any other key voids it so a
 		// later drain can never emit stale clipboard contents.
@@ -633,12 +655,12 @@ impl EditBuffer {
 			}),
 			Key::Up => self.collapse_or(false, |buffer| buffer.move_visual(-1)),
 			Key::Down => self.collapse_or(true, |buffer| buffer.move_visual(1)),
-			Key::PageUp => {
-				self.collapse_or(false, |buffer| buffer.move_visual(-(page_rows.max(1) as isize)))
-			},
-			Key::PageDown => {
-				self.collapse_or(true, |buffer| buffer.move_visual(page_rows.max(1) as isize))
-			},
+			Key::PageUp => self.collapse_or(false, |buffer| {
+				buffer.move_visual(-(page_rows.saturating_sub(1).max(1) as isize))
+			}),
+			Key::PageDown => self.collapse_or(true, |buffer| {
+				buffer.move_visual(page_rows.saturating_sub(1).max(1) as isize)
+			}),
 			Key::SelectLeft => self.extend(Self::move_left),
 			Key::SelectRight => self.extend(Self::move_right),
 			Key::SelectWordLeft => self.extend(|buffer| {
@@ -700,7 +722,9 @@ impl EditBuffer {
 		width_limit: u16,
 		max_rows: usize,
 	) -> (SmallVec<VisualRow<'_>, 8>, (usize, usize, usize)) {
-		let segments = self.segments(width_limit.max(1));
+		let width_limit = width_limit.max(1);
+		self.layout_width.set(width_limit);
+		let segments = self.segments(width_limit);
 		let cursor_row = self.segment_at_cursor(&segments);
 		let total = segments.len();
 		let visible = total.min(max_rows);
@@ -719,10 +743,13 @@ impl EditBuffer {
 				start:         segment.start,
 				end:           segment.end,
 				text:          &self.text[segment.start..segment.end],
-				cursor_column: (self.cursor >= segment.start
-					&& self.cursor <= segment.end
-					&& (segment.last || self.cursor < segment.end))
-					.then(|| cell_width(&self.text[segment.start..self.cursor])),
+				cursor_column: (self.cursor >= segment.source_start
+					&& self.cursor <= segment.source_end
+					&& (segment.last || self.cursor < segment.source_end))
+					.then(|| {
+						let cursor = self.cursor.clamp(segment.start, segment.end);
+						cell_width(&self.text[segment.start..cursor])
+					}),
 			})
 			.collect();
 		(rows, (first, visible, total))
@@ -732,7 +759,9 @@ impl EditBuffer {
 	///
 	/// Returns whether the clamped viewport offset changed.
 	pub fn scroll_rows(&self, delta: i32, width_limit: u16, max_rows: usize) -> bool {
-		let segments = self.segments(width_limit.max(1));
+		let width_limit = width_limit.max(1);
+		self.layout_width.set(width_limit);
+		let segments = self.segments(width_limit);
 		let visible = segments.len().min(max_rows);
 		let max_offset = segments.len().saturating_sub(visible);
 		let current = if self.manual_scroll.get() {
@@ -751,17 +780,20 @@ impl EditBuffer {
 
 	/// Returns the clipped visual row count.
 	pub fn visual_height(&self, width: u16, max_rows: usize) -> usize {
-		self.segments(width.max(1)).len().min(max_rows)
+		let width = width.max(1);
+		self.layout_width.set(width);
+		self.segments(width).len().min(max_rows)
 	}
 
 	/// Reports whether the cursor is at the document's visual start.
 	pub fn at_visual_start(&self) -> bool {
-		self.segment_at_cursor(&self.segments(self.layout_width)) == 0 && self.cursor == 0
+		let width = self.layout_width.get();
+		self.segment_at_cursor(&self.segments(width)) == 0 && self.cursor == 0
 	}
 
 	/// Reports whether the cursor is at the document's visual end.
 	pub fn at_visual_end(&self) -> bool {
-		let segments = self.segments(self.layout_width);
+		let segments = self.segments(self.layout_width.get());
 		self.segment_at_cursor(&segments) + 1 == segments.len() && self.cursor == self.text.len()
 	}
 
@@ -827,7 +859,9 @@ impl EditBuffer {
 	}
 
 	fn insert_char(&mut self, ch: char) -> BufferOutcome {
-		let word = ch.is_alphanumeric() || ch == '_';
+		// pi groups every consecutive non-whitespace typing run into one undo
+		// unit, including punctuation and symbols.
+		let word = !ch.is_whitespace();
 		let selection = self.selection();
 		if selection.is_some() || !word || self.last_action != Action::TypeWord {
 			self.snapshot();
@@ -893,6 +927,10 @@ impl EditBuffer {
 	fn move_right(&mut self) -> BufferOutcome {
 		let Some(grapheme) = self.text[self.cursor..].graphemes().next() else {
 			self.break_sequence();
+			let segments = self.segments(self.layout_width.get());
+			let segment = segments[self.segment_at_cursor(&segments)];
+			let cursor = self.cursor.clamp(segment.start, segment.end);
+			self.desired = Some(cell_width(&self.text[segment.start..cursor]));
 			return BufferOutcome::Ignored;
 		};
 		let at = self
@@ -903,15 +941,15 @@ impl EditBuffer {
 
 	fn move_visual(&mut self, delta: isize) -> BufferOutcome {
 		self.break_sequence();
-		let segments = self.segments(self.layout_width);
+		let segments = self.segments(self.layout_width.get());
 		let current = self.segment_at_cursor(&segments);
 		let target = current.saturating_add_signed(delta).min(segments.len() - 1);
 		if target == current {
 			let edge = self.snap_position(
 				if delta < 0 {
-					segments[current].start
+					segments[current].source_start
 				} else {
-					segments[current].end
+					segments[current].source_end
 				},
 				delta > 0,
 			);
@@ -923,22 +961,37 @@ impl EditBuffer {
 		}
 		let source = segments[current];
 		let destination = segments[target];
-		let column = self
-			.desired
-			.unwrap_or_else(|| cell_width(&self.text[source.start..self.cursor]));
-		let max = if destination.last {
-			cell_width(&self.text[destination.start..destination.end])
-		} else {
-			let text = &self.text[destination.start..destination.end];
-			text
-				.graphemes()
-				.next_back()
-				.map_or(0, |g| cell_width(text).saturating_sub(cell_width(g)))
+		let source_cursor = self.cursor.clamp(source.start, source.end);
+		let column = cell_width(&self.text[source.start..source_cursor]);
+		let source_max = segment_max_column(&self.text[source.start..source.end], source.last);
+		let target_max =
+			segment_max_column(&self.text[destination.start..destination.end], destination.last);
+		let target_column = match self.desired {
+			None if target_max < column => {
+				self.desired = Some(column);
+				target_max
+			},
+			None => column,
+			Some(_) if column < source_max && target_max < column => {
+				self.desired = Some(column);
+				target_max
+			},
+			Some(_) if column < source_max => {
+				self.desired = None;
+				column
+			},
+			Some(preferred) if target_max < column || target_max < preferred => target_max,
+			Some(preferred) => {
+				self.desired = None;
+				preferred
+			},
 		};
 		let at = destination.start
-			+ byte_at_column(&self.text[destination.start..destination.end], column.min(max));
+			+ byte_at_column(
+				&self.text[destination.start..destination.end],
+				target_column.min(target_max),
+			);
 		self.cursor = self.snap_position(at, delta > 0);
-		self.desired = Some(column);
 		BufferOutcome::Changed
 	}
 
@@ -971,6 +1024,9 @@ impl EditBuffer {
 	}
 
 	fn kill_line_start(&mut self) -> BufferOutcome {
+		if let Some(range) = self.selection() {
+			return self.delete_range(range.start, range.end, true);
+		}
 		let (start, _) = self.line_bounds();
 		let start = if start == self.cursor && start > 0 {
 			start - 1
@@ -981,6 +1037,9 @@ impl EditBuffer {
 	}
 
 	fn kill_line_end(&mut self) -> BufferOutcome {
+		if let Some(range) = self.selection() {
+			return self.delete_range(range.start, range.end, true);
+		}
 		let (_, end) = self.line_bounds();
 		let end = if self.cursor < end {
 			end
@@ -993,11 +1052,17 @@ impl EditBuffer {
 	}
 
 	fn kill_word_backward(&mut self) -> BufferOutcome {
+		if let Some(range) = self.selection() {
+			return self.delete_range(range.start, range.end, true);
+		}
 		let start = self.word_left();
 		self.delete_range(start, self.cursor, true)
 	}
 
 	fn kill_word_forward(&mut self) -> BufferOutcome {
+		if let Some(range) = self.selection() {
+			return self.delete_range(range.start, range.end, true);
+		}
 		let end = self.word_right();
 		self.delete_range(self.cursor, end, true)
 	}
@@ -1012,6 +1077,16 @@ impl EditBuffer {
 		let (start, end) = self.expand_to_atoms(start, end);
 		self.snapshot();
 		let removed = self.text[start..end].to_owned();
+		let removed_atoms = self
+			.atoms
+			.iter()
+			.filter(|atom| atom.start >= start && atom.end <= end)
+			.map(|atom| Atom {
+				start:   atom.start - start,
+				end:     atom.end - start,
+				payload: atom.payload.clone(),
+			})
+			.collect();
 		let backward = end == self.cursor;
 		self.splice(start..end, "");
 		self.cursor = start;
@@ -1019,19 +1094,37 @@ impl EditBuffer {
 		self.desired = None;
 		self.last_yank = None;
 		if kill {
-			self.record_kill(removed, backward);
+			self.record_kill(KillEntry { text: removed, atoms: removed_atoms }, backward);
 		} else {
 			self.last_action = Action::Other;
 		}
 		BufferOutcome::Changed
 	}
 
-	fn record_kill(&mut self, killed: String, backward: bool) {
+	fn record_kill(&mut self, mut killed: KillEntry, backward: bool) {
 		if self.last_action == Action::Kill && !self.kill_ring.is_empty() {
+			let current = &mut self.kill_ring[0];
 			if backward {
-				self.kill_ring[0].insert_str(0, &killed);
+				let shift = killed.text.len();
+				for atom in current.atoms.iter_mut() {
+					atom.start += shift;
+					atom.end += shift;
+				}
+				for atom in &current.atoms {
+					killed.atoms.push_back(atom.clone());
+				}
+				killed.text.push_str(&current.text);
+				*current = killed;
 			} else {
-				self.kill_ring[0].push_str(&killed);
+				let shift = current.text.len();
+				for atom in killed.atoms.iter_mut() {
+					atom.start += shift;
+					atom.end += shift;
+				}
+				current.text.push_str(&killed.text);
+				for atom in &killed.atoms {
+					current.atoms.push_back(atom.clone());
+				}
 			}
 		} else {
 			self.kill_ring.insert(0, killed);
@@ -1043,6 +1136,17 @@ impl EditBuffer {
 		self.last_action = Action::Kill;
 	}
 
+	fn insert_kill_entry(&mut self, start: usize, value: &KillEntry) {
+		self.splice(start..start, &value.text);
+		for atom in &value.atoms {
+			self.atoms.push_back(Atom {
+				start:   start + atom.start,
+				end:     start + atom.end,
+				payload: atom.payload.clone(),
+			});
+		}
+	}
+
 	fn yank(&mut self) -> BufferOutcome {
 		let Some(value) = self.kill_ring.first().cloned() else {
 			self.break_sequence();
@@ -1051,8 +1155,9 @@ impl EditBuffer {
 		self.snapshot();
 		let range = self.selection().unwrap_or(self.cursor..self.cursor);
 		let start = range.start;
-		self.splice(range, &value);
-		self.cursor = start + value.len();
+		self.splice(range, "");
+		self.insert_kill_entry(start, &value);
+		self.cursor = start + value.text.len();
 		self.anchor = None;
 		self.kill_index = 0;
 		self.last_yank = Some((start, self.cursor));
@@ -1065,6 +1170,7 @@ impl EditBuffer {
 		let Some(range) = self.selection() else {
 			return BufferOutcome::Ignored;
 		};
+		self.break_sequence();
 		self.copied = Some(Str::new(&self.text[range]));
 		BufferOutcome::Changed
 	}
@@ -1088,8 +1194,9 @@ impl EditBuffer {
 		self.snapshot();
 		self.kill_index = (self.kill_index + 1) % self.kill_ring.len();
 		let value = self.kill_ring[self.kill_index].clone();
-		self.splice(start..end, &value);
-		self.cursor = start + value.len();
+		self.splice(start..end, "");
+		self.insert_kill_entry(start, &value);
+		self.cursor = start + value.text.len();
 		self.last_yank = Some((start, self.cursor));
 		self.last_action = Action::YankPop;
 		BufferOutcome::Changed
@@ -1170,59 +1277,7 @@ impl EditBuffer {
 			let logical_end = self.text[logical_start..]
 				.find('\n')
 				.map_or(self.text.len(), |at| logical_start + at);
-			if logical_start == logical_end {
-				result.push(Segment { start: logical_start, end: logical_end, last: true });
-			} else if self.text[logical_start..logical_end]
-				.bytes()
-				.all(|byte| matches!(byte, b' '..=b'~'))
-			{
-				let limit = usize::from(width_limit.max(1));
-				let mut start = logical_start;
-				while start < logical_end {
-					let hard_end = start.saturating_add(limit).min(logical_end);
-					let end = if hard_end < logical_end {
-						self.text.as_bytes()[start..hard_end]
-							.iter()
-							.rposition(|byte| *byte == b' ')
-							.map_or(hard_end, |offset| start + offset + 1)
-					} else {
-						hard_end
-					};
-					result.push(Segment { start, end, last: end == logical_end });
-					start = end;
-				}
-			} else {
-				let mut start = logical_start;
-				while start < logical_end {
-					let mut cells = 0u16;
-					let mut end = start;
-					let mut whitespace_end = None;
-					for (offset, grapheme) in self.text[start..logical_end].grapheme_indices() {
-						let next = cells.saturating_add(cell_width(grapheme));
-						if next > width_limit && end > start {
-							break;
-						}
-						cells = next;
-						end = start + offset + grapheme.len();
-						if grapheme.chars().all(char::is_whitespace) {
-							whitespace_end = Some(end);
-						}
-						if cells >= width_limit {
-							break;
-						}
-					}
-					if end < logical_end
-						&& let Some(boundary) = whitespace_end.filter(|at| *at > start)
-					{
-						end = boundary;
-					}
-					if end == start {
-						end = start + self.text[start..].graphemes().next().map_or(0, str::len);
-					}
-					result.push(Segment { start, end, last: end == logical_end });
-					start = end;
-				}
-			}
+			wrap_logical_line(&self.text, logical_start, logical_end, width_limit.max(1), &mut result);
 			if logical_end == self.text.len() {
 				break;
 			}
@@ -1235,18 +1290,320 @@ impl EditBuffer {
 		segments
 			.iter()
 			.position(|segment| {
-				self.cursor >= segment.start
-					&& (self.cursor < segment.end || segment.last && self.cursor == segment.end)
+				self.cursor >= segment.source_start
+					&& (self.cursor < segment.source_end
+						|| segment.last && self.cursor == segment.source_end)
 			})
 			.unwrap_or(segments.len() - 1)
 	}
 }
 
+#[derive(Clone, Copy)]
+struct GraphemeCell {
+	start:      usize,
+	end:        usize,
+	width:      u16,
+	whitespace: bool,
+}
+
+fn push_wrapped_segment(
+	text: &str,
+	result: &mut SmallVec<Segment, 16>,
+	source_start: usize,
+	source_end: usize,
+	start: usize,
+	end: usize,
+) {
+	let end = start + text[start..end].trim_end_matches(char::is_whitespace).len();
+	result.push(Segment { source_start, source_end, start, end, last: false });
+}
+
+fn wrap_logical_line(
+	text: &str,
+	logical_start: usize,
+	logical_end: usize,
+	width_limit: u16,
+	result: &mut SmallVec<Segment, 16>,
+) {
+	let first_segment = result.len();
+	if logical_start == logical_end {
+		result.push(Segment {
+			source_start: logical_start,
+			source_end:   logical_end,
+			start:        logical_start,
+			end:          logical_end,
+			last:         true,
+		});
+		return;
+	}
+
+	let glyphs = text[logical_start..logical_end]
+		.grapheme_indices()
+		.map(|(offset, grapheme)| GraphemeCell {
+			start:      logical_start + offset,
+			end:        logical_start + offset + grapheme.len(),
+			width:      cell_width(grapheme),
+			whitespace: grapheme.chars().all(char::is_whitespace),
+		})
+		.collect::<Vec<_>>();
+
+	let mut chunk_source_start = logical_start;
+	let mut chunk_start = logical_start;
+	let mut chunk_end = logical_start;
+	let mut chunk_width = 0_u16;
+	let mut token_start = 0;
+	while token_start < glyphs.len() {
+		let whitespace = glyphs[token_start].whitespace;
+		let mut token_end = token_start + 1;
+		while token_end < glyphs.len() && glyphs[token_end].whitespace == whitespace {
+			token_end += 1;
+		}
+		let token_start_byte = glyphs[token_start].start;
+		let token_end_byte = glyphs[token_end - 1].end;
+		let token_width = glyphs[token_start..token_end]
+			.iter()
+			.fold(0_u16, |width, glyph| width.saturating_add(glyph.width));
+		let token_has_wide = glyphs[token_start..token_end]
+			.iter()
+			.any(|glyph| glyph.width > 1);
+
+		if chunk_end == chunk_start && whitespace {
+			if let Some(previous) = result
+				.get_mut(first_segment..)
+				.and_then(|rows| rows.last_mut())
+			{
+				previous.source_end = token_end_byte;
+			} else {
+				chunk_start = token_end_byte;
+				chunk_end = token_end_byte;
+			}
+			token_start = token_end;
+			continue;
+		}
+
+		if token_width > width_limit {
+			let mut consumed = token_start;
+			if chunk_end > chunk_start && chunk_width < width_limit {
+				let mut available = width_limit - chunk_width;
+				while consumed < token_end && glyphs[consumed].width <= available {
+					available -= glyphs[consumed].width;
+					chunk_width += glyphs[consumed].width;
+					chunk_end = glyphs[consumed].end;
+					consumed += 1;
+				}
+			}
+			if chunk_end > chunk_start {
+				let source_end = if consumed > token_start {
+					chunk_end
+				} else {
+					token_start_byte
+				};
+				push_wrapped_segment(
+					text,
+					result,
+					chunk_source_start,
+					source_end,
+					chunk_start,
+					chunk_end,
+				);
+				chunk_source_start = source_end;
+			}
+
+			while consumed < token_end {
+				let segment_start = glyphs[consumed].start;
+				let source_start = chunk_source_start;
+				let mut segment_end = segment_start;
+				let mut segment_width = 0_u16;
+				while consumed < token_end {
+					let next = segment_width.saturating_add(glyphs[consumed].width);
+					if next > width_limit && segment_end > segment_start {
+						break;
+					}
+					segment_width = next;
+					segment_end = glyphs[consumed].end;
+					consumed += 1;
+					if segment_width >= width_limit {
+						break;
+					}
+				}
+				if consumed < token_end {
+					push_wrapped_segment(
+						text,
+						result,
+						source_start,
+						segment_end,
+						segment_start,
+						segment_end,
+					);
+					chunk_source_start = segment_end;
+				} else {
+					chunk_source_start = source_start;
+					chunk_start = segment_start;
+					chunk_end = segment_end;
+					chunk_width = segment_width;
+				}
+			}
+			token_start = token_end;
+			continue;
+		}
+
+		if chunk_width.saturating_add(token_width) > width_limit {
+			let mut consumed = token_start;
+			if !whitespace && token_has_wide && chunk_end > chunk_start {
+				let mut available = width_limit - chunk_width;
+				while consumed < token_end && glyphs[consumed].width <= available {
+					available -= glyphs[consumed].width;
+					chunk_end = glyphs[consumed].end;
+					consumed += 1;
+				}
+			}
+			let source_end = if consumed > token_start {
+				chunk_end
+			} else {
+				token_start_byte
+			};
+			push_wrapped_segment(text, result, chunk_source_start, source_end, chunk_start, chunk_end);
+			chunk_source_start = source_end;
+			if consumed == token_end {
+				chunk_start = source_end;
+				chunk_end = source_end;
+				chunk_width = 0;
+			} else if whitespace {
+				if let Some(previous) = result.last_mut() {
+					previous.source_end = token_end_byte;
+				}
+				chunk_source_start = token_end_byte;
+				chunk_start = token_end_byte;
+				chunk_end = token_end_byte;
+				chunk_width = 0;
+			} else {
+				chunk_start = glyphs[consumed].start;
+				chunk_end = token_end_byte;
+				chunk_width = glyphs[consumed..token_end]
+					.iter()
+					.fold(0_u16, |width, glyph| width.saturating_add(glyph.width));
+			}
+		} else {
+			if chunk_end == chunk_start {
+				chunk_start = token_start_byte;
+			}
+			chunk_end = token_end_byte;
+			chunk_width = chunk_width.saturating_add(token_width);
+		}
+		token_start = token_end;
+	}
+
+	if chunk_end > chunk_start || result.len() == first_segment {
+		push_wrapped_segment(text, result, chunk_source_start, logical_end, chunk_start, chunk_end);
+	} else if let Some(last) = result.last_mut() {
+		last.source_end = logical_end;
+	}
+	if let Some(last) = result.last_mut() {
+		last.last = true;
+	}
+}
+
+/// Markdown code spans and fences whose contents are opaque to XML completion
+/// and prose assistance.
+pub(crate) fn code_ranges(text: &str) -> SmallVec<Range<usize>, 8> {
+	let bytes = text.as_bytes();
+	let mut ranges = SmallVec::new();
+	let mut at = 0;
+	while at < bytes.len() {
+		let marker = bytes[at];
+		if marker != b'`' && marker != b'~' {
+			at += 1;
+			continue;
+		}
+		let mut run = 1;
+		while bytes.get(at + run) == Some(&marker) {
+			run += 1;
+		}
+		let fenced = run >= 3
+			&& text[..at].rsplit_once('\n').map_or_else(
+				|| at <= 3 && text[..at].trim().is_empty(),
+				|(_, prefix)| prefix.len() <= 3 && prefix.trim().is_empty(),
+			);
+		if marker == b'~' && !fenced {
+			at += run;
+			continue;
+		}
+		let mut search = at + run;
+		let mut close = None;
+		while search < bytes.len() {
+			let Some(relative) = bytes[search..].iter().position(|byte| *byte == marker) else {
+				break;
+			};
+			let candidate = search + relative;
+			let mut candidate_run = 1;
+			while bytes.get(candidate + candidate_run) == Some(&marker) {
+				candidate_run += 1;
+			}
+			let closes = if fenced {
+				candidate_run >= run
+					&& text[..candidate].rsplit_once('\n').map_or_else(
+						|| candidate <= 3 && text[..candidate].trim().is_empty(),
+						|(_, prefix)| prefix.len() <= 3 && prefix.trim().is_empty(),
+					)
+			} else {
+				candidate_run == run
+			};
+			if closes {
+				close = Some(candidate + candidate_run);
+				break;
+			}
+			search = candidate + candidate_run;
+		}
+		let end = close.unwrap_or(text.len());
+		ranges.push(at..end);
+		at = end;
+	}
+	ranges
+}
+
+/// XML tags, comments, declarations, and processing instructions hidden from
+/// prose assistance. Apparent markup inside Markdown code is already covered
+/// by [`code_ranges`].
+pub(crate) fn xml_ranges(text: &str) -> SmallVec<Range<usize>, 8> {
+	let mut ranges = SmallVec::new();
+	let mut offset = 0;
+	while let Some(relative) = text[offset..].find('<') {
+		let start = offset + relative;
+		let rest = &text[start + 1..];
+		let valid = rest.chars().next().is_some_and(|character| {
+			matches!(character, '/' | '!' | '?') || character.is_ascii_alphabetic()
+		});
+		if !valid {
+			offset = start + 1;
+			continue;
+		}
+		let end = if let Some(comment) = text[start..].strip_prefix("<!--") {
+			comment
+				.find("-->")
+				.map_or(text.len(), |relative| start + 4 + relative + 3)
+		} else {
+			let processing = text[start..].starts_with("<?");
+			tag_end(text, start + 1, processing).map_or(text.len(), |end| end + 1)
+		};
+		ranges.push(start..end);
+		offset = end;
+	}
+	ranges
+}
+
 fn nearest_open_tag(text: &str) -> Option<&str> {
+	let code = code_ranges(text);
 	let mut stack: SmallVec<&str, 16> = SmallVec::new();
 	let mut offset = 0;
 	while let Some(relative) = text[offset..].find('<') {
 		let start = offset + relative;
+		if let Some(range) = code
+			.iter()
+			.find(|range| range.start <= start && start < range.end)
+		{
+			offset = range.end;
+			continue;
+		}
 		let rest = &text[start..];
 		if let Some(body) = rest.strip_prefix("<!--") {
 			let Some(end) = body.find("-->") else {
@@ -1277,10 +1634,13 @@ fn nearest_open_tag(text: &str) -> Option<&str> {
 		if name_end == name_start {
 			continue;
 		}
+		let name = &text[name_start..name_end];
 		if closing {
-			stack.pop();
+			if let Some(index) = stack.iter().rposition(|open| *open == name) {
+				stack.truncate(index);
+			}
 		} else if !text[name_end..end].trim_ascii_end().ends_with('/') {
-			stack.push(&text[name_start..name_end]);
+			stack.push(name);
 		}
 	}
 	stack.pop()
@@ -1307,6 +1667,19 @@ fn tag_end(text: &str, start: usize, processing: bool) -> Option<usize> {
 fn byte_at_column(text: &str, column: u16) -> usize {
 	text.truncate_width(usize::from(column)).len()
 }
+
+fn segment_max_column(text: &str, last: bool) -> u16 {
+	let width = cell_width(text);
+	if last {
+		width
+	} else {
+		text
+			.graphemes()
+			.next_back()
+			.map_or(0, |grapheme| width.saturating_sub(cell_width(grapheme)))
+	}
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum WordClass {
 	Word,
@@ -1364,9 +1737,6 @@ fn word_left(text: &str, at: usize) -> usize {
 		return 0;
 	};
 	let class = word_class(grapheme);
-	if class == WordClass::Cjk {
-		return offset;
-	}
 	if class != WordClass::Word {
 		let mut target = offset;
 		while let Some((offset, grapheme)) = graphemes.peek() {
@@ -1409,9 +1779,6 @@ fn word_right(text: &str, at: usize) -> usize {
 	};
 	let class = word_class(first);
 	let mut end = at + first_at + first.len();
-	if class == WordClass::Cjk {
-		return end;
-	}
 	if class != WordClass::Word {
 		while let Some((_, grapheme)) = graphemes.peek() {
 			if word_class(grapheme) != class {
@@ -1832,6 +2199,7 @@ pub struct Editor {
 	/// Volatile speech-preview range and exact text in the visible buffer.
 	volatile:          Option<(Range<usize>, Str)>,
 	last_layout_width: Cell<u16>,
+	last_page_rows:    Cell<usize>,
 }
 
 impl Editor {
@@ -1851,6 +2219,7 @@ impl Editor {
 			history_query: None,
 			volatile: None,
 			last_layout_width: Cell::new(80),
+			last_page_rows: Cell::new(1),
 		}
 	}
 
@@ -2020,6 +2389,7 @@ impl Editor {
 	/// Returns up to `max_rows` cursor-centered visible input rows at `width`.
 	pub fn view_rows(&self, width: u16, max_rows: usize) -> SmallVec<VisualRow<'_>, 8> {
 		self.last_layout_width.set(width.max(1));
+		self.last_page_rows.set(max_rows.max(1));
 		self.buffer.rows(width, max_rows)
 	}
 
@@ -2031,6 +2401,7 @@ impl Editor {
 		max_rows: usize,
 	) -> (SmallVec<VisualRow<'_>, 8>, (usize, usize, usize)) {
 		self.last_layout_width.set(width.max(1));
+		self.last_page_rows.set(max_rows.max(1));
 		self.buffer.rows_with_metrics(width, max_rows)
 	}
 
@@ -2074,6 +2445,8 @@ impl Editor {
 	///
 	/// Returns whether the clamped viewport offset changed.
 	pub fn scroll_rows(&self, delta: i32, width: u16, max_rows: usize) -> bool {
+		self.last_layout_width.set(width.max(1));
+		self.last_page_rows.set(max_rows.max(1));
 		self.buffer.scroll_rows(delta, width, max_rows)
 	}
 
@@ -2125,9 +2498,10 @@ impl Editor {
 					self.history_index = None;
 					self.history_query = None;
 				}
-				let outcome = self
-					.buffer
-					.handle(key, self.last_layout_width.get(), MAX_INPUT_ROWS);
+				let outcome =
+					self
+						.buffer
+						.handle(key, self.last_layout_width.get(), self.last_page_rows.get());
 				if matches!(outcome, BufferOutcome::Changed) {
 					if self.options.emoji {
 						match key {
@@ -3394,6 +3768,40 @@ mod tests {
 	}
 
 	#[test]
+	fn close_tag_ignores_inline_and_fenced_code() {
+		let inline = type_slash("<real>`<fake>`<");
+		assert_eq!(inline.text(), "<real>`<fake>`</real>");
+
+		let fenced = type_slash("<real>\n```\n<fake>\n```\n<");
+		assert_eq!(fenced.text(), "<real>\n```\n<fake>\n```\n</real>");
+	}
+
+	#[test]
+	fn close_tag_recovers_from_a_mismatched_closer_without_leaking_inner_tags() {
+		let buffer = type_slash("<outer><inner></outer><");
+		assert_eq!(buffer.text(), "<outer><inner></outer></");
+	}
+
+	#[test]
+	fn code_and_xml_masks_cover_structural_text_only() {
+		let text = "prose `let x = <fake>` <real attr=\">\">body</real>\n~~~\n<tag>\n~~~";
+		assert_eq!(
+			code_ranges(text)
+				.iter()
+				.map(|range| &text[range.clone()])
+				.collect::<Vec<_>>(),
+			["`let x = <fake>`", "~~~\n<tag>\n~~~"]
+		);
+		assert_eq!(
+			xml_ranges(text)
+				.iter()
+				.map(|range| &text[range.clone()])
+				.collect::<Vec<_>>(),
+			["<fake>", "<real attr=\">\">", "</real>", "<tag>"]
+		);
+	}
+
+	#[test]
 	fn close_tag_types_literal_slash_when_stack_is_empty() {
 		let buffer = type_slash("<");
 		assert_eq!(buffer.text(), "</");
@@ -3894,6 +4302,31 @@ mod tests {
 	}
 
 	#[test]
+	fn word_motion_matches_pi_unicode_coarse_blocks() {
+		let text = "你好，世界\u{a0}foo‑bar «привет»";
+		let mut buffer = EditBuffer::new(text);
+		for expected in [
+			text.rfind('»').expect("closing quote"),
+			text.find('п').expect("Russian word"),
+			text.find('«').expect("opening quote"),
+			text.find('f').expect("joined Latin word"),
+			text.find('世').expect("second CJK block"),
+			text.find('，').expect("Unicode delimiter"),
+			0,
+		] {
+			assert_eq!(buffer.handle(Key::WordLeft, 80, 10), BufferOutcome::Changed);
+			assert_eq!(buffer.cursor(), expected);
+		}
+
+		assert_eq!(buffer.handle(Key::WordRight, 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.cursor(), text.find('，').expect("after first CJK block"));
+		assert_eq!(buffer.handle(Key::WordRight, 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.cursor(), text.find('，').expect("delimiter") + '，'.len_utf8());
+		assert_eq!(buffer.handle(Key::WordRight, 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.cursor(), text.find('\u{a0}').expect("after second CJK block"));
+	}
+
+	#[test]
 	fn word_deletes_merge_logical_lines() {
 		let mut editor = editor();
 		editor.insert_text("first\nsecond");
@@ -3944,13 +4377,59 @@ mod tests {
 	}
 
 	#[test]
-	fn undo_coalesces_word_typing_and_splits_at_punctuation() {
+	fn kill_and_yank_preserve_atomic_reference_identity() {
+		let mut buffer = EditBuffer::new("prefix ");
+		buffer.insert_reference("[chip]", "<attachment/>");
+		assert_eq!(buffer.handle(Key::Ctrl('w'), 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.text(), "prefix ");
+		assert!(buffer.atom_ranges().is_empty());
+
+		assert_eq!(buffer.handle(Key::Ctrl('y'), 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.text(), "prefix [chip]");
+		assert_eq!(buffer.atom_ranges().as_slice(), &[(7, 13)]);
+		assert_eq!(buffer.expanded_text(), "prefix <attachment/>");
+
+		assert_eq!(buffer.handle(Key::Backspace, 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.text(), "prefix ");
+	}
+
+	#[test]
+	fn backward_kill_accumulation_keeps_reference_offsets() {
+		let mut buffer = EditBuffer::new("");
+		buffer.insert_reference("[one]", "<one/>");
+		buffer.insert_text(" tail");
+		buffer.handle(Key::Ctrl('w'), 80, 10);
+		buffer.handle(Key::Ctrl('w'), 80, 10);
+		assert_eq!(buffer.handle(Key::Ctrl('y'), 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.text(), "[one] tail");
+		assert_eq!(buffer.atom_ranges().as_slice(), &[(0, 5)]);
+		assert_eq!(buffer.expanded_text(), "<one/> tail");
+	}
+
+	#[test]
+	fn yank_pop_restores_atoms_from_an_older_kill_entry() {
+		let mut buffer = EditBuffer::new("");
+		buffer.insert_reference("[one]", "<one/>");
+		buffer.handle(Key::Ctrl('w'), 80, 10);
+		buffer.insert_text("plain");
+		buffer.handle(Key::Ctrl('w'), 80, 10);
+
+		buffer.handle(Key::Ctrl('y'), 80, 10);
+		assert_eq!(buffer.text(), "plain");
+		assert_eq!(buffer.handle(Key::Alt('y'), 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.text(), "[one]");
+		assert_eq!(buffer.atom_ranges().as_slice(), &[(0, 5)]);
+		assert_eq!(buffer.expanded_text(), "<one/>");
+	}
+
+	#[test]
+	fn undo_coalesces_non_whitespace_typing_and_splits_at_spaces() {
 		let mut editor = editor();
-		type_text(&mut editor, "abc def");
+		type_text(&mut editor, "abc.def ghi");
 		assert_eq!(editor.handle(Key::Ctrl('-')), EditOutcome::Changed);
-		assert_eq!(editor.text(), "abc ");
+		assert_eq!(editor.text(), "abc.def ");
 		assert_eq!(editor.handle(Key::Ctrl('_')), EditOutcome::Changed);
-		assert_eq!(editor.text(), "abc");
+		assert_eq!(editor.text(), "abc.def");
 		assert_eq!(editor.handle(Key::Ctrl('-')), EditOutcome::Changed);
 		assert_eq!(editor.text(), "");
 	}
@@ -4127,6 +4606,21 @@ mod tests {
 	}
 
 	#[test]
+	fn reference_markers_are_single_units_for_caret_and_selection_motion() {
+		let mut buffer = EditBuffer::new("a");
+		buffer.insert_reference("[chip]", "<ref/>");
+		buffer.insert_text("z");
+		buffer.set_cursor_line_column(0, 1);
+		assert_eq!(buffer.handle(Key::Right, 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.cursor(), 7);
+		assert_eq!(buffer.handle(Key::Left, 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.cursor(), 1);
+		assert_eq!(buffer.handle(Key::SelectRight, 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.selection(), Some(1..7));
+		assert_eq!(buffer.selected_text(), Some("[chip]"));
+	}
+
+	#[test]
 	fn partial_replacements_widen_to_whole_reference_markers() {
 		let mut torn = editor();
 		type_text(&mut torn, "ab");
@@ -4158,6 +4652,37 @@ mod tests {
 	}
 
 	#[test]
+	fn character_jump_crosses_lines_and_never_lands_inside_an_atom() {
+		let mut buffer = EditBuffer::new("a\n");
+		buffer.insert_reference("[chip]", "<ref/>");
+		buffer.insert_text("\nz");
+		buffer.set_cursor_line_column(0, 0);
+		buffer.handle(Key::Ctrl(']'), 80, 10);
+		assert_eq!(buffer.handle(Key::Char('h'), 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.cursor(), 8, "forward jump snaps to the atom's far edge");
+
+		buffer.handle(Key::CtrlAlt(']'), 80, 10);
+		assert_eq!(buffer.handle(Key::Char('c'), 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.cursor(), 2, "backward jump snaps to the atom's near edge");
+	}
+
+	#[test]
+	fn line_message_and_selection_motions_use_distinct_boundaries() {
+		let mut buffer = EditBuffer::new("one\ntwo\nthree");
+		buffer.set_cursor_line_column(1, 1);
+		assert_eq!(buffer.handle(Key::SelectEnd, 80, 10), BufferOutcome::Changed);
+		assert_eq!(buffer.selected_text(), Some("wo"));
+		assert_eq!(buffer.handle(Key::Home, 80, 10), BufferOutcome::Changed);
+		assert_eq!((buffer.cursor_line(), buffer.cursor_column()), (1, 1));
+		assert_eq!(buffer.handle(Key::Home, 80, 10), BufferOutcome::Changed);
+		assert_eq!((buffer.cursor_line(), buffer.cursor_column()), (1, 0));
+		assert_eq!(buffer.move_to_message_edge(false), BufferOutcome::Changed);
+		assert_eq!(buffer.cursor(), 0);
+		assert_eq!(buffer.move_to_message_edge(true), BufferOutcome::Changed);
+		assert_eq!(buffer.cursor(), buffer.text().len());
+	}
+
+	#[test]
 	fn page_motion_uses_visible_rows_and_keeps_sticky_column() {
 		let mut editor = editor();
 		editor.insert_text("abcd\nx\nabcd\nx\nabcd\nx\nabcd\nx\nabcd");
@@ -4169,6 +4694,29 @@ mod tests {
 	}
 
 	#[test]
+	fn page_motion_uses_the_rendered_viewport_minus_one_row() {
+		let mut editor = editor();
+		editor.insert_text("0\n1\n2\n3\n4\n5\n6");
+		editor.buffer.set_cursor_line_column(0, 0);
+		let _ = editor.view_rows(20, 4);
+		assert_eq!(editor.handle(Key::PageDown), EditOutcome::Changed);
+		assert_eq!(editor.buffer.cursor_line(), 3);
+		assert_eq!(editor.handle(Key::PageUp), EditOutcome::Changed);
+		assert_eq!(editor.buffer.cursor_line(), 0);
+	}
+
+	#[test]
+	fn right_at_message_end_seeds_the_vertical_sticky_column() {
+		let mut buffer = EditBuffer::new("abcd\nx\nabcd");
+		buffer.set_cursor_line_column(2, 4);
+		assert_eq!(buffer.handle(Key::Right, 80, 8), BufferOutcome::Ignored);
+		assert_eq!(buffer.handle(Key::Up, 80, 8), BufferOutcome::Changed);
+		assert_eq!((buffer.cursor_line(), buffer.cursor_column()), (1, 1));
+		assert_eq!(buffer.handle(Key::Up, 80, 8), BufferOutcome::Changed);
+		assert_eq!((buffer.cursor_line(), buffer.cursor_column()), (0, 4));
+	}
+
+	#[test]
 	fn view_word_wraps_and_vertical_motion_uses_visual_rows() {
 		let mut editor = editor();
 		editor.insert_text("hello world");
@@ -4177,12 +4725,85 @@ mod tests {
 			.iter()
 			.map(|row| row.text)
 			.collect::<Vec<_>>();
-		assert_eq!(rows, ["hello ", "world"]);
+		assert_eq!(rows, ["hello", "world"]);
 		editor.buffer.set_cursor_line_column(0, 4);
 		editor.handle(Key::Down);
 		assert_eq!(editor.buffer.cursor(), 10);
 		editor.handle(Key::Up);
 		assert_eq!(editor.buffer.cursor(), 4);
+	}
+
+	#[test]
+	fn wrapping_fills_wide_tokens_but_keeps_narrow_words_whole() {
+		let wide = EditBuffer::new("word 一二三四五");
+		assert_eq!(
+			wide
+				.rows(10, 8)
+				.iter()
+				.map(|row| row.text)
+				.collect::<Vec<_>>(),
+			["word 一二", "三四五"]
+		);
+
+		let mixed = EditBuffer::new("word 一a二b三c四d");
+		assert_eq!(
+			mixed
+				.rows(10, 8)
+				.iter()
+				.map(|row| row.text)
+				.collect::<Vec<_>>(),
+			["word 一a二", "b三c四d"]
+		);
+
+		let narrow = EditBuffer::new("word über");
+		assert_eq!(
+			narrow
+				.rows(8, 8)
+				.iter()
+				.map(|row| row.text)
+				.collect::<Vec<_>>(),
+			["word", "über"]
+		);
+	}
+
+	#[test]
+	fn wrapping_uses_remaining_width_before_splitting_a_long_token() {
+		let buffer = EditBuffer::new("word abcdefghijklmnop");
+		assert_eq!(
+			buffer
+				.rows(10, 8)
+				.iter()
+				.map(|row| row.text)
+				.collect::<Vec<_>>(),
+			["word abcde", "fghijklmno", "p"]
+		);
+	}
+
+	#[test]
+	fn wrap_hidden_whitespace_stays_addressable_and_rows_fit() {
+		let mut buffer = EditBuffer::new("word     next");
+		let rows = buffer.rows(6, 8);
+		assert_eq!(rows.iter().map(|row| row.text).collect::<Vec<_>>(), ["word", "next"]);
+		assert!(rows.iter().all(|row| cell_width(row.text) <= 6));
+		drop(rows);
+
+		buffer.set_cursor_line_column(0, 7);
+		let rows = buffer.rows(6, 8);
+		assert_eq!(rows[0].cursor_column, Some(4));
+		assert_eq!(rows[1].cursor_column, None);
+	}
+
+	#[test]
+	fn manual_scroll_detaches_until_the_next_edit_then_follows_the_caret() {
+		let mut buffer = EditBuffer::new("0\n1\n2\n3\n4");
+		assert_eq!(buffer.rows_with_metrics(20, 2).1, (3, 2, 5));
+		assert!(buffer.scroll_rows(-2, 20, 2));
+		assert_eq!(buffer.rows_with_metrics(20, 2).1, (1, 2, 5));
+
+		assert_eq!(buffer.handle(Key::Char('x'), 20, 2), BufferOutcome::Changed);
+		assert_eq!(buffer.rows_with_metrics(20, 2).1, (3, 2, 5));
+		buffer.replace_external("a\nb\nc", false);
+		assert_eq!(buffer.rows_with_metrics(20, 2).1, (1, 2, 3));
 	}
 
 	#[test]
@@ -4218,6 +4839,18 @@ mod tests {
 		assert_eq!(buffer.text(), "abcd");
 		assert_eq!(buffer.cursor(), 2);
 		assert_eq!(buffer.handle(Key::Ctrl('_'), 80, 8), BufferOutcome::Ignored);
+	}
+
+	#[test]
+	fn kill_commands_prefer_the_active_selection() {
+		for key in [Key::Ctrl('u'), Key::Ctrl('k'), Key::Ctrl('w'), Key::WordDelete] {
+			let mut buffer = EditBuffer::new("one two");
+			buffer.handle(Key::SelectWordLeft, 80, 8);
+			assert_eq!(buffer.handle(key, 80, 8), BufferOutcome::Changed);
+			assert_eq!(buffer.text(), "one ", "{key:?}");
+			assert_eq!(buffer.handle(Key::Ctrl('y'), 80, 8), BufferOutcome::Changed);
+			assert_eq!(buffer.text(), "one two", "{key:?}");
+		}
 	}
 
 	#[test]

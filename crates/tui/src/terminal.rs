@@ -1869,10 +1869,13 @@ impl Terminal {
 	/// Copies `text` to the system clipboard.
 	///
 	/// Writes OSC 52 to the terminal first (works over SSH and multiplexers
-	/// that forward it), then spawns a detached best-effort native write via
-	/// [`crate::paste::write_clipboard_text`] for local sessions whose
-	/// terminal ignores OSC 52.
-	pub fn copy_to_clipboard(&mut self, text: &str) -> io::Result<()> {
+	/// that forward it), then starts a detached native write for local
+	/// sessions whose terminal ignores OSC 52. The returned receiver preserves
+	/// the native backend outcome for hosts that surface copy notices.
+	pub fn copy_to_clipboard(
+		&mut self,
+		text: &str,
+	) -> io::Result<tokio::sync::oneshot::Receiver<paste::ClipboardWriteOutcome>> {
 		let encoded = base64::encode(text.as_bytes()).into_string();
 		let mut sequence = String::with_capacity(esc!(osc, "52;c;").len() + encoded.len() + 1);
 		sequence.push_str(esc!(osc, "52;c;"));
@@ -1880,13 +1883,7 @@ impl Terminal {
 		sequence.push('\x07');
 		terminal_write_all(&mut self.tty, sequence.as_bytes())?;
 		self.tty.flush()?;
-		let text = text.to_owned();
-		thread::Builder::new()
-			.name("omp-tui-clipboard".into())
-			.spawn(move || {
-				let _ = paste::write_clipboard_text(&text);
-			})?;
-		Ok(())
+		Ok(paste::spawn_clipboard_write(Str::new(text)))
 	}
 
 	fn set_appearance(&mut self, appearance: Appearance) {
