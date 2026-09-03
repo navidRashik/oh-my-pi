@@ -15,7 +15,7 @@ pub use node::{Node, NodeSpec, Value};
 pub use omp_vocab::{KnownTag, PropId, PropKey, Tag};
 pub use op::{Op, StreamOp};
 pub use selector::SelectorError;
-pub use snapshot::Snapshot;
+pub use snapshot::{Snapshot, SnapshotDecodeError};
 pub use stream::Sid;
 pub use subscribe::{Event, Patch};
 pub use txn::{Applied, Dom, DomError, Txn};

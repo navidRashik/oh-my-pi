@@ -1,6 +1,12 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
-use crate::{Handle, Node, Sid, Value, stream::SnapshotStream};
+use crate::{Handle, KnownTag, Node, Sid, Tag, Value, stream::SnapshotStream};
+
+/// Largest allocator high-water mark accepted from an untrusted replica
+/// snapshot. A canonical snapshot cannot describe more live nodes than its
+/// encoded bytes, but removed handles make the allocator intentionally sparse.
+pub const SNAPSHOT_HIGH_WATER_LIMIT: u64 = 1_048_576;
 
 #[derive(Serialize)]
 struct Canonical<'a> {
@@ -10,11 +16,52 @@ struct Canonical<'a> {
 	streams:    &'a [SnapshotStream],
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct CanonicalNode {
 	handle: Handle,
 	parent: Option<Handle>,
 	node:   Node,
+}
+
+#[derive(Deserialize)]
+struct EncodedSnapshot {
+	high_water: u64,
+	next_sid:   Sid,
+	nodes:      Vec<CanonicalNode>,
+	streams:    Vec<SnapshotStream>,
+}
+
+/// Failure to decode an untrusted canonical session snapshot.
+#[derive(Debug, Error)]
+pub enum SnapshotDecodeError {
+	/// The canonical JSON encoding was malformed.
+	#[error("session snapshot JSON was malformed")]
+	Json(#[from] serde_json::Error),
+	/// The snapshot requested an allocator range too large to materialize.
+	#[error("session snapshot high-water mark {actual} exceeds limit {limit}")]
+	HighWater {
+		/// Encoded high-water mark.
+		actual: u64,
+		/// Maximum accepted high-water mark.
+		limit:  u64,
+	},
+	/// A node or parent handle fell outside the declared allocator range.
+	#[error("session snapshot handle {handle} exceeds high-water mark {high_water}")]
+	HandleOutOfRange {
+		/// Invalid handle.
+		handle:     u64,
+		/// Declared high-water mark.
+		high_water: u64,
+	},
+	/// Two encoded nodes claimed the same stable handle.
+	#[error("session snapshot repeats handle {handle}")]
+	DuplicateHandle {
+		/// Repeated handle.
+		handle: u64,
+	},
+	/// Node children, parents, or open streams were internally inconsistent.
+	#[error("session snapshot tree structure was inconsistent")]
+	InconsistentStructure,
 }
 
 /// Deterministic, self-contained image of a materialized session tree.
@@ -31,6 +78,100 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+	/// Decodes and validates canonical bytes received by a session-tree
+	/// replica.
+	pub fn from_bytes(bytes: &[u8]) -> Result<Self, SnapshotDecodeError> {
+		let encoded: EncodedSnapshot = serde_json::from_slice(bytes)?;
+		if encoded.high_water > SNAPSHOT_HIGH_WATER_LIMIT {
+			return Err(SnapshotDecodeError::HighWater {
+				actual: encoded.high_water,
+				limit:  SNAPSHOT_HIGH_WATER_LIMIT,
+			});
+		}
+		let high_water = encoded.high_water.max(4);
+		let slots =
+			usize::try_from(high_water.saturating_add(1)).expect("bounded high-water fits usize");
+		let mut nodes = vec![None; slots];
+		let mut parents = vec![None; slots];
+		for encoded_node in encoded.nodes {
+			let raw = encoded_node.handle.get();
+			if raw > high_water {
+				return Err(SnapshotDecodeError::HandleOutOfRange { handle: raw, high_water });
+			}
+			let index = raw as usize;
+			if nodes[index].is_some() {
+				return Err(SnapshotDecodeError::DuplicateHandle { handle: raw });
+			}
+			if let Some(parent) = encoded_node.parent {
+				if parent.get() > high_water {
+					return Err(SnapshotDecodeError::HandleOutOfRange {
+						handle: parent.get(),
+						high_water,
+					});
+				}
+				parents[index] = Some(parent);
+			}
+			nodes[index] = Some(encoded_node.node);
+		}
+		let canonical_roots = [
+			(1, KnownTag::Session, None),
+			(2, KnownTag::Meta, Handle::new(1)),
+			(3, KnownTag::Body, Handle::new(1)),
+			(4, KnownTag::Queues, Handle::new(1)),
+		];
+		for (index, tag, parent) in canonical_roots {
+			let Some(node) = nodes.get(index).and_then(Option::as_ref) else {
+				return Err(SnapshotDecodeError::InconsistentStructure);
+			};
+			if node.tag != Tag::Known(tag) || parents[index] != parent {
+				return Err(SnapshotDecodeError::InconsistentStructure);
+			}
+		}
+		let expected_root_children = [
+			Handle::new(2).expect("canonical handle"),
+			Handle::new(3).expect("canonical handle"),
+			Handle::new(4).expect("canonical handle"),
+		];
+		if nodes[1]
+			.as_ref()
+			.is_none_or(|root| root.kids.as_slice() != expected_root_children)
+		{
+			return Err(SnapshotDecodeError::InconsistentStructure);
+		}
+		for (index, node) in nodes.iter().enumerate().skip(1) {
+			let Some(node) = node else {
+				continue;
+			};
+			let handle = Handle::new(index as u64).expect("nonzero enumerated handle");
+			for child in &node.kids {
+				let child_index = child.get() as usize;
+				if nodes.get(child_index).and_then(Option::as_ref).is_none()
+					|| parents.get(child_index).copied().flatten() != Some(handle)
+				{
+					return Err(SnapshotDecodeError::InconsistentStructure);
+				}
+			}
+			if let Some(parent) = parents[index]
+				&& nodes
+					.get(parent.get() as usize)
+					.and_then(Option::as_ref)
+					.is_none()
+			{
+				return Err(SnapshotDecodeError::InconsistentStructure);
+			}
+		}
+		for stream in &encoded.streams {
+			if nodes
+				.get(stream.node.get() as usize)
+				.and_then(Option::as_ref)
+				.is_none()
+			{
+				return Err(SnapshotDecodeError::InconsistentStructure);
+			}
+		}
+		Ok(Self::build(high_water, encoded.next_sid, nodes, parents, encoded.streams))
+	}
+
 	pub(crate) fn build(
 		high_water: u64,
 		next_sid: Sid,

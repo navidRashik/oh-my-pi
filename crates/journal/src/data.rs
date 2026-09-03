@@ -48,6 +48,168 @@ pub struct MsgUser {
 	pub attachments: Vec<Attachment>,
 }
 
+/// One settled job in the typed payload of a journaled
+/// `<user async_result=true>` patch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncJobDelivery {
+	/// Stable job identity.
+	pub id:          Str,
+	/// User-facing execution type (`bash`, `task`, `eval`, or another tool).
+	#[serde(rename = "type")]
+	pub job_type:    Str,
+	/// Work label captured when the job started.
+	pub label:       Str,
+	/// Exact elapsed wall time captured when the job settled.
+	pub duration_ms: u64,
+	/// Terminal lifecycle status.
+	pub status:      AsyncJobStatus,
+	/// Full-output artifact when the completed result was spilled.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub artifact:    Option<Str>,
+	/// Stable terminal diagnostic for a failed or cancelled job.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fault:       Option<Str>,
+}
+
+/// Terminal state carried by a background-job delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum AsyncJobStatus {
+	/// The job produced its result successfully.
+	Completed,
+	/// The job settled with an error.
+	Failed,
+	/// The job was cancelled before completion.
+	Cancelled,
+}
+
+/// Replay-stable typed payload of a journaled `<user async_result=true>` patch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncResult {
+	/// Jobs delivered together, oldest first.
+	pub jobs: Vec<AsyncJobDelivery>,
+}
+
+/// One supervised-process completion carried by a journaled
+/// `<user launch_completion=true>` patch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchDaemonCompletion {
+	/// Stable daemon name supplied to `hub start`.
+	pub name:        Str,
+	/// Terminal success/failure classification.
+	pub status:      LaunchDaemonStatus,
+	/// Process exit code, absent when launch or supervision failed before exit.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub exit_code:   Option<i32>,
+	/// Exact elapsed wall time captured by the process supervisor.
+	pub duration_ms: u64,
+	/// Typed terminal fault, absent for successful completion.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fault:       Option<LaunchDaemonFault>,
+}
+
+/// Terminal status of a supervised process completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum LaunchDaemonStatus {
+	/// The process exited successfully.
+	Completed,
+	/// The process failed, was denied, timed out, or was cancelled.
+	Failed,
+}
+
+/// Typed reason a supervised process did not complete successfully.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchDaemonFault {
+	/// Stable failure classification.
+	pub kind:    LaunchDaemonFaultKind,
+	/// Supervisor diagnostic, when one is available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub message: Option<Str>,
+	/// Terminating signal, when one was reported.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signal:  Option<Str>,
+}
+
+/// Stable supervised-process failure classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum LaunchDaemonFaultKind {
+	/// The process reported a failed execution outcome.
+	Failed,
+	/// The process exceeded its configured timeout.
+	Timeout,
+	/// The process was cancelled or explicitly stopped.
+	Cancelled,
+	/// Host policy denied process execution.
+	Denied,
+	/// The supervisor itself could not launch or monitor the process.
+	Supervisor,
+}
+
+/// Replay-stable typed payload for one or more supervised-process completions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchCompletion {
+	/// Terminal daemon rows, in delivery order.
+	pub daemons: Vec<LaunchDaemonCompletion>,
+}
+
+/// Direction of a replay-stable IRC transcript observation.
+#[derive(
+	Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Display, EnumString, IntoStaticStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum IrcDirection {
+	/// A peer message received by this session.
+	Incoming,
+	/// A reply emitted automatically on this session's behalf.
+	Autoreply,
+	/// An observation of traffic relayed between two other agents.
+	Relay,
+	/// A work-pool assignment or dispatch observation.
+	Workpool,
+}
+
+/// Typed payload of a journaled IRC transcript observation.
+///
+/// The controller records this payload on a `<notice kind=irc>` patch. The
+/// message body is duplicated as the element content so generic fallback and
+/// copy remain useful even when a future actor does not understand this revision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IrcTraffic {
+	/// Direction-specific presentation kind.
+	pub direction:    IrcDirection,
+	/// Sending peer, when the observation has one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub from:         Option<Str>,
+	/// Receiving peer, when the observation has one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub to:           Option<Str>,
+	/// Message body.
+	pub body:         Str,
+	/// Stable identity of the message this replies to.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reply_to:     Option<Str>,
+	/// Work-pool identity for a pool dispatch.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pool:         Option<Str>,
+	/// Work-pool scheduling mode.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mode:         Option<Str>,
+	/// Producer-observed Unix timestamp in milliseconds.
+	pub timestamp_ms: u64,
+}
+
 /// `msg.assistant.start@1` payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgAssistantStart {
@@ -135,6 +297,9 @@ pub enum ToolResult {
 		/// Durable model-facing projection produced by the exact tool revision.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		prompt_parts: Option<Box<RawValue>>,
+		/// Environment-provided outcome artifact adopted into the session CAS.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		source_blob:  Option<BlobRef>,
 	},
 	/// Failed terminal payload.
 	Fault {
@@ -143,6 +308,9 @@ pub enum ToolResult {
 		/// Durable model-facing projection produced by the exact tool revision.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		prompt_parts: Option<Box<RawValue>>,
+		/// Environment-provided outcome artifact adopted into the session CAS.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		source_blob:  Option<BlobRef>,
 	},
 }
 
@@ -154,25 +322,65 @@ impl<'de> Deserialize<'de> for ToolResult {
 		#[derive(Deserialize)]
 		#[serde(deny_unknown_fields)]
 		struct Wire {
-			#[serde(default)]
+			#[serde(default, deserialize_with = "deserialize_present_raw")]
 			outcome:      Option<Box<RawValue>>,
-			#[serde(default)]
+			#[serde(default, deserialize_with = "deserialize_present_raw")]
 			fault:        Option<Box<RawValue>>,
 			#[serde(default)]
 			prompt_parts: Option<Box<RawValue>>,
+			#[serde(default)]
+			source_blob:  Option<BlobRef>,
+		}
+
+		fn deserialize_present_raw<'de, D>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error>
+		where
+			D: Deserializer<'de>,
+		{
+			Box::<RawValue>::deserialize(deserializer).map(Some)
 		}
 
 		let wire = Wire::deserialize(deserializer)?;
 		match (wire.outcome, wire.fault) {
-			(Some(outcome), None) => Ok(Self::Outcome { outcome, prompt_parts: wire.prompt_parts }),
-			(None, Some(fault)) => Ok(Self::Fault { fault, prompt_parts: wire.prompt_parts }),
+			(Some(outcome), None) => Ok(Self::Outcome {
+				outcome,
+				prompt_parts: wire.prompt_parts,
+				source_blob: wire.source_blob,
+			}),
+			(None, Some(fault)) => Ok(Self::Fault {
+				fault,
+				prompt_parts: wire.prompt_parts,
+				source_blob: wire.source_blob,
+			}),
 			_ => Err(de::Error::custom("tool result must contain exactly one of outcome or fault")),
 		}
 	}
 }
 
+/// The inference role which produced a receipt.
+#[derive(Clone, Copy, Debug, Default, IntoStaticStr, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReceiptRole {
+	/// The primary model serving the user-visible turn.
+	#[default]
+	Primary,
+	/// The auxiliary advisor reviewing the primary model's work.
+	Advisor,
+}
+
+/// Credential-free identity of the inference which produced a receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptIdentity {
+	/// Semantic role of the inference.
+	pub role:     ReceiptRole,
+	/// Concrete serving provider.
+	pub provider: Str,
+	/// Concrete serving model.
+	pub model:    Str,
+}
+
 /// `turn.receipt@1` payload.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnReceipt {
 	/// Input token count.
 	pub tokens_in:                   u64,
@@ -200,6 +408,10 @@ pub struct TurnReceipt {
 	/// every other route.
 	#[serde(default, skip_serializing_if = "is_zero")]
 	pub premium_requests_millionths: u64,
+	/// Credential-free serving identity for auxiliary inference. Primary
+	/// receipts written before this field existed remain `None`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub identity:                    Option<ReceiptIdentity>,
 }
 
 impl TurnReceipt {
@@ -215,6 +427,7 @@ impl TurnReceipt {
 			ttft_ms: None,
 			duration_ms: None,
 			premium_requests_millionths: 0,
+			identity: None,
 		}
 	}
 }
@@ -296,5 +509,82 @@ mod tests {
 		assert_eq!(serde_json::from_str::<MsgUser>(&json).unwrap(), payload);
 		let bare: MsgUser = serde_json::from_str(r#"{"text":"hi"}"#).unwrap();
 		assert!(bare.attachments.is_empty());
+	}
+
+	#[test]
+	fn receipt_identity_is_optional_and_round_trips_advisor_billing() {
+		let legacy: TurnReceipt =
+			serde_json::from_str(r#"{"tokens_in":1,"tokens_out":2,"cost_nano_usd":3}"#)
+				.expect("legacy receipt");
+		assert_eq!(legacy.identity, None);
+
+		let advisor = TurnReceipt {
+			cost_nano_usd: 80_000_000,
+			identity: Some(ReceiptIdentity {
+				role:     ReceiptRole::Advisor,
+				provider: Str::new_static("anthropic"),
+				model:    Str::new_static("claude-sonnet-4-5"),
+			}),
+			..TurnReceipt::default()
+		};
+		let json = serde_json::to_string(&advisor).expect("advisor receipt");
+		assert!(json.contains(
+			r#""identity":{"role":"advisor","provider":"anthropic","model":"claude-sonnet-4-5"}"#
+		));
+		assert_eq!(serde_json::from_str::<TurnReceipt>(&json).expect("round trip"), advisor);
+	}
+
+	#[test]
+	fn irc_traffic_round_trips_every_directional_fact() {
+		let payload = IrcTraffic {
+			direction:    IrcDirection::Workpool,
+			from:         Some(Str::new_static("scheduler")),
+			to:           Some(Str::new_static("Scout")),
+			body:         Str::new_static("inspect the parser"),
+			reply_to:     Some(Str::new_static("01K4A")),
+			pool:         Some(Str::new_static("audit")),
+			mode:         Some(Str::new_static("parallel")),
+			timestamp_ms: 1_777_777_777_000,
+		};
+		let json = serde_json::to_string(&payload).expect("traffic serializes");
+		assert_eq!(
+			serde_json::from_str::<IrcTraffic>(&json).expect("traffic decodes"),
+			payload
+		);
+		assert!(json.contains(r#""direction":"workpool""#));
+		assert!(json.contains(r#""reply_to":"01K4A""#));
+		assert!(
+			serde_json::from_str::<IrcTraffic>(&json.replace(
+				"}",
+				r#","untyped":"discard me"}"#,
+			))
+			.is_err()
+		);
+	}
+
+	#[test]
+	fn launch_completion_round_trips_typed_terminal_facts() {
+		let payload = LaunchCompletion {
+			daemons: vec![LaunchDaemonCompletion {
+				name:        Str::new_static("web"),
+				status:      LaunchDaemonStatus::Failed,
+				exit_code:   Some(17),
+				duration_ms: 2_500,
+				fault:       Some(LaunchDaemonFault {
+					kind:    LaunchDaemonFaultKind::Failed,
+					message: Some(Str::new_static("readiness process exited")),
+					signal:  Some(Str::new_static("SIGTERM")),
+				}),
+			}],
+		};
+		let json = serde_json::to_string(&payload).expect("completion serializes");
+		assert_eq!(
+			serde_json::from_str::<LaunchCompletion>(&json).expect("completion decodes"),
+			payload
+		);
+		assert!(
+			serde_json::from_str::<LaunchCompletion>(r#"{"daemons":[],"untyped":"discard me"}"#)
+				.is_err()
+		);
 	}
 }

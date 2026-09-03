@@ -47,10 +47,12 @@ fn tool_result_uses_outcome_or_fault_key_without_wrapper_tags() {
 	let outcome = data::ToolResult::Outcome {
 		outcome:      RawValue::from_string(json!({"text": "ok"}).to_string()).expect("raw JSON"),
 		prompt_parts: None,
+		source_blob:  None,
 	};
 	let fault = data::ToolResult::Fault {
 		fault:        RawValue::from_string(json!({"code": "denied"}).to_string()).expect("raw JSON"),
 		prompt_parts: None,
+		source_blob:  None,
 	};
 	let outcome_json = serde_json::to_string(&outcome).expect("serialize");
 	let fault_json = serde_json::to_string(&fault).expect("serialize");
@@ -64,6 +66,17 @@ fn tool_result_uses_outcome_or_fault_key_without_wrapper_tags() {
 		serde_json::from_str::<data::ToolResult>(&fault_json).expect("deserialize fault"),
 		data::ToolResult::Fault { .. }
 	));
+	assert!(matches!(
+		serde_json::from_str::<data::ToolResult>(r#"{"outcome":null}"#)
+			.expect("deserialize null outcome"),
+		data::ToolResult::Outcome { .. }
+	));
+	assert!(matches!(
+		serde_json::from_str::<data::ToolResult>(r#"{"fault":null}"#)
+			.expect("deserialize null fault"),
+		data::ToolResult::Fault { .. }
+	));
+	assert!(serde_json::from_str::<data::ToolResult>(r#"{"outcome":null,"fault":null}"#).is_err());
 }
 
 #[test]

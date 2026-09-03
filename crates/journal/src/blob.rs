@@ -19,7 +19,7 @@
 use std::{
 	fmt::{self, Display},
 	fs::{self, File, OpenOptions},
-	io::{self, Read, Write},
+	io::{self, Read, Seek, SeekFrom, Write},
 	path::{Path, PathBuf},
 	process,
 	sync::atomic::{AtomicU64, Ordering},
@@ -131,6 +131,22 @@ pub enum Error {
 		/// The byte length found on disk.
 		actual:   u64,
 	},
+	/// Blob bytes did not match the content-addressed digest.
+	#[error("blob digest mismatch: expected {expected}, found {actual}")]
+	DigestMismatch {
+		/// Digest named by the durable reference.
+		expected: Hash32,
+		/// Digest computed from the stored bytes.
+		actual:   Hash32,
+	},
+	/// A requested byte range starts beyond the stored content.
+	#[error("blob range starts at {offset}, beyond stored size {size}")]
+	RangeOutOfBounds {
+		/// Requested zero-based byte offset.
+		offset: u64,
+		/// Complete stored blob size.
+		size:   u64,
+	},
 	/// A digest was not exactly 64 lowercase hexadecimal characters.
 	#[error("invalid SHA-256 hash hex")]
 	BadHex,
@@ -178,6 +194,45 @@ impl WheelName {
 			}
 		}
 		Ok(name)
+	}
+}
+
+/// One bounded byte range opened from immutable content-addressed storage.
+///
+/// The open file pins the selected inode for the lifetime of the transfer, so
+/// concurrent retention cleanup cannot switch or truncate a resumed read.
+#[derive(Debug)]
+pub struct BlobRange {
+	reference: BlobRef,
+	offset:    u64,
+	length:    u64,
+	file:      File,
+}
+
+impl BlobRange {
+	/// Returns the identity of the complete stored blob.
+	pub const fn reference(&self) -> BlobRef {
+		self.reference
+	}
+
+	/// Returns the zero-based starting offset of this range.
+	pub const fn offset(&self) -> u64 {
+		self.offset
+	}
+
+	/// Returns the exact number of bytes selected for this range.
+	pub const fn len(&self) -> u64 {
+		self.length
+	}
+
+	/// Returns whether this range contains no bytes.
+	pub const fn is_empty(&self) -> bool {
+		self.length == 0
+	}
+
+	/// Transfers ownership of the positioned file to an asynchronous reader.
+	pub fn into_file(self) -> File {
+		self.file
 	}
 }
 
@@ -301,6 +356,35 @@ impl BlobStore {
 			return Err(Error::Corrupt { expected: reference.size, actual });
 		}
 		Ok(Bytes::from(data))
+	}
+
+	/// Opens a bounded range without materializing the complete blob.
+	///
+	/// `offset` may equal the complete stored size. A zero `length` selects the
+	/// remainder; any other length is clamped to the available bytes. The
+	/// returned identity always carries the complete size and digest so every
+	/// resumed segment has the same provenance.
+	///
+	/// # Errors
+	///
+	/// Returns [`Error::NotFound`] when the digest is absent,
+	/// [`Error::RangeOutOfBounds`] when `offset` exceeds the complete size, or
+	/// [`Error::Io`] when metadata or positioning fails.
+	pub fn open_range(&self, hash: Hash32, offset: u64, length: u64) -> Result<BlobRange, Error> {
+		let probe = BlobRef { hash, size: 0 };
+		let mut file = File::open(self.path(&probe)).map_err(map_read_error)?;
+		let size = file.metadata()?.len();
+		if offset > size {
+			return Err(Error::RangeOutOfBounds { offset, size });
+		}
+		let available = size - offset;
+		let length = if length == 0 {
+			available
+		} else {
+			length.min(available)
+		};
+		file.seek(SeekFrom::Start(offset))?;
+		Ok(BlobRange { reference: BlobRef { hash, size }, offset, length, file })
 	}
 
 	/// Returns whether the referenced blob path currently exists as a file.
