@@ -105,11 +105,7 @@ fn render_section(
 	} else {
 		""
 	};
-	let stats = if matches!(view.status, CardStatus::Done) && (added > 0 || removed > 0) {
-		sf!(" ⟨+{added}/-{removed}⟩")
-	} else {
-		Str::default()
-	};
+	let show_stats = matches!(view.status, CardStatus::Done) && (added > 0 || removed > 0);
 	let href = file_link(path);
 	dom! {
 		<box border=round bc={if fault.is_some() { "err" } else { "border" }} bg={if fault.is_some() { "error_surface" } else { "panel" }} bleed title_pad=3>
@@ -118,7 +114,7 @@ fn render_section(
 				<text fg=accent>{"Edit"}</text><text>{":"}</text><text>{" "}</text>
 				<icon name={path_language_icon(path)} fg=output/><text>{" "}</text>
 				<text fg=accent href={href}>{path}</text>
-				if !stats.is_empty() {
+				if show_stats {
 					<text>{" "}</text><text fg=muted>{"⟨"}</text><text fg=info>{sf!("+{added}")}</text>
 					<text fg=muted>{"/"}</text><text fg=err>{sf!("-{removed}")}</text><text fg=muted>{"⟩"}</text>
 				}

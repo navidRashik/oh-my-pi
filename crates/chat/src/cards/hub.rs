@@ -70,7 +70,9 @@ fn render_generic(view: &CardView<'_>) -> Component {
 	let icon = match view.status {
 		CardStatus::Done => dom! { <i:check-button fg=ok/> }.into_component(),
 		CardStatus::Failed => dom! { <i:error fg=err/> }.into_component(),
-		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending fg=output/> }.into_component(),
+		CardStatus::StreamingArgs | CardStatus::InProgress => {
+			dom! { <i:pending fg=output/> }.into_component()
+		},
 	};
 	dom! {
 		<col>
@@ -243,7 +245,9 @@ fn render_send(view: &CardView<'_>, args: Option<&Value>, raw: &str) -> Componen
 	let icon = match view.status {
 		CardStatus::Done => dom! { <i:irc fg=accent/> }.into_component(),
 		CardStatus::Failed => dom! { <i:error fg=err/> }.into_component(),
-		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending fg=output/> }.into_component(),
+		CardStatus::StreamingArgs | CardStatus::InProgress => {
+			dom! { <i:pending fg=output/> }.into_component()
+		},
 	};
 	dom! {
 		<col>
@@ -327,7 +331,9 @@ fn render_inbox(view: &CardView<'_>, args: Option<&Value>, raw: &str, waiting: b
 		CardStatus::Done => dom! { <i:irc fg=accent/> }.into_component(),
 		CardStatus::Failed if waiting => dom! { <i:warning-status fg=warn/> }.into_component(),
 		CardStatus::Failed => dom! { <i:error fg=err/> }.into_component(),
-		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending fg=output/> }.into_component(),
+		CardStatus::StreamingArgs | CardStatus::InProgress => {
+			dom! { <i:pending fg=output/> }.into_component()
+		},
 	};
 	dom! {
 		<col pad-x=1>
@@ -405,7 +411,9 @@ fn render_roster(view: &CardView<'_>) -> Component {
 	let icon = match view.status {
 		CardStatus::Done => dom! { <i:irc fg=accent/> }.into_component(),
 		CardStatus::Failed => dom! { <i:error fg=err/> }.into_component(),
-		CardStatus::StreamingArgs | CardStatus::InProgress => dom! { <i:pending fg=output/> }.into_component(),
+		CardStatus::StreamingArgs | CardStatus::InProgress => {
+			dom! { <i:pending fg=output/> }.into_component()
+		},
 	};
 	dom! {
 		<col pad-x=1>

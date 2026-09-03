@@ -175,6 +175,15 @@ pub enum TodoOp {
 	Import(Option<Str>),
 }
 
+/// `/loop` budget parsed with pi's `loop-limit.ts` grammar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoopLimit {
+	/// Stop after this many loop iterations.
+	Iterations(u32),
+	/// Stop after this wall-clock duration.
+	DurationMs(u64),
+}
+
 /// `/shake` modes (pi `shake-types.ts`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display, strum::EnumString)]
 #[strum(serialize_all = "lowercase")]
@@ -219,10 +228,10 @@ pub enum CommandAction {
 		/// Rough objective seeding the interview.
 		initial: Option<Str>,
 	},
-	/// `/loop [count] [prompt]`: toggle the loop Director.
+	/// `/loop [count|duration] [prompt]`: toggle the loop Director.
 	Loop {
-		/// Iteration cap; `None` is unbounded.
-		limit:  Option<u32>,
+		/// Iteration or wall-clock cap; `None` is unbounded.
+		limit:  Option<LoopLimit>,
 		/// Prompt re-sent each iteration; `None` records the next prompt.
 		prompt: Option<Str>,
 	},
@@ -327,10 +336,10 @@ pub enum CommandAction {
 	},
 	/// `/clear`: drop the model context in place, keeping the session.
 	Clear,
-	/// `/move <path>`: relocate the session to another directory.
+	/// `/move [path]`: open the directory editor or relocate directly.
 	Move {
-		/// Target directory as typed (resolved against the working directory).
-		path: Str,
+		/// Target directory as typed; `None` opens the autocomplete editor.
+		path: Option<Str>,
 	},
 	/// `/wt [branch]`: fork the checkout into a worktree and move there.
 	Worktree {

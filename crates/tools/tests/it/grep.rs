@@ -1,18 +1,15 @@
 //! Model-facing behavioral contracts for `grep@1`.
 
-use std::{future, future::Future, str, sync::Arc};
+use std::{future, future::Future, sync::Arc};
 
 use bytes::Bytes;
 use futures::{StreamExt, executor::block_on};
 use omp_core::{Str, sf};
 use omp_tool::{
-	BlobRef, CallOutcome, CapsBase, Claims, ErasedEv, ErasedOutcome, IncomingParams, ModelClass,
-	Part, Precedence, Presentation, PromptCaps, Registry, Tool,
+	CallOutcome, CapsBase, Claims, ErasedEv, ErasedOutcome, IncomingParams, ModelClass, Part,
+	Precedence, Presentation, PromptCaps, Registry, Tool, VisibilityReceipt, VisibleSourceLine,
 };
-use omp_tools::{
-	glob, grep,
-	read::{Fault as ReadFault, ReadBlobs, StoredArtifact},
-};
+use omp_tools::{glob, grep};
 use parking_lot::Mutex;
 use serde_json::json;
 
@@ -42,6 +39,10 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 		async move { result }
 	}
 
+	fn stage_snapshots(&self, _snapshots: Vec<grep::SearchSnapshot>) -> Result<(), grep::Fault> {
+		Ok(())
+	}
+
 	fn record_snapshots(&self, records: Vec<grep::SnapshotRecord>) -> Result<(), grep::Fault> {
 		self.recorded.lock().extend(records);
 		Ok(())
@@ -52,42 +53,6 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 		_request: glob::WalkRequest,
 	) -> impl Future<Output = Result<glob::WalkResult, glob::Fault>> + Send + '_ {
 		future::ready(Err(glob::Fault::Workspace { message: sf!("unused fake glob boundary") }))
-	}
-}
-
-#[derive(Clone, Default)]
-struct RecordingBlobs {
-	stored: Arc<Mutex<Vec<Bytes>>>,
-}
-
-impl ReadBlobs for RecordingBlobs {
-	fn store(
-		&self,
-		bytes: Bytes,
-		media_type: Str,
-	) -> impl Future<Output = Result<BlobRef, ReadFault>> + Send + '_ {
-		let stored = Arc::clone(&self.stored);
-		async move {
-			let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-			stored.lock().push(bytes);
-			Ok(BlobRef { hash: sf!("grep-full"), media_type, byte_len })
-		}
-	}
-
-	fn store_artifact(
-		&self,
-		bytes: Bytes,
-		media_type: Str,
-	) -> impl Future<Output = Result<StoredArtifact, ReadFault>> + Send + '_ {
-		let stored = Arc::clone(&self.stored);
-		async move {
-			let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-			stored.lock().push(bytes);
-			Ok(StoredArtifact {
-				blob: BlobRef { hash: sf!("grep-full"), media_type, byte_len },
-				uri:  sf!("artifact://1"),
-			})
-		}
 	}
 }
 
@@ -122,17 +87,16 @@ fn context(line_number: u32, line: &str) -> grep::ContextLine {
 	grep::ContextLine { line_number, line: Str::new(line) }
 }
 
-fn invoke_with_context_and_blobs(
+fn invoke_with_context(
 	workspace: &FakeWorkspace,
 	raw: &str,
 	context_before: u32,
 	context_after: u32,
-	blobs: RecordingBlobs,
 ) -> Invocation {
 	let mut registry = Registry::new();
 	registry
 		.register(
-			grep::tool(workspace.clone(), blobs, context_before, context_after),
+			grep::tool(workspace.clone(), context_before, context_after),
 			Presentation::Slot,
 			Claims { precedence: Precedence::CORE, claimant: sf!("omp/core"), replaces: None },
 		)
@@ -157,16 +121,12 @@ fn invoke_with_context_and_blobs(
 	}
 }
 
-fn invoke_with_blobs(workspace: &FakeWorkspace, raw: &str, blobs: RecordingBlobs) -> Invocation {
-	invoke_with_context_and_blobs(workspace, raw, 2, 2, blobs)
-}
-
 fn invoke(workspace: &FakeWorkspace, raw: &str) -> Invocation {
-	invoke_with_blobs(workspace, raw, RecordingBlobs::default())
+	invoke_with_context(workspace, raw, 2, 2)
 }
 
 fn prompt(workspace: &FakeWorkspace, outcome: &CallOutcome<grep::Payload, grep::Fault>) -> String {
-	let tool = grep::tool(workspace.clone(), RecordingBlobs::default(), 2, 2);
+	let tool = grep::tool(workspace.clone(), 2, 2);
 	let caps = PromptCaps::for_tool(
 		CapsBase {
 			maximum_parts:      1,
@@ -194,7 +154,7 @@ fn invoke_prompt(workspace: &FakeWorkspace, raw: &str) -> (String, bool) {
 
 #[test]
 fn schema_is_exactly_the_native_grep_schema() {
-	let tool = grep::tool(fake(grep::SearchResult::default()), RecordingBlobs::default(), 2, 2);
+	let tool = grep::tool(fake(grep::SearchResult::default()), 2, 2);
 	let actual: serde_json::Value =
 		serde_json::from_slice(&tool.spec().schema).expect("grep schema is JSON");
 	assert_eq!(
@@ -289,25 +249,15 @@ fn asymmetric_and_zero_context_are_request_scoped_and_preserve_source_order() {
 		..grep::SearchResult::default()
 	});
 
-	let asymmetric = invoke_with_context_and_blobs(
-		&workspace,
-		r#"{"pattern":"needle","path":"src/context.rs"}"#,
-		1,
-		3,
-		RecordingBlobs::default(),
-	);
+	let asymmetric =
+		invoke_with_context(&workspace, r#"{"pattern":"needle","path":"src/context.rs"}"#, 1, 3);
 	assert_eq!(
 		prompt(&workspace, &asymmetric.outcome),
 		"[src/context.rs#C0DE]\n 3:before 3\n*4:needle\n 5:after 1\n 6:after 2\n 7:after 3"
 	);
 
-	let zero = invoke_with_context_and_blobs(
-		&workspace,
-		r#"{"pattern":"needle","path":"src/context.rs"}"#,
-		0,
-		0,
-		RecordingBlobs::default(),
-	);
+	let zero =
+		invoke_with_context(&workspace, r#"{"pattern":"needle","path":"src/context.rs"}"#, 0, 0);
 	assert_eq!(prompt(&workspace, &zero.outcome), "[src/context.rs#C0DE]\n*4:needle");
 
 	let requests = workspace.requests.lock();
@@ -385,7 +335,7 @@ fn line_selector_filters_matches_before_projection() {
 }
 
 #[test]
-fn range_overfetch_and_output_truncation_authorize_only_emitted_rows() {
+fn central_visibility_receipt_authorizes_only_dispatcher_retained_rows() {
 	let mut matches = (1..500)
 		.map(|line_number| matched("src/range.rs", line_number, "needle before range", Some("F00D")))
 		.collect::<Vec<_>>();
@@ -402,27 +352,67 @@ fn range_overfetch_and_output_truncation_authorize_only_emitted_rows() {
 		multi_scope: false,
 		..grep::SearchResult::default()
 	});
-	let blobs = RecordingBlobs::default();
-	let invocation =
-		invoke_with_blobs(&workspace, r#"{"pattern":"needle","path":"src/range.rs:500-600"}"#, blobs);
-	let text = prompt(&workspace, &invocation.outcome);
-	let visible = text
-		.lines()
-		.filter_map(|line| line.strip_prefix('*'))
-		.filter_map(|line| line.split_once(':'))
-		.filter_map(|(number, _)| number.parse::<usize>().ok())
-		.collect::<Vec<_>>();
+	let invocation = invoke(&workspace, r#"{"pattern":"needle","path":"src/range.rs:500-600"}"#);
+	let CallOutcome::Ok(payload) = &invocation.outcome else {
+		panic!("grep must succeed: {:?}", invocation.outcome);
+	};
+	assert!(
+		workspace.recorded.lock().is_empty(),
+		"the tool must not authorize source lines before central bounding"
+	);
+	let tool = grep::tool(workspace.clone(), 2, 2);
+	let caps = PromptCaps::for_tool(
+		CapsBase {
+			maximum_parts:      1,
+			maximum_text_bytes: u32::MAX,
+			media:              false,
+			model_class:        ModelClass::Standard,
+		},
+		&tool.spec().rev,
+	);
+	let projection = tool.projection(Ok(payload), &caps);
+	let [Part::Text { text }] = projection.parts.as_slice() else {
+		panic!("grep must project exactly one text part: {:?}", projection.parts);
+	};
+	let centrally_retained = 32 * 1024;
+	let receipt = VisibilityReceipt {
+		lines: projection
+			.visibility
+			.iter()
+			.filter(|span| span.end_byte <= centrally_retained)
+			.map(|span| VisibleSourceLine {
+				source_key: span.source_key.clone(),
+				line:       span.line,
+			})
+			.collect(),
+	};
+	tool
+		.authorize_visibility(Ok(payload), &receipt)
+		.expect("document authority accepts central receipt");
 	let recorded = workspace.recorded.lock();
 	let [record] = recorded.as_slice() else {
 		panic!("one visible file snapshot must be recorded: {recorded:?}");
 	};
 
 	assert!(text.starts_with("[src/range.rs#F00D]\n*500:needle "));
-	assert!(text.contains("[truncated:"));
-	assert!(!visible.is_empty());
-	assert!(visible.iter().all(|line| (500..=600).contains(line)));
-	assert!(!visible.contains(&600), "the shared byte cap must omit tail matches");
-	assert_eq!(record.seen_lines, visible);
+	assert!(!text.contains("[truncated:"), "tool-local truncation prose is prohibited");
+	assert!(text.contains("*600:needle "), "complete projection reaches the dispatcher");
+	assert!(!record.seen_lines.is_empty());
+	assert!(
+		record
+			.seen_lines
+			.iter()
+			.all(|line| (500..=600).contains(line))
+	);
+	assert!(!record.seen_lines.contains(&600), "central receipt must omit tail matches");
+	assert_eq!(
+		record.seen_lines,
+		receipt
+			.lines
+			.iter()
+			.map(|line| line.line)
+			.collect::<Vec<_>>()
+	);
 }
 
 #[test]
@@ -454,7 +444,7 @@ fn injected_timeout_projects_the_fixed_thirty_second_mapping() {
 }
 
 #[test]
-fn oversized_projection_spills_complete_output_with_truthful_footer() {
+fn oversized_projection_remains_complete_for_central_dispatch() {
 	let matches = (1..=200)
 		.map(|line_number| {
 			matched("large.rs", line_number, &format!("needle {}", "x".repeat(400)), Some("B10B"))
@@ -462,32 +452,18 @@ fn oversized_projection_spills_complete_output_with_truthful_footer() {
 		.collect();
 	let workspace =
 		fake(grep::SearchResult { matches, multi_scope: false, ..grep::SearchResult::default() });
-	let blobs = RecordingBlobs::default();
-	let invocation =
-		invoke_with_blobs(&workspace, r#"{"pattern":"needle","path":"large.rs"}"#, blobs.clone());
+	let invocation = invoke(&workspace, r#"{"pattern":"needle","path":"large.rs"}"#);
 	let text = prompt(&workspace, &invocation.outcome);
 	let CallOutcome::Ok(payload) = &invocation.outcome else {
 		panic!("large grep output must succeed");
 	};
-	let stored = blobs.stored.lock();
-	let [full] = stored.as_slice() else {
-		panic!("grep must store exactly one complete pre-truncation output");
-	};
-	let full = str::from_utf8(full).expect("rendered grep output is UTF-8");
-	assert!(full.starts_with("[large.rs#B10B]\n*1:needle "));
+	assert!(text.starts_with("[large.rs#B10B]\n*1:needle "));
 	let expected_tail = format!("*200:needle {}", "x".repeat(400));
-	assert!(full.ends_with(expected_tail.as_str()));
-	assert_eq!(payload.output_total_lines, 201);
-	assert!(payload.output_shown_lines < payload.output_total_lines);
-	assert_eq!(payload.output_blob.as_ref().map(|blob| blob.hash.as_str()), Some("grep-full"));
-	assert_eq!(payload.output_artifact_uri.as_deref(), Some("artifact://1"));
-	let expected_footer = format!(
-		"[truncated: {} of {} lines shown; read artifact://1 for full output]",
-		payload.output_shown_lines, payload.output_total_lines
-	);
-	assert!(text.ends_with(expected_footer.as_str()));
+	assert!(text.ends_with(expected_tail.as_str()));
+	assert!(!text.contains("[truncated"));
+	assert_eq!(payload.files[0].matches.len(), 200);
 
-	let zero_tool = grep::tool(workspace, RecordingBlobs::default(), 2, 2);
+	let zero_tool = grep::tool(workspace, 2, 2);
 	let zero = zero_tool.prompt(
 		Ok(payload),
 		&PromptCaps::for_tool(

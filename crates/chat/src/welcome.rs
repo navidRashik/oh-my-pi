@@ -328,7 +328,7 @@ impl Welcome {
 
 	fn paint_session(&self, pc: &mut PaintCtx<'_>, x: u16, y: u16, width: u16, index: usize) {
 		let theme = pc.ctx.theme;
-		let dim = Style::new().fg(theme.border);
+		let dim = Style::new().fg(theme.dim);
 		let muted = Style::new().fg(theme.muted);
 		if self.facts.recent.is_empty() {
 			if index == 0 {
@@ -364,7 +364,7 @@ impl Welcome {
 
 	fn paint_lsp(&self, pc: &mut PaintCtx<'_>, x: u16, y: u16, index: usize) {
 		let theme = pc.ctx.theme;
-		let dim = Style::new().fg(theme.border);
+		let dim = Style::new().fg(theme.dim);
 		let muted = Style::new().fg(theme.muted);
 		if self.facts.lsp.is_empty() {
 			if index == 0 {
@@ -501,8 +501,9 @@ impl Component for Welcome {
 		};
 		let theme = pc.ctx.theme;
 		let (tl, tr, bl, br, horizontal, vertical) = pc.ctx.charset.border(Border::Round);
-		let dim = Style::new().fg(theme.border);
+		let dim = Style::new().fg(theme.dim);
 		let muted = Style::new().fg(theme.muted);
+		let border_muted = Style::new().fg(theme.border_muted);
 		let accent = Style::new().fg(theme.accent).bold();
 		let x = rect.x;
 		let mut y = rect.y.saturating_add(1);
@@ -553,7 +554,7 @@ impl Component for Welcome {
 				1 => put_centered(pc, left_x, y, left_col, "Welcome back!", Style::new().bold()),
 				row if row == model_row => put_centered(pc, left_x, y, left_col, &self.model, muted),
 				row if row == model_row + 1 => {
-					put_centered(pc, left_x, y, left_col, &self.provider, dim);
+					put_centered(pc, left_x, y, left_col, &self.provider, border_muted);
 				},
 				_ => {},
 			}

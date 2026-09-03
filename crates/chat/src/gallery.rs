@@ -9,6 +9,7 @@ use omp_tool::Part;
 use omp_tools::{eval, shell};
 use omp_tui::{Charset, Frame, IntoComponent as _, Ui, UiContext, dom};
 use serde_json::{Value, value::RawValue};
+use smallvec::SmallVec;
 use strum::{Display, EnumIter};
 use thiserror::Error;
 
@@ -191,13 +192,31 @@ fn render_fixture(
 		{
 			return Err(GalleryError::Missing("projected result truth"));
 		}
-	} else if status == CardStatus::Failed {
-		let diag =
-			child(&snapshot, tool, KnownTag::Diag).ok_or(GalleryError::Missing("diag element"))?;
+	}
+	let diagnostics = snapshot
+		.children(tool)
+		.iter()
+		.filter_map(|handle| snapshot.get(*handle))
+		.filter(|node| node.tag == Tag::Known(KnownTag::Diag))
+		.collect::<Vec<_>>();
+	let diag = diagnostics.iter().rev().copied().find(|node| {
+		node
+			.prop(&PropId::Severity.into())
+			.and_then(DomValue::as_str)
+			== Some("error")
+			|| node.prop(&PropId::Fault.into()).is_some()
+	});
+	if status == CardStatus::Failed {
+		let diag = diag.ok_or(GalleryError::Missing("diag element"))?;
 		if diag.prop(&PropId::Fault.into()).is_none() || diag.prop(&PropId::Data.into()).is_none() {
 			return Err(GalleryError::Missing("projected fault truth"));
 		}
 	}
+	let notices = diagnostics
+		.iter()
+		.copied()
+		.filter(|node| diag.is_none_or(|terminal| !std::ptr::eq(*node, terminal)))
+		.collect::<SmallVec<_, 2>>();
 	let result = child(&snapshot, tool, KnownTag::Result);
 	// Like the live projection (`project.rs` `card_view`), `output` is the
 	// text of a running call only; settled cards read the `<result>` element.
@@ -207,7 +226,8 @@ fn render_fixture(
 	let view = CardView {
 		input,
 		result,
-		diag: child(&snapshot, tool, KnownTag::Diag),
+		diag,
+		notices,
 		usage: child(&snapshot, tool, KnownTag::Usage),
 		status,
 		output,
@@ -586,13 +606,8 @@ fn fixture_payload(
 				"timed_out": false,
 				"truncated": false,
 				"result_limit_reached": null,
-				"partial_match_count": count.clone(),
-				"timeout_ms": 0,
-				"projected_text": "",
-				"output_blob": null,
-				"output_artifact_uri": null,
-				"output_shown_lines": count.clone(),
-				"output_total_lines": count
+				"partial_match_count": count,
+				"timeout_ms": 0
 			})
 		},
 		"grep" => {
@@ -636,12 +651,7 @@ fn fixture_payload(
 				"skip": 0,
 				"file_limit_reached": false,
 				"per_file_limit_reached": false,
-				"notes": [],
-				"projected_text": "",
-				"output_blob": null,
-				"output_artifact_uri": null,
-				"output_shown_lines": 0,
-				"output_total_lines": 0
+				"notes": []
 			})
 		},
 		"ast_grep" => {
@@ -935,8 +945,7 @@ fn projected_parts(tool: &str, value: &serde_json::Value) -> Result<Vec<Part>, s
 			.as_str()
 			.or_else(|| {
 				value
-					.get("projected_text")
-					.or_else(|| value.get("output"))
+					.get("output")
 					.or_else(|| value.get("message"))
 					.and_then(Value::as_str)
 			})
@@ -1043,6 +1052,7 @@ mod tests {
 			"ast_grep",
 			"bash",
 			"browser",
+			"checkpoint",
 			"computer",
 			"context_gauge",
 			"custom",
@@ -1063,21 +1073,30 @@ mod tests {
 			"hub_send",
 			"hub_start",
 			"hub_wait",
+			"image_gen",
 			"inspect_image",
+			"learn",
 			"lsp",
+			"manage_skill",
+			"memory_edit",
 			"read",
 			"read_group",
 			"recall",
 			"reflect",
 			"reject",
+			"report_issue",
 			"report_tool_issue",
 			"resolve",
 			"retain",
+			"rewind",
+			"security_scan",
 			"task",
 			"think",
 			"todo",
+			"tts",
 			"web_search",
 			"write",
+			"yield",
 		]);
 	}
 
@@ -1094,11 +1113,11 @@ mod tests {
 	}
 
 	#[test]
-	fn all_41_fixtures_use_projected_production_settlement() {
+	fn all_51_fixtures_use_projected_production_settlement() {
 		let sections = render_sections(None, &GalleryState::ALL, 100, false)
 			.expect("every fixture should fold through settle_projected/fail_projected");
-		assert_eq!(fixture_names().len(), 41);
-		assert_eq!(sections.len(), 41 * GalleryState::ALL.len());
+		assert_eq!(fixture_names().len(), 51);
+		assert_eq!(sections.len(), 51 * GalleryState::ALL.len());
 		assert!(
 			sections
 				.iter()

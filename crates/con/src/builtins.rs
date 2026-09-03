@@ -121,6 +121,12 @@ crate::var! {
 		max: 1.0,
 		flags: archive | session,
 	};
+	/// Lists discovered skills in the model prompt; `/skillful` writes a
+	/// session override without disabling discovery or `skill://` reads.
+	pub static AI_SKILLFUL = ai_skillful: bool {
+		default: true,
+		flags: archive | session,
+	};
 	/// Shows model thinking in transcript views.
 	pub static CL_SHOWTHINKING = cl_showthinking: bool {
 		default: true,

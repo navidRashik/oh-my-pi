@@ -1,12 +1,156 @@
-//! Custom transcript notices: late LSP diagnostics, `/tan` breadcrumbs,
-//! advisor notes, collaboration guest bubbles, and collapsed synthetic input.
+//! Custom transcript notices: background-job deliveries, late LSP
+//! diagnostics, `/tan` breadcrumbs, advisor notes, collaboration guest
+//! bubbles, and collapsed synthetic input.
+
+use std::fmt::Write as _;
 
 use omp_core::{Str, StrMut, sf};
-use omp_dom::{Node, PropId};
+use omp_dom::{Node, PropId, Value};
+use omp_journal::data::{
+	AsyncJobStatus, AsyncResult, LaunchCompletion, LaunchDaemonCompletion, LaunchDaemonStatus,
+};
 use omp_tui::{IntoComponent as _, dom};
 
-use super::prop_text;
+use super::{format_duration, prop_text};
 use crate::cards::Component;
+
+/// Reads an async-result payload from its journal-derived user node.
+#[must_use]
+pub(crate) fn async_result(node: &Node) -> Option<AsyncResult> {
+	if node.prop(&omp_dom::PropKey::Custom(Str::new_static("async_result")))
+		!= Some(&Value::Bool(true))
+	{
+		return None;
+	}
+	let Value::Json(data) = node.prop(&PropId::Data.into())? else {
+		return None;
+	};
+	let result: AsyncResult = serde_json::from_str(data.get()).ok()?;
+	(!result.jobs.is_empty()).then_some(result)
+}
+
+/// Plain text represented by an async-result block. It carries every compact
+/// row fact so transcript dumps and non-terminal projections match the visible
+/// presentation; artifact and fault details remain in the model-facing body.
+#[must_use]
+pub(crate) fn async_result_text(result: &AsyncResult) -> Str {
+	let mut text = StrMut::new("");
+	for (index, job) in result.jobs.iter().enumerate() {
+		if index > 0 {
+			text.push('\n');
+		}
+		let _ = write!(text, "Background job {} [{}] {}", job.status, job.job_type, job.id);
+		if !job.label.is_empty() {
+			let _ = write!(text, " — {}", job.label);
+		}
+		let _ = write!(text, " ({})", format_duration(job.duration_ms));
+	}
+	text.freeze()
+}
+
+/// One compact success/failure row per completed background-job delivery.
+#[must_use]
+pub(crate) fn async_result_block(result: &AsyncResult) -> Component {
+	let rows = result
+		.jobs
+		.iter()
+		.map(|job| {
+			let failed = job.status != AsyncJobStatus::Completed;
+			let state = sf!("Background job {}", job.status);
+			let kind = sf!("[{}]", job.job_type);
+			let duration = sf!("({})", format_duration(job.duration_ms));
+			let label = (!job.label.is_empty()).then(|| job.label.clone());
+			dom! {
+				<row gap=1 pad-x=1>
+					if failed { <i:error fg=err/> } else { <i:done fg=ok/> }
+					<text fg={if failed { "err" } else { "ok" }}>{state}</text>
+					<text fg=muted dim>{kind}</text>
+					<text fg=accent>{job.id.clone()}</text>
+					if let Some(label) = label {
+						<i:dash fg=muted dim/>
+						<text fg=muted dim truncate=end>{label}</text>
+					}
+					<text fg=muted dim>{duration}</text>
+				</row>
+			}
+			.into_component()
+		})
+		.collect::<Vec<Component>>();
+	dom! { <col>{rows}</col> }.into_component()
+}
+
+/// Reads a supervised-process completion payload from its journal-derived
+/// user node.
+#[must_use]
+pub(crate) fn launch_completion(node: &Node) -> Option<LaunchCompletion> {
+	if node.prop(&omp_dom::PropKey::Custom(Str::new_static("launch_completion")))
+		!= Some(&Value::Bool(true))
+	{
+		return None;
+	}
+	let Value::Json(data) = node.prop(&PropId::Data.into())? else {
+		return None;
+	};
+	let completion: LaunchCompletion = serde_json::from_str(data.get()).ok()?;
+	(!completion.daemons.is_empty()).then_some(completion)
+}
+
+/// Plain-text projection of supervised-process completion rows.
+#[must_use]
+pub(crate) fn launch_completion_text(completion: &LaunchCompletion) -> Str {
+	let mut text = StrMut::new("");
+	for (index, daemon) in completion.daemons.iter().enumerate() {
+		if index > 0 {
+			text.push('\n');
+		}
+		let _ = write!(text, "Supervised process {} {}", daemon.status, daemon.name);
+		if let Some(code) = daemon.exit_code {
+			let _ = write!(text, " (exit {code})");
+		}
+		let _ = write!(text, " ({})", format_duration(daemon.duration_ms));
+		if let Some(fault) = &daemon.fault {
+			let _ = write!(text, " — {}", fault.kind);
+			if let Some(message) = &fault.message {
+				let _ = write!(text, ": {message}");
+			}
+			if let Some(signal) = &fault.signal {
+				let _ = write!(text, " ({signal})");
+			}
+		}
+	}
+	text.freeze()
+}
+
+/// Compact success/failure projection of one supervised-process completion.
+#[must_use]
+fn launch_daemon_row(daemon: &LaunchDaemonCompletion) -> Component {
+	let failed = daemon.status == LaunchDaemonStatus::Failed;
+	let state = sf!("Supervised process {}", daemon.status);
+	let exit = daemon.exit_code.map(|code| sf!("(exit {code})"));
+	let duration = sf!("({})", format_duration(daemon.duration_ms));
+	let name = daemon.name.clone();
+	dom! {
+		<row gap=1 pad-x=1>
+			if failed { <i:error fg=err/> } else { <i:done fg=ok/> }
+			<text fg={if failed { "err" } else { "ok" }}>{state}</text>
+			<text fg=accent>{name}</text>
+			if let Some(exit) = exit { <text fg=muted dim>{exit}</text> }
+			<text fg=muted dim>{duration}</text>
+		</row>
+	}
+	.into_component()
+}
+
+/// One compact row per terminal supervised process.
+#[must_use]
+pub(crate) fn launch_completion_block(completion: &LaunchCompletion) -> Component {
+	let rows = completion
+		.daemons
+		.iter()
+		.map(launch_daemon_row)
+		.collect::<Vec<Component>>();
+	dom! { <col>{rows}</col> }.into_component()
+}
 
 /// Dispatches a `<notice kind=K>` custom kind to its renderer; `None` for
 /// the controller kinds (`error | warn | info | success`) and anything else.
@@ -375,6 +519,63 @@ mod tests {
 	fn render(component: Component, width: u16) -> String {
 		let ui = Ui::from_root(component, width, UiContext::default());
 		frame_text(ui.frame())
+	}
+
+	#[test]
+	fn launch_completion_is_typed_and_compact() {
+		let completion = LaunchCompletion {
+			daemons: vec![
+				LaunchDaemonCompletion {
+					name:        Str::new_static("web"),
+					status:      LaunchDaemonStatus::Completed,
+					exit_code:   Some(0),
+					duration_ms: 2_500,
+					fault:       None,
+				},
+				LaunchDaemonCompletion {
+					name:        Str::new_static("worker"),
+					status:      LaunchDaemonStatus::Failed,
+					exit_code:   Some(17),
+					duration_ms: 80_000,
+					fault:       Some(omp_journal::data::LaunchDaemonFault {
+						kind:    omp_journal::data::LaunchDaemonFaultKind::Failed,
+						message: Some(Str::new_static("readiness process exited")),
+						signal:  Some(Str::new_static("SIGTERM")),
+					}),
+				},
+			],
+		};
+		let data = serde_json::value::to_raw_value(&completion).expect("completion serializes");
+		let node = Node {
+			tag:     Tag::Known(KnownTag::User),
+			props:   smallvec![
+				(PropKey::Custom(Str::new_static("launch_completion")), Value::Bool(true),),
+				(PropId::Data.into(), Value::Json(data)),
+			],
+			kids:    Vec::new(),
+			content: Some(Str::new_static("model-facing completion notice")),
+		};
+		assert_eq!(launch_completion(&node), Some(completion.clone()));
+
+		let text = launch_completion_text(&completion);
+		assert_eq!(
+			text.as_str(),
+			"Supervised process completed web (exit 0) (2.5s)\nSupervised process failed worker \
+			 (exit 17) (1m20s) — failed: readiness process exited (SIGTERM)"
+		);
+		let rendered = render(launch_completion_block(&completion), 80);
+		assert!(
+			rendered.contains("Supervised process completed web (exit 0) (2.5s)"),
+			"{rendered:?}"
+		);
+		assert!(
+			rendered.contains("Supervised process failed worker (exit 17) (1m20s)"),
+			"{rendered:?}"
+		);
+		assert!(
+			!rendered.contains("readiness process exited"),
+			"fault detail stays out of the compact row: {rendered:?}"
+		);
 	}
 
 	#[test]

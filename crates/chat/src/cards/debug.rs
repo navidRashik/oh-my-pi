@@ -39,7 +39,8 @@ impl Card for DebugCard {
 					<row kind=title gap=1><i:error fg=err/><text>{format!("Debug {action}")}</text></row>
 					<col><hr title="Output" title_pad=3 bc=err/><text>{fault}</text></col>
 				</box>
-			}.into_component();
+			}
+			.into_component();
 		}
 		let Some(result) = typed_result::<omp_tools::debug::Payload>(view) else {
 			return dom! {

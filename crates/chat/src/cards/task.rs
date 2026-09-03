@@ -5,9 +5,7 @@ use omp_dom::{Node, PropId};
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
 
-use super::{
-	Card, CardStatus, CardView, Component, elapsed_badge, partial_string, typed_input, typed_result,
-};
+use super::{Card, CardStatus, CardView, Component, partial_string, typed_input, typed_result};
 
 /// Agent rows a collapsed batch call shows; the rest fold into one
 /// `… N more agents` line (pi `COLLAPSED_AGENT_LIMIT`).
@@ -143,7 +141,7 @@ fn call_rows(args: &CallArgs) -> Vec<Component> {
 			.name
 			.as_deref()
 			.map_or_else(|| Str::new_static("agent"), task_id);
-		rows.push(call_row(label, brief, args.agent.as_deref(), false));
+		rows.push(call_row(label, brief, args.agent.as_deref(), args.isolated));
 	}
 	let shown = args.tasks.len().min(COLLAPSED_AGENT_LIMIT);
 	for (index, item) in args.tasks.iter().take(shown).enumerate() {

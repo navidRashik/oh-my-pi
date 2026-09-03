@@ -12,6 +12,7 @@ mod memory;
 mod report_issue;
 mod resolve;
 mod think;
+mod utility;
 mod web_search;
 
 /// One tool-card gallery fixture.
@@ -52,6 +53,7 @@ pub(crate) fn all() -> Vec<&'static CardFixture> {
 	fixtures.extend(report_issue::FIXTURES);
 	fixtures.extend(resolve::FIXTURES);
 	fixtures.extend(think::FIXTURES);
+	fixtures.extend(utility::FIXTURES);
 	fixtures.extend(web_search::FIXTURES);
 	fixtures
 }

@@ -22,8 +22,8 @@ use tempfile::tempdir;
 /// Top-level `name:` of every entry in pi's builtin registry —
 /// `/work/pi/packages/coding-agent/src/slash-commands/builtin-*.ts`
 /// (`BUILTIN_*_SLASH_COMMANDS` arrays; subcommand and alias names
-/// excluded), 79 commands as of pi at the time of the omp2 spine rebuild.
-const PI_BUILTIN_COMMANDS: [&str; 79] = [
+/// excluded), 80 commands in the current pi oracle.
+const PI_BUILTIN_COMMANDS: [&str; 80] = [
 	"advisor",
 	"export",
 	"trace",
@@ -80,6 +80,7 @@ const PI_BUILTIN_COMMANDS: [&str; 79] = [
 	"model",
 	"switch",
 	"fast",
+	"skillful",
 	"extended-context",
 	"computer",
 	"vision",
@@ -105,8 +106,16 @@ const PI_BUILTIN_COMMANDS: [&str; 79] = [
 	"mcp",
 ];
 
-/// pi aliases (`aliases: [...]`) of the sixteen commands.
-const PI_ALIASES: [(&str, &str); 3] = [("models", "model"), ("q", "quit"), ("worktree", "wt")];
+/// Pi aliases (`aliases: [...]`) are registered as first-class console names.
+const PI_ALIASES: [(&str, &str); 7] = [
+	("force:", "force"),
+	("q", "quit"),
+	("worktree", "wt"),
+	("providers", "setup"),
+	("models", "model"),
+	("status", "extensions"),
+	("rewind", "branch"),
+];
 
 #[test]
 fn every_pi_builtin_slash_command_is_registered() {
@@ -595,16 +604,23 @@ fn move_validates_the_directory_then_asks_the_controller() {
 	let mut h = harness(Vec::new());
 	let target = h.project.clone().join("elsewhere");
 	std::fs::create_dir_all(&target).expect("target");
-	h.host.console("move").expect("usage");
-	assert_eq!(h.host.notice(), Some("Usage: /move <path>"));
-	h.host.console("move nowhere").expect("missing");
-	assert_eq!(
-		h.host.notice(),
-		Some(format!("Directory does not exist: {}", h.project.join("nowhere").display()).as_str())
-	);
-	assert!(h.commands.try_recv().is_err());
+	h.host.console("move").expect("editor");
+	assert_eq!(h.host.overlay_id(), Some("move"));
+	h.host.key(Key::Esc).expect("cancel editor");
+	h.host
+		.console("move nowhere")
+		.expect("missing confirmation");
+	assert_eq!(h.host.overlay_id(), Some("move"));
+	h.host.key(Key::Char('y')).expect("confirm create");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Move { path, create: true }) if path == h.project.join("nowhere")
+	));
 	h.host.console("move elsewhere").expect("move");
-	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::Move { path }) if path == target));
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Move { path, create: false }) if path == target
+	));
 }
 
 #[test]
@@ -612,7 +628,10 @@ fn wt_creates_a_worktree_through_services_and_moves_there() {
 	let mut h = harness(Vec::new());
 	h.host.console("wt feature/x").expect("wt");
 	let expected = h.project.join("wt").join("feature/x");
-	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::Move { path }) if path == expected));
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Move { path, create: false }) if path == expected
+	));
 	assert_eq!(
 		h.host.notice(),
 		Some(
@@ -632,7 +651,7 @@ fn wt_creates_a_worktree_through_services_and_moves_there() {
 	assert!(h.commands.try_recv().is_err());
 	h.host.console("wt").expect("default branch");
 	match h.commands.try_recv() {
-		Ok(HostCommand::Move { path }) => {
+		Ok(HostCommand::Move { path, create: false }) => {
 			let branch = path.strip_prefix(h.project.join("wt")).expect("under wt");
 			assert!(branch.to_string_lossy().starts_with("wt/"), "{}", branch.display());
 		},

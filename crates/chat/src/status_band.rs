@@ -6,14 +6,15 @@ use std::time::Duration;
 
 use omp_core::{Str, sf};
 use omp_tui::{
-	Charset, Color, Component, Icon, PaintCtx, Prop, Props, Rect, Slot, Style, Theme, UiContext,
+	Appearance, Charset, Color, Component, Icon, PaintCtx, Prop, Props, Rect, Slot, Style, Theme,
+	UiContext,
 	anim::{Easing, Tween},
 	cell_width,
 	components::{
-		CompactionBoundaries, ContextGauge, GaugeCell, compaction_boundary_color,
-		compaction_threshold_color, spend_label, write_compact_count,
+		CompactionBoundaries, ContextGauge, GaugeCell, advisor_spend_label,
+		compaction_boundary_color, spend_label, write_compact_count,
 	},
-	next_slot,
+	next_slot, session_accent_color,
 };
 use smallvec::SmallVec;
 
@@ -21,6 +22,90 @@ use crate::chrome::STATUS_ID;
 
 /// Longest path label in the status band (pi `clampPathLength` default).
 const PATH_MAX: u16 = 40;
+
+/// Status-line segment preset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StatusPreset {
+	/// Pi's balanced launch/runtime bar.
+	#[default]
+	Default,
+	/// Path, branch, title, mode, and context only.
+	Minimal,
+	/// Model/mode/VCS with title, cost, and context.
+	Compact,
+	/// Full diagnostic status.
+	Full,
+	/// Full diagnostic status with Nerd Font-oriented identities.
+	Nerd,
+	/// ASCII-safe compact status.
+	Ascii,
+	/// Host-supplied custom order; until arrays are supplied it follows pi's
+	/// custom defaults.
+	Custom,
+}
+
+/// Separator family between status segments.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StatusSeparator {
+	/// Full powerline wedge.
+	Powerline,
+	/// Thin powerline divider and solid end cap.
+	#[default]
+	PowerlineThin,
+	/// Slash.
+	Slash,
+	/// Vertical pipe.
+	Pipe,
+	/// Block.
+	Block,
+	/// Space only.
+	None,
+	/// Seven-bit arrows.
+	Ascii,
+}
+
+/// Context-line presentation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContextLine {
+	/// Solid identity rule.
+	Off,
+	/// Proportional used/remainder rule.
+	Percentage,
+	/// Proportional rule with compaction markers.
+	Annotated,
+	/// Markers plus percent/window labels.
+	#[default]
+	Embedded,
+}
+
+/// Retained status appearance, including settings-preview overrides.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StatusAppearance {
+	/// Segment preset.
+	pub preset:       StatusPreset,
+	/// Segment separator.
+	pub separator:    StatusSeparator,
+	/// Flexible context-line mode.
+	pub context_line: ContextLine,
+	/// Drop fill and powerline caps.
+	pub transparent:  bool,
+}
+
+impl StatusAppearance {
+	/// Pi's default separator for a preset.
+	#[must_use]
+	pub const fn for_preset(preset: StatusPreset) -> Self {
+		let separator = match preset {
+			StatusPreset::Full | StatusPreset::Nerd => StatusSeparator::Powerline,
+			StatusPreset::Ascii => StatusSeparator::Ascii,
+			StatusPreset::Minimal => StatusSeparator::Slash,
+			StatusPreset::Default | StatusPreset::Compact | StatusPreset::Custom => {
+				StatusSeparator::PowerlineThin
+			},
+		};
+		Self { preset, separator, context_line: ContextLine::Embedded, transparent: false }
+	}
+}
 
 /// Background compaction speculation state shown on the gauge tick (pi
 /// `compactionSpeculation`).
@@ -57,6 +142,79 @@ pub struct AdvisorBadge {
 	pub yielded: bool,
 }
 
+/// Exact porcelain counts shown after the branch (pi's `git` segment).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GitStatus {
+	/// Files staged in the index.
+	pub staged:    u32,
+	/// Tracked files changed in the worktree.
+	pub unstaged:  u32,
+	/// Untracked entries.
+	pub untracked: u32,
+}
+
+impl GitStatus {
+	/// Whether any status class is non-empty.
+	#[must_use]
+	pub const fn dirty(self) -> bool {
+		self.staged != 0 || self.unstaged != 0 || self.untracked != 0
+	}
+}
+
+/// Pull request associated with the checked-out branch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PullRequest {
+	/// GitHub pull request number.
+	pub number: u64,
+	/// Target URL used by hyperlink-capable presenters.
+	pub url:    Str,
+}
+
+/// Linked-worktree display identity. The path segment collapses the nested
+/// checkout path to `project`, adding `worktree` only when it differs from the
+/// branch already visible beside it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorktreeLabel {
+	/// Shared primary checkout directory name.
+	pub project:  Str,
+	/// Linked checkout directory name.
+	pub worktree: Str,
+}
+
+/// One provider-account quota window for pi's `usage` segment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UsageWindow {
+	/// Used percentage.
+	pub percent:     f64,
+	/// Time until reset. Minute windows retain minute precision; long windows
+	/// format as hours/days.
+	pub reset_after: Option<Duration>,
+}
+
+/// Cached provider-account usage. Fetchers update this off the paint path.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AccountUsage {
+	/// Human-facing account/tier label.
+	pub tier:      Option<Str>,
+	/// Five-hour request window.
+	pub five_hour: Option<UsageWindow>,
+	/// Daily request window.
+	pub daily:     Option<UsageWindow>,
+	/// Seven-day request window.
+	pub seven_day: Option<UsageWindow>,
+	/// Monthly request window.
+	pub monthly:   Option<UsageWindow>,
+}
+
+/// Collaboration role shown by pi's `collab` segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollabBadge {
+	/// Whether this observer is a guest rather than the host.
+	pub guest:        bool,
+	/// Connected participants, including the local observer.
+	pub participants: u32,
+}
+
 /// Lifecycle of an engaged goal Director (pi `goalMode.status`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GoalState {
@@ -70,6 +228,20 @@ pub enum GoalState {
 	BudgetLimited,
 	/// The goal was dropped.
 	Dropped,
+}
+
+/// Bounded loop status shown by the mode segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoopLimit {
+	/// Remaining and initial iteration counts.
+	Iterations {
+		/// Iterations still available.
+		remaining: u64,
+		/// Original iteration budget.
+		initial:   u64,
+	},
+	/// Remaining wall-clock duration.
+	Duration(Duration),
 }
 
 /// The active Director workflow shown as the band's mode chip (pi `mode`
@@ -87,16 +259,20 @@ pub enum ModeChip {
 	Goal(GoalState),
 	/// The vibe Director is engaged.
 	Vibe,
-	/// Loop mode is engaged; `limit` is `(remaining, initial)` iterations
-	/// when the loop is bounded.
-	Loop {
-		/// Remaining and initial iterations of a bounded loop.
-		limit: Option<(u32, u32)>,
+	/// Loop mode is engaged but waiting for its first/next prompt.
+	LoopWaiting {
+		/// Optional iteration or duration bound.
+		limit: Option<LoopLimit>,
 	},
-	/// Loop mode is paused, retaining its optional iteration limit.
+	/// Loop mode is engaged and running.
+	Loop {
+		/// Optional iteration or duration bound.
+		limit: Option<LoopLimit>,
+	},
+	/// Loop mode is paused, retaining its optional bound.
 	LoopPaused {
-		/// Remaining and initial iterations of a bounded loop.
-		limit: Option<(u32, u32)>,
+		/// Optional iteration or duration bound.
+		limit: Option<LoopLimit>,
 	},
 }
 
@@ -124,12 +300,36 @@ pub struct StatusFacts {
 	/// Whether the project lives under a scratch root (pi `scratchFolder`
 	/// icon instead of the folder icon).
 	pub scratch: bool,
+	/// Absolute `file://` hyperlink target for the displayed path.
+	pub path_url: Option<Str>,
 	/// Checked-out git branch, an observer-local fact the app supplies.
 	pub branch: Option<Str>,
-	/// Working tree has staged, unstaged, or untracked changes.
-	pub dirty: bool,
+	/// Exact staged/unstaged/untracked counts. `None` while the first
+	/// background probe is pending.
+	pub git_status: Option<GitStatus>,
+	/// Pull request associated with the branch.
+	pub pull_request: Option<PullRequest>,
+	/// Linked-worktree identity used to collapse redundant path components.
+	pub worktree: Option<WorktreeLabel>,
+	/// Collaboration presence badge.
+	pub collab: Option<CollabBadge>,
+	/// Sanitized extension/hook status strings, already key-sorted by the host.
+	pub hook_status: Vec<Str>,
+	/// Number of running subagents.
+	pub subagents: u32,
+	/// Number of background jobs not already represented by `subagents`.
+	pub background_jobs: u32,
+	/// Short durable session id for the optional `session` segment.
+	pub session_id: Option<Str>,
+	/// Host label for the optional `hostname` segment.
+	pub hostname: Option<Str>,
+	/// Preformatted local wall clock (`H:MM`, optionally seconds/suffix),
+	/// refreshed by the observer only when its visible unit changes.
+	pub wall_time: Option<Str>,
 	/// User-facing session title, the elastic right-group chip.
 	pub session_name: Option<Str>,
+	/// Status visual configuration.
+	pub appearance: StatusAppearance,
 	/// Tokens in the last inference request (context usage).
 	pub tokens: u64,
 	/// Total context window when known.
@@ -139,6 +339,9 @@ pub struct StatusFacts {
 	pub compact_percent: u8,
 	/// Background compaction speculation, animating the threshold tick.
 	pub speculation: Speculation,
+	/// Context percentage where background speculation begins; `None` when
+	/// async/local compaction has no meaningful start marker.
+	pub speculation_percent: Option<f64>,
 	/// Cumulative input tokens across the session.
 	pub tokens_in: u64,
 	/// Cumulative output tokens across the session.
@@ -154,6 +357,15 @@ pub struct StatusFacts {
 	pub cost_nano_usd: u64,
 	/// The route bills to a subscription rather than metered usage.
 	pub subscription: bool,
+	/// Advisor spend in nano-US dollars, kept distinct from the main route.
+	pub advisor_cost_nano_usd: u64,
+	/// The advisor route bills to a subscription.
+	pub advisor_subscription: bool,
+	/// Cached account/tier quota windows.
+	pub account_usage: Option<AccountUsage>,
+	/// Display-quantized total active processing time; idle wall-clock time is
+	/// excluded.
+	pub active_time: Duration,
 	/// Premium-request units consumed at millionth precision (GitHub Copilot
 	/// `premium_interactions`: `330_000` is 0.33 of a request).
 	pub premium_requests_millionths: u64,
@@ -177,13 +389,25 @@ impl Default for StatusFacts {
 			advisor: None,
 			cwd: Str::default(),
 			scratch: false,
+			path_url: None,
 			branch: None,
-			dirty: false,
+			git_status: None,
+			pull_request: None,
+			worktree: None,
+			collab: None,
+			hook_status: Vec::new(),
+			subagents: 0,
+			background_jobs: 0,
+			session_id: None,
+			hostname: None,
+			wall_time: None,
 			session_name: None,
+			appearance: StatusAppearance::default(),
 			tokens: 0,
 			context_window: None,
 			compact_percent: 80,
 			speculation: Speculation::None,
+			speculation_percent: None,
 			tokens_in: 0,
 			tokens_out: 0,
 			cache_read: 0,
@@ -191,6 +415,10 @@ impl Default for StatusFacts {
 			tokens_per_second: None,
 			cost_nano_usd: 0,
 			subscription: false,
+			advisor_cost_nano_usd: 0,
+			advisor_subscription: false,
+			account_usage: None,
+			active_time: Duration::ZERO,
 			premium_requests_millionths: 0,
 			working: None,
 			focused_agent: None,
@@ -336,6 +564,234 @@ fn write_premium_requests(out: &mut String, millionths: u64) {
 	}
 }
 
+fn count_label(charset: Charset, icon: Icon, value: u64) -> Str {
+	let mut text = String::from(charset.icon(icon));
+	if !text.is_empty() {
+		text.push(' ');
+	}
+	let _ = write_compact_count(&mut text, value);
+	Str::new(text)
+}
+
+fn context_percent_label(charset: Charset, tokens: u64, window: Option<u64>) -> Str {
+	let mut text = String::from(charset.icon(Icon::Context));
+	if !text.is_empty() {
+		text.push(' ');
+	}
+	if let Some(window) = window.filter(|window| *window > 0) {
+		let percent = tokens as f64 / window as f64 * 100.0;
+		let _ = write!(text, "{percent:.1}%/");
+		let _ = write_compact_count(&mut text, window);
+	} else {
+		let _ = write_compact_count(&mut text, tokens);
+		text.push_str("/?");
+	}
+	Str::new(text)
+}
+
+fn context_color(theme: &Theme, tokens: u64, window: Option<u64>) -> Color {
+	let Some(window) = window.filter(|window| *window > 0) else {
+		return theme.status_context;
+	};
+	let percent = tokens as f64 / window as f64 * 100.0;
+	if percent >= 90.0 || tokens >= 500_000 {
+		theme.err
+	} else if percent >= 70.0 || tokens >= 270_000 {
+		theme.secondary
+	} else if percent >= 50.0 || tokens >= 150_000 {
+		theme.warn
+	} else {
+		theme.status_context
+	}
+}
+
+fn append_git_counts(out: &mut String, status: GitStatus) {
+	if status.unstaged > 0 {
+		let _ = write!(out, " *{}", status.unstaged);
+	}
+	if status.staged > 0 {
+		let _ = write!(out, " +{}", status.staged);
+	}
+	if status.untracked > 0 {
+		let _ = write!(out, " ?{}", status.untracked);
+	}
+}
+
+fn sanitize_status(value: &str) -> Str {
+	let mut clean = String::with_capacity(value.len());
+	let mut separated = false;
+	for ch in value.chars() {
+		if ch.is_control() || ch == '\n' || ch == '\r' {
+			if !separated && !clean.is_empty() {
+				clean.push(' ');
+				separated = true;
+			}
+		} else {
+			clean.push(ch);
+			separated = ch.is_whitespace();
+		}
+	}
+	Str::new(clean.trim())
+}
+
+fn active_time_label(charset: Charset, elapsed: Duration) -> Str {
+	const MINUTE_MS: u128 = 60_000;
+	const HOUR_MS: u128 = 60 * MINUTE_MS;
+	const DAY_MS: u128 = 24 * HOUR_MS;
+
+	let millis = elapsed.as_millis();
+	let mut text = String::from(charset.icon(Icon::Time));
+	if !text.is_empty() {
+		text.push(' ');
+	}
+	if millis < MINUTE_MS {
+		let _ = write!(text, "{:.1}s", millis as f64 / 1_000.0);
+	} else if millis < HOUR_MS {
+		let minutes = millis / MINUTE_MS;
+		let seconds = millis % MINUTE_MS / 1_000;
+		let _ = write!(text, "{minutes}m");
+		if seconds > 0 {
+			let _ = write!(text, "{seconds}s");
+		}
+	} else if millis < DAY_MS {
+		let hours = millis / HOUR_MS;
+		let minutes = millis % HOUR_MS / MINUTE_MS;
+		let _ = write!(text, "{hours}h");
+		if minutes > 0 {
+			let _ = write!(text, "{minutes}m");
+		}
+	} else {
+		let days = millis / DAY_MS;
+		let hours = millis % DAY_MS / HOUR_MS;
+		let _ = write!(text, "{days}d");
+		if hours > 0 {
+			let _ = write!(text, "{hours}h");
+		}
+	}
+	Str::new(text)
+}
+
+fn write_reset(out: &mut String, reset: Duration, minute_window: bool) {
+	let minutes = reset.as_secs().saturating_add(30) / 60;
+	if minute_window {
+		if minutes < 60 {
+			let _ = write!(out, "{minutes}m");
+		} else {
+			let hours = minutes / 60;
+			let rest = minutes % 60;
+			let _ = write!(out, "{hours}h");
+			if rest > 0 {
+				let _ = write!(out, " {rest}m");
+			}
+		}
+		return;
+	}
+	let hours = reset.as_secs().saturating_add(1_800) / 3_600;
+	if hours < 24 {
+		let _ = write!(out, "{hours}h");
+	} else {
+		let days = hours / 24;
+		let rest = hours % 24;
+		let _ = write!(out, "{days}d");
+		if rest > 0 {
+			let _ = write!(out, " {rest}h");
+		}
+	}
+}
+
+fn usage_color(theme: &Theme, percent: f64) -> Color {
+	if percent >= 80.0 {
+		theme.err
+	} else if percent >= 50.0 {
+		theme.warn
+	} else {
+		theme.muted
+	}
+}
+
+type StyledPart = (u16, Str, Color);
+
+fn write_usage_window(
+	out: &mut String,
+	parts: &mut SmallVec<StyledPart, 9>,
+	label: &str,
+	window: UsageWindow,
+	minute_window: bool,
+	floor_percent: bool,
+	theme: &Theme,
+) {
+	if !out.is_empty() {
+		out.push_str(" · ");
+	}
+	let _ = write!(out, "{label} ");
+	let percent = if floor_percent {
+		window.percent.floor()
+	} else {
+		window.percent.round()
+	};
+	let percent = sf!("{percent:.0}%");
+	let offset = cell_width(out);
+	out.push_str(&percent);
+	parts.push((offset, percent, usage_color(theme, window.percent)));
+	if let Some(reset) = window.reset_after {
+		let mut reset_text = String::from(" (");
+		write_reset(&mut reset_text, reset, minute_window);
+		reset_text.push(')');
+		let reset_text = Str::new(reset_text);
+		let offset = cell_width(out);
+		out.push_str(&reset_text);
+		parts.push((offset, reset_text, theme.muted));
+	}
+}
+
+fn account_usage_label(
+	charset: Charset,
+	usage: &AccountUsage,
+	theme: &Theme,
+	accent: Color,
+) -> Option<(Str, SmallVec<StyledPart, 9>)> {
+	if usage.five_hour.is_none()
+		&& usage.daily.is_none()
+		&& usage.seven_day.is_none()
+		&& usage.monthly.is_none()
+	{
+		return None;
+	}
+	let mut text = String::new();
+	let mut parts = SmallVec::new();
+	if let Some(tier) = usage.tier.as_deref().filter(|tier| !tier.is_empty()) {
+		let tier = clamp_end(&sanitize_status(tier), 40);
+		let offset = cell_width(&text);
+		text.push_str(&tier);
+		parts.push((offset, tier, accent));
+	}
+	if let Some(window) = usage.five_hour {
+		write_usage_window(&mut text, &mut parts, "5h", window, true, false, theme);
+	}
+	if let Some(window) = usage.daily {
+		write_usage_window(&mut text, &mut parts, "1d", window, true, false, theme);
+	}
+	if let Some(window) = usage.seven_day {
+		write_usage_window(&mut text, &mut parts, "7d", window, false, false, theme);
+	}
+	if let Some(window) = usage.monthly {
+		write_usage_window(&mut text, &mut parts, "mo", window, false, true, theme);
+	}
+	if parts.is_empty() {
+		return None;
+	}
+	let icon = charset.icon(Icon::Time);
+	if !icon.is_empty() {
+		let shift = cell_width(icon).saturating_add(1);
+		for (offset, ..) in &mut parts {
+			*offset = offset.saturating_add(shift);
+		}
+		text.insert(0, ' ');
+		text.insert_str(0, icon);
+	}
+	Some((Str::new(text), parts))
+}
+
 /// Themed icon of a reasoning level (pi `theme.thinking[level]`).
 fn thinking_icon(level: &str) -> Icon {
 	match level {
@@ -387,20 +843,118 @@ fn speculation_flip(now: Duration) -> Duration {
 	Duration::from_millis(u64::try_from(next).unwrap_or(u64::MAX))
 }
 
+/// Observer-clock accumulator for the union of active processing windows.
+///
+/// Repeated starts and stops are idempotent, so overlapping lifecycle signals
+/// form one running window instead of double-counting. A session or branch
+/// replacement resets both completed activity and the old in-flight window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ActiveTime {
+	accumulated: Duration,
+	started:     Option<Duration>,
+}
+
+impl ActiveTime {
+	/// Starts or stops the current processing window at `now`.
+	pub(crate) fn set_running(&mut self, now: Duration, running: bool) {
+		match (self.started, running) {
+			(None, true) => self.started = Some(now),
+			(Some(started), false) => {
+				self.accumulated = self.accumulated.saturating_add(now.saturating_sub(started));
+				self.started = None;
+			},
+			(None, false) | (Some(_), true) => {},
+		}
+	}
+
+	/// Starts a fresh meter for a replaced session or branch.
+	pub(crate) fn reset(&mut self, now: Duration, running: bool) {
+		self.accumulated = Duration::ZERO;
+		self.started = running.then_some(now);
+	}
+
+	/// Returns completed activity plus the currently open window.
+	#[must_use]
+	pub(crate) fn elapsed(self, now: Duration) -> Duration {
+		self.started.map_or(self.accumulated, |started| {
+			self.accumulated.saturating_add(now.saturating_sub(started))
+		})
+	}
+
+	/// Returns a stable value for [`StatusFacts::active_time`], changing only
+	/// when [`active_time_label`] would paint different text.
+	#[must_use]
+	pub(crate) fn display_elapsed(self, now: Duration) -> Duration {
+		let elapsed = self.elapsed(now);
+		let millis = elapsed.as_millis();
+		let visible_ms = if millis < 1_000 {
+			0
+		} else if millis < 60_000 {
+			// Pi uses `toFixed(1)`: round to the nearest tenth while retaining
+			// the sub-minute formatting branch for a rounded `60.0s`.
+			((millis + 50) / 100 * 100).min(59_999)
+		} else if millis < 3_600_000 {
+			millis / 1_000 * 1_000
+		} else if millis < 86_400_000 {
+			millis / 60_000 * 60_000
+		} else {
+			millis / 3_600_000 * 3_600_000
+		};
+		Duration::from_millis(visible_ms.try_into().unwrap_or(u64::MAX))
+	}
+
+	/// Next instant at which the visible active-time label changes.
+	#[must_use]
+	pub(crate) fn next_wake(self, now: Duration) -> Option<Duration> {
+		self.started?;
+		let elapsed = self.elapsed(now);
+		let millis = elapsed.as_millis();
+		let next_ms = if millis < 1_000 {
+			1_000
+		} else if millis < 60_000 {
+			let rounded_tenths = (millis + 50) / 100;
+			(rounded_tenths * 100 + 50).min(60_000)
+		} else if millis < 3_600_000 {
+			(millis / 1_000 + 1) * 1_000
+		} else if millis < 86_400_000 {
+			(millis / 60_000 + 1) * 60_000
+		} else {
+			(millis / 3_600_000 + 1) * 3_600_000
+		};
+		let next_elapsed = Duration::from_millis(next_ms.try_into().unwrap_or(u64::MAX));
+		Some(now.saturating_add(next_elapsed.saturating_sub(elapsed)))
+	}
+}
+
 /// Identity of one band segment, for overflow policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Chip {
 	Brand,
 	Model,
 	Mode,
+	Collab,
 	Path,
 	Git,
+	Pr,
+	Hook,
+	Subagents,
+	Jobs,
 	Session,
+	SessionId,
+	Hostname,
 	TokenIn,
 	TokenOut,
 	TokenTotal,
 	TokenRate,
+	CacheRead,
+	CacheWrite,
+	CacheHit,
+	ContextPct,
+	ContextTotal,
 	Cost,
+	ActiveTime,
+	Usage,
+	Clock,
 }
 
 /// One rendered chip: identity, text, and foreground.
@@ -408,8 +962,13 @@ type Label = (Chip, Str, Color);
 
 /// Both fitted groups of the band.
 struct Layout {
-	left:  SmallVec<Label, 5>,
-	right: SmallVec<Label, 6>,
+	left:        SmallVec<Label, 5>,
+	right:       SmallVec<Label, 6>,
+	gauge:       Color,
+	pr_url:      Option<Str>,
+	path_url:    Option<Str>,
+	git_parts:   SmallVec<(u16, Str, Color), 3>,
+	usage_parts: SmallVec<StyledPart, 9>,
 }
 
 /// What a fitted layout depends on besides the facts: the row width, the
@@ -472,6 +1031,22 @@ impl StatusBand {
 		true
 	}
 
+	/// Applies a live or preview appearance without rebuilding the component.
+	pub fn set_appearance(&mut self, appearance: StatusAppearance) -> bool {
+		if self.facts.appearance == appearance {
+			return false;
+		}
+		self.facts.appearance = appearance;
+		self.cache = None;
+		true
+	}
+
+	/// Current appearance.
+	#[must_use]
+	pub const fn appearance(&self) -> StatusAppearance {
+		self.facts.appearance
+	}
+
 	/// Whether the fitted layout is retained for `key` (test hook).
 	#[cfg(test)]
 	fn cached_for(&self, key: LayoutKey) -> bool {
@@ -504,17 +1079,17 @@ impl StatusBand {
 
 	/// Mode chip text and color (pi `modeSegment`), when a Director owns
 	/// subsequent turns.
-	fn mode_label(&self, charset: Charset, theme: &Theme) -> Option<(Str, Color)> {
+	fn mode_label(&self, charset: Charset, theme: &Theme, accent: Color) -> Option<(Str, Color)> {
 		let mode = self.facts.mode?;
 		Some(match mode {
-			ModeChip::Plan => (sf!("{} Plan", charset.icon(Icon::Plan)), theme.accent),
+			ModeChip::Plan => (sf!("{} Plan", charset.icon(Icon::Plan)), accent),
 			ModeChip::PlanPaused => {
 				(sf!("{} Plan {}", charset.icon(Icon::Plan), charset.icon(Icon::Pause)), theme.warn)
 			},
-			ModeChip::Prewalk => (sf!("{} Prewalk", charset.icon(Icon::Prewalk)), theme.accent),
+			ModeChip::Prewalk => (sf!("{} Prewalk", charset.icon(Icon::Prewalk)), accent),
 			ModeChip::Goal(state) => {
 				let (icon, color) = match state {
-					GoalState::Active => (Icon::Goal, theme.accent),
+					GoalState::Active => (Icon::Goal, accent),
 					GoalState::Paused => (Icon::Pause, theme.warn),
 					GoalState::Complete => (Icon::Success, theme.ok),
 					GoalState::BudgetLimited => (Icon::WarningStatus, theme.warn),
@@ -522,24 +1097,68 @@ impl StatusBand {
 				};
 				(sf!("{} Goal", charset.icon(icon)), color)
 			},
-			ModeChip::Vibe => (sf!("{} Vibe", charset.icon(Icon::Agents)), theme.accent),
+			ModeChip::Vibe => (sf!("{} Vibe", charset.icon(Icon::Agents)), accent),
+			ModeChip::LoopWaiting { limit } => {
+				let icon = charset.icon(Icon::Loop);
+				let label = Self::loop_label(icon, "waiting", limit);
+				(label, theme.secondary)
+			},
 			ModeChip::Loop { limit } => {
 				let icon = charset.icon(Icon::Loop);
-				let label = match limit {
-					Some((remaining, initial)) => sf!("{icon} Loop running {remaining}/{initial}"),
-					None => sf!("{icon} Loop running"),
-				};
-				(label, theme.info)
+				let label = Self::loop_label(icon, "running", limit);
+				(label, theme.secondary)
 			},
 			ModeChip::LoopPaused { limit } => {
 				let icon = charset.icon(Icon::Pause);
-				let label = match limit {
-					Some((remaining, initial)) => sf!("{icon} Loop paused {remaining}/{initial}"),
-					None => sf!("{icon} Loop paused"),
-				};
+				let label = Self::loop_label(icon, "paused", limit);
 				(label, theme.warn)
 			},
 		})
+	}
+
+	fn loop_label(icon: &str, state: &str, limit: Option<LoopLimit>) -> Str {
+		let mut label = format!("{icon} Loop {state}");
+		match limit {
+			Some(LoopLimit::Iterations { remaining, initial }) => {
+				let _ = write!(label, " {remaining}/{initial}");
+			},
+			Some(LoopLimit::Duration(remaining)) => {
+				label.push(' ');
+				let seconds = remaining.as_secs().max(u64::from(!remaining.is_zero()));
+				if seconds >= 3_600 {
+					let hours = seconds / 3_600;
+					let minutes = (seconds % 3_600) / 60;
+					let _ = write!(label, "{hours}h");
+					if minutes > 0 {
+						let _ = write!(label, "{minutes}m");
+					}
+				} else if seconds >= 60 {
+					let _ = write!(label, "{}m{}s", seconds / 60, seconds % 60);
+				} else {
+					let _ = write!(label, "{seconds}s");
+				}
+				label.push_str(" left");
+			},
+			None => {},
+		}
+		Str::new(label)
+	}
+
+	/// Session-derived identity color, falling back to the requested theme
+	/// role while the session remains unnamed.
+	fn session_accent(&self, pc: &PaintCtx<'_>, fallback: Color) -> Color {
+		let Some(name) = self
+			.facts
+			.session_name
+			.as_deref()
+			.filter(|name| !name.is_empty())
+		else {
+			return fallback;
+		};
+		let theme = pc.ctx.theme;
+		let occupied = [theme.accent, theme.info, theme.ok, theme.warn, theme.err, theme.secondary];
+		let surface = matches!(pc.ctx.appearance, Appearance::Light).then_some(1.0);
+		session_accent_color(name, &occupied, surface)
 	}
 
 	/// Model icon: the thinking glyph in compact mode, else the model icon.
@@ -590,71 +1209,261 @@ impl StatusBand {
 		Str::new(text)
 	}
 
-	/// Left-group labels at `path_max`, in band order. The brand label is
-	/// the scratch written by [`Self::write_brand`] for this frame; its color
-	/// is patched per frame by the caller.
+	/// Left-group labels at `path_max`, in pi's segment order. The brand
+	/// label is the scratch written by [`Self::write_brand`] for this frame;
+	/// its color is patched per frame by the caller.
+	fn git_parts(&self, pc: &PaintCtx<'_>) -> SmallVec<(u16, Str, Color), 3> {
+		let charset = pc.ctx.charset;
+		let theme = pc.ctx.theme;
+		let status = self.facts.git_status.unwrap_or_default();
+		let mut parts = SmallVec::new();
+		let mut offset = self
+			.facts
+			.branch
+			.as_deref()
+			.filter(|branch| !branch.is_empty())
+			.map_or_else(
+				|| cell_width(charset.icon(Icon::Git)),
+				|branch| {
+					cell_width(charset.icon(Icon::Branch))
+						.saturating_add(1)
+						.saturating_add(cell_width(&sanitize_status(branch)))
+				},
+			);
+		for (prefix, count, color) in [
+			('*', status.unstaged, theme.status_dirty),
+			('+', status.staged, theme.status_staged),
+			('?', status.untracked, theme.status_untracked),
+		] {
+			if count == 0 {
+				continue;
+			}
+			offset = offset.saturating_add(1);
+			let part = sf!("{prefix}{count}");
+			let width = cell_width(&part);
+			parts.push((offset, part, color));
+			offset = offset.saturating_add(width);
+		}
+		parts
+	}
+
 	fn left_labels(&self, pc: &PaintCtx<'_>, path_max: u16) -> SmallVec<Label, 5> {
 		let charset = pc.ctx.charset;
 		let theme = pc.ctx.theme;
+		let accent = self.session_accent(pc, theme.accent);
 		let mut labels = SmallVec::new();
 		labels.push((Chip::Brand, Str::new(&self.brand), theme.muted));
-		labels.push((Chip::Model, self.model_label(charset), theme.ok));
-		if let Some((label, color)) = self.mode_label(charset, &theme) {
+		labels.push((
+			Chip::Model,
+			self.model_label(charset),
+			self.session_accent(pc, theme.status_model),
+		));
+		if let Some((label, color)) = self.mode_label(charset, &theme, accent) {
 			labels.push((Chip::Mode, label, color));
 		}
-		if !self.facts.cwd.is_empty() {
-			let icon = charset.icon(if self.facts.scratch {
-				Icon::ScratchFolder
+		if let Some(collab) = self.facts.collab {
+			let role = if collab.guest {
+				"collab guest:"
 			} else {
-				Icon::Folder
-			});
-			let path = clamp_path(&self.facts.cwd, path_max);
-			labels.push((Chip::Path, sf!("{icon} {path}"), theme.secondary));
-		}
-		if let Some(branch) = self.facts.branch.as_deref().filter(|b| !b.is_empty()) {
-			let icon = charset.icon(Icon::Branch);
-			let (label, color) = if self.facts.dirty {
-				(sf!("{icon} {branch} *"), theme.warn)
-			} else {
-				(sf!("{icon} {branch}"), theme.info)
+				"collab:"
 			};
-			labels.push((Chip::Git, label, color));
+			labels.push((Chip::Collab, sf!("⇄ {role}{}", collab.participants), accent));
+		}
+		for status in &self.facts.hook_status {
+			let clean = sanitize_status(status);
+			if !clean.is_empty() {
+				labels.push((Chip::Hook, clean, accent));
+			}
+		}
+		if !self.facts.cwd.is_empty() {
+			let (icon, path) = if let Some(worktree) = &self.facts.worktree {
+				let label = if self.facts.branch.as_deref() == Some(worktree.worktree.as_str()) {
+					worktree.project.clone()
+				} else {
+					sf!("{}/{}", worktree.project, worktree.worktree)
+				};
+				(Icon::Worktree, clamp_path(&label, path_max))
+			} else {
+				(
+					if self.facts.scratch {
+						Icon::ScratchFolder
+					} else {
+						Icon::Folder
+					},
+					clamp_path(&self.facts.cwd, path_max),
+				)
+			};
+			labels.push((Chip::Path, sf!("{} {path}", charset.icon(icon)), theme.status_path));
+		}
+		let status = self.facts.git_status.unwrap_or_default();
+		if let Some(branch) = self
+			.facts
+			.branch
+			.as_deref()
+			.filter(|branch| !branch.is_empty())
+		{
+			let branch = sanitize_status(branch);
+			let mut label = format!("{} {branch}", charset.icon(Icon::Branch));
+			append_git_counts(&mut label, status);
+			let color = if status.dirty() {
+				theme.status_git_dirty
+			} else {
+				theme.status_git_clean
+			};
+			labels.push((Chip::Git, Str::new(label), color));
+		} else if status.dirty() {
+			let mut label = String::from(charset.icon(Icon::Git));
+			append_git_counts(&mut label, status);
+			labels.push((Chip::Git, Str::new(label), theme.status_git_dirty));
+		}
+		if let Some(pull) = &self.facts.pull_request {
+			labels.push((Chip::Pr, sf!("{} #{}", charset.icon(Icon::Pr), pull.number), accent));
 		}
 		labels
 	}
 
-	/// Right-group labels with the session title clamped to `name_max`, in
-	/// pi's default right order.
-	fn right_labels(&self, pc: &PaintCtx<'_>, name_max: u16) -> SmallVec<Label, 6> {
+	/// Right-group labels with the session title clamped to `name_max`.
+	/// Values are formatted only when the facts/layout key changes; animation
+	/// frames re-slice this retained set.
+	fn right_labels(
+		&self,
+		pc: &PaintCtx<'_>,
+		name_max: u16,
+		usage_label: Option<&Str>,
+	) -> SmallVec<Label, 6> {
 		let charset = pc.ctx.charset;
 		let theme = pc.ctx.theme;
+		let accent = self.session_accent(pc, theme.accent);
 		let facts = &self.facts;
 		let mut labels = SmallVec::new();
-		if let Some(name) = facts.session_name.as_deref().filter(|n| !n.is_empty()) {
-			labels.push((Chip::Session, clamp_end(name, name_max), theme.accent));
+		if facts.background_jobs > 0 {
+			labels.push((
+				Chip::Jobs,
+				count_label(charset, Icon::Job, u64::from(facts.background_jobs)),
+				theme.status_subagents,
+			));
 		}
-		let count = |icon: Icon, value: u64| {
-			let mut text = String::from(charset.icon(icon));
-			text.push(' ');
-			let _ = write_compact_count(&mut text, value);
-			Str::new(text)
-		};
+		if facts.subagents > 0 {
+			let mut text = format!("{} {}", charset.icon(Icon::Agents), facts.subagents);
+			text.push_str(if facts.subagents == 1 {
+				" agent"
+			} else {
+				" agents"
+			});
+			labels.push((Chip::Subagents, Str::new(text), theme.status_subagents));
+		}
+		if let Some(name) = facts
+			.session_name
+			.as_deref()
+			.filter(|name| !name.is_empty())
+		{
+			labels.push((Chip::Session, clamp_end(&sanitize_status(name), name_max), accent));
+		}
+		if let Some(session) = facts
+			.session_id
+			.as_deref()
+			.filter(|session| !session.is_empty())
+		{
+			let end = session
+				.char_indices()
+				.nth(8)
+				.map_or(session.len(), |(index, _)| index);
+			labels.push((
+				Chip::SessionId,
+				sf!("{} {}", charset.icon(Icon::Session), &session[..end]),
+				theme.muted,
+			));
+		}
+		if let Some(host) = facts.hostname.as_deref().filter(|host| !host.is_empty()) {
+			let host = sanitize_status(host);
+			labels.push((Chip::Hostname, sf!("{} {host}", charset.icon(Icon::Host)), accent));
+		}
+		if let Some(clock) = facts.wall_time.as_deref().filter(|clock| !clock.is_empty()) {
+			labels.push((
+				Chip::Clock,
+				sf!("{} {}", charset.icon(Icon::Time), sanitize_status(clock)),
+				theme.muted,
+			));
+		}
 		if facts.tokens_in > 0 {
-			labels.push((Chip::TokenIn, count(Icon::Input, facts.tokens_in), theme.secondary));
+			labels.push((
+				Chip::TokenIn,
+				count_label(charset, Icon::Input, facts.tokens_in),
+				theme.status_spend,
+			));
 		}
 		if facts.tokens_out > 0 {
-			labels.push((Chip::TokenOut, count(Icon::Output, facts.tokens_out), theme.info));
+			labels.push((
+				Chip::TokenOut,
+				count_label(charset, Icon::Output, facts.tokens_out),
+				theme.status_output,
+			));
 		}
 		let total = facts
 			.tokens_in
 			.saturating_add(facts.tokens_out)
 			.saturating_add(facts.cache_write);
 		if total > 0 {
-			labels.push((Chip::TokenTotal, count(Icon::Tokens, total), theme.secondary));
+			labels.push((
+				Chip::TokenTotal,
+				count_label(charset, Icon::Tokens, total),
+				theme.status_spend,
+			));
 		}
 		if let Some(rate) = facts.tokens_per_second.filter(|rate| *rate > 0.0) {
-			let label = sf!("{} {rate:.1} tok/s", charset.icon(Icon::Throughput));
-			labels.push((Chip::TokenRate, label, theme.info));
+			labels.push((
+				Chip::TokenRate,
+				sf!("{} {rate:.1} tok/s", charset.icon(Icon::Throughput)),
+				theme.status_output,
+			));
+		}
+		if facts.cache_read > 0 {
+			labels.push((
+				Chip::CacheRead,
+				count_label(charset, Icon::Cache, facts.cache_read),
+				theme.status_spend,
+			));
+		}
+		if facts.cache_write > 0 {
+			labels.push((
+				Chip::CacheWrite,
+				count_label(charset, Icon::Cache, facts.cache_write),
+				theme.status_output,
+			));
+		}
+		let prompt_total = facts
+			.cache_read
+			.saturating_add(facts.cache_write)
+			.saturating_add(facts.tokens_in);
+		if facts.cache_read > 0 && prompt_total > 0 {
+			let hit = facts.cache_read as f64 / prompt_total as f64 * 100.0;
+			labels.push((
+				Chip::CacheHit,
+				sf!("{} {hit:.2}%", charset.icon(Icon::Cache)),
+				theme.status_spend,
+			));
+		}
+		labels.push((
+			Chip::ContextPct,
+			context_percent_label(charset, facts.tokens, facts.context_window),
+			context_color(&theme, facts.tokens, facts.context_window),
+		));
+		if let Some(window) = facts.context_window.filter(|window| *window > 0) {
+			labels.push((
+				Chip::ContextTotal,
+				count_label(charset, Icon::Context, window),
+				theme.status_context,
+			));
+		}
+		if facts.active_time >= Duration::from_secs(1) {
+			labels.push((
+				Chip::ActiveTime,
+				active_time_label(charset, facts.active_time),
+				theme.muted,
+			));
+		}
+		if let Some(label) = usage_label {
+			labels.push((Chip::Usage, label.clone(), theme.fg));
 		}
 		let mut cost =
 			String::from(spend_label(facts.cost_nano_usd, facts.subscription, charset).as_str());
@@ -666,10 +1475,194 @@ impl StatusBand {
 			cost.push(' ');
 			write_premium_requests(&mut cost, facts.premium_requests_millionths);
 		}
+		if facts.advisor_cost_nano_usd > 0 {
+			if !cost.is_empty() {
+				cost.push_str(" + ");
+			}
+			cost.push_str(
+				advisor_spend_label(facts.advisor_cost_nano_usd, facts.advisor_subscription, charset)
+					.as_str(),
+			);
+		}
 		if !cost.is_empty() {
-			labels.push((Chip::Cost, Str::new(cost), theme.secondary));
+			labels.push((Chip::Cost, Str::new(cost), theme.status_cost));
 		}
 		labels
+	}
+
+	fn apply_preset(
+		&self,
+		left: SmallVec<Label, 5>,
+		right: SmallVec<Label, 6>,
+	) -> (SmallVec<Label, 5>, SmallVec<Label, 6>) {
+		const DEFAULT_LEFT: &[Chip] = &[
+			Chip::Brand,
+			Chip::Model,
+			Chip::Mode,
+			Chip::Collab,
+			Chip::Path,
+			Chip::Git,
+			Chip::Pr,
+			Chip::ContextPct,
+			Chip::Cost,
+		];
+		const DEFAULT_RIGHT: &[Chip] = &[Chip::Jobs, Chip::Subagents, Chip::Session];
+		const MINIMAL_LEFT: &[Chip] = &[Chip::Path, Chip::Git];
+		const MINIMAL_RIGHT: &[Chip] =
+			&[Chip::Jobs, Chip::Subagents, Chip::Session, Chip::Mode, Chip::ContextPct];
+		const COMPACT_LEFT: &[Chip] = &[Chip::Model, Chip::Mode, Chip::Git, Chip::Pr];
+		const COMPACT_RIGHT: &[Chip] =
+			&[Chip::Jobs, Chip::Subagents, Chip::Session, Chip::Cost, Chip::ContextPct];
+		const FULL_LEFT: &[Chip] = &[
+			Chip::Brand,
+			Chip::Hostname,
+			Chip::Model,
+			Chip::Mode,
+			Chip::Path,
+			Chip::Git,
+			Chip::Pr,
+			Chip::Subagents,
+			Chip::Hook,
+		];
+		const FULL_RIGHT: &[Chip] = &[
+			Chip::Jobs,
+			Chip::Session,
+			Chip::CacheHit,
+			Chip::TokenIn,
+			Chip::TokenOut,
+			Chip::TokenRate,
+			Chip::CacheRead,
+			Chip::Cost,
+			Chip::ContextPct,
+			Chip::ActiveTime,
+			Chip::Usage,
+			Chip::Clock,
+		];
+		const NERD_LEFT: &[Chip] = &[
+			Chip::Brand,
+			Chip::Hostname,
+			Chip::Model,
+			Chip::Mode,
+			Chip::Path,
+			Chip::Git,
+			Chip::Pr,
+			Chip::SessionId,
+			Chip::Subagents,
+			Chip::Hook,
+		];
+		const NERD_RIGHT: &[Chip] = &[
+			Chip::Jobs,
+			Chip::Session,
+			Chip::TokenIn,
+			Chip::TokenOut,
+			Chip::CacheRead,
+			Chip::CacheWrite,
+			Chip::TokenRate,
+			Chip::Cost,
+			Chip::ContextPct,
+			Chip::ContextTotal,
+			Chip::ActiveTime,
+			Chip::Usage,
+			Chip::Clock,
+		];
+		const ASCII_LEFT: &[Chip] = &[Chip::Model, Chip::Mode, Chip::Path, Chip::Git, Chip::Pr];
+		const ASCII_RIGHT: &[Chip] = &[
+			Chip::Jobs,
+			Chip::Subagents,
+			Chip::Session,
+			Chip::TokenTotal,
+			Chip::Cost,
+			Chip::ContextPct,
+		];
+		let (left_order, right_order) = match self.facts.appearance.preset {
+			StatusPreset::Default => (DEFAULT_LEFT, DEFAULT_RIGHT),
+			StatusPreset::Minimal => (MINIMAL_LEFT, MINIMAL_RIGHT),
+			StatusPreset::Compact => (COMPACT_LEFT, COMPACT_RIGHT),
+			StatusPreset::Full => (FULL_LEFT, FULL_RIGHT),
+			StatusPreset::Nerd => (NERD_LEFT, NERD_RIGHT),
+			StatusPreset::Ascii | StatusPreset::Custom => (ASCII_LEFT, ASCII_RIGHT),
+		};
+		let mut pool = Vec::with_capacity(left.len() + right.len());
+		pool.extend(left);
+		pool.extend(right);
+		let mut selected_left = SmallVec::<Label, 5>::new();
+		for wanted in left_order {
+			if let Some(label) = pool.iter().find(|(chip, ..)| chip == wanted) {
+				selected_left.push(label.clone());
+			}
+		}
+		let mut selected_right = SmallVec::<Label, 6>::new();
+		for wanted in right_order {
+			if let Some(label) = pool.iter().find(|(chip, ..)| chip == wanted) {
+				selected_right.push(label.clone());
+			}
+		}
+		if self.facts.appearance.context_line == ContextLine::Embedded
+			&& self.facts.context_window.is_some_and(|window| window > 0)
+		{
+			selected_left.retain(|(chip, ..)| !matches!(chip, Chip::ContextPct | Chip::ContextTotal));
+			selected_right.retain(|(chip, ..)| !matches!(chip, Chip::ContextPct | Chip::ContextTotal));
+		}
+		(selected_left, selected_right)
+	}
+
+	fn band_chrome(
+		charset: Charset,
+		end: bool,
+		separator: StatusSeparator,
+		transparent: bool,
+	) -> (&'static str, &'static str, &'static str) {
+		let chrome = match separator {
+			StatusSeparator::PowerlineThin => {
+				if end {
+					charset.status_band_end()
+				} else {
+					charset.status_band()
+				}
+			},
+			StatusSeparator::Powerline => match (charset, end) {
+				(Charset::Ascii, false) => ("", ">", ">"),
+				(Charset::Ascii, true) => ("<", "<", ""),
+				(Charset::Unicode, false) => ("", "▶", "▶"),
+				(Charset::Unicode, true) => ("◀", "◀", ""),
+				(Charset::NerdFont, false) => ("\u{e0b6}", "\u{e0b0}", "\u{e0b0}"),
+				(Charset::NerdFont, true) => ("\u{e0b2}", "\u{e0b2}", ""),
+			},
+			StatusSeparator::Slash => (
+				"",
+				if charset == Charset::NerdFont {
+					"\u{e0bb}"
+				} else {
+					"/"
+				},
+				"",
+			),
+			StatusSeparator::Pipe => (
+				"",
+				match charset {
+					Charset::Ascii => "|",
+					Charset::Unicode => "│",
+					Charset::NerdFont => "\u{e0b3}",
+				},
+				"",
+			),
+			StatusSeparator::Block => (
+				"",
+				if charset == Charset::Ascii {
+					"#"
+				} else {
+					"▌"
+				},
+				"",
+			),
+			StatusSeparator::None => ("", " ", ""),
+			StatusSeparator::Ascii => ("", if end { "<" } else { ">" }, ""),
+		};
+		if transparent {
+			("", chrome.1, "")
+		} else {
+			chrome
+		}
 	}
 
 	/// Cells a group needs: labels, separators with their pads, the interior
@@ -695,6 +1688,9 @@ impl StatusBand {
 	/// Narrowest gauge that still carries both labels (pi
 	/// `embeddedContextGaugeMinWidth`); one cell without a window.
 	fn gauge_min_width(&self) -> u16 {
+		if self.facts.appearance.context_line != ContextLine::Embedded {
+			return 1;
+		}
 		let Some(window) = self.facts.context_window.filter(|window| *window > 0) else {
 			return 1;
 		};
@@ -718,12 +1714,31 @@ impl StatusBand {
 	/// unlike git/model decoration it changes how the next turn behaves.
 	fn fitted(&self, pc: &PaintCtx<'_>, width: u16) -> Layout {
 		let charset = pc.ctx.charset;
-		let left_chrome = charset.status_band();
-		let right_chrome = charset.status_band_end();
+		let transparent =
+			self.facts.appearance.transparent || pc.ctx.theme.status_bg == Color::Default;
+		let left_chrome =
+			Self::band_chrome(charset, false, self.facts.appearance.separator, transparent);
+		let right_chrome =
+			Self::band_chrome(charset, true, self.facts.appearance.separator, transparent);
 		let gauge_min = self.gauge_min_width();
 		let mut path_max = PATH_MAX;
-		let mut left = self.left_labels(pc, path_max);
-		let mut right = self.right_labels(pc, u16::MAX);
+		let usage = if matches!(self.facts.appearance.preset, StatusPreset::Full | StatusPreset::Nerd)
+		{
+			self.facts.account_usage.as_ref().and_then(|usage| {
+				account_usage_label(
+					charset,
+					usage,
+					&pc.ctx.theme,
+					self.session_accent(pc, pc.ctx.theme.accent),
+				)
+			})
+		} else {
+			None
+		};
+		let (mut left, mut right) = self.apply_preset(
+			self.left_labels(pc, path_max),
+			self.right_labels(pc, u16::MAX, usage.as_ref().map(|(label, _)| label)),
+		);
 		// pi `minimumGapWidth`: a lone surviving chip that cannot share the
 		// row with both gauge labels keeps the one-cell gauge instead of
 		// losing the whole band.
@@ -744,7 +1759,10 @@ impl StatusBand {
 			let current = cell_width(&right[index].1);
 			let shrink = current.saturating_sub(SESSION_NAME_MIN).min(excess);
 			if shrink > 0 {
-				right = self.right_labels(pc, current - shrink);
+				(_, right) = self.apply_preset(
+					self.left_labels(pc, path_max),
+					self.right_labels(pc, current - shrink, usage.as_ref().map(|(label, _)| label)),
+				);
 			}
 		}
 		while overflow(&left, &right) > 0 && !right.is_empty() {
@@ -753,7 +1771,26 @@ impl StatusBand {
 		loop {
 			let excess = overflow(&left, &right);
 			if excess == 0 || left.is_empty() {
-				return Layout { left, right };
+				let usage_parts = if right.iter().any(|(chip, ..)| *chip == Chip::Usage) {
+					usage
+						.as_ref()
+						.map_or_else(SmallVec::new, |(_, parts)| parts.clone())
+				} else {
+					SmallVec::new()
+				};
+				return Layout {
+					left,
+					right,
+					gauge: self.session_accent(pc, pc.ctx.theme.status_rule),
+					pr_url: self
+						.facts
+						.pull_request
+						.as_ref()
+						.map(|pull| pull.url.clone()),
+					path_url: self.facts.path_url.clone(),
+					git_parts: self.git_parts(pc),
+					usage_parts,
+				};
 			}
 			let path_width = left
 				.iter()
@@ -764,13 +1801,25 @@ impl StatusBand {
 				&& current > PATH_MIN
 			{
 				path_max = path_max.min(current).saturating_sub(excess).max(PATH_MIN);
-				left = self.left_labels(pc, path_max);
+				(left, _) = self.apply_preset(
+					self.left_labels(pc, path_max),
+					self.right_labels(pc, u16::MAX, usage.as_ref().map(|(label, _)| label)),
+				);
 				continue;
 			}
-			let drop = [Chip::Git, Chip::Model, Chip::Brand, Chip::Path, Chip::Mode]
-				.into_iter()
-				.find_map(|candidate| left.iter().position(|(chip, ..)| *chip == candidate))
-				.unwrap_or(left.len() - 1);
+			let drop = [
+				Chip::Pr,
+				Chip::Git,
+				Chip::Hook,
+				Chip::Collab,
+				Chip::Mode,
+				Chip::Model,
+				Chip::Brand,
+				Chip::Path,
+			]
+			.into_iter()
+			.find_map(|candidate| left.iter().position(|(chip, ..)| *chip == candidate))
+			.unwrap_or(left.len() - 1);
 			left.remove(drop);
 		}
 	}
@@ -784,24 +1833,35 @@ impl StatusBand {
 		labels: &[Label],
 		rect: Rect,
 		end: bool,
+		dimmed: bool,
+		separator: StatusSeparator,
+		transparent: bool,
 		mut on_label: impl FnMut(Chip, u16),
 	) {
 		let theme = pc.ctx.theme;
-		let (left_cap, separator, cap) = if end {
-			pc.ctx.charset.status_band_end()
+		let (left_cap, separator, cap) =
+			Self::band_chrome(pc.ctx.charset, end, separator, transparent);
+		let background = if transparent {
+			Color::Default
 		} else {
-			pc.ctx.charset.status_band()
+			theme.status_bg
 		};
-		let band = Style::new().fg(theme.fg).bg(theme.panel);
-		let edge = Style::new().fg(theme.panel);
+		let mut band = Style::new().fg(theme.fg).bg(background);
+		let mut separator_style = Style::new().fg(theme.status_sep).bg(background);
+		let mut edge = Style::new().fg(theme.status_bg);
+		if dimmed {
+			band = band.dim();
+			separator_style = separator_style.dim();
+			edge = edge.dim();
+		}
 		let y = rect.y;
 		let mut column = pc.frame.put(rect.x, y, left_cap, edge);
 		column = pc.frame.put(column, y, " ", band);
 		for (index, (chip, label, color)) in labels.iter().enumerate() {
 			if index > 0 {
-				column = pc.frame.put(column, y, " ", band.dim());
-				column = pc.frame.put(column, y, separator, band.dim());
-				column = pc.frame.put(column, y, " ", band.dim());
+				column = pc.frame.put(column, y, " ", separator_style);
+				column = pc.frame.put(column, y, separator, separator_style);
+				column = pc.frame.put(column, y, " ", separator_style);
 			}
 			on_label(*chip, column);
 			column = pc.frame.put(column, y, label, band.fg(*color));
@@ -894,23 +1954,93 @@ impl Component for StatusBand {
 		let advisor = self.advisor_span(charset);
 		let advisor_badge = self.facts.advisor;
 		let slot = self.slot;
-		let (tokens, context_window, compact_percent, speculation) = (
+		let (tokens, context_window, compact_percent, speculation, speculation_percent) = (
 			self.facts.tokens,
 			self.facts.context_window,
 			self.facts.compact_percent,
 			self.facts.speculation,
+			self.facts.speculation_percent,
 		);
-		let Layout { left, right } = self.layout(pc, rect.width, brand_color);
-		let left_width = Self::group_width(left, charset.status_band()).min(rect.width);
-		let right_width = Self::group_width(right, charset.status_band_end())
-			.min(rect.width.saturating_sub(left_width));
+		let dimmed = self.facts.focused_agent.is_some();
+		let appearance = self.facts.appearance;
+		let transparent = appearance.transparent || theme.status_bg == Color::Default;
+		let band_bg = if transparent {
+			Color::Default
+		} else {
+			theme.status_bg
+		};
+		let speculation_accent = self.session_accent(pc, theme.accent);
+		let Layout { left, right, gauge, pr_url, path_url, git_parts, usage_parts } =
+			self.layout(pc, rect.width, brand_color);
+		let gauge_color = *gauge;
+		let left_width = Self::group_width(
+			left,
+			Self::band_chrome(charset, false, appearance.separator, transparent),
+		)
+		.min(rect.width);
+		let right_width = Self::group_width(
+			right,
+			Self::band_chrome(charset, true, appearance.separator, transparent),
+		)
+		.min(rect.width.saturating_sub(left_width));
 		let mut advisor_column = None;
+		let mut pr_column = None;
+		let mut git_column = None;
+		let mut path_column = None;
 		if left_width > 0 {
-			Self::paint_group(pc, left, Rect::new(rect.x, rect.y, left_width, 1), false, |chip, x| {
-				if chip == Chip::Model {
-					advisor_column = advisor.map(|(offset, icon)| (x.saturating_add(offset), icon));
+			Self::paint_group(
+				pc,
+				left,
+				Rect::new(rect.x, rect.y, left_width, 1),
+				false,
+				dimmed,
+				appearance.separator,
+				transparent,
+				|chip, x| {
+					if chip == Chip::Model {
+						advisor_column = advisor.map(|(offset, icon)| (x.saturating_add(offset), icon));
+					} else if chip == Chip::Pr {
+						pr_column = Some(x);
+					} else if chip == Chip::Git {
+						git_column = Some(x);
+					} else if chip == Chip::Path {
+						path_column = Some(x);
+					}
+				},
+			);
+		}
+		if let Some(column) = path_column
+			&& let Some(url) = path_url
+			&& let Some((_, label, color)) = left.iter().find(|(chip, ..)| *chip == Chip::Path)
+			&& let Some((icon, path)) = label.split_once(' ')
+		{
+			let offset = cell_width(icon).saturating_add(1);
+			let mut style = Style::new().fg(*color).bg(band_bg).link(url);
+			if dimmed {
+				style = style.dim();
+			}
+			pc.frame
+				.put(column.saturating_add(offset), rect.y, path, style);
+		}
+		if let Some(column) = git_column {
+			for (offset, part, color) in git_parts {
+				let mut style = Style::new().fg(*color).bg(band_bg);
+				if dimmed {
+					style = style.dim();
 				}
-			});
+				pc.frame
+					.put(column.saturating_add(*offset), rect.y, part, style);
+			}
+		}
+		if let Some(column) = pr_column
+			&& let Some(url) = pr_url
+			&& let Some((_, label, color)) = left.iter().find(|(chip, ..)| *chip == Chip::Pr)
+		{
+			let mut style = Style::new().fg(*color).bg(band_bg).link(url);
+			if dimmed {
+				style = style.dim();
+			}
+			pc.frame.put(column, rect.y, label, style);
 		}
 		if let Some(((column, icon), badge)) = advisor_column.zip(advisor_badge)
 			&& column.saturating_add(cell_width(icon)) <= rect.x.saturating_add(left_width)
@@ -923,12 +2053,39 @@ impl Component for StatusBand {
 				AdvisorHealth::Running => theme.ok,
 				AdvisorHealth::Paused => theme.muted,
 			};
-			pc.frame
-				.put(column, rect.y, icon, Style::new().fg(color).bg(theme.panel));
+			let mut style = Style::new().fg(color).bg(band_bg);
+			if dimmed {
+				style = style.dim();
+			}
+			pc.frame.put(column, rect.y, icon, style);
 		}
 		if right_width > 0 {
 			let x = rect.x.saturating_add(rect.width - right_width);
-			Self::paint_group(pc, right, Rect::new(x, rect.y, right_width, 1), true, |_, _| {});
+			let mut usage_column = None;
+			Self::paint_group(
+				pc,
+				right,
+				Rect::new(x, rect.y, right_width, 1),
+				true,
+				dimmed,
+				appearance.separator,
+				transparent,
+				|chip, column| {
+					if chip == Chip::Usage {
+						usage_column = Some(column);
+					}
+				},
+			);
+			if let Some(column) = usage_column {
+				for (offset, part, color) in usage_parts {
+					let mut style = Style::new().fg(*color).bg(band_bg);
+					if dimmed {
+						style = style.dim();
+					}
+					pc.frame
+						.put(column.saturating_add(*offset), rect.y, part, style);
+				}
+			}
 		}
 
 		let gap = rect
@@ -940,35 +2097,42 @@ impl Component for StatusBand {
 		}
 		let mut rule_utf8 = [0; 4];
 		let rule: &str = charset.rule().encode_utf8(&mut rule_utf8);
-		let gauge = ContextGauge::plan(
-			gap,
-			tokens,
-			context_window,
-			Some(CompactionBoundaries {
-				threshold_percent:   f64::from(compact_percent),
-				speculation_percent: None,
-			}),
-		);
-		let used = Style::new().fg(compaction_threshold_color(&theme));
-		let unused = Style::new().fg(theme.border);
-		let boundary = Style::new().fg(compaction_boundary_color(&theme));
+		let boundaries = Some(CompactionBoundaries {
+			threshold_percent: f64::from(compact_percent),
+			speculation_percent,
+		});
+		let gauge = match self.facts.appearance.context_line {
+			ContextLine::Off => ContextGauge::plan(gap, tokens, None, None),
+			ContextLine::Percentage => {
+				ContextGauge::plan_with_labels(gap, tokens, context_window, None, false)
+			},
+			ContextLine::Annotated => {
+				ContextGauge::plan_with_labels(gap, tokens, context_window, boundaries, false)
+			},
+			ContextLine::Embedded => ContextGauge::plan(gap, tokens, context_window, boundaries),
+		};
+		let dim = |style: Style| if dimmed { style.dim() } else { style };
+		let used = dim(Style::new().fg(gauge_color));
+		let unused = dim(Style::new().fg(theme.border));
+		let boundary = dim(Style::new().fg(compaction_boundary_color(&theme)));
+		let speculation_marker = dim(Style::new().fg(theme.muted));
 		// Background speculation animates the compaction tick: pulsing
 		// accent/muted while a summary is produced, solid accent once armed
 		// (pi `contextPctSegment`).
 		let threshold = match speculation {
 			Speculation::None => boundary,
-			Speculation::Armed => Style::new().fg(theme.accent),
+			Speculation::Armed => dim(Style::new().fg(speculation_accent)),
 			Speculation::Running => {
 				pc.wake(slot, speculation_flip(pc.now));
-				Style::new().fg(if speculation_on(pc.now) {
-					theme.accent
+				dim(Style::new().fg(if speculation_on(pc.now) {
+					speculation_accent
 				} else {
 					theme.muted
-				})
+				}))
 			},
 		};
 		let percent = if gauge.overflowed() {
-			Style::new().fg(theme.err)
+			dim(Style::new().fg(theme.err))
 		} else {
 			used
 		};
@@ -979,7 +2143,7 @@ impl Component for StatusBand {
 				GaugeCell::Used => pc.frame.put(column, rect.y, rule, used),
 				GaugeCell::Unused => pc.frame.put(column, rect.y, rule, unused),
 				GaugeCell::Threshold => pc.frame.put(column, rect.y, tick, threshold),
-				GaugeCell::Speculation => pc.frame.put(column, rect.y, tick, boundary),
+				GaugeCell::Speculation => pc.frame.put(column, rect.y, tick, speculation_marker),
 				GaugeCell::Percent(text) => pc.frame.put(column, rect.y, text, percent),
 				GaugeCell::Window(text) => pc.frame.put(column, rect.y, text, boundary),
 			};
@@ -1081,9 +2245,101 @@ pub(crate) mod tests {
 		let row = row(facts(), 80);
 		assert!(row.starts_with(" π  > ⬢ Sonnet 4.5 > 📁 ~/proj > ⑂ main ▶"), "{row}");
 		assert!(row.contains("10%"), "{row}");
+		assert!(!row.contains("10.0%/"), "embedded mode absorbs the numeric chip: {row}");
 		assert!(row.ends_with("200K─"), "{row}");
 		assert!(row.contains('┃'), "{row}");
 		assert_eq!(cell_width(&row), 80, "the gauge runs to the edge");
+	}
+
+	#[test]
+	fn embedded_context_keeps_the_unknown_window_chip() {
+		let row = row(StatusFacts { context_window: None, ..facts() }, 100);
+		assert!(row.contains("◫ 20K/?"), "{row}");
+	}
+
+	#[test]
+	fn non_embedded_context_modes_keep_their_numeric_chips() {
+		for context_line in [ContextLine::Off, ContextLine::Percentage, ContextLine::Annotated] {
+			let row = row(
+				StatusFacts {
+					appearance: StatusAppearance {
+						context_line,
+						..StatusAppearance::for_preset(StatusPreset::Default)
+					},
+					..facts()
+				},
+				120,
+			);
+			assert!(row.contains("◫ 10.0%/200K"), "{context_line:?}: {row}");
+		}
+
+		let nerd = row(
+			StatusFacts {
+				appearance: StatusAppearance {
+					context_line: ContextLine::Percentage,
+					..StatusAppearance::for_preset(StatusPreset::Nerd)
+				},
+				..facts()
+			},
+			220,
+		);
+		assert!(nerd.contains("◫ 10.0%/200K"), "{nerd}");
+		assert!(nerd.contains("◫ 200K"), "{nerd}");
+	}
+
+	#[test]
+	fn active_time_unions_windows_resets_and_wakes_at_visible_units() {
+		let mut meter = ActiveTime::default();
+		meter.set_running(Duration::from_millis(100), true);
+		meter.set_running(Duration::from_millis(400), true);
+		assert_eq!(meter.elapsed(Duration::from_millis(900)), Duration::from_millis(800));
+		assert_eq!(meter.display_elapsed(Duration::from_millis(900)), Duration::ZERO);
+		assert_eq!(meter.next_wake(Duration::from_millis(900)), Some(Duration::from_millis(1_100)));
+
+		meter.set_running(Duration::from_millis(1_100), false);
+		meter.set_running(Duration::from_secs(5), false);
+		assert_eq!(meter.elapsed(Duration::from_secs(5)), Duration::from_secs(1));
+		meter.set_running(Duration::from_secs(8), true);
+		assert_eq!(meter.elapsed(Duration::from_secs(10)), Duration::from_secs(3));
+
+		meter.reset(Duration::from_secs(10), true);
+		assert_eq!(meter.elapsed(Duration::from_secs(11)), Duration::from_secs(1));
+		assert_eq!(meter.next_wake(Duration::from_secs(11)), Some(Duration::from_millis(11_050)));
+		assert_eq!(meter.display_elapsed(Duration::from_millis(11_049)), Duration::from_secs(1));
+		assert_eq!(
+			meter.display_elapsed(Duration::from_millis(11_050)),
+			Duration::from_millis(1_100)
+		);
+
+		assert!(
+			active_time_label(Charset::Unicode, Duration::from_millis(1_234))
+				.as_str()
+				.ends_with("1.2s")
+		);
+		assert!(
+			active_time_label(Charset::Unicode, Duration::from_secs(61))
+				.as_str()
+				.ends_with("1m1s")
+		);
+		assert!(
+			active_time_label(Charset::Unicode, Duration::from_secs(9_000))
+				.as_str()
+				.ends_with("2h30m")
+		);
+		assert!(
+			active_time_label(Charset::Unicode, Duration::from_secs(266_400))
+				.as_str()
+				.ends_with("3d2h")
+		);
+
+		meter.reset(Duration::ZERO, true);
+		assert_eq!(
+			meter.next_wake(Duration::from_secs(3_600)),
+			Some(Duration::from_secs(3_660)),
+			"hour-scale labels change only on minute boundaries"
+		);
+		meter.set_running(Duration::from_secs(3_601), false);
+		assert_eq!(meter.next_wake(Duration::from_secs(4_000)), None);
 	}
 
 	#[test]
@@ -1162,12 +2418,15 @@ pub(crate) mod tests {
 	#[test]
 	fn git_chip_marks_a_dirty_tree_in_the_warning_color() {
 		let ui = Ui::from_root(
-			StatusBand::new(StatusFacts { dirty: true, ..facts() }),
+			StatusBand::new(StatusFacts {
+				git_status: Some(GitStatus { unstaged: 1, ..GitStatus::default() }),
+				..facts()
+			}),
 			80,
 			UiContext::default(),
 		);
 		let row = frame_text(ui.frame()).lines().next().unwrap().to_owned();
-		assert!(row.contains("> ⑂ main * ▶"), "{row}");
+		assert!(row.contains("> ⑂ main *1 ▶"), "{row}");
 		let column = cell_width(" π  > ⬢ Sonnet 4.5 > 📁 ~/proj > ");
 		assert_eq!(
 			ui.frame().cell(column, 0).style().foreground_color(),
@@ -1199,6 +2458,38 @@ pub(crate) mod tests {
 			170,
 		);
 		assert!(free.ends_with("tok/s < (sub)"), "a zero-cost subscription keeps its marker: {free}");
+	}
+
+	#[test]
+	fn advisor_spend_keeps_its_identity_subscription_marker_color_and_overflow_unit() {
+		let spending = StatusFacts {
+			advisor_cost_nano_usd: 80_000_000,
+			advisor_subscription: true,
+			..spending()
+		};
+		let ctx = UiContext::default();
+		let ui = Ui::from_root(StatusBand::new(spending.clone()), 210, ctx.clone());
+		let row = frame_text(ui.frame()).lines().next().unwrap().to_owned();
+		assert!(row.ends_with("< $0.12 ★ 2 + 👁 S0.08"), "{row}");
+		let advisor = row.find('👁').expect("advisor identity");
+		let advisor_column = cell_width(&row[..advisor]);
+		assert_eq!(
+			ui.frame()
+				.cell(advisor_column, 0)
+				.style()
+				.foreground_color(),
+			ctx.theme.status_cost,
+			"advisor spend uses the semantic cost color"
+		);
+
+		for width in 40..=210 {
+			let row = self::row(spending.clone(), width);
+			assert_eq!(
+				row.contains("$0.12"),
+				row.contains('👁'),
+				"primary and advisor spend are one atomic overflow chip at width {width}: {row}"
+			);
+		}
 	}
 
 	#[test]
@@ -1376,9 +2667,17 @@ pub(crate) mod tests {
 		assert_eq!(chip(ModeChip::Goal(GoalState::BudgetLimited)), "⚠ Goal");
 		assert_eq!(chip(ModeChip::Goal(GoalState::Dropped)), "⏹ Goal");
 		assert_eq!(chip(ModeChip::Loop { limit: None }), "↻ Loop running");
-		assert_eq!(chip(ModeChip::Loop { limit: Some((3, 5)) }), "↻ Loop running 3/5");
+		assert_eq!(
+			chip(ModeChip::Loop { limit: Some(LoopLimit::Iterations { remaining: 3, initial: 5 }) }),
+			"↻ Loop running 3/5"
+		);
 		assert_eq!(chip(ModeChip::LoopPaused { limit: None }), "⏸ Loop paused");
-		assert_eq!(chip(ModeChip::LoopPaused { limit: Some((3, 5)) }), "⏸ Loop paused 3/5");
+		assert_eq!(
+			chip(ModeChip::LoopPaused {
+				limit: Some(LoopLimit::Iterations { remaining: 3, initial: 5 }),
+			}),
+			"⏸ Loop paused 3/5"
+		);
 		let row = self::row(StatusFacts { mode: Some(ModeChip::Plan), ..facts() }, 100);
 		assert!(row.starts_with(" π  > ⬢ Sonnet 4.5 > 🗺 Plan > 📁 ~/proj > ⑂ main ▶"), "{row}");
 		assert!(!self::row(facts(), 100).contains("Plan"), "no chip without a Director");

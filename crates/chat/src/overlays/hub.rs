@@ -29,9 +29,10 @@ use super::{
 	services::{AgentView, Pending, ServiceResult, SessionRow},
 };
 use crate::{
-	cards::{CardRegistry, CardStatus, CardView},
+	cards::{CardRegistry, CardStatus, CardView, result_image},
 	host::HostCommand,
 	notices::{format_duration, format_number},
+	project::{AssistantPart, assistant_parts},
 };
 
 /// pi `agent-hub.ts`: two-pane mode needs a useful roster and a readable
@@ -1331,7 +1332,7 @@ impl Panel for AgentHub {
 					Err(error) => PanelEvent::Notice(sf!("{error}")),
 				}
 			},
-			PanelNote::Outcome(_) => PanelEvent::Ignored,
+			PanelNote::Outcome(_) | PanelNote::Live(_) => PanelEvent::Ignored,
 		}
 	}
 
@@ -1402,20 +1403,37 @@ fn render_transcript(
 					if rendered.model.is_none() {
 						rendered.model = prop_text(node, PropId::Model);
 					}
-					if show_thinking
-						&& let Some(thinking) = live_text(dom, *handle, node, PropId::Thinking)
-						&& !thinking.is_empty()
-					{
-						rendered.blocks.push(
-							dom! { <text fg=muted italic pad-x=1>{thinking}</text> }.into_component(),
-						);
-					}
-					if let Some(text) = live_text(dom, *handle, node, PropId::Text)
-						&& !text.is_empty()
-					{
-						rendered
-							.blocks
-							.push(dom! { <md pad-x=1>{text}</md> }.into_component());
+					for part in assistant_parts(dom, *handle, node) {
+						match part {
+							AssistantPart::Thinking { text, .. } if show_thinking && !text.is_empty() => {
+								rendered.blocks.push(
+									dom! { <text fg=muted italic pad-x=1>{text}</text> }.into_component(),
+								);
+							},
+							AssistantPart::Text { text, .. } if !text.is_empty() => {
+								rendered
+									.blocks
+									.push(dom! { <md pad-x=1>{text}</md> }.into_component());
+							},
+							AssistantPart::Artifact { uri, mime, kind, .. } => {
+								if kind.as_str() == "image" || mime.as_str().starts_with("image/") {
+									rendered
+										.blocks
+										.push(result_image(&uri, mime.as_str(), None, ui));
+								} else {
+									rendered.blocks.push(
+										dom! {
+											<col pad-x=1>
+												<text fg=muted>{sf!("[{}: {}]", kind, mime)}</text>
+												<a href={uri.clone()}>{uri}</a>
+											</col>
+										}
+										.into_component(),
+									);
+								}
+							},
+							_ => {},
+						}
 					}
 				},
 				Tag::Known(KnownTag::Notice) => {
@@ -1438,10 +1456,29 @@ fn render_transcript(
 					let status =
 						prop_text(node, PropId::Status).unwrap_or_else(|| Str::new_static("running"));
 					let result = child_handle(dom, *handle, KnownTag::Result);
+					let mut diag = None;
+					let mut notices = smallvec::SmallVec::<&Node, 2>::new();
+					for child in dom.children(*handle) {
+						let Some(child) = dom.get(*child) else {
+							continue;
+						};
+						if child.tag != Tag::Known(KnownTag::Diag) {
+							continue;
+						}
+						let is_error = child.prop(&PropId::Fault.into()).is_some()
+							|| child.prop(&PropId::Severity.into()).and_then(Value::as_str)
+								== Some("error");
+						if is_error {
+							diag = Some(child);
+						} else {
+							notices.push(child);
+						}
+					}
 					let view = CardView {
 						input,
 						result: result.and_then(|result| dom.get(result)),
-						diag: child(dom, *handle, KnownTag::Diag),
+						diag,
+						notices,
 						usage: child(dom, *handle, KnownTag::Usage),
 						status: CardStatus::from_dom(status.as_str()),
 						output: result.and_then(|result| dom.stream_text(result, &PropId::Text.into())),
@@ -1467,14 +1504,6 @@ fn child_handle(dom: &Dom, parent: omp_dom::Handle, tag: KnownTag) -> Option<omp
 
 fn child(dom: &Dom, parent: omp_dom::Handle, tag: KnownTag) -> Option<&Node> {
 	child_handle(dom, parent, tag).and_then(|handle| dom.get(handle))
-}
-
-fn live_text(dom: &Dom, handle: omp_dom::Handle, node: &Node, prop: PropId) -> Option<Str> {
-	let key: PropKey = prop.into();
-	match dom.stream_text(handle, &key) {
-		Some(text) => Some(Str::new(text)),
-		None => prop_text(node, prop),
-	}
 }
 
 /// Retained full-screen transcript viewer for one child session.
@@ -1818,7 +1847,7 @@ impl Panel for TranscriptViewer {
 					Err(error) => PanelEvent::Notice(sf!("{error}")),
 				}
 			},
-			PanelNote::Outcome(_) => PanelEvent::Ignored,
+			PanelNote::Outcome(_) | PanelNote::Live(_) => PanelEvent::Ignored,
 		}
 	}
 

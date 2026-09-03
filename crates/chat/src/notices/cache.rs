@@ -3,7 +3,7 @@
 //! `CacheInvalidationMarkerComponent`).
 
 use omp_core::{Str, sf};
-use omp_dom::{Dom, Handle, KnownTag, Tag};
+use omp_dom::{Dom, Handle, KnownTag, PropId, Tag, Value};
 use omp_tui::{
 	Charset, Component as TuiComponent, Icon, PaintCtx, Props, Rect, Slot, UiContext, cell_width,
 	next_slot,
@@ -61,10 +61,10 @@ pub fn cache_invalidations(dom: &Dom) -> Vec<(Handle, CacheInvalidation)> {
 	let mut prev: Option<UsageFacts> = None;
 	for turn in dom.children(dom.body()) {
 		for child in dom.children(*turn) {
-			if dom
-				.get(*child)
-				.is_none_or(|node| node.tag != Tag::Known(KnownTag::Usage))
-			{
+			if dom.get(*child).is_none_or(|node| {
+				node.tag != Tag::Known(KnownTag::Usage)
+					|| node.prop(&PropId::Kind.into()).and_then(Value::as_str) == Some("advisor")
+			}) {
 				continue;
 			}
 			let current = usage_facts(dom, *child);
@@ -171,7 +171,7 @@ impl TuiComponent for CacheMissMarker {
 #[cfg(test)]
 mod tests {
 	use omp_dom::{Op, PropKey, Txn, Value};
-	use omp_journal::data::TurnReceipt;
+	use omp_journal::data::{ReceiptIdentity, ReceiptRole, TurnReceipt};
 	use omp_session::{ComponentRegistry, Session};
 	use omp_tui::{Ui, frame_text};
 
@@ -281,16 +281,27 @@ mod tests {
 		};
 		let warm = TurnReceipt { cache_read: 40_000, ..TurnReceipt::tokens(900, 300, 0) };
 		let cold = TurnReceipt { cache_write: 50_000, ..TurnReceipt::tokens(900, 300, 0) };
-		let first = turn(&mut session, cold);
+		let first = turn(&mut session, cold.clone());
 		assert_eq!(cache_invalidations(session.dom()), vec![], "first turn has no predecessor");
 		let second = turn(&mut session, warm);
-		let third = turn(&mut session, cold);
+		session
+			.receipt(TurnReceipt {
+				cache_write: 80_000,
+				identity: Some(ReceiptIdentity {
+					role:     ReceiptRole::Advisor,
+					provider: Str::new_static("anthropic"),
+					model:    Str::new_static("claude-sonnet-4-5"),
+				}),
+				..TurnReceipt::default()
+			})
+			.expect("advisor receipt");
+		let third = turn(&mut session, cold.clone());
 		let _still_cold = turn(&mut session, cold);
 		assert_ne!(first, third);
 		assert_eq!(
 			cache_invalidations(session.dom()),
 			vec![(third, CacheInvalidation { reprocessed_tokens: 50_900 })],
-			"only the turn where the warm cache broke is flagged, not the re-warming run"
+			"advisor receipts do not break the primary warm-to-cold comparison"
 		);
 
 		// The scan reads DOM state: cooling the predecessor below the

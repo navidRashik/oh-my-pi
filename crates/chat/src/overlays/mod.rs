@@ -42,14 +42,20 @@ pub mod git;
 pub mod hub;
 /// Debug tools selector plus the context, hotkeys, and changelog reports.
 pub mod info;
+/// `/live` realtime voice visualizer and typed observer reducer.
+pub mod live;
 /// Login dialog, logout account selector, and provider picker.
 pub mod login;
+/// `/move` directory autocomplete editor and creation confirmation.
+pub mod move_panel;
 /// Large-paste menu (wrapped block, local file, inline chip).
 pub mod paste_menu;
 /// `/pause` full-screen hold screen.
 pub mod pause;
 /// `/plan-review` plan review dialog.
 pub mod plan_review;
+/// Destination editor opened by Plan Review's “Save and quit” verdict.
+pub mod plan_save;
 /// `/plugins`, `/marketplace` plugin selector.
 pub mod plugins;
 /// Centered scrollable markdown report.
@@ -60,6 +66,8 @@ pub mod reset_usage;
 pub mod rewind;
 /// Application-supplied data feeds for dashboards and account commands.
 pub mod services;
+/// Focused `/session info` panel.
+pub mod session_info;
 /// `/resume` session picker.
 pub mod sessions;
 /// `/settings` selector over the console variable registry.
@@ -86,6 +94,8 @@ pub enum PanelAnchor {
 	Center,
 	/// Full-screen dashboard.
 	Full,
+	/// Bottom-edge modal whose rendered frame is horizontally centered.
+	BottomCenter,
 	/// Side-channel panel above the editor (`/btw`, `/omfg`, `/cleanse`);
 	/// the composer stays live and Esc closes it at rung 2 of the ladder.
 	Side,
@@ -102,8 +112,39 @@ pub enum PanelEvent {
 	Close,
 	/// Run a console line; the panel stays open.
 	Run(Str),
+	/// Preview one presentation convar observer-locally without mutating it.
+	PreviewSetting {
+		/// Convar whose presentation is being previewed.
+		convar: Str,
+		/// Candidate script spelling.
+		value:  Str,
+	},
+	/// Cancel an observer-local setting preview and restore its baseline.
+	CancelSettingPreview {
+		/// Convar whose preview should be restored.
+		convar: Str,
+	},
+	/// Commit a previewed setting through the con command stream, then clear
+	/// the observer-local preview baseline.
+	RunSetting {
+		/// Convar whose preview is committed.
+		convar: Str,
+		/// `<convar> <value>; writecfg` command line.
+		line:   Str,
+	},
 	/// Close the panel, then run a console line.
 	Finish(Str),
+	/// Close the panel, then send a typed controller command.
+	FinishCommand(HostCommand),
+	/// Replace Plan Review with the observer-local destination editor.
+	OpenPlanSave {
+		/// Exact reviewed plan contents, including in-overlay edits.
+		content: Str,
+		/// Reviewed plan title used to suggest `<TOPIC>_PLAN.md`.
+		title:   Str,
+	},
+	/// Close the panel and show a transient status notice.
+	CloseNotice(Str),
 	/// Close the panel and place text in the composer.
 	Recall(Str),
 	/// Close the large-paste menu and land the held paste as chosen.
@@ -129,6 +170,8 @@ pub enum PanelEvent {
 	/// learns the result through [`Panel::notify`] with
 	/// [`PanelNote::Outcome`].
 	Command(HostCommand),
+	/// Send one realtime voice control request to the application.
+	Live(live::LiveControl),
 }
 
 /// Settled result of a controller-run mutation a panel asked for through
@@ -143,8 +186,12 @@ pub enum Outcome {
 	Service(services::ServiceOutcome),
 	/// An agent supervision request (revive, kill, send) settled.
 	Agent(hub::AgentOutcome),
+	/// A collaboration room operation settled.
+	Collab(services::CollabOutcome),
 	/// A project/global session-index read settled.
 	SessionIndex(sessions::SessionIndexOutcome),
+	/// A selected Claude Code or Codex transcript finished importing.
+	ForeignSessionImport(sessions::ForeignSessionImportOutcome),
 }
 
 /// A fact delivered to an open panel after it opened.
@@ -154,6 +201,8 @@ pub enum PanelNote<'a> {
 	Dom(&'a Dom),
 	/// A controller-run mutation settled.
 	Outcome(&'a Outcome),
+	/// Observer-only realtime voice state changed.
+	Live(&'a live::LiveUiEvent),
 }
 
 /// pi panel chords the host lowers before handing a panel the raw key

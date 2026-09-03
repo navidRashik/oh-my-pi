@@ -4,6 +4,16 @@ use omp_con::Kv;
 use omp_core::Str;
 
 omp_con::var! {
+	/// pi `theme.dark` (string, default: "titanium").
+	pub static CL_THEME_DARK = cl_theme_dark: Str {
+		default: Str::new_static("titanium"),
+		flags: archive,
+	};
+	/// pi `theme.light` (string, default: "light").
+	pub static CL_THEME_LIGHT = cl_theme_light: Str {
+		default: Str::new_static("light"),
+		flags: archive,
+	};
 	/// pi `colorBlindMode` (boolean, default: false).
 	pub static CL_COLOR_BLIND_MODE = cl_color_blind_mode: bool {
 		default: false,
@@ -79,11 +89,6 @@ omp_con::var! {
 		default: 8,
 		flags: archive,
 	};
-	/// pi `terminal.showProgress` (boolean, default: false).
-	pub static CL_TERMINAL_SHOW_PROGRESS = cl_terminal_show_progress: bool {
-		default: false,
-		flags: archive,
-	};
 	/// pi `tui.textSizing` (boolean, default: false).
 	pub static CL_TUI_TEXT_SIZING = cl_tui_text_sizing: bool {
 		default: false,
@@ -94,8 +99,8 @@ omp_con::var! {
 		default: true,
 		flags: archive,
 	};
-	/// pi `tui.titleState` (boolean, default: true).
-	pub static CL_TUI_TITLE_STATE = cl_tui_title_state: bool {
+	/// pi `tui.reactions` (boolean, default: true).
+	pub static CL_TUI_REACTIONS = cl_tui_reactions: bool {
 		default: true,
 		flags: archive,
 	};
@@ -286,6 +291,8 @@ omp_con::var! {
 
 /// Exact pi setting keys and their command-stream convar names.
 pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
+	("theme.dark", "cl_theme_dark"),
+	("theme.light", "cl_theme_light"),
 	("colorBlindMode", "cl_color_blind_mode"),
 	("composer.shape", "cl_composer_shape"),
 	("statusLine.preset", "cl_status_line_preset"),
@@ -301,10 +308,11 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("tui.maxInlineImageColumns", "cl_tui_max_inline_image_columns"),
 	("tui.maxInlineImageRows", "cl_tui_max_inline_image_rows"),
 	("tui.maxInlineImages", "cl_tui_max_inline_images"),
-	("terminal.showProgress", "cl_terminal_show_progress"),
+	("terminal.showProgress", "cl_show_progress"),
 	("tui.textSizing", "cl_tui_text_sizing"),
 	("tui.renderMermaid", "cl_tui_render_mermaid"),
-	("tui.titleState", "cl_tui_title_state"),
+	("tui.reactions", "cl_tui_reactions"),
+	("tui.titleState", "cl_title_state"),
 	("tui.hyperlinks", "cl_tui_hyperlinks"),
 	("tui.tight", "cl_tui_tight"),
 	("display.shimmer", "cl_display_shimmer"),

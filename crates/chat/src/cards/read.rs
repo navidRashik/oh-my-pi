@@ -365,6 +365,7 @@ mod tests {
 			input:   &input,
 			result:  Some(&result),
 			diag:    None,
+			notices: smallvec::SmallVec::new(),
 			usage:   None,
 			status:  CardStatus::Done,
 			output:  None,

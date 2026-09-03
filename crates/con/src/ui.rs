@@ -162,6 +162,17 @@ impl UiOption {
 	}
 }
 
+/// Runtime-owned option roster used by a curated submenu.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiRuntimeOptions {
+	/// Theme files discovered by the application.
+	Themes,
+	/// Built-in and extension-provided composer shapes.
+	ComposerShapes,
+	/// Thinking levels supported by the active model.
+	ThinkingLevels,
+}
+
 /// Widget behavior declared by pi UI metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiWidget {
@@ -171,6 +182,16 @@ pub enum UiWidget {
 	Enum(&'static [&'static str]),
 	/// Labeled single-choice list.
 	Submenu(&'static [UiOption]),
+	/// Single-choice list populated by the live application inventory.
+	RuntimeSubmenu(UiRuntimeOptions),
+	/// Provider-keyed positive concurrency limits.
+	ProviderLimits,
+	/// Metadata retained for a pi setting intentionally omitted from the
+	/// selector.
+	///
+	/// Pi excludes numeric and array values that do not declare finite choices;
+	/// they remain editable through `config.cfg`.
+	ConfigOnly,
 	/// Free text (the convar remains the type authority).
 	Text {
 		/// Whether the editor masks the value.
@@ -186,14 +207,28 @@ pub enum UiWidget {
 }
 
 /// Built-in visibility predicates used by pi's curated selector.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "camelCase")]
 pub enum UiCondition {
-	/// `retry.usageAwareFallback` is enabled.
-	UsageAwareFallbackEnabled,
+	/// The host is running on macOS.
+	#[strum(serialize = "macOS")]
+	MacOs,
+	/// The terminal negotiated an inline image protocol.
+	HasImageProtocol,
+	/// Advisor mode is enabled.
+	AdvisorEnabled,
+	/// The memory backend is Hindsight.
+	HindsightActive,
 	/// The memory backend is mnemopi.
 	MnemopiActive,
+	/// Automatic learning is enabled.
+	AutolearnActive,
 	/// Automatic thinking is selected.
 	AutoThinkingActive,
+	/// `retry.usageAwareFallback` is enabled.
+	UsageAwareFallbackEnabled,
+	/// Plan mode is enabled.
+	PlanModeEnabled,
 	/// Smart unexpected-stop detection is selected.
 	UnexpectedStopSmart,
 }
@@ -203,17 +238,37 @@ impl UiCondition {
 	#[must_use]
 	pub fn visible(self, con: &Ctx) -> bool {
 		match self {
-			Self::UsageAwareFallbackEnabled => con
-				.get("ai_retry_usage_aware_fallback")
+			Self::MacOs => cfg!(target_os = "macos"),
+			// Terminal capability is observer-local and evaluated by the chat
+			// settings surface. Keep the con-only projection permissive.
+			Self::HasImageProtocol => true,
+			Self::AdvisorEnabled => con
+				.get("ai_advisor_enabled")
 				.and_then(|value| value.as_bool())
+				.unwrap_or(false),
+			Self::HindsightActive => con
+				.get("ai_memory_backend")
+				.and_then(|value| value.as_str().map(|value| value == "hindsight"))
 				.unwrap_or(false),
 			Self::MnemopiActive => con
 				.get("ai_memory_backend")
 				.and_then(|value| value.as_str().map(|value| value == "mnemopi"))
 				.unwrap_or(false),
+			Self::AutolearnActive => con
+				.get("ai_autolearn_enabled")
+				.and_then(|value| value.as_bool())
+				.unwrap_or(false),
 			Self::AutoThinkingActive => con
 				.get("ai_default_thinking")
 				.and_then(|value| value.as_str().map(|value| value == "auto"))
+				.unwrap_or(false),
+			Self::UsageAwareFallbackEnabled => con
+				.get("ai_retry_usage_aware_fallback")
+				.and_then(|value| value.as_bool())
+				.unwrap_or(false),
+			Self::PlanModeEnabled => con
+				.get("ai_plan_enabled")
+				.and_then(|value| value.as_bool())
 				.unwrap_or(false),
 			Self::UnexpectedStopSmart => con
 				.get("ai_features_unexpected_stop_detection")
@@ -241,6 +296,12 @@ pub enum UiValueCodec {
 	Kibibytes,
 	/// Integer percent backed by a 0–1 fraction.
 	PercentFraction,
+	/// A pi `default` choice backed by integer sentinel `-1`.
+	DefaultMinusOne,
+	/// pi's `online` tiny-model choice backed by OMP's `@tiny` role selector.
+	OnlineTinyModel,
+	/// Pi edit-mode names backed by OMP's revision-qualified dialect selector.
+	EditModeRevision,
 	/// Integer seconds backed by a duration; zero means `never`.
 	SecondsDuration,
 	/// Integer milliseconds backed by a duration; zero means `never`.
@@ -358,15 +419,54 @@ macro_rules! ui {
 	};
 }
 
+macro_rules! ui_warn {
+	(
+		$path:literal,
+		$convar:literal,
+		$tab:ident,
+		$group:literal,
+		$label:literal,
+		$description:literal,
+		$warning:literal,
+		$widget:expr,
+		$condition:expr,
+		$codec:ident
+	) => {
+		UiSpec {
+			pi_path:     $path,
+			convar:      $convar,
+			tab:         SettingTab::$tab,
+			group:       $group,
+			label:       $label,
+			description: $description,
+			warning:     Some($warning),
+			widget:      $widget,
+			condition:   $condition,
+			codec:       UiValueCodec::$codec,
+		}
+	};
+}
+
 mod ui_appearance_model;
 mod ui_contextual;
+mod ui_files;
+mod ui_interaction;
+mod ui_memory;
 mod ui_tools_tasks_providers;
 
 /// All curated built-in entries in tab/group/declaration order.
 pub fn builtin_ui_entries() -> impl Iterator<Item = &'static UiSpec> {
 	ui_appearance_model::ENTRIES
 		.iter()
-		.chain(ui_contextual::ENTRIES)
+		.chain(ui_interaction::ENTRIES)
+		.chain(
+			ui_contextual::ENTRIES
+				.iter()
+				.take_while(|entry| entry.tab == SettingTab::Context),
+		)
+		.chain(ui_memory::ENTRIES)
+		.chain(ui_files::ENTRIES)
+		.chain(ui_contextual::ENTRIES.iter().filter(|entry| entry.tab == SettingTab::Shell))
 		.chain(ui_tools_tasks_providers::ENTRIES)
 }
 

@@ -5,8 +5,10 @@
 //! autolink rules agree with the screen.
 
 use omp_core::{Str, StrMut};
-use omp_dom::{Dom, KnownTag, PropId, Tag, Value};
+use omp_dom::{Dom, KnownTag, Tag};
 use omp_tui::{LinkId, RichSink, Style, markdown::MdTheme, with_link_url};
+
+use crate::project::{AssistantPart, assistant_parts};
 
 /// A hyperlink the renderer draws for a message: inline `[text](href)`,
 /// `<autolink>`, bare URL, or reference link.
@@ -104,16 +106,13 @@ pub fn last_link(dom: &Dom) -> Option<Link> {
 			if node.tag != Tag::Known(KnownTag::Assistant) {
 				continue;
 			}
-			let key: omp_dom::PropKey = PropId::Text.into();
-			let text = match dom.stream_text(*handle, &key) {
-				Some(text) => Str::new(text),
-				None => match node.prop(&key).and_then(Value::as_str) {
-					Some(text) => Str::new(text),
-					None => continue,
-				},
-			};
-			if let Some(link) = extract_links(text.as_str()).pop() {
-				last = Some(link);
+			for part in assistant_parts(dom, *handle, node) {
+				let AssistantPart::Text { text, .. } = part else {
+					continue;
+				};
+				if let Some(link) = extract_links(text.as_str()).pop() {
+					last = Some(link);
+				}
 			}
 		}
 	}

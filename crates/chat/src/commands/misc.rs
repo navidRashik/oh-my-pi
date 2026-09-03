@@ -5,12 +5,9 @@
 //! `/extended-context`, `/advisor`, `/collab`, `/join`, `/leave`, `/live`.
 //!
 //! Every command here either flips a convar (ADR 0012: the convar *is* the
-//! live setting), asks the application through the [`Services`] seam, or
-//! opens an observer-local panel. Commands whose backing service left the
-//! tree in the kernel cutover (`/collab`, `/join`, `/leave`, `/prewalk`) are
-//! registered so the palette matches pi and answer with the exact missing
-//! seam instead of pretending. `/advisor` controls the journal-backed advisor
-//! Director; `/vision` sets the journaled
+//! live setting), asks the application through the [`Services`] seam, opens
+//! an observer-local panel, or sends a typed controller request. `/advisor`
+//! controls the journal-backed advisor Director; `/vision` sets the journaled
 //! `ai_vision` convar the kernel's request projection consumes.
 //!
 //! [`Services`]: crate::overlays::services::Services
@@ -28,7 +25,7 @@ use crate::{
 	overlays::{
 		PanelAnchor, PanelCall, PanelCx, PanelEvent, PanelOpener,
 		report::ReportPanel,
-		services::{CleanseRequest, MemoryOp, ServiceError, SshHostSpec},
+		services::{CleanseRequest, CollabOp, MemoryOp, ServiceError, SshHostSpec},
 		tasks::{PendingPanel, Settle},
 	},
 	project::{BlockKind, block_views},
@@ -46,6 +43,7 @@ pub const PALETTE: &[PaletteEntry] = &[
 	PaletteEntry { name: "computer", icon: Icon::Desktop },
 	PaletteEntry { name: "vision", icon: Icon::Eye },
 	PaletteEntry { name: "prewalk", icon: Icon::Prewalk },
+	PaletteEntry { name: "skillful", icon: Icon::Compass },
 	PaletteEntry { name: "extended-context", icon: Icon::Context },
 	PaletteEntry { name: "advisor", icon: Icon::Advisor },
 	PaletteEntry { name: "collab", icon: Icon::Link },
@@ -65,15 +63,6 @@ const SECURITY_REVIEW_BRIEF: &str =
 	 injection, secrets in source, unsafe deserialization, path traversal, missing authorization \
 	 checks, and unsafe shell or SQL construction. Report findings first, each with file:line, \
 	 severity, and a concrete fix; never edit files.";
-const DEFERRED_COLLAB: &str = "Collaboration hosting is unavailable: the relay host loop \
-                               (HostJournalBridge over the removed omp_agent::Journal replication \
-                               subscription) has no seam on the journal-first session.";
-const DEFERRED_JOIN: &str = "Joining a collaboration room is unavailable: the guest replica and \
-                             its UI state were removed in 7546bcfa06; omp_driver::collab only \
-                             keeps relay presence.";
-const DEFERRED_PREWALK: &str = "Prewalk is unavailable: it needs a prewalk Director in \
-                                crates/agent/src/directors (the mode regime was deleted with the \
-                                kernel cutover); sv_task_agent_prewalk only affects children.";
 omp_con::var! {
 	/// Uses the premium extended-context pricing tier of the current model
 	/// (pi `/extended-context`).
@@ -152,6 +141,7 @@ pub(crate) fn share_snapshot(dom: &omp_dom::Dom) -> serde_json::Value {
 				BlockKind::Assistant => "assistant",
 				BlockKind::Thinking => "thinking",
 				BlockKind::Tool => "tool",
+				BlockKind::Local => "local",
 				BlockKind::Notice => "notice",
 				BlockKind::Usage => "usage",
 				BlockKind::Divider => "divider",
@@ -490,10 +480,39 @@ omp_con::cmd! {
 		}))
 	};
 
-	/// Reasons on the cheap model until the first edit: `/prewalk [on|off|status]`.
-	prewalk(?mode: Str) = |ctx, args| {
-		switch(args.opt::<Str>(0)?.as_ref(), "Usage: /prewalk [on|off|status]")?;
-		call(ctx, PanelCall::new(|_cx| notice(DEFERRED_PREWALK)))
+	/// Arms a one-shot switch to `@smol` at the next edit/write action.
+	prewalk() = |ctx, _args| {
+		call(ctx, PanelCall::new(|_cx| PanelEvent::Command(HostCommand::Prewalk)))
+	};
+
+	/// Lists discovered skills in the system prompt for this session:
+	/// `/skillful [on|off|toggle|status]`.
+	skillful(?mode: Str) = |ctx, args| {
+		let mode = args
+			.opt::<Str>(0)?
+			.map_or_else(|| Str::new_static("toggle"), |mode| Str::new(mode.trim().to_ascii_lowercase()));
+		if !matches!(mode.as_str(), "on" | "off" | "toggle" | "status") {
+			return Err(usage("Usage: /skillful [on|off|status]"));
+		}
+		call(ctx, PanelCall::new(move |cx| {
+			let current = var_bool(cx, "ai_skillful").unwrap_or(true);
+			if mode == "status" {
+				return notice(if current { "Skill listing: on." } else { "Skill listing: off." });
+			}
+			let enabled = match mode.as_str() {
+				"on" => true,
+				"off" => false,
+				_ => !current,
+			};
+			if let Err(error) = set_var(cx, "ai_skillful", Value::Bool(enabled)) {
+				return notice(error);
+			}
+			notice(if enabled {
+				"Skill listing enabled for this session."
+			} else {
+				"Skill listing disabled for this session."
+			})
+		}))
 	};
 
 	/// Uses the premium extended-context tier: `/extended-context [on|off|status]`.
@@ -546,24 +565,50 @@ omp_con::cmd! {
 		}))
 	};
 
-	/// Hosts a live collaboration room: `/collab [start|view|status|stop]`.
-	collab(?sub: Str) = |ctx, args| {
-		match args.opt::<Str>(0)?.as_deref().map(str::trim) {
-			None | Some("start" | "view" | "status" | "stop") => {
-				call(ctx, PanelCall::new(|_cx| notice(DEFERRED_COLLAB)))
+	/// Hosts a live collaboration room: `/collab [start|view|status|stop] [relay]`.
+	collab(?sub: Str, ?relay: Str) = |ctx, args| {
+		let words = rest(args, 0).unwrap_or_default();
+		let words = words.as_str().trim();
+		let (verb, tail) = words
+			.split_once(char::is_whitespace)
+			.map_or((words, ""), |(verb, tail)| (verb, tail.trim()));
+		let op = match verb {
+			"" | "start" => CollabOp::Start {
+				read_only: false,
+				relay: (!tail.is_empty()).then(|| Str::new(tail)),
 			},
-			Some(_) => Err(usage("Usage: /collab [start|view|status|stop]")),
-		}
+			"view" => CollabOp::Start {
+				read_only: true,
+				relay: (!tail.is_empty()).then(|| Str::new(tail)),
+			},
+			"status" if tail.is_empty() => CollabOp::Status,
+			"stop" if tail.is_empty() => CollabOp::Leave,
+			relay if !relay.is_empty() && tail.is_empty() => CollabOp::Start {
+				read_only: false,
+				relay: Some(Str::new(relay)),
+			},
+			_ => return Err(usage("Usage: /collab [start|view|status|stop] [relayUrl]")),
+		};
+		call(ctx, PanelCall::new(move |_cx| PanelEvent::Command(HostCommand::Collab(op.clone()))))
 	};
 
 	/// Joins a shared collaboration room: `/join <link>`.
 	join(link: Str) = |ctx, args| {
-		args.get::<Str>(0).map_err(|_| usage("Usage: /join <link>"))?;
-		call(ctx, PanelCall::new(|_cx| notice(DEFERRED_JOIN)))
+		let link = rest(args, 0).ok_or_else(|| usage("Usage: /join <link>"))?;
+		call(ctx, PanelCall::new(move |_cx| {
+			PanelEvent::Command(HostCommand::Collab(CollabOp::Join {
+				link: link.clone(),
+				name: None,
+			}))
+		}))
 	};
 
 	/// Leaves the collaboration room.
-	leave() = |ctx, _args| call(ctx, PanelCall::new(|_cx| notice("Not in a collab session")));
+	leave() = |ctx, _args| {
+		call(ctx, PanelCall::new(|_cx| {
+			PanelEvent::Command(HostCommand::Collab(CollabOp::Leave))
+		}))
+	};
 
 	/// Starts or stops the duplex live-voice session.
 	live() = |ctx, _args| post(ctx, HostAction::LiveToggle);
@@ -698,11 +743,21 @@ mod tests {
 	}
 
 	#[test]
-	fn deferred_commands_name_their_missing_seam() {
+	fn collaboration_commands_route_to_the_controller() {
 		let (_, event) = run_call("join wss://relay.example/room");
-		assert!(matches!(event, PanelEvent::Notice(text) if text.contains("7546bcfa06")));
-		let (_, event) = run_call("prewalk on");
-		assert!(matches!(event, PanelEvent::Notice(text) if text.contains("Director")));
+		assert!(matches!(
+			event,
+			PanelEvent::Command(HostCommand::Collab(CollabOp::Join { link, name: None }))
+				if link == "wss://relay.example/room"
+		));
+		let (_, event) = run_call("collab view wss://relay.example");
+		assert!(matches!(
+			event,
+			PanelEvent::Command(HostCommand::Collab(CollabOp::Start {
+				read_only: true,
+				relay: Some(relay),
+			})) if relay == "wss://relay.example"
+		));
 	}
 
 	#[test]

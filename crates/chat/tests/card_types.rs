@@ -54,6 +54,7 @@ where
 		input:   &input,
 		result:  Some(&result),
 		diag:    None,
+		notices: smallvec::SmallVec::new(),
 		usage:   None,
 		status:  CardStatus::Done,
 		output:  None,
@@ -156,8 +157,7 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 	renders_typed::<tools::glob::Params, tools::glob::Payload, tools::glob::Fault>(
 		"glob",
 		json!({"matches": [], "missing_paths": [], "timed_out": false, "truncated": false,
-			"result_limit_reached": null, "partial_match_count": 0, "timeout_ms": 0, "projected_text": "",
-			"output_blob": null, "output_artifact_uri": null, "output_shown_lines": 0, "output_total_lines": 0}),
+			"result_limit_reached": null, "partial_match_count": 0, "timeout_ms": 0}),
 	);
 	renders_typed::<tools::goal::Params, tools::goal::Payload, tools::goal::Fault>(
 		"goal",
@@ -166,9 +166,7 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 	renders_typed::<tools::grep::Params, tools::grep::Payload, tools::grep::Fault>(
 		"grep",
 		json!({"files": [], "total_files": 0, "total_files_lower_bound": false, "multi_scope": false,
-			"skip": 0, "file_limit_reached": false, "per_file_limit_reached": false, "notes": [],
-			"projected_text": "", "output_blob": null, "output_artifact_uri": null,
-			"output_shown_lines": 0, "output_total_lines": 0}),
+			"skip": 0, "file_limit_reached": false, "per_file_limit_reached": false, "notes": []}),
 	);
 	renders_typed::<tools::hub::Params, tools::hub::Response, tools::hub::Fault>(
 		"hub",
@@ -242,6 +240,11 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 		tools::manage_skill::MutationOutcome,
 		tools::manage_skill::Fault,
 	>("manage_skill", json!({"action":"create","name":"rust","path":"rust/SKILL.md","revision":1}));
+	renders_typed::<
+		tools::security_scan::Params,
+		tools::security_scan::Payload,
+		tools::security_scan::Fault,
+	>("security_scan", json!({"action":"preflight","output":"No findings.","data":{"findings":0}}));
 	let registry = CardRegistry::standard();
 	for identity in tools::builtin_tool_identities() {
 		assert!(registry.contains(identity.name), "{} must have a dedicated card", identity.name);

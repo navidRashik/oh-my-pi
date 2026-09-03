@@ -15,10 +15,16 @@ use flume::{Receiver, Sender};
 use notify::{RecursiveMode, Watcher as _};
 use omp_core::Str;
 use omp_vcs::git::GitRepo;
-use tokio::{task::JoinHandle, time};
+use serde::Deserialize;
+use tokio::{process::Command, task::JoinHandle, time};
+
+use crate::status_band::{GitStatus, PullRequest, WorktreeLabel};
 
 /// Safety-poll cadence when the head watcher is silent or unavailable.
 pub const GIT_POLL: Duration = Duration::from_secs(5);
+
+/// A PR lookup is never allowed to stall observer-local status refresh.
+const PR_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Coalescing window after a filesystem event before the repository is
 /// re-probed, so one `git checkout` (HEAD, index, ORIG_HEAD) probes once.
@@ -29,10 +35,14 @@ const SETTLE: Duration = Duration::from_millis(100);
 pub struct GitFacts {
 	/// Checked-out local branch; `None` outside a checkout or on a detached
 	/// HEAD.
-	pub branch: Option<Str>,
-	/// Whether porcelain status reports a staged, unstaged, or untracked
-	/// change.
-	pub dirty:  bool,
+	pub branch:       Option<Str>,
+	/// Exact porcelain counts. `None` only for the cheap synchronous launch
+	/// snapshot before the first background probe.
+	pub status:       Option<GitStatus>,
+	/// Pull request associated with the branch, refreshed after HEAD events.
+	pub pull_request: Option<PullRequest>,
+	/// Linked-worktree identity for the compact path segment.
+	pub worktree:     Option<WorktreeLabel>,
 }
 
 /// A running head watcher. Dropping it stops the task and releases the
@@ -56,9 +66,14 @@ impl GitWatch {
 	pub fn start_with(project: &Path, poll: Duration) -> Option<(Self, Receiver<GitFacts>)> {
 		let handle = tokio::runtime::Handle::try_current().ok()?;
 		let repo = Arc::new(GitRepo::discover(project).ok().flatten()?);
-		// The branch read is a single file; the dirty probe walks the worktree
-		// and stays off the launch path.
-		let launch = GitFacts { branch: branch_of(&repo), dirty: false };
+		// The branch and linked-worktree identity are metadata reads; porcelain
+		// status and GitHub lookup stay off the launch path.
+		let launch = GitFacts {
+			branch:       branch_of(&repo),
+			status:       None,
+			pull_request: None,
+			worktree:     worktree_label(&repo),
+		};
 		let (events, changes) = flume::unbounded::<()>();
 		let watcher = HeadWatcher::install(&repo, events);
 		let (sender, receiver) = flume::unbounded();
@@ -130,8 +145,9 @@ async fn watch_loop(
 	sender: Sender<GitFacts>,
 	poll: Duration,
 ) {
-	// Deliver the dirty flag the launch probe skipped.
+	// Deliver the status counts and PR the launch probe skipped.
 	let mut due = true;
+	let mut refresh_pr = true;
 	loop {
 		if !due {
 			tokio::select! {
@@ -142,6 +158,7 @@ async fn watch_loop(
 						if let Some(watcher) = watcher.as_mut() {
 							watcher.rearm();
 						}
+						refresh_pr = true;
 					}
 				},
 				() = time::sleep(poll) => {},
@@ -149,9 +166,15 @@ async fn watch_loop(
 		}
 		due = false;
 		let probe = Arc::clone(&repo);
-		let Ok(facts) = tokio::task::spawn_blocking(move || probe_facts(&probe)).await else {
+		let Ok(mut facts) = tokio::task::spawn_blocking(move || probe_facts(&probe)).await else {
 			return;
 		};
+		if refresh_pr {
+			facts.pull_request = lookup_pr(&repo).await;
+			refresh_pr = false;
+		} else {
+			facts.pull_request.clone_from(&last.pull_request);
+		}
 		if facts != last {
 			last = facts.clone();
 			if sender.send(facts).is_err() {
@@ -166,7 +189,62 @@ fn branch_of(repo: &GitRepo) -> Option<Str> {
 }
 
 fn probe_facts(repo: &GitRepo) -> GitFacts {
-	GitFacts { branch: branch_of(repo), dirty: repo.is_dirty().unwrap_or(false) }
+	let status = repo.status_summary().ok().map(|status| GitStatus {
+		staged:    status.staged,
+		unstaged:  status.unstaged,
+		untracked: status.untracked,
+	});
+	GitFacts { branch: branch_of(repo), status, pull_request: None, worktree: worktree_label(repo) }
+}
+
+fn worktree_label(repo: &GitRepo) -> Option<WorktreeLabel> {
+	let linked = repo.linked_worktree()?;
+	let project = repo
+		.primary_root()
+		.file_name()
+		.and_then(|name| name.to_str())
+		.map(Str::new)?;
+	let worktree = linked
+		.root
+		.file_name()
+		.and_then(|name| name.to_str())
+		.map(Str::new)?;
+	Some(WorktreeLabel { project, worktree })
+}
+
+#[derive(Deserialize)]
+struct GhPullRequest {
+	number: u64,
+	url:    Str,
+}
+
+/// Bounded, event-driven PR lookup. It runs only at launch and after HEAD
+/// changes, never on animation frames or the five-second safety poll.
+async fn lookup_pr(repo: &GitRepo) -> Option<PullRequest> {
+	let github = repo.remote_list().ok()?.into_iter().any(|name| {
+		repo
+			.remote_url(&name)
+			.ok()
+			.flatten()
+			.is_some_and(|url| url.contains("github.com"))
+	});
+	if !github {
+		return None;
+	}
+	let mut command = Command::new("gh");
+	command
+		.args(["pr", "view", "--json", "number,url"])
+		.current_dir(repo.root())
+		.kill_on_drop(true);
+	let output = time::timeout(PR_TIMEOUT, command.output())
+		.await
+		.ok()?
+		.ok()?;
+	if !output.status.success() {
+		return None;
+	}
+	let pull: GhPullRequest = serde_json::from_slice(&output.stdout).ok()?;
+	Some(PullRequest { number: pull.number, url: pull.url })
 }
 
 #[cfg(test)]
@@ -194,11 +272,12 @@ mod tests {
 		// A poll this slow cannot be what delivers below.
 		let (watch, facts) = GitWatch::start_with(root, Duration::from_secs(60)).expect("watch");
 		assert_eq!(watch.launch().branch, Some(seeded.clone()));
-		assert!(!watch.launch().dirty);
+		assert!(watch.launch().status.is_none());
 
-		// The launch probe skips the dirty walk; the first delivery resolves it.
-		let first = facts.recv_timeout(WATCHER).expect("initial dirty probe");
-		assert_eq!(first, GitFacts { branch: Some(seeded), dirty: true });
+		// The launch probe skips the porcelain walk; the first delivery resolves it.
+		let first = facts.recv_timeout(WATCHER).expect("initial status probe");
+		assert_eq!(first.branch, Some(seeded));
+		assert!(first.status.is_some_and(GitStatus::dirty));
 
 		// In-place rewrite of the marker.
 		let head = repo.info().head_path.clone();
@@ -217,7 +296,7 @@ mod tests {
 		fs::write(&head, "ref: refs/heads/fourth\n").expect("move HEAD again");
 		let again = facts.recv_timeout(WATCHER).expect("post-rename HEAD write");
 		assert_eq!(again.branch.as_deref(), Some("fourth"));
-		assert!(again.dirty);
+		assert!(again.status.is_some_and(GitStatus::dirty));
 		drop(watch);
 	}
 
@@ -228,18 +307,21 @@ mod tests {
 		let (_, seeded) = seeded_repo(root);
 		let poll = Duration::from_millis(200);
 		let (watch, facts) = GitWatch::start_with(root, poll).expect("watch");
-		let first = facts.recv_timeout(poll * 10).expect("initial dirty probe");
-		assert_eq!(first, GitFacts { branch: Some(seeded.clone()), dirty: true });
+		let first = facts.recv_timeout(poll * 10).expect("initial status probe");
+		assert_eq!(first.branch, Some(seeded.clone()));
+		assert!(first.status.is_some_and(GitStatus::dirty));
 
 		// Worktree files are outside the watched git dir: only the poll sees
 		// them.
 		fs::remove_file(root.join("note.txt")).expect("clean worktree");
 		let clean = facts.recv_timeout(poll * 10).expect("clean probe");
-		assert_eq!(clean, GitFacts { branch: Some(seeded.clone()), dirty: false });
+		assert_eq!(clean.branch, Some(seeded.clone()));
+		assert!(clean.status.is_some_and(|status| !status.dirty()));
 
 		fs::write(root.join("again.txt"), "two\n").expect("dirty again");
 		let dirty = facts.recv_timeout(poll * 10).expect("dirty probe");
-		assert_eq!(dirty, GitFacts { branch: Some(seeded), dirty: true });
+		assert_eq!(dirty.branch, Some(seeded));
+		assert!(dirty.status.is_some_and(GitStatus::dirty));
 
 		assert!(facts.recv_timeout(poll * 3).is_err(), "unchanged facts are not re-sent");
 		drop(watch);

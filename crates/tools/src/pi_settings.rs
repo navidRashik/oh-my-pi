@@ -39,9 +39,14 @@ omp_con::var! {
 		default: false,
 		flags: archive,
 	};
-	/// pi `images.urls.backends` (array, default: ["provider-files").
+	/// pi `images.urls.backends` ordered publication fallback chain.
 	pub static SV_IMAGES_URLS_BACKENDS = sv_images_urls_backends: Vec<Str> {
-		default: vec![Str::new_static("provider-files")],
+		default: vec![
+			Str::new_static("provider-files"),
+			Str::new_static("tailscale"),
+			Str::new_static("cloudflared"),
+			Str::new_static("litterbox"),
+		],
 		flags: archive,
 	};
 	/// pi `images.urls.options` (record, default: {).
@@ -281,21 +286,6 @@ omp_con::var! {
 		default: true,
 		flags: archive,
 	};
-	/// pi `tools.xdev` (boolean, default: true).
-	pub static SV_TOOLS_XDEV = sv_tools_xdev: bool {
-		default: true,
-		flags: archive,
-	};
-	/// pi `tools.xdevDocs` (enum, default: "builtins").
-	pub static SV_TOOLS_XDEV_DOCS = sv_tools_xdev_docs: Str {
-		default: Str::new_static("builtins"),
-		flags: archive,
-	};
-	/// pi `tools.xdevInlineDevices` (array, default: EMPTY_STRING_ARRAY).
-	pub static SV_TOOLS_XDEV_INLINE_DEVICES = sv_tools_xdev_inline_devices: Vec<Str> {
-		default: Vec::new(),
-		flags: archive,
-	};
 	/// pi `exa.enabled` (boolean, default: true).
 	pub static SV_EXA_ENABLED = sv_exa_enabled: bool {
 		default: true,
@@ -365,9 +355,6 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("github.cache.softTtlSec", "sv_github_cache_soft_ttl_sec"),
 	("github.cache.hardTtlSec", "sv_github_cache_hard_ttl_sec"),
 	("tools.abortOnFabricatedResult", "sv_tools_abort_on_fabricated_result"),
-	("tools.xdev", "sv_tools_xdev"),
-	("tools.xdevDocs", "sv_tools_xdev_docs"),
-	("tools.xdevInlineDevices", "sv_tools_xdev_inline_devices"),
 	("exa.enabled", "sv_exa_enabled"),
 	("exa.searchDelayMs", "sv_exa_search_delay_ms"),
 ];

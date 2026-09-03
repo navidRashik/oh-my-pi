@@ -1,6 +1,8 @@
 #![warn(missing_docs)]
 //! Projection-only interactive actor over the OMP session patch stream.
 
+/// Observer-local exact-account usage refresh lifecycle.
+pub mod account_usage;
 /// Console commands the interactive actor executes locally.
 pub mod actions;
 /// Composer autocomplete providers.
@@ -17,12 +19,16 @@ pub mod commands;
 pub mod composer;
 /// External editor resolution and temporary-draft round trips.
 pub mod editor;
+/// Observer-local extension and hook status feed.
+pub mod extension_status;
 /// Journal-derived tool-card gallery.
 pub mod gallery;
 /// Live git branch/dirty facts for the status band.
 pub mod gitwatch;
 /// Interactive terminal actor.
 pub mod host;
+/// Bounded, typed normalization for composer-staged media.
+pub mod media;
 /// Terminal input and command bindings.
 pub mod input;
 /// Renderer-faithful Markdown facts (the hyperlinks a message draws).
@@ -50,8 +56,9 @@ pub mod transcript;
 /// Welcome banner.
 pub mod welcome;
 
-pub use actions::{HostAction, HostMailbox};
+pub use actions::{HostAction, HostMailbox, SttFailureKind, SttUiEvent};
 pub use chrome::ModelBadge;
+pub use extension_status::{ExtensionStatusEvent, ExtensionStatuses, status_text_from_tml};
 pub use host::{
 	CtrlCAction, Host, HostCommand, HostError, HostOptions, InitialPanel, LocalFacts, NativeEffect,
 	NativeHost, UpEvent, ctrl_c_action, render_surface,

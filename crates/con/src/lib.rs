@@ -60,8 +60,8 @@ mod ui;
 mod value;
 
 pub use builtins::{
-	AI_COMPACT_THRESHOLD, AI_FASTMODE, AI_MODEL, AI_PROMPT_MODE, AI_TASK_MODEL, AI_THINKING,
-	AI_VISION, CL_CHARSET, CL_IME_SAFE_CURSOR, CL_RESIZE_POLICY, CL_SHOWTHINKING,
+	AI_COMPACT_THRESHOLD, AI_FASTMODE, AI_MODEL, AI_PROMPT_MODE, AI_SKILLFUL, AI_TASK_MODEL,
+	AI_THINKING, AI_VISION, CL_CHARSET, CL_IME_SAFE_CURSOR, CL_RESIZE_POLICY, CL_SHOWTHINKING,
 	CL_STATUS_COMPACT_THINKING, CL_THEME, ResizePolicy, SV_APPROVAL_MODE, SV_CHEATS, SV_TOOLS,
 	VisionMode,
 };
@@ -83,7 +83,7 @@ pub use spec::{
 };
 pub use ui::{
 	DynamicUiOption, DynamicUiSpec, DynamicUiWidget, SETTING_TABS, SettingTab, TabSpec, UiCondition,
-	UiOption, UiSpec, UiValueCodec, UiWidget, builtin_ui, builtin_ui_entries,
+	UiOption, UiRuntimeOptions, UiSpec, UiValueCodec, UiWidget, builtin_ui, builtin_ui_entries,
 };
 pub use value::{ConType, Kv, Span, TypeSpec, Value, ValueKind};
 

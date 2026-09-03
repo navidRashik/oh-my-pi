@@ -1,9 +1,34 @@
 //! Status-line values derived only from the actor's DOM replica.
 
+use std::time::Duration;
+
 use omp_core::Str;
 use omp_dom::{Dom, KnownTag, PropId, PropKey, Tag, Value};
+use smallvec::SmallVec;
 
-use crate::status_band::{AdvisorBadge, AdvisorHealth, GoalState, ModeChip};
+use crate::status_band::{AdvisorBadge, AdvisorHealth, GoalState, LoopLimit, ModeChip};
+
+/// One credential-free serving identity from an advisor receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvisorIdentity {
+	/// Concrete serving provider.
+	pub provider: Str,
+	/// Concrete serving model.
+	pub model:    Str,
+}
+
+/// Cumulative auxiliary-advisor spend and every serving identity represented
+/// by it. Keeping the small identity roster lets a resumed host classify
+/// historical subscription spend once without probing accounts during paint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvisorSpend {
+	/// Distinct identities which accrued spend, in first-use order.
+	pub identities:    SmallVec<AdvisorIdentity, 2>,
+	/// Identity which produced the newest advisor receipt.
+	pub latest:        AdvisorIdentity,
+	/// Advisor-only cumulative spend in nano-US dollars.
+	pub cost_nano_usd: u64,
+}
 
 /// Observer-visible status values.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,10 +54,13 @@ pub struct StatusLine {
 	pub cache_read: u64,
 	/// Total prompt-cache tokens written across visible turns.
 	pub cache_write: u64,
-	/// Total spend across visible turns in nano-US dollars.
+	/// Total primary-model spend across visible turns in nano-US dollars.
 	pub cost_nano_usd: u64,
-	/// Total premium-request units billed across visible turns at millionth
-	/// precision (GitHub Copilot `premium_interactions`; pi
+	/// Advisor-only spend and serving identity from journaled advisor
+	/// receipts.
+	pub advisor: Option<AdvisorSpend>,
+	/// Total premium-request units billed across visible primary turns at
+	/// millionth precision (GitHub Copilot `premium_interactions`; pi
 	/// `usage.premiumRequests`).
 	pub premium_requests_millionths: u64,
 	/// Output throughput of the most recent receipt (`tokens_out` over
@@ -75,6 +103,7 @@ impl StatusLine {
 		let mut cache_read = 0_u64;
 		let mut cache_write = 0_u64;
 		let mut cost_nano_usd = 0_u64;
+		let mut advisor: Option<AdvisorSpend> = None;
 		let mut premium_requests_millionths = 0_u64;
 		let mut tokens_per_second = None;
 		let mut turns = 0;
@@ -98,6 +127,31 @@ impl StatusLine {
 						}
 					},
 					Tag::Known(KnownTag::Usage) => {
+						if child.prop(&PropId::Kind.into()).and_then(Value::as_str) == Some("advisor") {
+							let Some(provider) =
+								child.prop(&PropId::Provider.into()).and_then(Value::as_str)
+							else {
+								continue;
+							};
+							let Some(model) = child.prop(&PropId::Model.into()).and_then(Value::as_str)
+							else {
+								continue;
+							};
+							let identity =
+								AdvisorIdentity { provider: Str::new(provider), model: Str::new(model) };
+							let spend = advisor.get_or_insert_with(|| AdvisorSpend {
+								identities:    SmallVec::new(),
+								latest:        identity.clone(),
+								cost_nano_usd: 0,
+							});
+							let cost = prop_u64(child, PropId::CostNanoUsd);
+							if cost > 0 && !spend.identities.contains(&identity) {
+								spend.identities.push(identity.clone());
+							}
+							spend.latest = identity;
+							spend.cost_nano_usd = spend.cost_nano_usd.saturating_add(cost);
+							continue;
+						}
 						let input = prop_u64(child, PropId::TokensIn);
 						let read = prop_u64(child, PropId::CacheRead);
 						let write = prop_u64(child, PropId::CacheWrite);
@@ -128,6 +182,7 @@ impl StatusLine {
 			cache_read,
 			cache_write,
 			cost_nano_usd,
+			advisor,
 			premium_requests_millionths,
 			tokens_per_second,
 			turns,
@@ -210,16 +265,27 @@ pub fn director_mode(dom: &Dom) -> Option<ModeChip> {
 		},
 		3 => ModeChip::Vibe,
 		4 => {
-			let limit = custom_int(node, "state/count")
-				.and_then(|count| u32::try_from(count).ok())
-				.map(|initial| {
-					let used = custom_int(node, "state/used")
-						.and_then(|used| u32::try_from(used).ok())
-						.unwrap_or(0);
-					(initial.saturating_sub(used), initial)
-				});
+			let limit = match custom_str(node, "state/limit_kind") {
+				Some("iterations") => custom_int(node, "state/limit")
+					.and_then(|limit| u64::try_from(limit).ok())
+					.map(|initial| {
+						let used = custom_int(node, "state/used")
+							.and_then(|used| u64::try_from(used).ok())
+							.unwrap_or(0);
+						LoopLimit::Iterations { remaining: initial.saturating_sub(used), initial }
+					}),
+				Some("duration_ms") => custom_int(node, "state/remaining_ms")
+					.and_then(|remaining| u64::try_from(remaining).ok())
+					.map(|remaining| LoopLimit::Duration(Duration::from_millis(remaining))),
+				_ => None,
+			};
 			if paused {
 				ModeChip::LoopPaused { limit }
+			} else if custom_str(node, "state/prompt")
+				.unwrap_or_default()
+				.is_empty()
+			{
+				ModeChip::LoopWaiting { limit }
 			} else {
 				ModeChip::Loop { limit }
 			}
@@ -315,7 +381,7 @@ fn prop_u64(node: &omp_dom::Node, prop: PropId) -> u64 {
 #[cfg(test)]
 mod tests {
 	use omp_dom::{Handle, NodeSpec, Op, Txn};
-	use omp_journal::data::TurnReceipt;
+	use omp_journal::data::{ReceiptIdentity, ReceiptRole, TurnReceipt};
 	use omp_session::{ComponentRegistry, Session};
 
 	use super::*;
@@ -436,8 +502,14 @@ mod tests {
 		);
 		assert_eq!(mode("vibe", "active", &[]), Some(ModeChip::Vibe));
 		assert_eq!(
-			mode("loop", "active", &[("state/count", Value::Int(5)), ("state/used", Value::Int(2)),]),
-			Some(ModeChip::Loop { limit: Some((3, 5)) })
+			mode("loop", "active", &[
+				("state/limit_kind", Value::Str(Str::new_static("iterations"))),
+				("state/limit", Value::Int(5)),
+				("state/used", Value::Int(2)),
+			],),
+			Some(ModeChip::LoopWaiting {
+				limit: Some(LoopLimit::Iterations { remaining: 3, initial: 5 }),
+			})
 		);
 		assert_eq!(mode("loop", "paused", &[]), Some(ModeChip::LoopPaused { limit: None }));
 		assert_eq!(mode("goal", "queued", &[]), None, "queued frames stay hidden");
@@ -458,6 +530,7 @@ mod tests {
 				ttft_ms:                     None,
 				duration_ms:                 Some(4_000),
 				premium_requests_millionths: 330_000,
+				identity:                    None,
 			})
 			.expect("receipt");
 
@@ -473,8 +546,34 @@ mod tests {
 				ttft_ms:                     None,
 				duration_ms:                 Some(2_000),
 				premium_requests_millionths: 1_000_000,
+				identity:                    None,
 			})
 			.expect("receipt");
+		session
+			.receipt(TurnReceipt {
+				tokens_in: 7_000,
+				tokens_out: 80,
+				cost_nano_usd: 80_000_000,
+				duration_ms: Some(1_000),
+				premium_requests_millionths: 9_000_000,
+				identity: Some(ReceiptIdentity {
+					role:     ReceiptRole::Advisor,
+					provider: Str::new_static("anthropic"),
+					model:    Str::new_static("claude-sonnet-4-5"),
+				}),
+				..TurnReceipt::default()
+			})
+			.expect("advisor receipt");
+		session
+			.receipt(TurnReceipt {
+				identity: Some(ReceiptIdentity {
+					role:     ReceiptRole::Advisor,
+					provider: Str::new_static("openai"),
+					model:    Str::new_static("gpt-5"),
+				}),
+				..TurnReceipt::default()
+			})
+			.expect("second advisor identity");
 
 		let status = StatusLine::from_dom(session.dom());
 		assert_eq!(status.turns, 2);
@@ -487,11 +586,25 @@ mod tests {
 		assert_eq!(status.cache_read, 3_400);
 		assert_eq!(status.cache_write, 50);
 		assert_eq!(status.cost_nano_usd, 125_000_000);
+		let advisor = status.advisor.expect("advisor spend");
+		assert_eq!(advisor.cost_nano_usd, 80_000_000);
+		assert_eq!(advisor.latest, AdvisorIdentity {
+			provider: Str::new_static("openai"),
+			model:    Str::new_static("gpt-5"),
+		});
+		assert_eq!(advisor.identities.as_slice(), &[AdvisorIdentity {
+			provider: Str::new_static("anthropic"),
+			model:    Str::new_static("claude-sonnet-4-5"),
+		}]);
 		assert_eq!(
 			status.premium_requests_millionths, 1_330_000,
-			"premium units sum across receipts"
+			"advisor billing stays out of primary premium units"
 		);
-		assert_eq!(status.tokens_per_second, Some(200.0), "400 tokens over 2s");
+		assert_eq!(
+			status.tokens_per_second,
+			Some(200.0),
+			"advisor receipt does not replace primary throughput"
+		);
 	}
 
 	#[test]
@@ -509,6 +622,7 @@ mod tests {
 				ttft_ms:                     None,
 				duration_ms:                 None,
 				premium_requests_millionths: 0,
+				identity:                    None,
 			})
 			.expect("receipt");
 		let status = StatusLine::from_dom(session.dom());

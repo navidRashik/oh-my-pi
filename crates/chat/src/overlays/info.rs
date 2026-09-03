@@ -56,13 +56,13 @@ pub const DEBUG_ACTIONS: [DebugAction; 12] = [
 		action:      DebugActionId::Performance,
 		key:         "performance",
 		label:       "Report: performance issue",
-		description: "Capture native work evidence and bundle",
+		description: "Profile CPU, reproduce, then bundle",
 	},
 	DebugAction {
 		action:      DebugActionId::Work,
 		key:         "work",
 		label:       "Profile: work scheduling",
-		description: "Open flamegraph of recent scheduling",
+		description: "Open flamegraph of last 30s",
 	},
 	DebugAction {
 		action:      DebugActionId::Dump,
@@ -74,13 +74,13 @@ pub const DEBUG_ACTIONS: [DebugAction; 12] = [
 		action:      DebugActionId::Memory,
 		key:         "memory",
 		label:       "Report: memory issue",
-		description: "Process memory snapshot + bundle",
+		description: "Heap snapshot + bundle",
 	},
 	DebugAction {
 		action:      DebugActionId::Logs,
 		key:         "logs",
 		label:       "View: recent logs",
-		description: "Show bounded recent log entries",
+		description: "Show last 50 log entries",
 	},
 	DebugAction {
 		action:      DebugActionId::System,
@@ -104,7 +104,7 @@ pub const DEBUG_ACTIONS: [DebugAction; 12] = [
 		action:      DebugActionId::RawSse,
 		key:         "raw-sse",
 		label:       "View: raw SSE stream",
-		description: "Show live redacted provider SSE frames",
+		description: "Show live provider SSE frames",
 	},
 	DebugAction {
 		action:      DebugActionId::Transcript,
@@ -116,7 +116,7 @@ pub const DEBUG_ACTIONS: [DebugAction; 12] = [
 		action:      DebugActionId::ClearCache,
 		key:         "clear-cache",
 		label:       "Clear: artifact cache",
-		description: "Remove expired unreferenced artifacts",
+		description: "Remove old session artifacts",
 	},
 ];
 
@@ -147,7 +147,7 @@ impl DebugSelector {
 		self.rows = rows;
 		let height = rows.saturating_add(1);
 		let tree = dom! {
-			<box border=round title="Debug tools" pad-x=1>
+			<box border=round title="Debug Tools" pad-x=1>
 				<col>
 					<select id="actions" h={height}>
 						for action in DEBUG_ACTIONS {

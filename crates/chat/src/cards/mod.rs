@@ -39,6 +39,7 @@ use omp_dom::{Node, PropId};
 use omp_tool::{ArgPath, CallOutcome};
 use omp_tui::{Graphics, IntoComponent as _, UiContext, dom};
 use serde::de::DeserializeOwned;
+use smallvec::SmallVec;
 
 /// A boxed retained TUI component.
 pub type Component = Box<dyn omp_tui::Component>;
@@ -59,10 +60,8 @@ pub(crate) const fn inline_images(ui: &UiContext) -> bool {
 
 /// Builds an absolute `file://` target for a project-relative card path.
 pub(crate) fn file_link(path: &str) -> Str {
-	std::path::absolute(path).map_or_else(
-		|_| sf!("file://{path}"),
-		|absolute| sf!("file://{}", absolute.display()),
-	)
+	std::path::absolute(path)
+		.map_or_else(|_| sf!("file://{path}"), |absolute| sf!("file://{}", absolute.display()))
 }
 
 /// pi `imageFallback`: `[Image: <name> [<mime>] <WxH>]`, the text stand-in
@@ -145,8 +144,12 @@ pub struct CardView<'a> {
 	pub input:   &'a Node,
 	/// Successful result state, when present.
 	pub result:  Option<&'a Node>,
-	/// Diagnostic state, when present.
+	/// Terminal diagnostic state, when present. This is the last error/fault
+	/// diagnostic and is the only diagnostic that describes call failure.
 	pub diag:    Option<&'a Node>,
+	/// Non-error diagnostics in journal order. Harness-owned output bounding
+	/// lives here and never changes the call's success/failure presentation.
+	pub notices: SmallVec<&'a Node, 2>,
 	/// Usage state, when present.
 	pub usage:   Option<&'a Node>,
 	/// Tool lifecycle status.
@@ -216,6 +219,19 @@ impl CardView<'_> {
 	pub fn outcome_json(&self) -> Option<serde_json::Value> {
 		let node = self.result?;
 		outcome_value(node_outcome(node, PropId::Outcome)?, "ok")
+	}
+
+	/// The terminal fault's raw journaled payload as untyped JSON.
+	///
+	/// Generic and dynamic-device cards use this to select human fields
+	/// without ever printing the protocol envelope itself.
+	#[must_use]
+	pub fn fault_json(&self) -> Option<serde_json::Value> {
+		let node = self.diag?;
+		match node_outcome(node, PropId::Fault) {
+			Some(raw) => outcome_value(raw, "faulted"),
+			None => parse_either(node),
+		}
 	}
 
 	/// The successful result's model-facing projection parsed as JSON: the
@@ -431,7 +447,7 @@ where
 						None => view
 							.diag
 							.and_then(node_text)
-							.filter(|text| !text.is_empty())
+							.filter(|text| !text.is_empty() && !text.trim_start().starts_with(['{', '[']))
 							.map_or_else(|| fault_message(&value), Str::new),
 					}
 				},
@@ -457,12 +473,26 @@ where
 }
 
 fn fault_message(value: &serde_json::Value) -> Str {
-	let text = value
+	if let Some(message) = value
 		.get("message")
+		.or_else(|| value.get("error"))
 		.and_then(serde_json::Value::as_str)
-		.map(str::to_owned)
-		.unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default());
-	Str::new(text)
+		.filter(|message| !message.is_empty())
+	{
+		return Str::new(message);
+	}
+	if let Some(kind) = value
+		.get("kind")
+		.or_else(|| value.get("code"))
+		.and_then(serde_json::Value::as_str)
+		.filter(|kind| !kind.is_empty())
+	{
+		return Str::new(kind.replace(['_', '-'], " "));
+	}
+	if let Some(message) = value.as_str().filter(|message| !message.is_empty()) {
+		return Str::new(message);
+	}
+	Str::new_static("tool failed")
 }
 
 /// The journaled `CallOutcome` envelope (`{"kind":…,"value":…}`) the fold
@@ -507,6 +537,69 @@ fn node_text(node: &Node) -> Option<&str> {
 		.and_then(omp_dom::Value::as_str)
 		.filter(|text| !text.is_empty())
 		.or(node.content.as_deref())
+}
+
+/// Renders a harness diagnostic without exposing its serialized protocol
+/// object. Output bounding is an informational artifact continuation, not a
+/// tool failure (ADR 0009).
+fn render_notice(node: &Node) -> Option<Component> {
+	let severity = node
+		.prop(&PropId::Severity.into())
+		.and_then(omp_dom::Value::as_str)
+		.unwrap_or("info");
+	if severity == "error" {
+		return None;
+	}
+	let value = node_data(node)
+		.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+		.unwrap_or(serde_json::Value::Null);
+	let kind = node
+		.prop(&PropId::Kind.into())
+		.and_then(omp_dom::Value::as_str)
+		.or_else(|| value.get("kind").and_then(serde_json::Value::as_str))
+		.unwrap_or_default();
+	let artifact = value
+		.get("artifact")
+		.and_then(serde_json::Value::as_str)
+		.map(Str::new);
+	let clamped = value
+		.get("lines_clamped")
+		.and_then(serde_json::Value::as_u64)
+		.unwrap_or(0);
+	let message = value
+		.get("text")
+		.or_else(|| value.get("message"))
+		.and_then(serde_json::Value::as_str)
+		.filter(|text| !text.is_empty())
+		.map(Str::new)
+		.or_else(|| {
+			matches!(kind, "output_bounded" | "truncated").then(|| {
+				if clamped == 0 {
+					Str::new_static("Output was bounded")
+				} else if clamped == 1 {
+					Str::new_static("1 output line was clipped")
+				} else {
+					sf!("{clamped} output lines were clipped")
+				}
+			})
+		})
+		.or_else(|| {
+			node_text(node)
+				.filter(|text| !text.trim_start().starts_with(['{', '[']))
+				.map(Str::new)
+		})
+		.or_else(|| (!kind.is_empty()).then(|| Str::new(kind.replace(['_', '-'], " "))))?;
+	let tone = if matches!(severity, "warn" | "warning") {
+		"warn"
+	} else {
+		"info"
+	};
+	Some(if let Some(artifact) = artifact {
+		let content = sf!("{message}\n\n[Read {artifact} for full output]({artifact})");
+		dom! { <callout kind={tone}>{content}</callout> }.into_component()
+	} else {
+		dom! { <callout kind={tone}>{message}</callout> }.into_component()
+	})
 }
 
 /// One typed renderer for a tool identity.
@@ -592,10 +685,20 @@ impl CardRegistry {
 		expanded: bool,
 		ui: &UiContext,
 	) -> Component {
-		self.cards.get(tool).map_or_else(
+		let card = self.cards.get(tool).map_or_else(
 			|| self.fallback.render_named(tool, view, expanded, ui),
 			|card| card.render(view, expanded, ui),
-		)
+		);
+		let notices = view
+			.notices
+			.iter()
+			.filter_map(|node| render_notice(node))
+			.collect::<Vec<_>>();
+		if notices.is_empty() {
+			card
+		} else {
+			dom! { <col>{card}{notices}</col> }.into_component()
+		}
 	}
 }
 

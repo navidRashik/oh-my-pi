@@ -155,7 +155,12 @@ impl Local {
 			if !matches!(node.tag, Tag::Custom(_)) {
 				continue;
 			}
-			let key = crate::project::block_key(*handle, BlockKind::Tool);
+			let kind = if crate::notices::local::is_local(node) {
+				BlockKind::Local
+			} else {
+				BlockKind::Tool
+			};
+			let key = crate::project::block_key(*handle, kind);
 			match node
 				.prop(&PropId::Status.into())
 				.and_then(Value::as_str)

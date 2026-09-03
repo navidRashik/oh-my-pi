@@ -33,10 +33,16 @@ impl GenericCard {
 			.map(|artifact| result_image(&Str::new(artifact), "image/*", None, _ui))
 			.collect::<Vec<_>>();
 		let fault = view
-			.diag
-			.and_then(node_text)
-			.filter(|text| !text.is_empty())
-			.map(Str::new);
+			.fault_json()
+			.as_ref()
+			.and_then(human_fault)
+			.or_else(|| {
+				view
+					.diag
+					.and_then(node_text)
+					.filter(|text| !text.is_empty() && !text.trim_start().starts_with(['{', '[']))
+					.map(Str::new)
+			});
 		dom! {
 			<col pad="1 0">
 				<row pad-x=1 gap=1 bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }}>
@@ -143,6 +149,24 @@ fn display_result(text: Option<&str>, expanded: bool) -> Option<Str> {
 
 fn json_text(value: &Value) -> String {
 	serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
+}
+
+fn human_fault(value: &Value) -> Option<Str> {
+	value
+		.get("message")
+		.or_else(|| value.get("error"))
+		.and_then(Value::as_str)
+		.filter(|text| !text.is_empty())
+		.map(Str::new)
+		.or_else(|| {
+			value
+				.get("kind")
+				.or_else(|| value.get("code"))
+				.and_then(Value::as_str)
+				.filter(|kind| !kind.is_empty())
+				.map(|kind| Str::new(kind.replace(['_', '-'], " ")))
+		})
+		.or_else(|| value.as_str().filter(|text| !text.is_empty()).map(Str::new))
 }
 
 fn node_text(node: &Node) -> Option<&str> {

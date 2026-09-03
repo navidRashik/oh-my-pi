@@ -2,13 +2,15 @@
 //! blocks.
 
 use omp_core::{Str, StrMut, sf};
-use omp_dom::{Dom, Handle, KnownTag, Node, PropId, Tag, Value};
+use omp_dom::{Dom, Handle, KnownTag, Node, PropId, PropKey, Tag, Value};
 use omp_journal::data::Attachment;
+use omp_session::{ASSISTANT_CONTENT_TAG, PROVIDER_BLOCK_INDEX_PROP};
 use omp_tui::{Charset, Icon, IntoComponent, UiContext, dom, slots::Mode};
+use smallvec::SmallVec;
 
 use crate::{
-	cards::{CardRegistry, CardStatus, CardView, Component},
-	notices::{cache, custom, divider, error, misc, usage},
+	cards::{CardRegistry, CardStatus, CardView, Component, result_image},
+	notices::{cache, custom, divider, error, irc, local, misc, usage},
 	reaction, thinking,
 	transcript::{Local, REVEAL_HORIZON, StreamHead},
 };
@@ -24,6 +26,8 @@ pub enum BlockKind {
 	Thinking,
 	/// Visible assistant answer.
 	Assistant,
+	/// User-local `!` or `$` execution, never a model tool card.
+	Local,
 	/// Tool element rendered by the card registry.
 	Tool,
 	/// Controller notice.
@@ -66,6 +70,9 @@ pub(crate) struct RenderedBlock {
 pub struct Options<'a> {
 	/// Reveal reasoning text (`cl_showthinking`).
 	pub show_thinking: bool,
+	/// Reveal model-initiated tool activity and its delivery notices
+	/// (`cl_showtools`).
+	pub show_tools:    bool,
 	/// Expand tool cards (`cl_tools_expanded`).
 	pub expanded:      bool,
 	/// Type streamed text out at the reveal cadence (`cl_smooth_streaming`).
@@ -82,7 +89,14 @@ impl<'a> Options<'a> {
 	/// prose-only reasoning on.
 	#[must_use]
 	pub const fn new(local: &'a Local) -> Self {
-		Self { show_thinking: true, expanded: false, smooth: true, prose_only: true, local }
+		Self {
+			show_thinking: true,
+			show_tools: true,
+			expanded: false,
+			smooth: true,
+			prose_only: true,
+			local,
+		}
 	}
 }
 
@@ -127,6 +141,38 @@ pub(crate) fn project(
 			};
 			match &node.tag {
 				Tag::Known(KnownTag::User) => {
+					if let Some(completion) = misc::launch_completion(node) {
+						reaction_target = None;
+						if options.show_tools {
+							let text = misc::launch_completion_text(&completion);
+							let component = misc::launch_completion_block(&completion);
+							blocks.push(rendered(
+								*handle,
+								BlockKind::Notice,
+								text,
+								Mode::Mutable,
+								true,
+								component,
+							));
+						}
+						continue;
+					}
+					if let Some(result) = misc::async_result(node) {
+						reaction_target = None;
+						if options.show_tools {
+							let text = misc::async_result_text(&result);
+							let component = misc::async_result_block(&result);
+							blocks.push(rendered(
+								*handle,
+								BlockKind::Notice,
+								text,
+								Mode::Mutable,
+								true,
+								component,
+							));
+						}
+						continue;
+					}
 					let raw = node.content.clone().unwrap_or_default();
 					// Display-only collapse before any branch: guest and synthetic
 					// rows show the same chips as the plain bubble.
@@ -149,9 +195,25 @@ pub(crate) fn project(
 					blocks.push(rendered(*handle, BlockKind::User, raw, Mode::Mutable, true, component));
 				},
 				Tag::Known(KnownTag::Assistant) => {
-					assistant_blocks(dom, *handle, node, options, &mut blocks, &mut reaction_target);
+					assistant_blocks(dom, *handle, node, ui, options, &mut blocks, &mut reaction_target);
 				},
 				Tag::Known(KnownTag::Notice) => {
+					if let Some(traffic) = irc::traffic(node) {
+						reaction_target = None;
+						if options.show_tools {
+							let text = irc::traffic_text(&traffic);
+							let component = irc::traffic_card(&traffic, options.expanded);
+							blocks.push(rendered(
+								*handle,
+								BlockKind::Notice,
+								text,
+								Mode::Mutable,
+								true,
+								component,
+							));
+						}
+						continue;
+					}
 					let kind = prop_text(node, PropId::Kind).unwrap_or_else(|| Str::new_static("info"));
 					// pi `custom_message` / `hookMessage` entries: framed
 					// Markdown boxes journaled by the kernel (`EnvEvent::Notice`).
@@ -187,6 +249,9 @@ pub(crate) fn project(
 					));
 				},
 				Tag::Known(KnownTag::Usage) => {
+					if node.prop(&PropId::Kind.into()).and_then(Value::as_str) == Some("advisor") {
+						continue;
+					}
 					let facts = usage::usage_facts(dom, *handle);
 					let text = usage::usage_line(&facts, ui);
 					blocks.push(rendered(
@@ -211,7 +276,14 @@ pub(crate) fn project(
 					}
 				},
 				Tag::Custom(tool) => {
-					if let Some(block) = tool_block(dom, *handle, node, tool, cards, ui, options) {
+					let block = if local::is_local(node) {
+						local_block(dom, *handle, node, options)
+					} else if options.show_tools {
+						tool_block(dom, *handle, node, tool, cards, ui, options)
+					} else {
+						None
+					};
+					if let Some(block) = block {
 						blocks.push(block);
 					}
 				},
@@ -240,55 +312,211 @@ pub(crate) fn project(
 	blocks
 }
 
-/// Assistant reasoning and answer blocks (pi `AssistantMessageComponent`).
+/// One assistant content-array entry retained in provider order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AssistantPart {
+	/// Visible answer prose.
+	Text { handle: Handle, text: Str },
+	/// Model reasoning prose.
+	Thinking { handle: Handle, text: Str },
+	/// Provider artifact stored by URI.
+	Artifact { handle: Handle, uri: Str, mime: Str, kind: Str },
+}
+
+/// Reads ordered assistant content children. Sessions written before the
+/// ordered-child contract retain their historical thinking → text → artifact
+/// projection.
+pub(crate) fn assistant_parts(
+	dom: &Dom,
+	assistant: Handle,
+	node: &Node,
+) -> SmallVec<AssistantPart, 8> {
+	let children = dom.children(assistant);
+	let ordered = children
+		.iter()
+		.any(|handle| dom.get(*handle).is_some_and(is_assistant_content));
+	let mut parts = SmallVec::new();
+	if !ordered {
+		if let Some(text) = live_text(dom, assistant, node, PropId::Thinking) {
+			parts.push(AssistantPart::Thinking { handle: assistant, text });
+		}
+		if let Some(text) = live_text(dom, assistant, node, PropId::Text) {
+			parts.push(AssistantPart::Text { handle: assistant, text });
+		}
+	}
+	let mut content = SmallVec::<(i64, usize, Handle), 8>::new();
+	for (position, handle) in children.iter().enumerate() {
+		let Some(child) = dom.get(*handle) else {
+			continue;
+		};
+		if ordered && is_assistant_content(child) || is_artifact(child) {
+			content.push((provider_block_index(child), position, *handle));
+		}
+	}
+	content.sort_by_key(|(index, position, _)| (*index, *position));
+	for (_, _, handle) in content {
+		let Some(child) = dom.get(handle) else {
+			continue;
+		};
+		if is_assistant_content(child) {
+			let Some(text) = live_text(dom, handle, child, PropId::Text) else {
+				continue;
+			};
+			match prop_text(child, PropId::Kind).as_deref() {
+				Some("text") => parts.push(AssistantPart::Text { handle, text }),
+				Some("thinking") => parts.push(AssistantPart::Thinking { handle, text }),
+				_ => {},
+			}
+		} else {
+			let Some(uri) = prop_text(child, PropId::Blob) else {
+				continue;
+			};
+			parts.push(AssistantPart::Artifact {
+				handle,
+				uri,
+				mime: prop_text(child, PropId::Mime)
+					.unwrap_or_else(|| Str::new_static("application/octet-stream")),
+				kind: prop_text(child, PropId::Kind).unwrap_or_else(|| Str::new_static("file")),
+			});
+		}
+	}
+	parts
+}
+
+fn is_assistant_content(node: &Node) -> bool {
+	matches!(&node.tag, Tag::Custom(tag) if tag.as_str() == ASSISTANT_CONTENT_TAG)
+}
+
+fn is_artifact(node: &Node) -> bool {
+	matches!(&node.tag, Tag::Custom(tag) if tag.as_str() == "artifact")
+}
+
+fn provider_block_index(node: &Node) -> i64 {
+	node
+		.prop(&PropKey::Custom(Str::new_static(PROVIDER_BLOCK_INDEX_PROP)))
+		.and_then(|value| match value {
+			Value::Int(index) => Some(*index),
+			_ => None,
+		})
+		.unwrap_or(i64::MAX)
+}
+
+/// Assistant reasoning, answer, and artifact blocks in exact provider order.
 ///
-/// Reasoning shown: an append-only Markdown head (`<md reveal>`, pi
-/// `new Markdown(text, 1, 0, …, { italic: true })`) whose stable prefix may
-/// retire into scrollback mid-stream; reasoning hidden while the model is
-/// still reasoning: the breathing starburst pulse with the speed badge; the
-/// answer: an append-only Markdown head as well (ADR 0034: streaming text
-/// is append-only, so rows pushed off the top of a long reply retire into
-/// native scrollback while it still streams), typed out through the reveal
-/// cursor and snapped to its full text once a tool call starts (a
-/// transcript order boundary) or the message ends.
+/// Every streamed text/thinking child owns its own append-only slot identity.
+/// Once a later provider block exists, an earlier stream's projection is final
+/// even before the enclosing assistant completes, so its stable rows can
+/// retire without a later artifact crossing them.
 fn assistant_blocks(
 	dom: &Dom,
 	handle: Handle,
 	node: &Node,
+	ui: &UiContext,
 	options: &Options<'_>,
 	blocks: &mut Vec<RenderedBlock>,
 	reaction_target: &mut Option<ReactionTarget>,
 ) {
-	let finalized = node.prop(&PropId::StopReason.into()).is_some();
-	let raw_thinking = live_text(dom, handle, node, PropId::Thinking).unwrap_or_default();
-	let full_text = live_text(dom, handle, node, PropId::Text).unwrap_or_default();
-	let text = apply_reaction(&full_text, finalized, reaction_target.take(), blocks);
-	let thinking = thinking::display_thinking(&raw_thinking, options.prose_only);
-	let thinking = Str::new(thinking.as_str().trim());
-	let has_thinking = thinking::is_displayable(raw_thinking.as_str(), thinking.as_str());
+	let assistant_finalized = node.prop(&PropId::StopReason.into()).is_some();
 	let tool_started = has_tool_calls(dom, handle);
-	let reveal = options.smooth && !finalized && !tool_started;
-	if options.show_thinking && has_thinking {
-		let component = if reveal {
-			dom! { <md id={omp_tui::slots::STREAM_ID} reveal={REVEAL_HORIZON_PROP} fg=muted italic pad-x=1>{thinking.clone()}</md> }
-		} else {
-			dom! { <md id={omp_tui::slots::STREAM_ID} fg=muted italic pad-x=1>{thinking.clone()}</md> }
-		};
-		let mut block = rendered(
-			handle,
-			BlockKind::Thinking,
-			thinking.clone(),
-			Mode::AppendOnly,
-			finalized,
-			component,
-		);
-		block.stream = Some(thinking.clone());
-		blocks.push(block);
-	} else if !options.show_thinking
-		&& !finalized
+	let ordered = dom
+		.children(handle)
+		.iter()
+		.any(|child| dom.get(*child).is_some_and(is_assistant_content));
+	let parts = assistant_parts(dom, handle, node);
+	let tail = parts.last();
+	let tail_is_thinking = matches!(tail, Some(AssistantPart::Thinking { .. }));
+	let mut target = reaction_target.take();
+	let mut opening_text_seen = false;
+	for (position, part) in parts.iter().enumerate() {
+		let is_tail = position + 1 == parts.len();
+		match part {
+			AssistantPart::Thinking { handle, text: raw } => {
+				let thinking = thinking::display_thinking(raw, options.prose_only);
+				let thinking = Str::new(thinking.trim());
+				if !options.show_thinking || !thinking::is_displayable(raw.as_str(), thinking.as_str())
+				{
+					continue;
+				}
+				let finalized = assistant_finalized || !is_tail || tool_started;
+				let reveal = options.smooth && !finalized;
+				let component = if reveal {
+					dom! { <md id={omp_tui::slots::STREAM_ID} reveal={REVEAL_HORIZON_PROP} fg=muted italic pad-x=1>{thinking.clone()}</md> }
+				} else {
+					dom! { <md id={omp_tui::slots::STREAM_ID} fg=muted italic pad-x=1>{thinking.clone()}</md> }
+				};
+				let mut block = rendered(
+					*handle,
+					BlockKind::Thinking,
+					thinking.clone(),
+					Mode::AppendOnly,
+					finalized,
+					component,
+				);
+				block.stream = Some(thinking);
+				blocks.push(block);
+			},
+			AssistantPart::Text { handle, text } => {
+				// Leading padding is presentation-only, but the live stream's
+				// trailing newline is semantic append state: dropping it makes
+				// the next delta replace rows instead of extending their prefix.
+				let text = Str::new(text.trim_start());
+				if text.is_empty() {
+					continue;
+				}
+				let text = if opening_text_seen {
+					text
+				} else {
+					opening_text_seen = true;
+					apply_reaction(&text, assistant_finalized, target.take(), blocks)
+				};
+				if text.is_empty() {
+					continue;
+				}
+				let finalized = assistant_finalized || !is_tail || tool_started;
+				let reveal = options.smooth && !finalized;
+				let component = if reveal {
+					dom! { <md id={omp_tui::slots::STREAM_ID} reveal={REVEAL_HORIZON_PROP} pad-x=1>{text.clone()}</md> }
+				} else {
+					dom! { <md id={omp_tui::slots::STREAM_ID} pad-x=1>{text.clone()}</md> }
+				};
+				let mut block = rendered(
+					*handle,
+					BlockKind::Assistant,
+					text.clone(),
+					Mode::AppendOnly,
+					finalized,
+					component,
+				);
+				block.stream = Some(text);
+				blocks.push(block);
+			},
+			AssistantPart::Artifact { handle, uri, mime, kind } => {
+				let component = if kind.as_str() == "image" || mime.as_str().starts_with("image/") {
+					result_image(uri, mime.as_str(), None, ui)
+				} else {
+					dom! {
+						<col pad-x=1>
+							<text fg=muted>{sf!("[{}: {}]", kind, mime)}</text>
+							<a href={uri.clone()}>{uri.clone()}</a>
+						</col>
+					}
+					.into_component()
+				};
+				blocks.push(rendered(
+					*handle,
+					BlockKind::Assistant,
+					uri.clone(),
+					Mode::Mutable,
+					true,
+					component,
+				));
+			},
+		}
+	}
+	if !options.show_thinking
+		&& !assistant_finalized
 		&& !tool_started
-		&& thinking::has_content(raw_thinking.as_str())
-		&& reasoning_is_head(options.local, text.as_str())
+		&& reasoning_is_head(options.local, ordered, tail_is_thinking)
 	{
 		let local = options.local;
 		let pulse = omp_tui::components::Pulse::new()
@@ -304,23 +532,6 @@ fn assistant_blocks(
 			false,
 			dom! { <row pad-x=1>{pulse}</row> },
 		));
-	}
-	if !text.is_empty() || finalized {
-		let component = if reveal {
-			dom! { <md id={omp_tui::slots::STREAM_ID} reveal={REVEAL_HORIZON_PROP} pad-x=1>{text.clone()}</md> }
-		} else {
-			dom! { <md id={omp_tui::slots::STREAM_ID} pad-x=1>{text.clone()}</md> }
-		};
-		let mut block = rendered(
-			handle,
-			BlockKind::Assistant,
-			text.clone(),
-			Mode::AppendOnly,
-			finalized,
-			component,
-		);
-		block.stream = Some(text);
-		blocks.push(block);
 	}
 }
 
@@ -365,13 +576,15 @@ fn apply_reaction(
 
 /// pi `#shouldAnimateThinking`: the pulse shows while the model is reasoning
 /// right now — the newest delta was reasoning — so a second reasoning phase
-/// after visible text pulses again. An observer that has seen no delta (a
-/// replica fed by patches alone) falls back to the only order the DOM
-/// keeps: answer text having started means reasoning stopped.
-fn reasoning_is_head(local: &Local, text: &str) -> bool {
+/// after visible text pulses again. Ordered children give replicas the tail
+/// kind; legacy live actors use their kernel-event stream head.
+fn reasoning_is_head(local: &Local, ordered: bool, tail_is_thinking: bool) -> bool {
+	if ordered {
+		return tail_is_thinking;
+	}
 	match local.stream_head() {
 		Some(head) => head == StreamHead::Thinking,
-		None => !thinking::has_content(text),
+		None => tail_is_thinking,
 	}
 }
 
@@ -620,10 +833,28 @@ fn card_view<'a>(
 		dom.get(*child)
 			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Result))
 	});
+	let mut diag = None;
+	let mut notices = smallvec::SmallVec::<&Node, 2>::new();
+	for child in dom.children(handle) {
+		let Some(node) = dom.get(*child) else {
+			continue;
+		};
+		if node.tag != Tag::Known(KnownTag::Diag) {
+			continue;
+		}
+		let is_error = node.prop(&PropId::Fault.into()).is_some()
+			|| node.prop(&PropId::Severity.into()).and_then(Value::as_str) == Some("error");
+		if is_error {
+			diag = Some(node);
+		} else {
+			notices.push(node);
+		}
+	}
 	Some(CardView {
 		input,
 		result: result.and_then(|handle| dom.get(handle)),
-		diag: child(dom, handle, KnownTag::Diag),
+		diag,
+		notices,
 		usage: child(dom, handle, KnownTag::Usage),
 		status: card_status,
 		output: result.and_then(|handle| dom.stream_text(handle, &PropId::Text.into())),
@@ -664,7 +895,7 @@ fn user_bubble(text: Str, reaction: Option<Str>, chips: &[Str]) -> Component {
 
 /// A guest or synthetic user row followed by its attachment chip row, when
 /// the journaled attachment set has entries the text does not reference.
-fn with_attachments(component: Component, chips: &[Str]) -> Component {
+pub(crate) fn with_attachments(component: Component, chips: &[Str]) -> Component {
 	if chips.is_empty() {
 		return component;
 	}
@@ -686,7 +917,7 @@ fn with_attachments(component: Component, chips: &[Str]) -> Component {
 /// an `attachment://N` reference: `<paperclip> #N · <size>`. A reference
 /// knows only its digest, size, and MIME, so the chip names the ordinal the
 /// model and the `read` tool use.
-fn attachment_chips(node: &Node, text: &str, charset: Charset) -> Vec<Str> {
+pub(crate) fn attachment_chips(node: &Node, text: &str, charset: Charset) -> Vec<Str> {
 	let Some(Value::Json(raw)) = node.prop(&PropId::Data.into()) else {
 		return Vec::new();
 	};
@@ -729,7 +960,7 @@ fn text_references_attachment(text: &str, ordinal: usize) -> bool {
 /// by their ` attachment://N` reference, but the transcript shows the same
 /// compact `<icon> #N` chip the composer used. Runs before Markdown layout
 /// so wrapping and bubble padding are computed on the visible text.
-fn collapse_image_markers(text: &Str, charset: Charset) -> Str {
+pub(crate) fn collapse_image_markers(text: &Str, charset: Charset) -> Str {
 	if !text.contains("[Image #") && !text.contains("[Video #") {
 		return text.clone();
 	}
@@ -813,11 +1044,32 @@ pub(crate) const fn block_key(handle: Handle, kind: BlockKind) -> u64 {
 		BlockKind::Thinking => 1,
 		BlockKind::Assistant => 2,
 		BlockKind::Tool => 3,
+		BlockKind::Local => 7,
 		BlockKind::Notice => 4,
 		BlockKind::Usage => 5,
 		BlockKind::Divider => 6,
 	};
 	handle.get().saturating_mul(8).saturating_add(suffix)
+}
+
+/// Dedicated user-local execution projection. The block remains mutable while
+/// its tail-window output streams and finalizes only at the dispatcher
+/// terminal.
+fn local_block(
+	dom: &Dom,
+	handle: Handle,
+	node: &Node,
+	options: &Options<'_>,
+) -> Option<RenderedBlock> {
+	let run = local::execution(dom, handle, node)?;
+	Some(rendered(
+		handle,
+		BlockKind::Local,
+		run.transcript_text(),
+		Mode::Mutable,
+		run.finalized(),
+		local::execution_block(&run, options.expanded),
+	))
 }
 
 fn tool_block(
@@ -943,6 +1195,62 @@ mod tests {
 		session
 	}
 
+	fn insert_assistant_part(
+		session: &mut Session,
+		assistant: Handle,
+		index: i64,
+		kind: &str,
+	) -> Handle {
+		session
+			.patch(omp_dom::Txn {
+				cause: session.head().expect("head"),
+				label: Some(Str::new_static("assistant.block")),
+				ops:   vec![omp_dom::Op::Ins {
+					parent: assistant,
+					after:  session.dom().children(assistant).last().copied(),
+					node:   omp_dom::NodeSpec::new(Tag::Custom(Str::new_static(ASSISTANT_CONTENT_TAG)))
+						.with_prop(PropId::Kind, Value::Str(Str::new(kind)))
+						.with_prop(
+							PropKey::Custom(Str::new_static(PROVIDER_BLOCK_INDEX_PROP)),
+							Value::Int(index),
+						),
+				}],
+			})
+			.expect("assistant part");
+		*session
+			.dom()
+			.children(assistant)
+			.last()
+			.expect("inserted assistant part")
+	}
+
+	fn insert_artifact(session: &mut Session, assistant: Handle, index: i64, byte: u8) -> Handle {
+		let uri = Str::new(format!("artifact://sha256/{}", format!("{byte:02x}").repeat(32)));
+		session
+			.patch(omp_dom::Txn {
+				cause: session.head().expect("head"),
+				label: Some(Str::new_static("assistant.artifact")),
+				ops:   vec![omp_dom::Op::Ins {
+					parent: assistant,
+					after:  session.dom().children(assistant).last().copied(),
+					node:   omp_dom::NodeSpec::new(Tag::Custom(Str::new_static("artifact")))
+						.with_prop(PropId::Blob, Value::Str(uri))
+						.with_prop(PropId::Mime, Value::Str(Str::new_static("image/png")))
+						.with_prop(PropId::Kind, Value::Str(Str::new_static("image")))
+						.with_prop(
+							PropKey::Custom(Str::new_static(PROVIDER_BLOCK_INDEX_PROP)),
+							Value::Int(index),
+						),
+				}],
+			})
+			.expect("artifact");
+		*session
+			.dom()
+			.children(assistant)
+			.last()
+			.expect("inserted artifact")
+	}
+
 	fn render(component: Component, width: u16) -> String {
 		let ui = Ui::from_root(component, width, UiContext::default());
 		frame_text(ui.frame())
@@ -950,6 +1258,199 @@ mod tests {
 
 	fn projected(session: &Session, options: &Options<'_>) -> Vec<RenderedBlock> {
 		project(session.dom(), &CardRegistry::standard(), &UiContext::default(), options)
+	}
+
+	#[test]
+	fn advisor_receipts_feed_status_without_rendering_a_second_usage_row() {
+		use omp_journal::data::{ReceiptIdentity, ReceiptRole, TurnReceipt};
+
+		let mut session = empty_session();
+		session.begin_turn().expect("turn");
+		session.user("review this", Vec::new()).expect("user");
+		session
+			.receipt(TurnReceipt::tokens(1_000, 200, 120_000_000))
+			.expect("primary receipt");
+		session
+			.receipt(TurnReceipt {
+				tokens_in: 700,
+				tokens_out: 80,
+				cost_nano_usd: 80_000_000,
+				identity: Some(ReceiptIdentity {
+					role:     ReceiptRole::Advisor,
+					provider: Str::new_static("anthropic"),
+					model:    Str::new_static("claude-sonnet-4-5"),
+				}),
+				..TurnReceipt::default()
+			})
+			.expect("advisor receipt");
+
+		let local = Local::default();
+		let options = Options { smooth: false, ..Options::new(&local) };
+		let blocks = projected(&session, &options);
+		assert_eq!(
+			blocks
+				.iter()
+				.filter(|block| block.view.kind == BlockKind::Usage)
+				.count(),
+			1,
+			"the auxiliary advisor receipt is status/accounting state, not a transcript row"
+		);
+	}
+
+	#[test]
+	fn irc_traffic_replays_copies_and_follows_tool_visibility() {
+		use omp_journal::data::{IrcDirection, IrcTraffic};
+
+		let directory = tempfile::tempdir().expect("temp directory");
+		let path = directory.path().join("irc-traffic.oms");
+		let mut session =
+			Session::create(&path, ComponentRegistry::standard()).expect("session creates");
+		session.begin_turn().expect("turn starts");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		omp_agent::append_irc_traffic(
+			&mut session,
+			turn,
+			&IrcTraffic {
+				direction:    IrcDirection::Workpool,
+				from:         Some(Str::new_static("scheduler")),
+				to:           Some(Str::new_static("Scout")),
+				body:         Str::new_static("inspect parser\nreport risks"),
+				reply_to:     Some(Str::new_static("01K4A")),
+				pool:         Some(Str::new_static("audit")),
+				mode:         Some(Str::new_static("parallel")),
+				timestamp_ms: u64::MAX,
+			},
+		)
+		.expect("IRC traffic journals");
+
+		let local = Local::default();
+		let visible = projected(&session, &Options { show_tools: true, ..Options::new(&local) });
+		let row = visible
+			.into_iter()
+			.find(|block| block.view.text.contains("Pool audit"))
+			.expect("IRC row");
+		assert_eq!(row.view.kind, BlockKind::Notice);
+		let rendered = render(row.component, 120);
+		assert!(rendered.contains("Pool audit ➤ Scout parallel · reply · just now"), "{rendered:?}");
+		assert!(rendered.contains("inspect parser"), "{rendered:?}");
+
+		let hidden = projected(&session, &Options { show_tools: false, ..Options::new(&local) });
+		assert!(
+			hidden.iter().all(|block| !block.view.text.contains("Pool audit")),
+			"IRC traffic follows tool-activity visibility"
+		);
+
+		let copied = crate::overlays::copy::collect_targets(session.dom(), true, true, false);
+		assert_eq!(
+			copied.last().expect("IRC copy target").content,
+			"inspect parser\nreport risks"
+		);
+		let hidden_copy = crate::overlays::copy::collect_targets(session.dom(), true, false, false);
+		assert!(hidden_copy.is_empty(), "hidden IRC traffic is not copied");
+
+		drop(session);
+		let restored = Session::open(&path, ComponentRegistry::standard()).expect("session replays");
+		let replayed = projected(&restored, &Options { show_tools: true, ..Options::new(&local) });
+		assert_eq!(
+			replayed
+				.iter()
+				.filter(|block| block.view.text.contains("Pool audit"))
+				.count(),
+			1,
+			"one typed IRC card survives replay"
+		);
+	}
+
+	#[test]
+	fn launch_completion_replays_copies_and_follows_tool_visibility() {
+		use omp_journal::data::{
+			LaunchCompletion, LaunchDaemonCompletion, LaunchDaemonFault, LaunchDaemonFaultKind,
+			LaunchDaemonStatus,
+		};
+
+		let directory = tempfile::tempdir().expect("temp directory");
+		let path = directory.path().join("launch-completion.oms");
+		let mut session =
+			Session::create(&path, ComponentRegistry::standard()).expect("session creates");
+		session.begin_turn().expect("turn starts");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		let completion = LaunchCompletion {
+			daemons: vec![LaunchDaemonCompletion {
+				name:        Str::new_static("web"),
+				status:      LaunchDaemonStatus::Failed,
+				exit_code:   Some(17),
+				duration_ms: 2_500,
+				fault:       Some(LaunchDaemonFault {
+					kind:    LaunchDaemonFaultKind::Failed,
+					message: Some(Str::new_static("readiness process exited")),
+					signal:  None,
+				}),
+			}],
+		};
+		let data = serde_json::value::to_raw_value(&completion).expect("completion serializes");
+		session
+			.patch(omp_dom::Txn {
+				cause: session.head().expect("journal head"),
+				label: Some(Str::new_static("jobs.settle")),
+				ops:   vec![omp_dom::Op::Ins {
+					parent: turn,
+					after:  session.dom().children(turn).last().copied(),
+					node:   omp_dom::NodeSpec::new(KnownTag::User)
+						.with_prop(
+							PropKey::Custom(Str::new_static("launch_completion")),
+							Value::Bool(true),
+						)
+						.with_prop(PropId::Data, Value::Json(data))
+						.with_content(Str::new_static(
+							"Supervised process web failed with exit code 17.",
+						)),
+				}],
+			})
+			.expect("completion journals");
+
+		let local = Local::default();
+		let visible = projected(&session, &Options { show_tools: true, ..Options::new(&local) });
+		let row = visible
+			.into_iter()
+			.find(|block| block.view.text.contains("Supervised process failed web"))
+			.expect("completion row");
+		assert_eq!(row.view.kind, BlockKind::Notice);
+		assert!(render(row.component, 80).contains("(exit 17) (2.5s)"));
+		let hidden = projected(&session, &Options { show_tools: false, ..Options::new(&local) });
+		assert!(
+			hidden
+				.iter()
+				.all(|block| !block.view.text.contains("Supervised process")),
+			"launch completion follows tool-activity visibility"
+		);
+
+		let copied = crate::overlays::copy::collect_targets(session.dom(), true, true, false);
+		assert_eq!(
+			copied.last().expect("completion copy target").content,
+			"Supervised process web failed with exit code 17."
+		);
+		let hidden_copy = crate::overlays::copy::collect_targets(session.dom(), true, false, false);
+		assert!(hidden_copy.is_empty(), "hidden tool activity is not copied");
+
+		drop(session);
+		let restored = Session::open(&path, ComponentRegistry::standard()).expect("session replays");
+		let replayed = projected(&restored, &Options { show_tools: true, ..Options::new(&local) });
+		assert_eq!(
+			replayed
+				.iter()
+				.filter(|block| block.view.text.contains("Supervised process failed web"))
+				.count(),
+			1,
+			"one compact completion row survives replay"
+		);
 	}
 
 	/// pi `user-message.ts`: `new Markdown(text, 1, 1, …)` on the tinted
@@ -1024,6 +1525,129 @@ mod tests {
 		assert_eq!(block.view.mode, Mode::AppendOnly);
 		assert!(!block.view.finalized);
 		assert_eq!(block.stream.as_deref(), Some("first paragraph\n\nsecond paragraph"));
+	}
+
+	#[test]
+	fn mixed_assistant_parts_preserve_provider_order_and_stream_identity() {
+		let local = Local::default();
+		let options = Options { smooth: false, ..Options::new(&local) };
+		let mut session = empty_session();
+		session.begin_turn().expect("turn");
+		session.user("mix them", Vec::new()).expect("user");
+		session
+			.assistant_start("test/model", "test", "test/model")
+			.expect("assistant");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		let assistant = *session.dom().children(turn).last().expect("assistant");
+
+		let first = insert_assistant_part(&mut session, assistant, 0, "text");
+		let sid = session
+			.stream_open(first, PropId::Text.into())
+			.expect("first text stream");
+		session.stream_append(sid, "before").expect("first text");
+		session.stream_close(sid).expect("first text close");
+		let image_one = insert_artifact(&mut session, assistant, 1, 1);
+		let last = insert_assistant_part(&mut session, assistant, 2, "text");
+		let sid = session
+			.stream_open(last, PropId::Text.into())
+			.expect("last text stream");
+		session.stream_append(sid, "aft").expect("last text prefix");
+
+		let before = projected(&session, &options);
+		let tail = before
+			.iter()
+			.find(|block| block.view.key == block_key(last, BlockKind::Assistant))
+			.expect("streamed tail");
+		assert_eq!(tail.stream.as_deref(), Some("aft"));
+		assert!(!tail.view.finalized);
+		assert_eq!(
+			before
+				.iter()
+				.filter(|block| {
+					matches!(block.view.kind, BlockKind::Assistant | BlockKind::Thinking)
+				})
+				.map(|block| (block.view.key, block.view.text.as_str()))
+				.collect::<Vec<_>>(),
+			[
+				(block_key(first, BlockKind::Assistant), "before"),
+				(
+					block_key(image_one, BlockKind::Assistant),
+					"artifact://sha256/0101010101010101010101010101010101010101010101010101010101010101"
+				),
+				(block_key(last, BlockKind::Assistant), "aft"),
+			]
+		);
+		session.stream_append(sid, "er").expect("last text suffix");
+		let after = projected(&session, &options);
+		let tail = after
+			.iter()
+			.find(|block| block.view.key == block_key(last, BlockKind::Assistant))
+			.expect("same streamed tail");
+		assert_eq!(tail.stream.as_deref(), Some("after"));
+		assert_eq!(
+			tail.view.key,
+			block_key(last, BlockKind::Assistant),
+			"stream updates keep one slot identity"
+		);
+		session.stream_close(sid).expect("last text close");
+
+		let thought_one = insert_assistant_part(&mut session, assistant, 3, "thinking");
+		let sid = session
+			.stream_open(thought_one, PropId::Text.into())
+			.expect("thinking stream");
+		session
+			.stream_append(sid, "first thought")
+			.expect("thinking");
+		session.stream_close(sid).expect("thinking close");
+		let image_two = insert_artifact(&mut session, assistant, 4, 2);
+		let thought_two = insert_assistant_part(&mut session, assistant, 5, "thinking");
+		let sid = session
+			.stream_open(thought_two, PropId::Text.into())
+			.expect("second thinking stream");
+		session
+			.stream_append(sid, "second thought")
+			.expect("thinking");
+		session.stream_close(sid).expect("thinking close");
+		let image_three = insert_artifact(&mut session, assistant, 6, 3);
+		let image_four = insert_artifact(&mut session, assistant, 7, 4);
+
+		let ordered = projected(&session, &options)
+			.into_iter()
+			.filter(|block| matches!(block.view.kind, BlockKind::Assistant | BlockKind::Thinking))
+			.map(|block| (block.view.key, block.view.text))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			ordered
+				.iter()
+				.map(|(key, text)| (*key, text.as_str()))
+				.collect::<Vec<_>>(),
+			[
+				(block_key(first, BlockKind::Assistant), "before"),
+				(
+					block_key(image_one, BlockKind::Assistant),
+					"artifact://sha256/0101010101010101010101010101010101010101010101010101010101010101"
+				),
+				(block_key(last, BlockKind::Assistant), "after"),
+				(block_key(thought_one, BlockKind::Thinking), "first thought"),
+				(
+					block_key(image_two, BlockKind::Assistant),
+					"artifact://sha256/0202020202020202020202020202020202020202020202020202020202020202"
+				),
+				(block_key(thought_two, BlockKind::Thinking), "second thought"),
+				(
+					block_key(image_three, BlockKind::Assistant),
+					"artifact://sha256/0303030303030303030303030303030303030303030303030303030303030303"
+				),
+				(
+					block_key(image_four, BlockKind::Assistant),
+					"artifact://sha256/0404040404040404040404040404040404040404040404040404040404040404"
+				),
+			]
+		);
 	}
 
 	/// pi `#shouldAnimateThinking`: with reasoning hidden, the pulse shows

@@ -8,7 +8,8 @@ use std::fmt::Write as _;
 
 use omp_con::{
 	Ctx, DynamicUiWidget, RegItem, SETTING_TABS, SettingTab, TypeSpec, UiCondition, UiOption,
-	UiSpec, UiValueCodec, UiWidget, Value, ValueKind, VarFlags, builtin_ui_entries,
+	UiRuntimeOptions, UiSpec, UiValueCodec, UiWidget, Value, ValueKind, VarFlags,
+	builtin_ui_entries,
 };
 use omp_core::{Str, StrMut, sf};
 use omp_tui::{
@@ -16,14 +17,19 @@ use omp_tui::{
 	cell_width, components::Tabs, dom,
 };
 
-use super::{Panel, PanelAnchor, PanelCx, PanelEvent};
+use super::{
+	Panel, PanelAnchor, PanelCx, PanelEvent,
+	services::{SettingsChoice, SettingsInventory},
+};
 
-const FOOTER: &str = "↑/↓ navigate · ←/→ tab · Enter change · type to search · Esc close";
-const TEXT_FOOTER: &str = "Enter apply · Esc cancel · Ctrl+U clear";
-const CHOICE_FOOTER: &str = "↑/↓ choose · Enter apply · Esc cancel";
-const MULTI_FOOTER: &str = "↑/↓ choose · Space toggle · ←/→ reorder · Enter apply · Esc cancel";
+const TEXT_FOOTER: &str = "Enter to save · Esc to cancel · Clear field to unset";
+const CHOICE_FOOTER: &str = "Enter to select · Esc to go back";
+const MULTI_FOOTER: &str = "Click/Enter/Space to toggle · Esc to go back";
+const ORDERED_MULTI_FOOTER: &str =
+	"Click to toggle · drag selected items to reorder · ←/→ move · 1-9 place · Esc to go back";
+const PROVIDER_FOOTER: &str = "Enter to edit provider · Esc to go back";
 const EMPTY: &str = "(empty)";
-const CHROME_ROWS: u16 = 10;
+const CHROME_ROWS: u16 = 11;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Choice {
@@ -42,11 +48,23 @@ impl From<&UiOption> for Choice {
 	}
 }
 
+impl From<&SettingsChoice> for Choice {
+	fn from(option: &SettingsChoice) -> Self {
+		Self {
+			value:       option.value.clone(),
+			label:       option.label.clone(),
+			description: option.description.clone(),
+		}
+	}
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RowWidget {
 	Boolean,
 	Enum(Vec<Str>),
 	Submenu(Vec<Choice>),
+	RuntimeSubmenu(UiRuntimeOptions, Vec<Choice>),
+	ProviderLimits,
 	Text { secret: bool },
 	MultiSelect { options: Vec<Choice>, ordered: bool },
 }
@@ -56,6 +74,7 @@ enum RowValue {
 	Boolean(bool),
 	Scalar(Str),
 	Multi(Vec<Str>),
+	ProviderLimits(Vec<(Str, i64)>),
 	Text(Str),
 }
 
@@ -89,18 +108,21 @@ impl SettingRow {
 			(RowWidget::Boolean, RowValue::Boolean(value)) => {
 				Str::new_static(if *value { "On" } else { "Off" })
 			},
-			(RowWidget::Submenu(options), RowValue::Scalar(value)) => options
+			(
+				RowWidget::Submenu(options) | RowWidget::RuntimeSubmenu(_, options),
+				RowValue::Scalar(value),
+			) => options
 				.iter()
 				.find(|option| option.value == *value)
 				.map_or_else(|| value.clone(), |option| option.label.clone()),
-			(RowWidget::MultiSelect { options, .. }, RowValue::Multi(values)) => {
+			(RowWidget::MultiSelect { options, ordered }, RowValue::Multi(values)) => {
 				if values.is_empty() {
-					return Str::new_static(EMPTY);
+					return Str::new_static(if *ordered { "default" } else { "none" });
 				}
 				let mut text = StrMut::new("");
 				for (index, value) in values.iter().enumerate() {
 					if index > 0 {
-						text.push_str(", ");
+						text.push_str(if *ordered { " → " } else { ", " });
 					}
 					let label = options
 						.iter()
@@ -109,6 +131,26 @@ impl SettingRow {
 					text.push_str(label);
 				}
 				text.freeze()
+			},
+			(RowWidget::ProviderLimits, RowValue::ProviderLimits(limits)) => {
+				if limits.is_empty() {
+					return Str::new_static("Unlimited");
+				}
+				let mut text = StrMut::new("");
+				for (index, (provider, limit)) in limits.iter().enumerate() {
+					if index > 0 {
+						text.push_str(", ");
+					}
+					let _ = write!(text, "{provider}: {limit}");
+				}
+				text.freeze()
+			},
+			(RowWidget::Text { secret: true }, RowValue::Text(value)) => {
+				Str::new_static(if value.is_empty() {
+					EMPTY
+				} else {
+					"••••••••"
+				})
 			},
 			(_, RowValue::Scalar(value) | RowValue::Text(value)) if value.is_empty() => {
 				Str::new_static(EMPTY)
@@ -123,21 +165,28 @@ impl SettingRow {
 			RowValue::Text(value) | RowValue::Scalar(value) => value.to_string(),
 			RowValue::Boolean(value) => value.to_string(),
 			RowValue::Multi(values) => values.iter().map(Str::as_str).collect::<Vec<_>>().join(" "),
+			RowValue::ProviderLimits(_) => String::new(),
 		}
 	}
 }
 
-fn static_widget(widget: UiWidget) -> RowWidget {
+fn static_widget(widget: UiWidget) -> Option<RowWidget> {
 	match widget {
-		UiWidget::Boolean => RowWidget::Boolean,
+		UiWidget::Boolean => Some(RowWidget::Boolean),
 		UiWidget::Enum(values) => {
-			RowWidget::Enum(values.iter().copied().map(Str::new_static).collect())
+			Some(RowWidget::Enum(values.iter().copied().map(Str::new_static).collect()))
 		},
-		UiWidget::Submenu(options) => RowWidget::Submenu(options.iter().map(Choice::from).collect()),
-		UiWidget::Text { secret } => RowWidget::Text { secret },
-		UiWidget::MultiSelect { options, ordered } => {
-			RowWidget::MultiSelect { options: options.iter().map(Choice::from).collect(), ordered }
+		UiWidget::Submenu(options) => {
+			Some(RowWidget::Submenu(options.iter().map(Choice::from).collect()))
 		},
+		UiWidget::RuntimeSubmenu(source) => Some(RowWidget::RuntimeSubmenu(source, Vec::new())),
+		UiWidget::ProviderLimits => Some(RowWidget::ProviderLimits),
+		UiWidget::ConfigOnly => None,
+		UiWidget::Text { secret } => Some(RowWidget::Text { secret }),
+		UiWidget::MultiSelect { options, ordered } => Some(RowWidget::MultiSelect {
+			options: options.iter().map(Choice::from).collect(),
+			ordered,
+		}),
 	}
 }
 
@@ -225,6 +274,32 @@ fn project_value(codec: UiValueCodec, widget: &RowWidget, value: &Value) -> RowV
 			let fraction = value.as_float().unwrap_or(0.0);
 			RowValue::Scalar(decimal(fraction * 100.0))
 		},
+		UiValueCodec::DefaultMinusOne => RowValue::Scalar(if value.as_int() == Some(-1) {
+			Str::new_static("default")
+		} else {
+			Str::new(value.to_string())
+		}),
+		UiValueCodec::OnlineTinyModel => RowValue::Scalar(value.as_str().map_or_else(
+			|| Str::new(value.to_string()),
+			|value| {
+				if value == "@tiny" {
+					Str::new_static("online")
+				} else {
+					Str::new(value)
+				}
+			},
+		)),
+		UiValueCodec::EditModeRevision => RowValue::Scalar(value.as_str().map_or_else(
+			|| Str::new(value.to_string()),
+			|value| match value {
+				"" | "hl.1" => Str::new_static("hashline"),
+				"rep.2" => Str::new_static("replace"),
+				"patch.2" => Str::new_static("patch"),
+				"apply_patch.1" => Str::new_static("apply_patch"),
+				"sloppy.1" => Str::new_static("sloppy"),
+				value => Str::new(value),
+			},
+		)),
 		UiValueCodec::SecondsDuration => RowValue::Scalar(span_units(value, false)),
 		UiValueCodec::MillisecondsDuration => RowValue::Scalar(span_units(value, true)),
 		UiValueCodec::Identity => match (widget, value) {
@@ -235,6 +310,19 @@ fn project_value(codec: UiValueCodec, widget: &RowWidget, value: &Value) -> RowV
 					.filter_map(|value| value.as_str().map(Str::new))
 					.collect(),
 			),
+			(RowWidget::ProviderLimits, Value::Kv(values)) => {
+				let mut limits = values
+					.iter()
+					.filter_map(|(provider, value)| {
+						value
+							.as_int()
+							.filter(|limit| *limit > 0)
+							.map(|limit| (provider.clone(), limit))
+					})
+					.collect::<Vec<_>>();
+				limits.sort_by(|left, right| left.0.cmp(&right.0));
+				RowValue::ProviderLimits(limits)
+			},
 			(RowWidget::Text { .. }, Value::Str(value)) => RowValue::Text(value.clone()),
 			(RowWidget::Text { .. }, value) => RowValue::Text(Str::new(value.to_string())),
 			(_, value) => RowValue::Scalar(
@@ -253,7 +341,7 @@ fn static_row(con: &Ctx, ui: &UiSpec) -> Option<SettingRow> {
 	if !spec.flags.contains(VarFlags::ARCHIVE) {
 		return None;
 	}
-	let widget = static_widget(ui.widget);
+	let widget = static_widget(ui.widget)?;
 	let value = con.get(spec.name).unwrap_or_else(|| (spec.default)());
 	let default = (spec.default)();
 	Some(SettingRow {
@@ -321,17 +409,31 @@ fn condition_visible(condition: UiCondition, rows: &[SettingRow], fallback: bool
 					Some(Str::new_static(if *value { "true" } else { "false" }))
 				},
 				RowValue::Scalar(value) | RowValue::Text(value) => Some(value.clone()),
-				RowValue::Multi(_) => None,
+				RowValue::Multi(_) | RowValue::ProviderLimits(_) => None,
 			})
 	};
 	match condition {
-		UiCondition::UsageAwareFallbackEnabled => scalar("ai_retry_usage_aware_fallback")
-			.is_some_and(|value| matches!(value.as_str(), "true" | "on")),
+		UiCondition::MacOs => cfg!(target_os = "macos"),
+		UiCondition::HasImageProtocol => fallback,
+		UiCondition::AdvisorEnabled => {
+			scalar("ai_advisor_enabled").is_some_and(|value| matches!(value.as_str(), "true" | "on"))
+		},
+		UiCondition::HindsightActive => {
+			scalar("ai_memory_backend").is_some_and(|value| value == "hindsight")
+		},
 		UiCondition::MnemopiActive => {
 			scalar("ai_memory_backend").is_some_and(|value| value == "mnemopi")
 		},
+		UiCondition::AutolearnActive => {
+			scalar("ai_autolearn_enabled").is_some_and(|value| matches!(value.as_str(), "true" | "on"))
+		},
 		UiCondition::AutoThinkingActive => {
 			scalar("ai_default_thinking").is_some_and(|value| value == "auto")
+		},
+		UiCondition::UsageAwareFallbackEnabled => scalar("ai_retry_usage_aware_fallback")
+			.is_some_and(|value| matches!(value.as_str(), "true" | "on")),
+		UiCondition::PlanModeEnabled => {
+			scalar("ai_plan_enabled").is_some_and(|value| matches!(value.as_str(), "true" | "on"))
 		},
 		UiCondition::UnexpectedStopSmart => {
 			scalar("ai_features_unexpected_stop_detection").map_or(fallback, |value| value == "smart")
@@ -342,7 +444,6 @@ fn condition_visible(condition: UiCondition, rows: &[SettingRow], fallback: bool
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Item {
 	TabHeader(SettingTab),
-	GroupHeader { tab: SettingTab, group: Str },
 	Row(usize),
 }
 
@@ -351,22 +452,30 @@ enum Editor {
 	Text(String),
 	Submenu { cursor: usize },
 	Multi { cursor: usize, selected: Vec<Str>, ordered: bool },
+	ProviderList { cursor: usize },
+	ProviderValue { provider: Str, buffer: String },
 }
 
 /// Retained curated settings selector.
 pub struct SettingsPanel {
-	rows:      Vec<SettingRow>,
-	tab:       usize,
-	query:     String,
-	items:     Vec<Item>,
-	selected:  usize,
-	scroll:    usize,
-	list_rows: usize,
-	editor:    Option<Editor>,
-	ui:        Ui,
-	ctx:       UiContext,
-	width:     u16,
-	height:    u16,
+	rows:               Vec<SettingRow>,
+	tab:                usize,
+	pre_search_tab:     usize,
+	query:              String,
+	query_cursor:       usize,
+	items:              Vec<Item>,
+	selected:           usize,
+	scroll:             usize,
+	list_rows:          usize,
+	section_focus:      bool,
+	section_cursor:     usize,
+	editor:             Option<Editor>,
+	providers:          Vec<Str>,
+	has_image_protocol: bool,
+	ui:                 Ui,
+	ctx:                UiContext,
+	width:              u16,
+	height:             u16,
 }
 
 impl SettingsPanel {
@@ -376,20 +485,106 @@ impl SettingsPanel {
 		if rows.is_empty() {
 			return Err(Str::new_static("No curated settings are registered"));
 		}
-		Ok(Self::from_rows(rows, cx.ui))
+		let inventory = cx.services.settings_inventory().unwrap_or_default();
+		Ok(Self::from_rows_with_inventory(rows, inventory, cx.ui))
+	}
+
+	#[cfg(test)]
+	#[must_use]
+	fn from_rows(rows: Vec<SettingRow>, ctx: &UiContext) -> Self {
+		Self::from_rows_with_inventory(rows, SettingsInventory::default(), ctx)
 	}
 
 	#[must_use]
-	fn from_rows(rows: Vec<SettingRow>, ctx: &UiContext) -> Self {
+	fn from_rows_with_inventory(
+		mut rows: Vec<SettingRow>,
+		inventory: SettingsInventory,
+		ctx: &UiContext,
+	) -> Self {
+		const COMPOSER_SHAPES: &[UiOption] = &[
+			UiOption::new(
+				"band",
+				"Status Band (Default)",
+				"Flush soft-capped status band above a curved prompt, no frame",
+			),
+			UiOption::new(
+				"box",
+				"Rounded Box",
+				"Status line embedded in top border, compact 2-line prompt",
+			),
+			UiOption::new(
+				"claude",
+				"Claude Code",
+				"Full-width horizontal rules above and below, status line at bottom",
+			),
+			UiOption::new("pi", "Pi", "Framed horizontal rules with status line at bottom"),
+			UiOption::new(
+				"borderless",
+				"Borderless",
+				"Clean prompt glyph with status line at bottom, no box borders",
+			),
+			UiOption::new(
+				"rule",
+				"Top Rule Dock",
+				"Single top rule with status docked onto it and below",
+			),
+			UiOption::new("field", "Compact Field", "Filled one-row field with accent end caps"),
+			UiOption::new(
+				"rail",
+				"Accent Rail",
+				"Filled one-row field anchored by a single accent rail",
+			),
+		];
+		for row in &mut rows {
+			let RowWidget::RuntimeSubmenu(source, options) = &mut row.widget else {
+				continue;
+			};
+			let runtime = match source {
+				UiRuntimeOptions::Themes => &inventory.themes,
+				UiRuntimeOptions::ComposerShapes => &inventory.composer_shapes,
+				UiRuntimeOptions::ThinkingLevels => &inventory.thinking_levels,
+			};
+			options.extend(runtime.iter().map(Choice::from));
+			if *source == UiRuntimeOptions::ComposerShapes {
+				for option in COMPOSER_SHAPES {
+					if !options
+						.iter()
+						.any(|candidate| candidate.value == option.value)
+					{
+						options.push(Choice::from(option));
+					}
+				}
+			}
+			if *source != UiRuntimeOptions::ThinkingLevels {
+				for value in [&row.value, &row.default] {
+					let RowValue::Scalar(value) = value else {
+						continue;
+					};
+					if !value.is_empty() && !options.iter().any(|option| option.value == *value) {
+						options.push(Choice {
+							value:       value.clone(),
+							label:       value.clone(),
+							description: Str::default(),
+						});
+					}
+				}
+			}
+		}
 		let mut panel = Self {
 			rows,
 			tab: 0,
+			pre_search_tab: 0,
 			query: String::new(),
+			query_cursor: 0,
 			items: Vec::new(),
 			selected: 0,
 			scroll: 0,
 			list_rows: 10,
+			section_focus: false,
+			section_cursor: 0,
 			editor: None,
+			providers: inventory.providers,
+			has_image_protocol: !matches!(ctx.graphics, omp_tui::Graphics::Cells),
 			ui: Ui::from_root(dom! { <col/> }, 80, ctx.clone()),
 			ctx: ctx.clone(),
 			width: 80,
@@ -407,54 +602,118 @@ impl SettingsPanel {
 	fn selected(&self) -> Option<&SettingRow> {
 		match self.items.get(self.selected)? {
 			Item::Row(index) => self.rows.get(*index),
-			Item::TabHeader(_) | Item::GroupHeader { .. } => None,
+			Item::TabHeader(_) => None,
+		}
+	}
+
+	fn visible_groups(&self) -> Vec<&'static str> {
+		SETTING_TABS[self.tab]
+			.groups
+			.iter()
+			.copied()
+			.filter(|group| !self.matching_indices(self.tab(), group).is_empty())
+			.collect()
+	}
+
+	fn sync_section_to_selection(&mut self) {
+		let Some(group) = self.selected().map(|row| row.group.clone()) else {
+			return;
+		};
+		self.section_cursor = self
+			.visible_groups()
+			.iter()
+			.position(|candidate| *candidate == group.as_str())
+			.unwrap_or(0);
+	}
+
+	fn move_section(&mut self, delta: isize) {
+		let groups = self.visible_groups();
+		if groups.is_empty() {
+			return;
+		}
+		self.section_cursor =
+			(self.section_cursor as isize + delta.signum()).rem_euclid(groups.len() as isize) as usize;
+		let group = groups[self.section_cursor];
+		if let Some(index) = self
+			.items
+			.iter()
+			.position(|item| matches!(item, Item::Row(row) if self.rows[*row].group == group))
+		{
+			self.selected = index;
+			self.clamp_scroll();
 		}
 	}
 
 	fn row_visible(&self, row: &SettingRow) -> bool {
-		row.condition
-			.is_none_or(|condition| condition_visible(condition, &self.rows, row.condition_met))
+		row.condition.is_none_or(|condition| {
+			if condition == UiCondition::HasImageProtocol {
+				self.has_image_protocol
+			} else {
+				condition_visible(condition, &self.rows, row.condition_met)
+			}
+		})
 	}
 
 	fn matching_indices(&self, tab: SettingTab, group: &str) -> Vec<usize> {
-		let query = self.query.to_ascii_lowercase();
 		self
 			.rows
 			.iter()
 			.enumerate()
 			.filter(|(_, row)| row.tab == tab && row.group == group && self.row_visible(row))
-			.filter(|(_, row)| {
-				query.is_empty()
-					|| row.label.to_ascii_lowercase().contains(query.as_str())
-					|| row
-						.description
-						.to_ascii_lowercase()
-						.contains(query.as_str())
-			})
 			.map(|(index, _)| index)
 			.collect()
+	}
+
+	fn search_matches(&self, tab: SettingTab) -> Vec<(i32, usize)> {
+		let mut matched = self
+			.rows
+			.iter()
+			.enumerate()
+			.filter(|(_, row)| row.tab == tab && self.row_visible(row))
+			.filter_map(|(index, row)| {
+				let mut text = StrMut::new(row.label.as_str());
+				text.push(' ');
+				text.push_str(&row.display());
+				text.push(' ');
+				text.push_str(&row.description);
+				if let Some(warning) = &row.warning {
+					text.push(' ');
+					text.push_str(warning);
+				}
+				omp_tui::fuzzy::fuzzy_match(&self.query, text.as_str()).map(|score| (score, index))
+			})
+			.collect::<Vec<_>>();
+		matched.sort_by_key(|(score, index)| (*score, *index));
+		matched
 	}
 
 	fn reflow_items(&mut self) {
 		self.items.clear();
 		let searching = !self.query.is_empty();
-		for tab in SETTING_TABS {
-			if !searching && tab.tab != self.tab() {
-				continue;
+		if searching {
+			let mut tabs = SETTING_TABS
+				.iter()
+				.enumerate()
+				.filter_map(|(order, tab)| {
+					let matched = self.search_matches(tab.tab);
+					let score = matched.first().map(|(score, _)| *score)?;
+					Some((score, order, tab.tab, matched))
+				})
+				.collect::<Vec<_>>();
+			tabs.sort_by_key(|(score, order, ..)| (*score, *order));
+			for (_, _, tab, matched) in tabs {
+				self.items.push(Item::TabHeader(tab));
+				self
+					.items
+					.extend(matched.into_iter().map(|(_, index)| Item::Row(index)));
 			}
-			let mut tab_added = false;
+		} else {
+			let tab = SETTING_TABS[self.tab];
 			for group in tab.groups {
 				let indices = self.matching_indices(tab.tab, group);
 				if indices.is_empty() {
 					continue;
 				}
-				if searching && !tab_added {
-					self.items.push(Item::TabHeader(tab.tab));
-					tab_added = true;
-				}
-				self
-					.items
-					.push(Item::GroupHeader { tab: tab.tab, group: Str::new_static(group) });
 				self.items.extend(indices.into_iter().map(Item::Row));
 			}
 		}
@@ -466,6 +725,7 @@ impl SettingsPanel {
 		self.scroll = 0;
 		self.clamp_scroll();
 		self.sync_tab_to_selection();
+		self.sync_section_to_selection();
 	}
 
 	fn clamp_scroll(&mut self) {
@@ -508,21 +768,40 @@ impl SettingsPanel {
 	}
 
 	fn switch_tab(&mut self, delta: isize) {
-		let len = SETTING_TABS.len() as isize;
-		self.tab = ((self.tab as isize + delta).rem_euclid(len)) as usize;
 		if self.query.is_empty() {
+			let len = SETTING_TABS.len() as isize;
+			self.tab = ((self.tab as isize + delta).rem_euclid(len)) as usize;
+			self.section_focus = false;
 			self.reflow_items();
-		} else if let Some(index) = self
+			return;
+		}
+		let headers = self
 			.items
 			.iter()
-			.position(|item| matches!(item, Item::TabHeader(tab) if *tab == self.tab()))
-		{
-			self.selected = self.items[index + 1..]
-				.iter()
-				.position(|item| matches!(item, Item::Row(_)))
-				.map_or(index, |offset| index + 1 + offset);
-			self.clamp_scroll();
+			.enumerate()
+			.filter_map(|(index, item)| match item {
+				Item::TabHeader(tab) => Some((index, *tab)),
+				Item::Row(_) => None,
+			})
+			.collect::<Vec<_>>();
+		if headers.is_empty() {
+			return;
 		}
+		let current = headers
+			.iter()
+			.position(|(_, tab)| *tab == self.tab())
+			.unwrap_or(0);
+		let next = (current as isize + delta.signum()).rem_euclid(headers.len() as isize) as usize;
+		let (index, tab) = headers[next];
+		self.tab = SETTING_TABS
+			.iter()
+			.position(|candidate| candidate.tab == tab)
+			.unwrap_or(self.tab);
+		self.selected = self.items[index + 1..]
+			.iter()
+			.position(|item| matches!(item, Item::Row(_)))
+			.map_or(index, |offset| index + 1 + offset);
+		self.clamp_scroll();
 	}
 
 	fn sync_tab_to_selection(&mut self) {
@@ -551,16 +830,27 @@ impl SettingsPanel {
 		let Some(label) = values.get("settings-tabs").and_then(|value| value.as_str()) else {
 			return;
 		};
-		if let Some(index) = SETTING_TABS.iter().position(|tab| tab.label == label) {
+		if let Some(index) = SETTING_TABS
+			.iter()
+			.position(|tab| label == tab.label || label.starts_with(&format!("{} (", tab.label)))
+		{
 			self.select_tab(index);
 		}
 	}
 
-	fn end_search(&mut self) {
-		let keep = self
-			.selected()
-			.map(|row| row.pi_path.clone().unwrap_or_else(|| row.convar.clone()));
+	fn end_search(&mut self, jump_to_selection: bool) {
+		let keep = jump_to_selection
+			.then(|| {
+				self
+					.selected()
+					.map(|row| row.pi_path.clone().unwrap_or_else(|| row.convar.clone()))
+			})
+			.flatten();
+		if !jump_to_selection {
+			self.tab = self.pre_search_tab;
+		}
 		self.query.clear();
+		self.query_cursor = 0;
 		self.reflow_items();
 		if let Some(keep) = keep
 			&& let Some(index) = self.items.iter().position(|item| matches!(item, Item::Row(row) if self.rows[*row].pi_path.as_ref().unwrap_or(&self.rows[*row].convar) == &keep))
@@ -595,7 +885,7 @@ impl SettingsPanel {
 					.map_or(0, |at| (at + 1) % values.len());
 				self.commit(index, RowValue::Scalar(values[next].clone()))
 			},
-			RowWidget::Submenu(options) => {
+			RowWidget::Submenu(options) | RowWidget::RuntimeSubmenu(_, options) => {
 				let current = match &self.rows[index].value {
 					RowValue::Scalar(value) => value,
 					_ => return PanelEvent::Consumed,
@@ -608,14 +898,36 @@ impl SettingsPanel {
 				self.rebuild();
 				PanelEvent::Consumed
 			},
+			RowWidget::ProviderLimits => {
+				if let RowValue::ProviderLimits(limits) = &self.rows[index].value {
+					for (provider, _) in limits {
+						if !self.providers.contains(provider) {
+							self.providers.push(provider.clone());
+						}
+					}
+				}
+				self.providers.sort();
+				self.providers.dedup();
+				self.editor = Some(Editor::ProviderList { cursor: 0 });
+				self.rebuild();
+				PanelEvent::Consumed
+			},
 			RowWidget::Text { .. } => {
 				self.editor = Some(Editor::Text(self.rows[index].editable()));
 				self.rebuild();
 				PanelEvent::Consumed
 			},
-			RowWidget::MultiSelect { ordered, .. } => {
+			RowWidget::MultiSelect { options, ordered } => {
 				let selected = match &self.rows[index].value {
-					RowValue::Multi(value) => value.clone(),
+					RowValue::Multi(value) => value
+						.iter()
+						.filter(|selected| {
+							options
+								.iter()
+								.any(|option| option.value.as_str() == selected.as_str())
+						})
+						.cloned()
+						.collect(),
 					_ => Vec::new(),
 				};
 				self.editor = Some(Editor::Multi { cursor: 0, selected, ordered: *ordered });
@@ -649,6 +961,24 @@ impl SettingsPanel {
 					.map(|value| decimal(value / 100.0))
 					.map_err(|_| Str::new_static("Invalid percent value"))
 			},
+			(UiValueCodec::DefaultMinusOne, RowValue::Scalar(value)) => Ok(if value == "default" {
+				Str::new_static("-1")
+			} else {
+				value.clone()
+			}),
+			(UiValueCodec::OnlineTinyModel, RowValue::Scalar(value)) => Ok(if value == "online" {
+				Str::new_static("@tiny")
+			} else {
+				value.clone()
+			}),
+			(UiValueCodec::EditModeRevision, RowValue::Scalar(value)) => match value.as_str() {
+				"apply_patch" => Ok(Str::new_static("apply_patch.1")),
+				"hashline" => Ok(Str::new_static("hl.1")),
+				"patch" => Ok(Str::new_static("patch.2")),
+				"replace" => Ok(Str::new_static("rep.2")),
+				"sloppy" => Ok(Str::new_static("sloppy.1")),
+				_ => Err(Str::new_static("Unknown edit mode")),
+			},
 			(UiValueCodec::SecondsDuration, RowValue::Scalar(value)) => Ok(if value == "0" {
 				Str::new_static("never")
 			} else {
@@ -678,6 +1008,15 @@ impl SettingsPanel {
 				text.push(']');
 				Ok(text.freeze())
 			},
+			(UiValueCodec::Identity, RowValue::ProviderLimits(limits)) => {
+				let value = Value::Kv(omp_con::Kv(
+					limits
+						.iter()
+						.map(|(provider, limit)| (provider.clone(), Value::Int(*limit)))
+						.collect(),
+				));
+				Ok(Str::new(value.to_string()))
+			},
 			_ => Err(Str::new_static("Setting value does not match its UI control")),
 		}
 	}
@@ -696,7 +1035,51 @@ impl SettingsPanel {
 		self.editor = None;
 		self.reflow_items();
 		self.rebuild();
-		PanelEvent::Run(sf!("{} {command}; writecfg", self.rows[index].convar))
+		let convar = self.rows[index].convar.clone();
+		PanelEvent::RunSetting { convar: convar.clone(), line: sf!("{convar} {command}; writecfg") }
+	}
+
+	fn commit_live(&mut self, index: usize, value: RowValue) -> PanelEvent {
+		if self.rows[index].value == value {
+			return PanelEvent::Consumed;
+		}
+		let command = match Self::command_value(&self.rows[index], &value) {
+			Ok(command) => command,
+			Err(error) => return PanelEvent::Notice(error),
+		};
+		self.rows[index].value = value;
+		self.rebuild();
+		let convar = self.rows[index].convar.clone();
+		PanelEvent::RunSetting { convar: convar.clone(), line: sf!("{convar} {command}; writecfg") }
+	}
+
+	fn previewable(row: &SettingRow) -> bool {
+		matches!(
+			row.pi_path.as_deref(),
+			Some(
+				"theme.dark"
+					| "theme.light"
+					| "composer.shape"
+					| "statusLine.preset"
+					| "statusLine.separator"
+					| "statusLine.contextLine"
+			)
+		)
+	}
+
+	fn preview_event(&self, index: usize, cursor: usize) -> PanelEvent {
+		let row = &self.rows[index];
+		let (RowWidget::Submenu(options) | RowWidget::RuntimeSubmenu(_, options)) = &row.widget
+		else {
+			return PanelEvent::Consumed;
+		};
+		if !Self::previewable(row) || options.is_empty() {
+			return PanelEvent::Consumed;
+		}
+		PanelEvent::PreviewSetting {
+			convar: row.convar.clone(),
+			value:  options[cursor.min(options.len() - 1)].value.clone(),
+		}
 	}
 
 	fn editor_key(&mut self, key: Key) -> PanelEvent {
@@ -743,24 +1126,34 @@ impl SettingsPanel {
 				_ => PanelEvent::Consumed,
 			},
 			Some(Editor::Submenu { cursor }) => {
-				let RowWidget::Submenu(options) = &self.rows[index].widget else {
+				let (RowWidget::Submenu(options) | RowWidget::RuntimeSubmenu(_, options)) =
+					&self.rows[index].widget
+				else {
 					return PanelEvent::Consumed;
 				};
 				match key {
 					Key::Esc => {
+						let previewed = Self::previewable(&self.rows[index]);
+						let convar = self.rows[index].convar.clone();
 						self.editor = None;
 						self.rebuild();
-						PanelEvent::Consumed
+						if previewed {
+							PanelEvent::CancelSettingPreview { convar }
+						} else {
+							PanelEvent::Consumed
+						}
 					},
 					Key::Up => {
 						*cursor = cursor.saturating_sub(1);
+						let cursor = *cursor;
 						self.rebuild();
-						PanelEvent::Consumed
+						self.preview_event(index, cursor)
 					},
 					Key::Down => {
 						*cursor = (*cursor + 1).min(options.len().saturating_sub(1));
+						let cursor = *cursor;
 						self.rebuild();
-						PanelEvent::Consumed
+						self.preview_event(index, cursor)
 					},
 					Key::Enter if !options.is_empty() => {
 						let value = options[*cursor].value.clone();
@@ -790,15 +1183,15 @@ impl SettingsPanel {
 						self.rebuild();
 						PanelEvent::Consumed
 					},
-					Key::Space if !options.is_empty() => {
+					Key::Space | Key::Enter if !options.is_empty() => {
 						let value = &options[*cursor].value;
 						if let Some(at) = selected.iter().position(|item| item == value) {
 							selected.remove(at);
 						} else {
 							selected.push(value.clone());
 						}
-						self.rebuild();
-						PanelEvent::Consumed
+						let value = RowValue::Multi(selected.clone());
+						self.commit_live(index, value)
 					},
 					Key::Left | Key::Right if *ordered && !options.is_empty() => {
 						let value = &options[*cursor].value;
@@ -810,19 +1203,230 @@ impl SettingsPanel {
 							};
 							selected.swap(at, next);
 						}
-						self.rebuild();
-						PanelEvent::Consumed
+						let value = RowValue::Multi(selected.clone());
+						self.commit_live(index, value)
 					},
-					Key::Enter => {
-						let value = selected.clone();
-						self.editor = None;
-						self.commit(index, RowValue::Multi(value))
+					Key::Char(character @ '1'..='9') if *ordered && !options.is_empty() => {
+						let value = options[*cursor].value.clone();
+						selected.retain(|item| item != &value);
+						let position = character.to_digit(10).unwrap_or(1) as usize;
+						selected.insert(position.saturating_sub(1).min(selected.len()), value);
+						let value = RowValue::Multi(selected.clone());
+						self.commit_live(index, value)
 					},
 					_ => PanelEvent::Consumed,
 				}
 			},
+			Some(Editor::ProviderList { cursor }) => {
+				let limits = match &self.rows[index].value {
+					RowValue::ProviderLimits(limits) => limits,
+					_ => return PanelEvent::Consumed,
+				};
+				let clear = !limits.is_empty();
+				let choices = self.providers.len() + usize::from(clear);
+				match key {
+					Key::Esc => {
+						self.editor = None;
+						self.rebuild();
+						PanelEvent::Consumed
+					},
+					Key::Up => {
+						*cursor = cursor.saturating_sub(1);
+						self.rebuild();
+						PanelEvent::Consumed
+					},
+					Key::Down => {
+						*cursor = (*cursor + 1).min(choices.saturating_sub(1));
+						self.rebuild();
+						PanelEvent::Consumed
+					},
+					Key::Enter if clear && *cursor == self.providers.len() => {
+						*cursor = 0;
+						self.commit_live(index, RowValue::ProviderLimits(Vec::new()))
+					},
+					Key::Enter if *cursor < self.providers.len() => {
+						let provider = self.providers[*cursor].clone();
+						let buffer = limits
+							.iter()
+							.find(|(name, _)| *name == provider)
+							.map(|(_, limit)| limit.to_string())
+							.unwrap_or_default();
+						self.editor = Some(Editor::ProviderValue { provider, buffer });
+						self.rebuild();
+						PanelEvent::Consumed
+					},
+					_ => PanelEvent::Consumed,
+				}
+			},
+			Some(Editor::ProviderValue { provider, buffer }) => match key {
+				Key::Esc => {
+					self.editor = Some(Editor::ProviderList { cursor: 0 });
+					self.rebuild();
+					PanelEvent::Consumed
+				},
+				Key::Enter => {
+					let trimmed = buffer.trim();
+					let parsed = if trimmed.is_empty() {
+						None
+					} else {
+						match trimmed.parse::<f64>() {
+							Ok(limit) if limit.is_finite() && limit > 0.0 => {
+								Some((limit.floor() as i64).max(1))
+							},
+							_ => {
+								return PanelEvent::Notice(Str::new_static(
+									"Limit must be a positive number.",
+								));
+							},
+						}
+					};
+					let provider = provider.clone();
+					let mut limits = match &self.rows[index].value {
+						RowValue::ProviderLimits(limits) => limits.clone(),
+						_ => Vec::new(),
+					};
+					limits.retain(|(name, _)| *name != provider);
+					if let Some(limit) = parsed {
+						limits.push((provider, limit));
+						limits.sort_by(|left, right| left.0.cmp(&right.0));
+					}
+					self.editor = Some(Editor::ProviderList { cursor: 0 });
+					self.commit_live(index, RowValue::ProviderLimits(limits))
+				},
+				Key::Backspace => {
+					buffer.pop();
+					self.rebuild();
+					PanelEvent::Consumed
+				},
+				Key::Ctrl('u') => {
+					buffer.clear();
+					self.rebuild();
+					PanelEvent::Consumed
+				},
+				Key::Char(character) if character.is_ascii_digit() || character == '.' => {
+					buffer.push(character);
+					self.rebuild();
+					PanelEvent::Consumed
+				},
+				_ => PanelEvent::Consumed,
+			},
 			None => PanelEvent::Consumed,
 		}
+	}
+
+	fn insert_query(&mut self, text: &str) {
+		if self.query.is_empty() {
+			self.pre_search_tab = self.tab;
+		}
+		self.query.insert_str(self.query_cursor, text);
+		self.query_cursor += text.len();
+		self.reflow_items();
+	}
+
+	fn query_left(&mut self) {
+		if self.query_cursor == 0 {
+			return;
+		}
+		self.query_cursor = self.query[..self.query_cursor]
+			.char_indices()
+			.next_back()
+			.map_or(0, |(index, _)| index);
+	}
+
+	fn query_right(&mut self) {
+		if self.query_cursor >= self.query.len() {
+			return;
+		}
+		self.query_cursor += self.query[self.query_cursor..]
+			.chars()
+			.next()
+			.map_or(0, char::len_utf8);
+	}
+
+	fn query_backspace(&mut self) {
+		if self.query_cursor == 0 {
+			return;
+		}
+		let previous = self.query[..self.query_cursor]
+			.char_indices()
+			.next_back()
+			.map_or(0, |(index, _)| index);
+		self.query.drain(previous..self.query_cursor);
+		self.query_cursor = previous;
+		if self.query.is_empty() {
+			self.end_search(false);
+		} else {
+			self.reflow_items();
+		}
+	}
+
+	fn query_word_backspace(&mut self) {
+		if self.query_cursor == 0 {
+			return;
+		}
+		let before = &self.query[..self.query_cursor];
+		let trimmed = before.trim_end_matches(char::is_whitespace);
+		let start = trimmed
+			.char_indices()
+			.rev()
+			.find(|(_, character)| character.is_whitespace())
+			.map_or(0, |(index, character)| index + character.len_utf8());
+		self.query.drain(start..self.query_cursor);
+		self.query_cursor = start;
+		if self.query.is_empty() {
+			self.end_search(false);
+		} else {
+			self.reflow_items();
+		}
+	}
+
+	fn tab_strip(&self) -> (Tabs, u16) {
+		let mut ordered = if self.query.is_empty() {
+			SETTING_TABS
+				.iter()
+				.map(|tab| (tab.tab, tab.label.to_owned()))
+				.collect::<Vec<_>>()
+		} else {
+			let mut matched = SETTING_TABS
+				.iter()
+				.enumerate()
+				.filter_map(|(order, tab)| {
+					let rows = self.search_matches(tab.tab);
+					rows.first().map(|(score, _)| {
+						(*score, order, tab.tab, format!("{} ({})", tab.label, rows.len()))
+					})
+				})
+				.collect::<Vec<_>>();
+			matched.sort_by_key(|(score, order, ..)| (*score, *order));
+			let matched_tabs = matched
+				.iter()
+				.map(|(_, _, tab, _)| *tab)
+				.collect::<Vec<_>>();
+			let mut ordered = matched
+				.into_iter()
+				.map(|(_, _, tab, label)| (tab, label))
+				.collect::<Vec<_>>();
+			ordered.extend(
+				SETTING_TABS
+					.iter()
+					.filter(|tab| !matched_tabs.contains(&tab.tab))
+					.map(|tab| (tab.tab, tab.label.to_owned())),
+			);
+			ordered
+		};
+		let selected = ordered
+			.iter()
+			.position(|(tab, _)| *tab == self.tab())
+			.unwrap_or(0) as u16;
+		let mut tabs = Tabs::new().with_str(Prop::Id, "settings-tabs");
+		for (tab, label) in ordered.drain(..) {
+			let icon = SETTING_TABS
+				.iter()
+				.find(|spec| spec.tab == tab)
+				.map_or("tab.appearance", |spec| spec.icon);
+			tabs = tabs.pane_icon(icon, label, dom! { <col/> });
+		}
+		(tabs, selected)
 	}
 
 	fn rebuild(&mut self) {
@@ -849,7 +1453,7 @@ impl SettingsPanel {
 			.enumerate()
 			.skip(self.scroll)
 			.take(self.list_rows)
-			.map(|(index, item)| self.list_row(item, index == self.selected, label_width))
+			.map(|(index, item)| self.list_row(item, index, index == self.selected, label_width))
 			.collect::<Vec<_>>();
 		let empty = self.items.is_empty();
 		let shown = list.len() + usize::from(empty);
@@ -858,32 +1462,91 @@ impl SettingsPanel {
 				.take(self.list_rows.saturating_sub(shown)),
 		);
 		let searching = !self.query.is_empty();
-		let query = Str::new(self.query.as_str());
+		let query_before = Str::new(&self.query[..self.query_cursor]);
+		let query_after = Str::new(&self.query[self.query_cursor..]);
 		let description = self
 			.selected()
 			.map(|row| row.description.clone())
 			.unwrap_or_default();
 		let warning = self.selected().and_then(|row| row.warning.clone());
-		let mut tabs = Tabs::new().with_str(Prop::Id, "settings-tabs");
-		for tab in SETTING_TABS {
-			tabs = tabs.pane_icon(tab.icon, tab.label, dom! { <col/> });
-		}
-		let tabs = tabs.select(self.tab as u16);
+		let (tabs, tab_selection) = self.tab_strip();
+		let tabs = tabs.select(tab_selection);
+		let match_count = self
+			.items
+			.iter()
+			.filter(|item| matches!(item, Item::Row(_)))
+			.count();
+		let match_label = if match_count == 1 {
+			Str::new_static("1 match")
+		} else {
+			sf!("{match_count} matches")
+		};
+		let groups = self.visible_groups();
+		let sidebar_width = SETTING_TABS
+			.iter()
+			.flat_map(|tab| tab.groups.iter())
+			.map(|group| cell_width(group))
+			.max()
+			.unwrap_or(0)
+			.min(22)
+			.saturating_add(4);
+		let body_width = self.width.saturating_sub(sidebar_width + 5).max(20);
+		let mut sidebar = groups
+			.iter()
+			.enumerate()
+			.map(|(index, group)| {
+				let id = sf!("setting-group-{index}");
+				let active = index == self.section_cursor;
+				if active && self.section_focus {
+					dom! { <row id={id} focus bg=surface><text bold fg=accent>{"› "}{*group}</text></row> }
+						.into_component()
+				} else if active {
+					dom! { <row id={id} focus><text fg=accent>{"  "}{*group}</text></row> }
+						.into_component()
+				} else {
+					dom! { <row id={id} focus><text fg=muted>{"  "}{*group}</text></row> }
+						.into_component()
+				}
+			})
+			.collect::<Vec<_>>();
+		sidebar.extend(
+			std::iter::repeat_with(|| dom! { <text>{" "}</text> }.into_component())
+				.take(self.list_rows.saturating_sub(sidebar.len())),
+		);
+		let footer = if searching {
+			"Enter to change · Tab to jump tabs · Esc to exit search"
+		} else if self.section_focus {
+			"↑/↓ to jump sections · Tab/Enter to settings · ←/→ to switch tabs · Esc to close"
+		} else if groups.len() > 1 {
+			"Enter/Space to change · Tab to jump sections · ←/→ to switch tabs · Type to search · Esc \
+			 to close"
+		} else {
+			"Enter/Space to change · Tab to switch tabs · Type to search · Esc to close"
+		};
 		self.ui = Ui::from_root(
 			dom! {
 				<box border=round title="Settings">
 					<col>
 						{tabs}
-						if searching { <row gap=1><text fg=muted>{"Search:"}</text><row><text>{query}</text><text fg=accent>{"_"}</text></row></row> }
-						else { <text fg=muted>{"Type to search labels and descriptions"}</text> }
+						if searching { <row gap=1><text fg=accent>{"⌕"}</text><row><text bold>{query_before}</text><text fg=accent>{"_"}</text><text bold>{query_after}</text></row><text fg=muted>{match_label}</text></row> }
+						else { <text fg=muted>{"Type to search labels, values, and descriptions"}</text> }
 						<text>{" "}</text>
 						if empty { <text fg=muted truncate>{"  No settings match."}</text> }
-						for row in list { {row} }
+						if searching {
+							for row in list { {row} }
+						} else {
+							<row gap=1>
+								<col w={sidebar_width}>for row in sidebar { {row} }</col>
+								<hr vertical border=round fg=muted/>
+								<col w={body_width}>for row in list { {row} }</col>
+							</row>
+						}
 						<hr border=round/>
-						<text fg=muted truncate>{description}</text>
-						if let Some(warning) = warning { <text fg=warn truncate>{warning}</text> }
-						else { <text>{" "}</text> }
-						<text fg=muted truncate>{FOOTER}</text>
+						<col h=3>
+							<text fg=muted wrap=word>{description}</text>
+							if let Some(warning) = warning { <text fg=warn wrap=word>{warning}</text> }
+						</col>
+						<text fg=muted truncate>{footer}</text>
 					</col>
 				</box>
 			},
@@ -894,8 +1557,8 @@ impl SettingsPanel {
 
 	fn rebuild_editor(&mut self) {
 		let Some(row) = self.selected() else { return };
-		let title = row.label.clone();
-		let description = row.description.clone();
+		let mut title = row.label.clone();
+		let mut description = row.description.clone();
 		let (lines, footer): (Vec<Box<dyn Component>>, &'static str) = match self
 			.editor
 			.as_ref()
@@ -916,28 +1579,130 @@ impl SettingsPanel {
 				)
 			},
 			Editor::Submenu { cursor } => {
-				let RowWidget::Submenu(options) = &row.widget else {
+				let (RowWidget::Submenu(options) | RowWidget::RuntimeSubmenu(_, options)) = &row.widget
+				else {
 					return;
 				};
-				(options.iter().enumerate().map(|(index, option)| {
-					let marker = if index == *cursor { "›" } else { " " };
-					let selected = matches!(&row.value, RowValue::Scalar(value) if *value == option.value);
-					let check = if selected { "●" } else { "○" };
-					let copy = if option.description.is_empty() { option.label.clone() } else { sf!("{} — {}", option.label, option.description) };
-					dom! { <row gap=1><text fg=accent>{marker}</text><text fg=muted>{check}</text><text truncate>{copy}</text></row> }.into_component()
-				}).collect(), CHOICE_FOOTER)
+				let start = cursor
+					.saturating_sub(9)
+					.min(options.len().saturating_sub(10));
+				(options
+					.iter()
+					.enumerate()
+					.skip(start)
+					.take(10)
+					.map(|(index, option)| {
+						let marker = if index == *cursor { "›" } else { " " };
+						let selected =
+							matches!(&row.value, RowValue::Scalar(value) if *value == option.value);
+						let check = if selected { "●" } else { "○" };
+						let copy = if option.description.is_empty() {
+							option.label.clone()
+						} else {
+							sf!("{} — {}", option.label, option.description)
+						};
+						let id = sf!("setting-choice-{index}");
+						dom! { <row id={id} focus gap=1><text fg=accent>{marker}</text><text fg=muted>{check}</text><text truncate>{copy}</text></row> }
+							.into_component()
+					})
+					.collect(), CHOICE_FOOTER)
 			},
 			Editor::Multi { cursor, selected, ordered } => {
 				let RowWidget::MultiSelect { options, .. } = &row.widget else {
 					return;
 				};
-				(options.iter().enumerate().map(|(index, option)| {
-					let marker = if index == *cursor { "›" } else { " " };
-					let at = selected.iter().position(|value| *value == option.value);
-					let check = at.map_or_else(|| Str::new_static("○"), |at| if *ordered { sf!("{}.", at + 1) } else { Str::new_static("●") });
-					let copy = if option.description.is_empty() { option.label.clone() } else { sf!("{} — {}", option.label, option.description) };
-					dom! { <row gap=1><text fg=accent>{marker}</text><text fg=muted>{check}</text><text truncate>{copy}</text></row> }.into_component()
-				}).collect(), MULTI_FOOTER)
+				let start = cursor
+					.saturating_sub(11)
+					.min(options.len().saturating_sub(12));
+				(
+					options
+						.iter()
+						.enumerate()
+						.skip(start)
+						.take(12)
+						.map(|(index, option)| {
+							let marker = if index == *cursor { "›" } else { " " };
+							let at = selected.iter().position(|value| *value == option.value);
+							let check = at.map_or_else(
+								|| Str::new_static(if *ordered { "·" } else { "○" }),
+								|at| {
+									if *ordered {
+										sf!("{}.", at + 1)
+									} else {
+										Str::new_static("●")
+									}
+								},
+							);
+							let copy = if option.description.is_empty() {
+								option.label.clone()
+							} else {
+								sf!("{} — {}", option.label, option.description)
+							};
+							let id = sf!("setting-choice-{index}");
+							dom! { <row id={id} focus gap=1><text fg=accent>{marker}</text><text fg=muted>{check}</text><text truncate>{copy}</text></row> }
+								.into_component()
+						})
+						.collect(),
+					if *ordered { ORDERED_MULTI_FOOTER } else { MULTI_FOOTER },
+				)
+			},
+			Editor::ProviderList { cursor } => {
+				let limits = match &row.value {
+					RowValue::ProviderLimits(limits) => limits,
+					_ => return,
+				};
+				let mut choices = self
+					.providers
+					.iter()
+					.map(|provider| {
+						let detail = limits
+							.iter()
+							.find(|(name, _)| name == provider)
+							.map_or_else(
+								|| Str::new_static("Unlimited"),
+								|(_, limit)| sf!("Limit: {limit}"),
+							);
+						(provider.clone(), detail)
+					})
+					.collect::<Vec<_>>();
+				if !limits.is_empty() {
+					choices.push((
+						Str::new_static("Clear all limits"),
+						Str::new_static("Make every provider unlimited"),
+					));
+				}
+				let start = cursor
+					.saturating_sub(11)
+					.min(choices.len().saturating_sub(12));
+				(
+					choices
+						.into_iter()
+						.enumerate()
+						.skip(start)
+						.take(12)
+						.map(|(index, (provider, detail))| {
+							let marker = if index == *cursor { "›" } else { " " };
+							let id = sf!("setting-choice-{index}");
+							dom! { <row id={id} focus gap=1><text fg=accent>{marker}</text><text>{provider}</text><text fg=muted truncate>{detail}</text></row> }
+								.into_component()
+						})
+						.collect(),
+					PROVIDER_FOOTER,
+				)
+			},
+			Editor::ProviderValue { provider, buffer } => {
+				title = sf!("Max In-Flight Requests: {provider}");
+				description = Str::new_static(
+					"Enter a positive number. Decimals round down. Clear the field to make this \
+					 provider unlimited.",
+				);
+				(
+					vec![
+						dom! { <row><text fg=accent>{buffer.clone()}</text><text fg=accent>{"_"}</text></row> }
+							.into_component(),
+					],
+					TEXT_FOOTER,
+				)
 			},
 		};
 		self.ui = Ui::from_root(
@@ -958,7 +1723,13 @@ impl SettingsPanel {
 		);
 	}
 
-	fn list_row(&self, item: &Item, selected: bool, label_width: usize) -> Box<dyn Component> {
+	fn list_row(
+		&self,
+		item: &Item,
+		item_index: usize,
+		selected: bool,
+		label_width: usize,
+	) -> Box<dyn Component> {
 		match item {
 			Item::TabHeader(tab) => {
 				let label = SETTING_TABS
@@ -967,18 +1738,16 @@ impl SettingsPanel {
 					.map_or("", |spec| spec.label);
 				dom! { <row gap=1><text bold fg=accent>{label}</text></row> }.into_component()
 			},
-			Item::GroupHeader { group, .. } => {
-				dom! { <row gap=1><text bold fg=muted>{group.clone()}</text></row> }.into_component()
-			},
 			Item::Row(index) => {
 				let row = &self.rows[*index];
 				let marker = if row.changed() { "●" } else { " " };
 				let label = pad(&row.label, label_width);
 				let value = row.display();
+				let id = sf!("setting-item-{item_index}");
 				if selected {
-					dom! { <row gap=1 bg=surface><text fg=accent>{marker}</text><pre bold fg=accent>{label}</pre><text fg=accent truncate>{value}</text></row> }.into_component()
+					dom! { <row id={id} focus gap=1 bg=surface><text fg=accent>{marker}</text><pre bold fg=accent>{label}</pre><text fg=accent truncate>{value}</text></row> }.into_component()
 				} else {
-					dom! { <row gap=1><text fg=accent>{marker}</text><pre>{label}</pre><text fg=muted truncate>{value}</text></row> }.into_component()
+					dom! { <row id={id} focus gap=1><text fg=accent>{marker}</text><pre>{label}</pre><text fg=muted truncate>{value}</text></row> }.into_component()
 				}
 			},
 		}
@@ -1012,17 +1781,58 @@ impl Panel for SettingsPanel {
 		match key {
 			Key::Esc if self.query.is_empty() => PanelEvent::Close,
 			Key::Esc => {
-				self.end_search();
+				self.end_search(true);
 				self.rebuild();
 				PanelEvent::Consumed
 			},
-			Key::Tab | Key::Right => {
+			Key::Tab | Key::BackTab if self.query.is_empty() && self.visible_groups().len() > 1 => {
+				self.section_focus = !self.section_focus;
+				self.sync_section_to_selection();
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Tab => {
 				self.switch_tab(1);
 				self.rebuild();
 				PanelEvent::Consumed
 			},
-			Key::BackTab | Key::Left => {
+			Key::BackTab => {
 				self.switch_tab(-1);
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Right if !self.query.is_empty() => {
+				self.query_right();
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Left if !self.query.is_empty() => {
+				self.query_left();
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Right => {
+				self.switch_tab(1);
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Left => {
+				self.switch_tab(-1);
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Up if self.section_focus => {
+				self.move_section(-1);
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Down if self.section_focus => {
+				self.move_section(1);
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Enter if self.section_focus => {
+				self.section_focus = false;
 				self.rebuild();
 				PanelEvent::Consumed
 			},
@@ -1054,6 +1864,16 @@ impl Panel for SettingsPanel {
 				}
 				PanelEvent::Consumed
 			},
+			Key::Home if !self.query.is_empty() => {
+				self.query_cursor = 0;
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::End if !self.query.is_empty() => {
+				self.query_cursor = self.query.len();
+				self.rebuild();
+				PanelEvent::Consumed
+			},
 			Key::Home => {
 				if self.move_selection(-(self.items.len() as isize)) {
 					self.sync_tab_to_selection();
@@ -1070,29 +1890,49 @@ impl Panel for SettingsPanel {
 			},
 			Key::Enter => self.activate(),
 			Key::Space
-				if matches!(
-					self.selected().map(|row| &row.widget),
-					Some(RowWidget::Boolean | RowWidget::Enum(_))
-				) =>
+				if self.query.is_empty()
+					&& matches!(
+						self.selected().map(|row| &row.widget),
+						Some(RowWidget::Boolean | RowWidget::Enum(_))
+					) =>
 			{
 				self.activate()
 			},
 			Key::Space => {
-				self.query.push(' ');
-				self.reflow_items();
+				self.insert_query(" ");
 				self.rebuild();
 				PanelEvent::Consumed
 			},
 			Key::Backspace => {
-				if self.query.pop().is_some() {
-					self.reflow_items();
-					self.rebuild();
-				}
+				self.query_backspace();
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Ctrl('u') if !self.query.is_empty() => {
+				self.query.clear();
+				self.query_cursor = 0;
+				self.end_search(false);
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Ctrl('w') if !self.query.is_empty() => {
+				self.query_word_backspace();
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Ctrl('a') if !self.query.is_empty() => {
+				self.query_cursor = 0;
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Ctrl('e') if !self.query.is_empty() => {
+				self.query_cursor = self.query.len();
+				self.rebuild();
 				PanelEvent::Consumed
 			},
 			Key::Char(character) if !character.is_control() => {
-				self.query.push(character);
-				self.reflow_items();
+				let mut encoded = [0; 4];
+				self.insert_query(character.encode_utf8(&mut encoded));
 				self.rebuild();
 				PanelEvent::Consumed
 			},
@@ -1102,20 +1942,90 @@ impl Panel for SettingsPanel {
 
 	fn paste(&mut self, text: &str) -> PanelEvent {
 		let clean = text.replace(['\n', '\r', '\t'], " ");
-		if let Some(Editor::Text(buffer)) = self.editor.as_mut() {
+		if let Some(Editor::Text(buffer) | Editor::ProviderValue { buffer, .. }) =
+			self.editor.as_mut()
+		{
 			buffer.push_str(&clean);
 		} else if self.editor.is_none() {
-			self.query.push_str(clean.trim());
-			self.reflow_items();
+			self.insert_query(clean.trim());
 		}
 		self.rebuild();
 		PanelEvent::Consumed
 	}
 
 	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		if matches!(report.kind, omp_tui::Mouse::WheelUp | omp_tui::Mouse::WheelDown) {
+			let key = if report.kind == omp_tui::Mouse::WheelUp {
+				Key::Up
+			} else {
+				Key::Down
+			};
+			if self.editor.is_some() {
+				return self.editor_key(key);
+			}
+			if self.section_focus {
+				self.move_section(if key == Key::Up { -1 } else { 1 });
+				self.rebuild();
+				return PanelEvent::Consumed;
+			}
+			if self.move_selection(if key == Key::Up { -1 } else { 1 }) {
+				self.sync_tab_to_selection();
+				self.rebuild();
+			}
+			return PanelEvent::Consumed;
+		}
 		let event = self
 			.ui
 			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		let focused = self.ui.focused_id().map(String::from);
+		if let Some(index) = focused
+			.as_deref()
+			.and_then(|id| id.strip_prefix("setting-choice-"))
+			.and_then(|index| index.parse::<usize>().ok())
+		{
+			match self.editor.as_mut() {
+				Some(Editor::Submenu { cursor })
+				| Some(Editor::Multi { cursor, .. })
+				| Some(Editor::ProviderList { cursor }) => *cursor = index,
+				Some(Editor::Text(_) | Editor::ProviderValue { .. }) | None => {},
+			}
+			if report.kind == omp_tui::Mouse::Click {
+				return self.editor_key(Key::Enter);
+			}
+			self.rebuild();
+			return PanelEvent::Consumed;
+		}
+		if let Some(index) = focused
+			.as_deref()
+			.and_then(|id| id.strip_prefix("setting-group-"))
+			.and_then(|index| index.parse::<usize>().ok())
+			.filter(|index| *index < self.visible_groups().len())
+		{
+			self.section_cursor = index;
+			self.section_focus = true;
+			self.move_section(0);
+			if report.kind == omp_tui::Mouse::Click {
+				self.section_focus = false;
+			}
+			self.rebuild();
+			return PanelEvent::Consumed;
+		}
+		if let Some(index) = focused
+			.as_deref()
+			.and_then(|id| id.strip_prefix("setting-item-"))
+			.and_then(|index| index.parse::<usize>().ok())
+			.filter(|index| matches!(self.items.get(*index), Some(Item::Row(_))))
+		{
+			let repeated = self.selected == index;
+			self.selected = index;
+			self.sync_tab_to_selection();
+			self.clamp_scroll();
+			if report.kind == omp_tui::Mouse::Click && repeated {
+				return self.activate();
+			}
+			self.rebuild();
+			return PanelEvent::Consumed;
+		}
 		self.sync_pointer_tab();
 		match event {
 			UiEvent::Cancel => PanelEvent::Close,
@@ -1307,13 +2217,13 @@ mod tests {
 			RowValue::Scalar(Str::new_static("one")),
 		));
 		let mut panel = SettingsPanel::from_rows(rows, &UiContext::default());
-		assert!(matches!(panel.key(Key::Enter), PanelEvent::Run(_)));
+		assert!(matches!(panel.key(Key::Enter), PanelEvent::RunSetting { .. }));
 		panel.key(Key::Right);
 		assert_eq!(panel.selected().map(|row| row.label.as_str()), Some("Thinking Level"));
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
 		panel.key(Key::Down);
 		assert!(
-			matches!(&panel.key(Key::Enter), PanelEvent::Run(line) if line.contains(" high; writecfg"))
+			matches!(&panel.key(Key::Enter), PanelEvent::RunSetting { line, .. } if line.contains(" high; writecfg"))
 		);
 		panel.key(Key::Right);
 		assert_eq!(panel.selected().map(|row| row.label.as_str()), Some("Profile Name"));
@@ -1323,16 +2233,15 @@ mod tests {
 		panel.key(Key::Space);
 		panel.key(Key::Char('C'));
 		assert!(
-			matches!(&panel.key(Key::Enter), PanelEvent::Run(line) if line.contains(" \"B C\"; writecfg"))
+			matches!(&panel.key(Key::Enter), PanelEvent::RunSetting { line, .. } if line.contains(" \"B C\"; writecfg"))
 		);
 		while panel.tab() != SettingTab::Providers {
 			panel.key(Key::Right);
 		}
 		panel.key(Key::Enter);
 		panel.key(Key::Down);
-		panel.key(Key::Space);
 		assert!(
-			matches!(&panel.key(Key::Enter), PanelEvent::Run(line) if line.contains("[a b]; writecfg"))
+			matches!(&panel.key(Key::Space), PanelEvent::RunSetting { line, .. } if line.contains("[a b]; writecfg"))
 		);
 	}
 
@@ -1352,6 +2261,16 @@ mod tests {
 			SettingsPanel::command_value(&setting, &RowValue::Scalar(Str::new_static("80")),).unwrap(),
 			"0.8"
 		);
+		setting.codec = UiValueCodec::DefaultMinusOne;
+		assert_eq!(
+			project_value(setting.codec, &setting.widget, &Value::Int(-1),),
+			RowValue::Scalar(Str::new_static("default"))
+		);
+		assert_eq!(
+			SettingsPanel::command_value(&setting, &RowValue::Scalar(Str::new_static("default")),)
+				.unwrap(),
+			"-1"
+		);
 		setting.codec = UiValueCodec::SecondsDuration;
 		assert_eq!(
 			SettingsPanel::command_value(&setting, &RowValue::Scalar(Str::new_static("30")),).unwrap(),
@@ -1363,6 +2282,40 @@ mod tests {
 				.unwrap(),
 			"300000ms"
 		);
+		setting.codec = UiValueCodec::EditModeRevision;
+		for (stored, displayed) in [
+			("", "hashline"),
+			("hl.1", "hashline"),
+			("rep.2", "replace"),
+			("patch.2", "patch"),
+			("apply_patch.1", "apply_patch"),
+			("sloppy.1", "sloppy"),
+		] {
+			assert_eq!(
+				project_value(
+					setting.codec,
+					&setting.widget,
+					&Value::Str(Str::new_static(stored)),
+				),
+				RowValue::Scalar(Str::new_static(displayed))
+			);
+		}
+		for (displayed, stored) in [
+			("apply_patch", "apply_patch.1"),
+			("hashline", "hl.1"),
+			("patch", "patch.2"),
+			("replace", "rep.2"),
+			("sloppy", "sloppy.1"),
+		] {
+			assert_eq!(
+				SettingsPanel::command_value(
+					&setting,
+					&RowValue::Scalar(Str::new_static(displayed)),
+				)
+				.unwrap(),
+				stored
+			);
+		}
 		setting.widget = RowWidget::Boolean;
 		setting.codec = UiValueCodec::InvertedBoolean;
 		assert_eq!(

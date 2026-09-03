@@ -70,8 +70,11 @@ fn render_recall(view: &CardView<'_>, expanded: bool) -> Component {
 	// expanded bodies stop at `PREVIEW_LIMITS.OUTPUT_EXPANDED`.
 	let found = items.len();
 	let hidden = found.saturating_sub(RECALL_EXPANDED_ITEMS);
-	let summary =
-		if found == 0 { "no matches".to_owned() } else { format!("{found} found") };
+	let summary = if found == 0 {
+		"no matches".to_owned()
+	} else {
+		format!("{found} found")
+	};
 	dom! {
 		<col>
 			<row gap=0>

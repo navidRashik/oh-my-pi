@@ -419,7 +419,7 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		"Max In-Flight Requests",
 		"Maximum concurrent LLM requests per provider id (for example \"openai\" or \"anthropic\"), \
 		 shared across local OMP processes with this config root. Omitted providers are unlimited.",
-		UiWidget::Text { secret: false },
+		UiWidget::ProviderLimits,
 		None,
 		Identity
 	),

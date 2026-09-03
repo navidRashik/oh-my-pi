@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-	Card, CardStatus, CardView, Component, elapsed_badge, result_image, typed_fault, typed_input,
-	typed_result,
+	Card, CardStatus, CardView, Component, GenericCard, elapsed_badge, result_image, typed_fault,
+	typed_input, typed_result,
 };
 
 /// Durable checkpoint creation card.
@@ -48,7 +48,14 @@ impl Card for CheckpointCard {
 			.as_ref()
 			.and_then(|value| value.get("token"))
 			.and_then(Value::as_str);
-		semantic_row("checkpoint", "Checkpoint", goal, token, view)
+		semantic_row(
+			"checkpoint",
+			"Checkpoint",
+			goal,
+			token,
+			typed_fault::<omp_tools::checkpoint::Fault>(view),
+			view,
+		)
 	}
 }
 
@@ -70,7 +77,14 @@ impl Card for RewindCard {
 			.as_ref()
 			.and_then(|value| value.get("receipt"))
 			.and_then(Value::as_str);
-		semantic_row("rewind", "Rewind", report, receipt, view)
+		semantic_row(
+			"rewind",
+			"Rewind",
+			report,
+			receipt,
+			typed_fault::<omp_tools::checkpoint::Fault>(view),
+			view,
+		)
 	}
 }
 
@@ -102,6 +116,7 @@ impl Card for YieldCard {
 			"Submit result",
 			detail,
 			(!kind.is_empty()).then_some(kind.as_str()),
+			typed_fault::<omp_tools::yield_tool::Fault>(view),
 			view,
 		)
 	}
@@ -139,7 +154,14 @@ impl Card for MemoryEditCard {
 			.as_ref()
 			.and_then(|value| value.get("status"))
 			.and_then(Value::as_str);
-		semantic_row("memory-tool", "Memory", &sf!("{operation} {id}"), status, view)
+		semantic_row(
+			"memory-tool",
+			"Memory",
+			&sf!("{operation} {id}"),
+			status,
+			typed_fault::<omp_tools::memory_edit::Fault>(view),
+			view,
+		)
 	}
 }
 
@@ -165,7 +187,14 @@ impl Card for LearnCard {
 		} else {
 			memory.lines().next().unwrap_or_default()
 		};
-		semantic_row("memory-tool", "Learn", body, id, view)
+		semantic_row(
+			"memory-tool",
+			"Learn",
+			body,
+			id,
+			typed_fault::<omp_tools::learn::Fault>(view),
+			view,
+		)
 	}
 }
 
@@ -193,16 +222,15 @@ impl Card for ManageSkillCard {
 			.as_ref()
 			.and_then(|value| value.get("path"))
 			.and_then(Value::as_str);
-		semantic_row("skill", "Skill", &sf!("{action} {name}"), path, view)
+		semantic_row(
+			"skill",
+			"Skill",
+			&sf!("{action} {name}"),
+			path,
+			typed_fault::<omp_tools::manage_skill::Fault>(view),
+			view,
+		)
 	}
-}
-
-#[derive(Deserialize, Serialize)]
-struct MediaParams {
-	prompt:      Option<Value>,
-	text:        Option<Str>,
-	provider:    Option<Str>,
-	output_path: Option<Str>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -210,13 +238,16 @@ struct MediaPayload {
 	artifact_id: Str,
 	media_type:  Str,
 	output_path: Option<Str>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct MediaFault {
-	code:    Str,
-	backend: Str,
-	message: Str,
+	#[serde(default)]
+	bytes:       Option<u64>,
+	#[serde(default)]
+	voice_id:    Option<Str>,
+	#[serde(default)]
+	codec:       Option<Str>,
+	#[serde(default)]
+	backend:     Option<Str>,
+	#[serde(default)]
+	sample_rate: Option<u32>,
 }
 
 impl Card for ImageGenCard {
@@ -245,16 +276,16 @@ impl Card for SecurityScanCard {
 	}
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
-		let result = view.outcome_json();
+		let result = typed_result::<omp_tools::security_scan::Payload>(view);
 		let summary = result
 			.as_ref()
-			.and_then(|value| value.get("summary").or_else(|| value.get("message")))
+			.and_then(|value| value.get("output"))
 			.and_then(Value::as_str)
 			.unwrap_or("repository security analysis");
 		let detail = expanded
-			.then(|| result.as_ref().map(compact_json))
+			.then(|| result.as_ref()?.get("data").map(compact_json))
 			.flatten();
-		let fault = view.diag.and_then(|node| node.content.clone());
+		let fault = typed_fault::<omp_tools::security_scan::Fault>(view);
 		dom! {
 			<col>
 				<row gap=1>
@@ -275,63 +306,67 @@ impl Card for SecurityScanCard {
 }
 
 fn render_media(view: &CardView<'_>, expanded: bool, ui: &UiContext, speech: bool) -> Component {
-	let args = typed_input::<MediaParams>(view);
-	let result = typed_result::<MediaPayload>(view);
-	let fault = typed_fault::<MediaFault>(view);
-	let label = if speech { "Speech" } else { "Image" };
-	let prompt = args
-		.as_ref()
-		.and_then(|value| value.get("prompt"))
-		.map(compact_json);
-	let description = if speech {
-		args
-			.as_ref()
-			.and_then(|value| value.get("text"))
-			.and_then(Value::as_str)
+	let label = if speech {
+		"Speech Generation"
 	} else {
-		prompt.as_deref()
+		"GenerateImage"
 	};
+	let card = GenericCard.render_named(label, view, expanded, ui);
+	let result = typed_result::<MediaPayload>(view);
 	let artifact = result
 		.as_ref()
 		.and_then(|value| value.get("artifact_id"))
 		.and_then(Value::as_str)
 		.map(Str::new);
+	if speech {
+		if expanded && let Some(artifact) = artifact {
+			let detail = result
+				.as_ref()
+				.and_then(|value| serde_json::from_value::<MediaPayload>(value.clone()).ok())
+				.map(|payload| {
+					let mut parts = Vec::new();
+					if let Some(backend) = payload.backend {
+						parts.push(format!("backend={backend}"));
+					}
+					if let Some(voice) = payload.voice_id {
+						parts.push(format!("voice={voice}"));
+					}
+					if let Some(codec) = payload.codec {
+						parts.push(format!("codec={codec}"));
+					}
+					if let Some(rate) = payload.sample_rate {
+						parts.push(format!("{rate} Hz"));
+					}
+					if let Some(bytes) = payload.bytes {
+						parts.push(format!("{bytes} bytes"));
+					}
+					Str::new(parts.join(", "))
+				});
+			return dom! {
+				<col>
+					{card}
+					if let Some(detail) = detail { <text pad-x=1 fg=muted>{detail}</text> }
+					<text pad-x=1 fg=muted href={artifact.clone()}>{artifact}</text>
+				</col>
+			}
+			.into_component();
+		}
+		return card;
+	}
+	let Some(artifact) = artifact else {
+		return card;
+	};
 	let mime = result
 		.as_ref()
 		.and_then(|value| value.get("media_type"))
 		.and_then(Value::as_str)
-		.unwrap_or(if speech { "audio/*" } else { "image/*" });
+		.unwrap_or("image/*");
 	let output_path = result
 		.as_ref()
 		.and_then(|value| value.get("output_path"))
-		.and_then(Value::as_str)
-		.map(Str::new);
-	let image = (!speech)
-		.then(|| {
-			artifact
-				.as_ref()
-				.map(|src| result_image(src, mime, output_path.as_deref(), ui))
-		})
-		.flatten();
-	dom! {
-		<col>
-			<row gap=1>
-				match view.status {
-					CardStatus::Failed => <i:error/>,
-					CardStatus::Done => <i:success/>,
-					CardStatus::StreamingArgs | CardStatus::InProgress => <spinner kind=status/>,
-				}
-				<text bold>{label}</text>
-				if let Some(path) = output_path.clone() { <text>{path}</text> }
-				if let Some(badge) = elapsed_badge(view) { {badge} }
-			</row>
-			if let Some(description) = description { <text pad-x=2>{description}</text> }
-			if let Some(image) = image { {image} }
-			if speech && expanded { if let Some(artifact) = artifact { <text pad-x=2>{artifact}</text> } }
-			if let Some(fault) = fault { <text pad-x=2 fg=err>{fault}</text> }
-		</col>
-	}
-	.into_component()
+		.and_then(Value::as_str);
+	let image = result_image(&artifact, mime, output_path, ui);
+	dom! { <col>{card}{image}</col> }.into_component()
 }
 
 fn semantic_row(
@@ -339,9 +374,9 @@ fn semantic_row(
 	title: &'static str,
 	detail: &str,
 	receipt: Option<&str>,
+	fault: Option<Str>,
 	view: &CardView<'_>,
 ) -> Component {
-	let fault = view.diag.and_then(|node| node.content.clone());
 	dom! {
 		<col>
 			<row gap=1>

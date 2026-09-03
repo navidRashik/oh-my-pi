@@ -63,12 +63,63 @@ fn render(
 	status: CardStatus,
 	expanded: bool,
 ) -> String {
-	let view = CardView { input, result, diag, usage: None, status, output: None, started: None };
+	let view = CardView {
+		input,
+		result,
+		diag,
+		notices: smallvec::SmallVec::new(),
+		usage: None,
+		status,
+		output: None,
+		started: None,
+	};
 	let registry = CardRegistry::standard();
 	let ui = UiContext::default();
 	let component = registry.render(tool, &view, expanded, &ui);
 	let rendered = Ui::from_root(component, 100, ui);
 	frame_text(rendered.frame())
+}
+
+#[test]
+fn bounded_output_notice_is_informational_and_links_the_artifact() {
+	let input = node(KnownTag::Input, r#"{"i":"Reading large log"}"#);
+	let result = result_node::<serde_json::Value>(json!({"output":"bounded body"}));
+	let mut notice = node(KnownTag::Diag, r#"{"kind":"output_bounded"}"#);
+	notice
+		.props
+		.push((PropId::Severity.into(), DomValue::Str(Str::new_static("info"))));
+	notice
+		.props
+		.push((PropId::Kind.into(), DomValue::Str(Str::new_static("output_bounded"))));
+	notice.props.push((
+		PropId::Data.into(),
+		DomValue::Json(
+			serde_json::value::to_raw_value(&json!({
+				"kind": "output_bounded",
+				"severity": "info",
+				"artifact": "artifact://sha256/0123456789abcdef",
+				"lines_clamped": 3
+			}))
+			.expect("diagnostic JSON"),
+		),
+	));
+	let view = CardView {
+		input:   &input,
+		result:  Some(&result),
+		diag:    None,
+		notices: smallvec::smallvec![&notice],
+		usage:   None,
+		status:  CardStatus::Done,
+		output:  None,
+		started: None,
+	};
+	let ui = UiContext::default();
+	let rendered =
+		Ui::from_root(CardRegistry::standard().render("custom", &view, false, &ui), 100, ui);
+	let text = frame_text(rendered.frame());
+	assert!(text.contains("3 output lines were clipped"), "{text}");
+	assert!(text.contains("Read artifact://sha256/0123456789abcdef for full output"), "{text}");
+	assert!(!text.contains("output_bounded") && !text.contains("{\""), "{text}");
 }
 
 fn render_done<T: DeserializeOwned + Serialize>(

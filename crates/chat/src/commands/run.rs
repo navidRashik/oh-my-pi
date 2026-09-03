@@ -9,14 +9,24 @@ use omp_core::{Str, StrMut};
 use omp_dom::{Dom, Handle, KnownTag, PropId, PropKey, Tag, Value};
 
 use super::{
-	CommandAction, CompactionMethod, GoalOp, Selector, SessionOp, TodoOp, plan::DEFAULT_PLAN,
+	CommandAction, CompactionMethod, GoalOp, LoopLimit, Selector, SessionOp, TodoOp,
+	plan::DEFAULT_PLAN,
 };
 use crate::{
 	actions::HostAction,
 	host::{HostCommand, HostError, Presenter, Routed, SpawnKind},
+	notices::format_duration,
 	overlays::{
-		PanelOpener, plan_review::PlanReviewPanel, report::ReportPanel, rewind::RewindPanel,
-		services::Mutation, sessions::SessionPicker, side::SidePanel, tree::TreePanel,
+		PanelOpener,
+		move_panel::MovePanel,
+		plan_review::PlanReviewPanel,
+		report::ReportPanel,
+		rewind::RewindPanel,
+		services::{ForeignSessionSource, Mutation},
+		session_info::SessionInfoPanel,
+		sessions::{ForeignSessionPicker, SessionPicker},
+		side::SidePanel,
+		tree::TreePanel,
 	},
 	status_line::StatusLine,
 };
@@ -254,21 +264,46 @@ impl Presenter {
 				if self.turn_active {
 					return Ok(self.notice(WAIT_BEFORE_MOVE));
 				}
+				let Some(path) = path else {
+					return self.act(HostAction::Open(PanelOpener::new(|cx| {
+						let cwd = cx
+							.services
+							.project_dir()
+							.or_else(|_| std::env::current_dir())
+							.unwrap_or_else(|_| PathBuf::from("."));
+						Ok(Box::new(MovePanel::open(cwd, cx.viewport, cx.ui)) as Box<_>)
+					})));
+				};
 				let cwd = self
 					.services
 					.project_dir()
 					.or_else(|_| std::env::current_dir())
 					.unwrap_or_else(|_| PathBuf::from("."));
 				let resolved = super::workspace::resolve_to_cwd(path.as_str(), &cwd);
-				if !resolved.is_dir() {
-					return Ok(self.notice(if resolved.exists() {
-						format!("Not a directory: {}", resolved.display())
-					} else {
-						format!("Directory does not exist: {}", resolved.display())
-					}));
+				if resolved.is_dir() {
+					let _ = self
+						.commands
+						.send(HostCommand::Move { path: resolved, create: false });
+					return Ok(Routed::Repaint);
 				}
-				let _ = self.commands.send(HostCommand::Move { path: resolved });
-				Routed::Repaint
+				if resolved.exists() {
+					return Ok(self.notice(format!("Not a directory: {}", resolved.display())));
+				}
+				let parent = resolved
+					.parent()
+					.unwrap_or_else(|| std::path::Path::new(""));
+				if !parent.is_dir() {
+					let name = resolved
+						.file_name()
+						.and_then(|name| name.to_str())
+						.unwrap_or_default();
+					return Ok(
+						self.notice(format!("Cannot create \"{name}\": parent directory does not exist"))
+					);
+				}
+				self.act(HostAction::Open(PanelOpener::new(move |cx| {
+					Ok(Box::new(MovePanel::confirm(resolved.clone(), cx.viewport, cx.ui)) as Box<_>)
+				})))?
 			},
 			CommandAction::Worktree { branch } => {
 				if self.turn_active {
@@ -279,7 +314,7 @@ impl Presenter {
 					Ok(worktree) => {
 						let _ = self
 							.commands
-							.send(HostCommand::Move { path: worktree.path.clone() });
+							.send(HostCommand::Move { path: worktree.path.clone(), create: false });
 						self.notice(format!(
 							"Moved to worktree {} on branch {} (checked out, uncommitted changes carried \
 							 over).",
@@ -338,7 +373,11 @@ impl Presenter {
 		if !self.plan_engaged() {
 			return self.notice("Plan mode is not active.");
 		}
-		let _ = self.commands.send(HostCommand::PlanMode { engage: false });
+		let _ = self.commands.send(HostCommand::Director {
+			id:     Str::new_static("plan"),
+			engage: false,
+			args:   Vec::new(),
+		});
 		if let Some(role) = role
 			&& let Some((_, model, _)) = self.cycle.iter().find(|(name, ..)| *name == role)
 			&& let Err(error) = omp_con::AI_MODEL.set(&self.con, model.clone())
@@ -421,9 +460,20 @@ impl Presenter {
 				Some(_) => self.goal_show(),
 				None => self.notice("No active goal."),
 			},
-			GoalOp::Pause | GoalOp::Resume => self.notice(
-				"Goal pause/resume is not journaled on this kernel; drop the goal or let it complete.",
-			),
+			GoalOp::Pause => match frame {
+				Some(_) => {
+					let _ = self.commands.send(engage(vec![Str::new_static("pause")]));
+					self.notice("Goal paused.")
+				},
+				None => self.notice("No active goal."),
+			},
+			GoalOp::Resume => match frame {
+				Some(_) => {
+					let _ = self.commands.send(engage(vec![Str::new_static("resume")]));
+					self.notice("Goal resumed.")
+				},
+				None => self.notice("No active goal."),
+			},
 			GoalOp::Drop => match frame {
 				Some(_) => {
 					let _ = self.commands.send(HostCommand::Director {
@@ -469,7 +519,14 @@ impl Presenter {
 		let used = int("tokens_used").unwrap_or(0);
 		let budget = int("token_budget");
 		let done = matches!(state(node, "done"), Some(Value::Bool(true)));
-		let status = if done { "complete" } else { "active" };
+		let paused = matches!(state(node, "paused"), Some(Value::Bool(true)));
+		let status = if done {
+			"complete"
+		} else if paused {
+			"paused"
+		} else {
+			"active"
+		};
 		let tokens = match budget {
 			Some(budget) => format!("{used} / {budget} ({} left)", budget.saturating_sub(used)),
 			None => format!("{used} (no budget)"),
@@ -497,7 +554,7 @@ impl Presenter {
 		self.submit(prompt.freeze())
 	}
 
-	fn loop_mode(&mut self, limit: Option<u32>, prompt: Option<Str>) -> Routed {
+	fn loop_mode(&mut self, limit: Option<LoopLimit>, prompt: Option<Str>) -> Routed {
 		if director_active(&self.replica, LOOP) {
 			let _ = self.commands.send(HostCommand::Director {
 				id:     Str::new_static(LOOP),
@@ -506,7 +563,15 @@ impl Presenter {
 			});
 			return self.notice("Loop mode disabled.");
 		}
-		let mut args = vec![Str::new(limit.map_or_else(String::new, |limit| limit.to_string()))];
+		let mut args = match limit {
+			None => vec![Str::new_static("unbounded")],
+			Some(LoopLimit::Iterations(count)) => {
+				vec![Str::new_static("iterations"), Str::new(count.to_string())]
+			},
+			Some(LoopLimit::DurationMs(duration)) => {
+				vec![Str::new_static("duration_ms"), Str::new(duration.to_string())]
+			},
+		};
 		if let Some(prompt) = &prompt {
 			args.push(prompt.clone());
 		}
@@ -516,8 +581,14 @@ impl Presenter {
 			args,
 		});
 		let mut text = StrMut::new("Loop mode enabled.");
-		if let Some(limit) = limit {
-			let _ = write!(text, " Limit: {limit} iterations.");
+		match limit {
+			Some(LoopLimit::Iterations(count)) => {
+				let _ = write!(text, " Limit: {count} iterations.");
+			},
+			Some(LoopLimit::DurationMs(duration)) => {
+				let _ = write!(text, " Limit: {}.", format_duration(duration));
+			},
+			None => {},
 		}
 		text.push_str(if prompt.is_some() {
 			" Repeating it after each turn."
@@ -569,6 +640,15 @@ impl Presenter {
 				SessionPicker::open(cx).map(|panel| Box::new(panel) as Box<_>)
 			})));
 		};
+		let foreign = id
+			.as_str()
+			.strip_prefix('@')
+			.and_then(|source| source.parse::<ForeignSessionSource>().ok());
+		if let Some(source) = foreign {
+			return self.act(HostAction::Open(PanelOpener::new(move |cx| {
+				ForeignSessionPicker::open(source, cx).map(|panel| Box::new(panel) as Box<_>)
+			})));
+		}
 		let direct = PathBuf::from(id.as_str());
 		let path = if direct.extension().is_some() && direct.is_file() {
 			Some(direct)
@@ -596,7 +676,7 @@ impl Presenter {
 			SessionOp::Info => {
 				let body = session_info(&self.replica, self.services.as_ref());
 				self.act(HostAction::Open(PanelOpener::new(move |cx| {
-					Ok(Box::new(ReportPanel::new("session", "Session", body.clone(), cx.ui)) as Box<_>)
+					Ok(Box::new(SessionInfoPanel::new(body.clone(), cx.ui)) as Box<_>)
 				})))
 			},
 			SessionOp::Delete => {
@@ -709,13 +789,40 @@ fn conversation_context(dom: &Dom) -> Str {
 /// pi `/session` info block projected from the replica.
 fn session_info(dom: &Dom, services: &dyn crate::overlays::Services) -> Str {
 	let status = StatusLine::from_dom(dom);
+	let session_id = services.live_session_id().ok().or_else(|| {
+		dom.get(dom.meta())
+			.and_then(|meta| meta.prop(&PropId::Id.into()))
+			.and_then(Value::as_str)
+			.filter(|id| !id.is_empty())
+			.map(Str::new)
+	});
+	let stored = services
+		.sessions(crate::overlays::services::SessionScope::Project)
+		.ok();
+	let session_file = session_id.as_ref().and_then(|id| {
+		stored
+			.as_ref()
+			.and_then(|rows| rows.iter().find(|row| row.id == *id))
+			.map(|row| Str::new(row.path.to_string_lossy().as_ref()))
+			.or_else(|| {
+				services
+					.sessions(crate::overlays::services::SessionScope::All)
+					.ok()?
+					.into_iter()
+					.find(|row| row.id == *id)
+					.map(|row| Str::new(row.path.to_string_lossy().as_ref()))
+			})
+	});
 	let mut out = StrMut::new("");
-	let file = if status.session.is_empty() {
-		"In-memory"
+	if let Some(file) = session_file {
+		let link = crate::cards::file_link(&file);
+		let _ = writeln!(out, "**File**: [{file}]({link})");
 	} else {
-		status.session.as_str()
-	};
-	let _ = writeln!(out, "**File**: {file}");
+		let _ = writeln!(out, "**File**: In-memory");
+	}
+	if let Some(id) = &session_id {
+		let _ = writeln!(out, "**ID**: {id}");
+	}
 	if let Some(name) = &status.name {
 		let _ = writeln!(out, "**Title**: {name}");
 	}
@@ -753,7 +860,7 @@ fn session_info(dom: &Dom, services: &dyn crate::overlays::Services) -> Str {
 		let _ = writeln!(out, "\n### Cost");
 		let _ = writeln!(out, "- Total: ${:.4}", status.cost_nano_usd as f64 / 1e9);
 	}
-	if let Ok(rows) = services.sessions(crate::overlays::services::SessionScope::Project) {
+	if let Some(rows) = stored {
 		let _ = writeln!(out, "\n### Stored sessions\n- {} on disk", rows.len());
 	}
 	out.freeze()

@@ -3,7 +3,7 @@
 use std::{
 	collections::{HashMap, HashSet},
 	fmt::Write as _,
-	future, mem,
+	future,
 	sync::Arc,
 };
 
@@ -13,9 +13,9 @@ use futures::{FutureExt, Stream, pin_mut, select_biased};
 use omp_core::{Str, sf};
 use omp_hashline::format_hashline_header;
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
-	IncomingParams, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
-	ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DocEffects, Effects, Ev, IncomingParams,
+	InterruptWaitError, ParamError, Part, ProjectionAuthorizationError, ProjectionSpan, PromptCaps,
+	PromptProjection, Rev, Tool, ToolSpec, ToolTerminal, VisibilityReceipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,6 @@ use crate::{
 	glob::{Fault as GlobFault, WalkRequest, WalkResult},
 	path::tracing_path_metadata,
 	read::{
-		ReadBlobs,
 		resolver::Scheme,
 		selector::{
 			LineRange, ParsedSelector, line_is_in_ranges, parse_selector, parse_uri,
@@ -35,7 +34,7 @@ use crate::{
 	render::{
 		TextProjection,
 		paths::{GroupedTreeEventKind, PathTreeInput, build_path_tree, walk_path_tree},
-		truncate::{DEFAULT_MAX_COLUMN, TruncationOptions, spill_truncated_text, truncate_head},
+		truncate::DEFAULT_MAX_COLUMN,
 	},
 };
 
@@ -177,15 +176,22 @@ pub struct SearchSnapshot {
 	pub bytes:      Bytes,
 }
 
-/// One snapshot whose exact model-visible source lines are ready to record.
+/// One staged snapshot identity carried in the durable grep payload.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnapshotCandidate {
+	/// Stable canonical identity shared with matching rows.
+	pub source_key: Str,
+	/// Exact revision identity staged by the document authority.
+	pub revision:   Bytes,
+}
+
+/// One staged snapshot whose centrally receipted lines may be authorized.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotRecord {
 	/// Stable canonical identity shared with matching rows.
 	pub source_key: Str,
-	/// Exact revision identity for the retained bytes.
+	/// Exact staged revision identity.
 	pub revision:   Bytes,
-	/// Complete bytes used to compute the model-facing snapshot tag.
-	pub bytes:      Bytes,
 	/// One-based source lines retained by final output projection.
 	pub seen_lines: Vec<usize>,
 }
@@ -244,6 +250,9 @@ pub struct FileGroup {
 pub struct Payload {
 	/// Current page of grouped file matches.
 	pub files:                   Vec<FileGroup>,
+	/// Revision-pinned candidates staged without authorizing source lines.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub snapshots:               Vec<SnapshotCandidate>,
 	/// Number of distinct matching files observed before pagination.
 	pub total_files:             u64,
 	/// Whether the total is a lower bound because native grep stopped early.
@@ -258,16 +267,6 @@ pub struct Payload {
 	pub per_file_limit_reached:  bool,
 	/// Ordered model-facing diagnostic notes.
 	pub notes:                   Vec<Str>,
-	/// Exact bounded model-facing text prepared before prompt projection.
-	pub projected_text:          Str,
-	/// Durable complete output when `projected_text` was pre-truncated.
-	pub output_blob:             Option<BlobRef>,
-	/// Resolver-valid address of `output_blob`.
-	pub output_artifact_uri:     Option<Str>,
-	/// Complete lines retained in `projected_text` before its footer.
-	pub output_shown_lines:      u64,
-	/// Complete line count in the pre-truncation output.
-	pub output_total_lines:      u64,
 }
 
 /// Ephemeral progress from `grep@1`; grep has no durable updates.
@@ -320,12 +319,6 @@ pub enum Fault {
 		/// Stable resource-owned explanation.
 		message: Str,
 	},
-	/// Durable blob storage failed while preserving complete output.
-	#[error("{message}")]
-	Blob {
-		/// Stable blob-owned explanation.
-		message: Str,
-	},
 	/// The resource itself observed cancellation without an invocation
 	/// interrupt.
 	#[error("workspace search was cancelled: {reason}")]
@@ -344,8 +337,10 @@ pub trait WorkspaceSearch: Send + Sync + 'static {
 		request: SearchRequest,
 	) -> impl Future<Output = Result<SearchResult, Fault>> + Send + '_;
 
-	/// Records only source lines retained by final grep filtering and output
-	/// truncation.
+	/// Stages exact snapshot bytes without authorizing any source line.
+	fn stage_snapshots(&self, snapshots: Vec<SearchSnapshot>) -> Result<(), Fault>;
+	/// Authorizes only source lines named by the central dispatcher's final
+	/// visibility receipt.
 	fn record_snapshots(&self, records: Vec<SnapshotRecord>) -> Result<(), Fault>;
 	/// Match paths in deterministic workspace traversal order.
 	fn glob(
@@ -362,11 +357,9 @@ pub trait WorkspaceSearch: Send + Sync + 'static {
 	}
 }
 
-/// Generic `grep@1` executor over environment-owned workspace and blob
-/// resources.
-pub struct Grep<W, B> {
+/// Generic `grep@1` executor over an environment-owned workspace resource.
+pub struct Grep<W> {
 	workspace:      W,
-	blobs:          B,
 	context_before: u32,
 	context_after:  u32,
 	spec:           ToolSpec,
@@ -406,17 +399,12 @@ pub fn spec() -> ToolSpec {
 	}
 }
 
-/// Construct `grep@1` over `workspace` and the shared durable blob namespace.
-pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(
-	workspace: W,
-	blobs: B,
-	context_before: u32,
-	context_after: u32,
-) -> Grep<W, B> {
-	Grep { workspace, blobs, context_before, context_after, spec: spec() }
+/// Construct `grep@1` over `workspace`.
+pub fn tool<W: WorkspaceSearch>(workspace: W, context_before: u32, context_after: u32) -> Grep<W> {
+	Grep { workspace, context_before, context_after, spec: spec() }
 }
 
-impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
+impl<W: WorkspaceSearch> Tool for Grep<W> {
 	type Fault = Fault;
 	type Params = Params;
 	type Payload = Payload;
@@ -485,7 +473,7 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
 				build_request(arguments, &roots, self.context_before, self.context_after);
 			let operation = async {
 				let result = self.workspace.search(request).await?;
-				prepare_payload(result, &roots, skip, &self.workspace, &self.blobs).await
+				prepare_payload(result, &roots, skip, &self.workspace)
 			}.instrument(span.clone()).fuse();
 			let interruption = params.next_interrupt().fuse();
 			pin_mut!(operation, interruption);
@@ -501,24 +489,77 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Grep<W, B> {
 	}
 
 	fn prompt(&self, view: Result<&Self::Payload, &Self::Fault>, caps: &PromptCaps) -> Vec<Part> {
-		let Some(mut projection) = TextProjection::new(*caps) else {
-			return Vec::new();
-		};
-		let text = match view {
-			Ok(payload) => payload.projected_text.as_str(),
-			Err(fault) => {
-				let message = fault.to_string();
-				projection.push(&message);
-				return projection.finish();
-			},
-		};
-		for fragment in text.split_inclusive('\n') {
-			if !projection.push(fragment) {
-				break;
-			}
-		}
-		projection.finish()
+		grep_projection(view, caps).parts
 	}
+
+	fn projection(
+		&self,
+		view: Result<&Self::Payload, &Self::Fault>,
+		caps: &PromptCaps,
+	) -> PromptProjection {
+		grep_projection(view, caps)
+	}
+
+	fn authorize_visibility(
+		&self,
+		view: Result<&Self::Payload, &Self::Fault>,
+		receipt: &VisibilityReceipt,
+	) -> Result<(), ProjectionAuthorizationError> {
+		let Ok(payload) = view else {
+			return Ok(());
+		};
+		let mut visible = HashMap::<Str, Vec<usize>>::new();
+		for line in &receipt.lines {
+			visible
+				.entry(line.source_key.clone())
+				.or_default()
+				.push(line.line);
+		}
+		let records = payload
+			.snapshots
+			.iter()
+			.filter_map(|snapshot| {
+				let mut seen_lines = visible.remove(&snapshot.source_key)?;
+				seen_lines.sort_unstable();
+				seen_lines.dedup();
+				Some(SnapshotRecord {
+					source_key: snapshot.source_key.clone(),
+					revision: snapshot.revision.clone(),
+					seen_lines,
+				})
+			})
+			.collect();
+		self
+			.workspace
+			.record_snapshots(records)
+			.map_err(ProjectionAuthorizationError::new)
+	}
+}
+
+fn grep_projection(view: Result<&Payload, &Fault>, caps: &PromptCaps) -> PromptProjection {
+	let Some(mut projection) = TextProjection::new(*caps) else {
+		return PromptProjection::default();
+	};
+	let mut visibility = Vec::new();
+	match view {
+		Ok(payload) => {
+			let (text, source_rows) = render_payload(payload);
+			for fragment in text.split_inclusive('\n') {
+				projection.push(fragment);
+			}
+			visibility.extend(source_rows.into_iter().map(|row| ProjectionSpan {
+				part:       0,
+				start_byte: row.start_byte,
+				end_byte:   row.end_byte,
+				source_key: row.source_key,
+				line:       row.line_number,
+			}));
+		},
+		Err(fault) => {
+			projection.push(&fault.to_string());
+		},
+	}
+	PromptProjection { parts: projection.finish(), visibility }
 }
 fn build_request(
 	arguments: Params,
@@ -743,6 +784,7 @@ fn make_payload(result: SearchResult, roots: &[SearchRoot], requested_skip: u64)
 	}
 	Payload {
 		files,
+		snapshots: Vec::new(),
 		total_files,
 		total_files_lower_bound: result.limit_reached,
 		multi_scope: result.multi_scope,
@@ -750,59 +792,34 @@ fn make_payload(result: SearchResult, roots: &[SearchRoot], requested_skip: u64)
 		file_limit_reached,
 		per_file_limit_reached,
 		notes,
-		projected_text: Str::new(""),
-		output_blob: None,
-		output_artifact_uri: None,
-		output_shown_lines: 0,
-		output_total_lines: 0,
 	}
 }
 
-async fn prepare_payload<W: WorkspaceSearch, B: ReadBlobs>(
+fn prepare_payload<W: WorkspaceSearch>(
 	mut result: SearchResult,
 	roots: &[SearchRoot],
 	requested_skip: u64,
 	workspace: &W,
-	blobs: &B,
 ) -> Result<Payload, Fault> {
-	let snapshots = mem::take(&mut result.snapshots);
+	let snapshots = std::mem::take(&mut result.snapshots);
 	let mut payload = make_payload(result, roots, requested_skip);
-	let (rendered, source_rows) = render_payload(&payload);
-	let retained_bytes = truncate_head(&rendered, TruncationOptions::default())
-		.content
-		.len();
-	let mut visible = HashMap::<Str, Vec<usize>>::new();
-	for row in source_rows {
-		if row.end_byte <= retained_bytes {
-			visible
-				.entry(row.source_key)
-				.or_default()
-				.push(row.line_number);
-		}
-	}
-	let output = spill_truncated_text(rendered, blobs)
-		.await
-		.map_err(|fault| Fault::Blob { message: fault.message().clone() })?;
-	let records = snapshots
+	let visible_sources = payload
+		.files
+		.iter()
+		.map(|file| file.source_key.clone())
+		.collect::<HashSet<_>>();
+	let snapshots = snapshots
 		.into_iter()
-		.filter_map(|snapshot| {
-			let mut seen_lines = visible.remove(&snapshot.source_key)?;
-			seen_lines.sort_unstable();
-			seen_lines.dedup();
-			Some(SnapshotRecord {
-				source_key: snapshot.source_key,
-				revision: snapshot.revision,
-				bytes: snapshot.bytes,
-				seen_lines,
-			})
+		.filter(|snapshot| visible_sources.contains(&snapshot.source_key))
+		.collect::<Vec<_>>();
+	payload.snapshots = snapshots
+		.iter()
+		.map(|snapshot| SnapshotCandidate {
+			source_key: snapshot.source_key.clone(),
+			revision:   snapshot.revision.clone(),
 		})
 		.collect();
-	workspace.record_snapshots(records)?;
-	payload.projected_text = output.content;
-	payload.output_blob = output.blob;
-	payload.output_artifact_uri = output.artifact_uri;
-	payload.output_shown_lines = output.shown_lines;
-	payload.output_total_lines = output.total_lines;
+	workspace.stage_snapshots(snapshots)?;
 	Ok(payload)
 }
 
@@ -810,6 +827,7 @@ async fn prepare_payload<W: WorkspaceSearch, B: ReadBlobs>(
 struct RenderedSourceLine {
 	source_key:  Str,
 	line_number: usize,
+	start_byte:  usize,
 	end_byte:    usize,
 }
 
@@ -976,11 +994,13 @@ fn push_match_line(
 		output.push_str("...\n");
 	}
 	let marker = if matched { '*' } else { ' ' };
+	let start_byte = output.len();
 	let _ = writeln!(output, "{marker}{number}:{line}");
 	if let Ok(line_number) = usize::try_from(number) {
 		source_rows.push(RenderedSourceLine {
 			source_key: source_key.clone(),
 			line_number,
+			start_byte,
 			end_byte: output.len().saturating_sub(1),
 		});
 	}

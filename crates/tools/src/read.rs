@@ -700,44 +700,22 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> Tool for ReadTool<S, B,
 			},
 		};
 		let mut output = Vec::new();
-		let mut remaining_text = caps.maximum_text_bytes as usize;
 		for part in &payload.parts {
 			if output.len() >= usize::from(caps.maximum_parts) {
 				break;
 			}
 			match part {
-				PayloadPart::Text { text } if remaining_text != 0 => {
-					let mut end = text.len().min(remaining_text);
-					while end != 0 && !text.is_char_boundary(end) {
-						end -= 1;
-					}
-					if end != 0 {
-						output.push(Part::Text { text: Str::new(&text[..end]) });
-						remaining_text -= end;
-					}
+				PayloadPart::Text { text } if caps.maximum_text_bytes != 0 => {
+					output.push(Part::Text { text: text.clone() });
 				},
 				PayloadPart::Blob { blob, alt, .. } if caps.media => {
 					output.push(Part::Blob { blob: blob.clone(), alt: Some(alt.clone()) });
 				},
-				PayloadPart::Blob { vision: Some(_), .. } if remaining_text != 0 => {
-					let mut end = VISION_UNAVAILABLE.len().min(remaining_text);
-					while end != 0 && !VISION_UNAVAILABLE.is_char_boundary(end) {
-						end -= 1;
-					}
-					if end != 0 {
-						output.push(Part::Text { text: Str::new(&VISION_UNAVAILABLE[..end]) });
-						remaining_text -= end;
-					}
+				PayloadPart::Blob { vision: Some(_), .. } if caps.maximum_text_bytes != 0 => {
+					output.push(Part::Text { text: Str::new_static(VISION_UNAVAILABLE) });
 				},
-				PayloadPart::Blob { alt, .. } if remaining_text != 0 => {
-					let mut end = alt.len().min(remaining_text);
-					while end != 0 && !alt.is_char_boundary(end) {
-						end -= 1;
-					}
-					if end != 0 {
-						output.push(Part::Text { text: Str::new(&alt[..end]) });
-						remaining_text -= end;
-					}
+				PayloadPart::Blob { alt, .. } if caps.maximum_text_bytes != 0 => {
+					output.push(Part::Text { text: alt.clone() });
 				},
 				_ => {},
 			}

@@ -986,12 +986,11 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 		match view {
 			Ok(payload) => {
 				let status = format!(
-					"[status={:?}; exit={:?}; signal={:?}; {}ms{}]\n",
+					"[status={:?}; exit={:?}; signal={:?}; {}ms]\n",
 					payload.status.outcome,
 					payload.status.exit_code,
 					payload.status.signal,
 					payload.status.wall_clock_ms,
-					spilled_output_note(&payload.status),
 				);
 				if projection.push(&status) {
 					for adjustment in &payload.adjustments {
@@ -1010,11 +1009,8 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 			},
 			Err(Fault::CommandFailed { payload }) => {
 				let status = format!(
-					"bash command failed: status={:?}, exit={:?}, signal={:?}{}\n",
-					payload.status.outcome,
-					payload.status.exit_code,
-					payload.status.signal,
-					spilled_output_note(&payload.status),
+					"bash command failed: status={:?}, exit={:?}, signal={:?}\n",
+					payload.status.outcome, payload.status.exit_code, payload.status.signal,
 				);
 				if projection.push(&status) {
 					push_transcript(&mut projection, &payload.transcript);
@@ -1206,13 +1202,6 @@ fn extract_transcript_images(transcript: &mut [TranscriptFrame]) -> Vec<ImagePas
 		}
 	}
 	images
-}
-
-fn spilled_output_note(status: &ExecStatus) -> String {
-	status
-		.spilled_output
-		.as_ref()
-		.map_or_else(String::new, |blob| format!("; full output: artifact://sha256/{}", blob.hash))
 }
 
 fn attachment_parts(attachments: &[BlobRef], media: bool, limit: usize) -> Vec<Part> {

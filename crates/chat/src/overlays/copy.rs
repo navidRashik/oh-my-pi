@@ -21,9 +21,14 @@ use omp_tui::{
 
 use super::{Panel, PanelAction, PanelAnchor, PanelEvent};
 use crate::{
-	cards::Component,
+	cards::{Component, result_image},
 	markdown::extract_links,
-	notices::divider::{SummaryDivider, turn_compactions},
+	notices::{
+		divider::{SummaryDivider, turn_compactions},
+		irc, local, misc,
+	},
+	project::{AssistantPart, assistant_parts},
+	reaction, thinking,
 };
 
 /// Rows the frame chrome occupies: top rule, header, rule, footer hint,
@@ -49,35 +54,62 @@ pub struct CopyBlock {
 }
 
 /// What kind of command a `/copy cmd` hit came from.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
 pub enum CommandKind {
 	/// A `bash` tool call.
+	#[strum(serialize = "bash command")]
 	Bash,
 	/// An `eval` tool call.
+	#[strum(serialize = "eval code")]
 	Eval,
 }
 
 impl CommandKind {
 	/// pi's status wording (`Copied bash command to clipboard`).
 	#[must_use]
-	pub const fn noun(self) -> &'static str {
-		match self {
-			Self::Bash => "bash command",
-			Self::Eval => "eval code",
+	pub fn noun(self) -> &'static str {
+		self.into()
+	}
+}
+
+impl From<local::LocalKind> for CommandKind {
+	fn from(value: local::LocalKind) -> Self {
+		match value {
+			local::LocalKind::Bash => Self::Bash,
+			local::LocalKind::Eval => Self::Eval,
 		}
 	}
 }
 
 /// One rendered piece of a message.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Segment {
-	User(Str),
+	User {
+		node:     Node,
+		reaction: Option<Str>,
+	},
+	/// A journaled async-result row; the picker mirrors its compact transcript
+	/// presentation while copying the full model-facing notice.
+	AsyncResult(omp_journal::data::AsyncResult),
+	/// A journaled supervised-process completion. It follows tool visibility
+	/// and copies the full model-facing notice.
+	LaunchCompletion(omp_journal::data::LaunchCompletion),
+	/// Replay-stable incoming, autoreply, relay, or work-pool IRC traffic.
+	IrcTraffic(omp_journal::data::IrcTraffic),
 	Thinking(Str),
 	Assistant(Str),
 	Tool {
 		name:   Str,
 		status: Str,
 		output: Str,
+	},
+	/// A user-local `!`/`$` run, preserving its dedicated neutral card.
+	Local(local::LocalExecution),
+	/// A provider artifact attached to an assistant reply.
+	Artifact {
+		uri:  Str,
+		mime: Str,
+		kind: Str,
 	},
 	/// A journaled extension or hook message (`<notice kind=custom|hook>`).
 	Message {
@@ -97,7 +129,7 @@ enum Segment {
 
 /// One selectable transcript message (pi `OutlineTarget`): a user prompt,
 /// or an assistant message with the tool results it folded.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CopyTarget {
 	/// Clipboard label for the whole message.
 	pub label:   Str,
@@ -125,11 +157,17 @@ pub struct CopySelector {
 }
 
 impl CopySelector {
-	/// Builds the picker over the session replica; `show_thinking` mirrors
-	/// the transcript's reveal setting.
+	/// Builds the picker over the session replica; `show_thinking` and
+	/// `show_tools` mirror the transcript's reveal settings.
 	#[must_use]
-	pub fn open(dom: &Dom, show_thinking: bool, ctx: &UiContext) -> Self {
-		let targets = collect_targets(dom, show_thinking);
+	pub fn open(
+		dom: &Dom,
+		show_thinking: bool,
+		show_tools: bool,
+		prose_only: bool,
+		ctx: &UiContext,
+	) -> Self {
+		let targets = collect_targets(dom, show_thinking, show_tools, prose_only);
 		let mut panel = Self {
 			ui: Ui::from_root(dom! { <col/> }, 80, ctx.clone()),
 			ctx: ctx.clone(),
@@ -324,7 +362,7 @@ impl CopySelector {
 				let segments = target
 					.segments
 					.iter()
-					.map(|segment| segment_view(segment, expanded))
+					.map(|segment| segment_view(segment, expanded, &self.ctx))
 					.collect::<Vec<_>>();
 				(id, descended, outlined, caption, cards, segments)
 			})
@@ -366,15 +404,29 @@ impl CopySelector {
 	}
 }
 
-fn segment_view(segment: &Segment, expanded: bool) -> Component {
+fn segment_view(segment: &Segment, expanded: bool, ui: &UiContext) -> Component {
 	match segment {
-		Segment::User(text) => {
-			let text = text.clone();
-			dom! { <text bg=surface pad="1 1">{text}</text> }.into_component()
+		Segment::User { node, reaction } => {
+			let raw = node.content.clone().unwrap_or_default();
+			let text = crate::project::collapse_image_markers(&raw, ui.charset);
+			let chips = crate::project::attachment_chips(node, raw.as_str(), ui.charset);
+			if crate::notices::prop_bool(node, PropId::Synthetic) {
+				crate::project::with_attachments(
+					crate::notices::misc::synthetic_row(text.as_str(), expanded),
+					&chips,
+				)
+			} else if let Some(author) = crate::notices::prop_text(node, PropId::Author) {
+				crate::project::with_attachments(
+					crate::notices::misc::guest_bubble(author.as_str(), text),
+					&chips,
+				)
+			} else {
+				copy_user_bubble(text, reaction.clone(), &chips)
+			}
 		},
 		Segment::Thinking(text) => {
 			let text = text.clone();
-			dom! { <text fg=muted italic pad-x=1>{text}</text> }.into_component()
+			dom! { <md fg=muted italic pad-x=1>{text}</md> }.into_component()
 		},
 		Segment::Assistant(text) => {
 			let text = text.clone();
@@ -394,6 +446,22 @@ fn segment_view(segment: &Segment, expanded: bool) -> Component {
 				</col>
 			}
 			.into_component()
+		},
+		Segment::Local(run) => local::execution_block(run, expanded),
+		Segment::AsyncResult(result) => misc::async_result_block(result),
+		Segment::LaunchCompletion(completion) => misc::launch_completion_block(completion),
+		Segment::IrcTraffic(traffic) => irc::traffic_card(traffic, expanded),
+		Segment::Artifact { uri, mime, kind } => {
+			if kind.as_str() == "image" || mime.as_str().starts_with("image/") {
+				result_image(uri, mime.as_str(), None, ui)
+			} else {
+				let uri = uri.clone();
+				let label = sf!("[{}: {}]", kind, mime);
+				dom! {
+					<col pad-x=1><text fg=muted>{label}</text><a href={uri.clone()}>{uri}</a></col>
+				}
+				.into_component()
+			}
 		},
 		Segment::Message { name, body } => {
 			let name = name.clone();
@@ -419,6 +487,33 @@ fn segment_view(segment: &Segment, expanded: bool) -> Component {
 		},
 		Segment::Summary(divider) => divider.clone().into_component(),
 	}
+}
+
+/// User bubble inside the alternate-screen copy overlay. It mirrors the main
+/// bubble but deliberately omits the OSC 133 prompt zone, matching pi's
+/// `stripPromptZones` and keeping terminal click-to-move state off the picker.
+fn copy_user_bubble(text: Str, reaction: Option<Str>, chips: &[Str]) -> Component {
+	if reaction.is_none() && chips.is_empty() {
+		return dom! { <md bg=surface pad="1 1">{text}</md> }.into_component();
+	}
+	let chips = chips.to_vec();
+	dom! {
+		<col bg=surface>
+			if let Some(reaction) = reaction {
+				<row h=1 justify=end pad-x=1><text>{reaction}</text></row>
+			} else {
+				<spacer h=1/>
+			}
+			<md pad-x=1>{text}</md>
+			if !chips.is_empty() {
+				<row h=1 gap=2 pad-x=1>
+					for chip in chips { <text bold fg=accent>{chip}</text> }
+				</row>
+			}
+			<spacer h=1/>
+		</col>
+	}
+	.into_component()
 }
 
 /// pi `targetCopy` `custom` for the notices omp renders with their own
@@ -603,12 +698,18 @@ impl Panel for CopySelector {
 }
 
 /// Walks the replica into pi's outline targets: every user prompt, every
-/// assistant message with the tool results it folded, every displayed
-/// notice (`message`), and every history-collapse divider (`summary`)
-/// after the turn holding its boundary.
+/// assistant message with the visible tool results it folded, every displayed
+/// notice (`message`), and every history-collapse divider (`summary`) after
+/// the turn holding its boundary. Hidden tool activity is not selectable.
 #[must_use]
-pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
+pub fn collect_targets(
+	dom: &Dom,
+	show_thinking: bool,
+	show_tools: bool,
+	prose_only: bool,
+) -> Vec<CopyTarget> {
 	let mut targets = Vec::new();
+	let mut reaction_target = None;
 	for turn in dom.children(dom.body()) {
 		if dom
 			.get(*turn)
@@ -623,30 +724,115 @@ pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 			};
 			match &node.tag {
 				Tag::Known(KnownTag::User) => {
+					if let Some(completion) = misc::launch_completion(node) {
+						reaction_target = None;
+						targets.extend(open.take());
+						if !show_tools {
+							continue;
+						}
+						let content = node.content.clone().unwrap_or_default();
+						let mut blocks = Vec::new();
+						push_markdown_blocks(&mut blocks, content.as_str());
+						targets.push(CopyTarget {
+							label: Str::new_static("message"),
+							content,
+							blocks,
+							segments: vec![Segment::LaunchCompletion(completion)],
+						});
+						continue;
+					}
+					if let Some(result) = misc::async_result(node) {
+						reaction_target = None;
+						targets.extend(open.take());
+						if !show_tools {
+							continue;
+						}
+						let content = node.content.clone().unwrap_or_default();
+						let mut blocks = Vec::new();
+						push_markdown_blocks(&mut blocks, content.as_str());
+						targets.push(CopyTarget {
+							label: Str::new_static("message"),
+							content,
+							blocks,
+							segments: vec![Segment::AsyncResult(result)],
+						});
+						continue;
+					}
 					targets.extend(open.take());
 					let text = node.content.clone().unwrap_or_default();
 					let mut blocks = Vec::new();
 					push_markdown_blocks(&mut blocks, text.as_str());
-					targets.push(CopyTarget {
+					let accepts_reaction = node.prop(&PropId::Synthetic.into())
+						!= Some(&Value::Bool(true))
+						&& prop_text(node, PropId::Author).is_none();
+					let target = CopyTarget {
 						label: Str::new_static("user message"),
 						content: text.clone(),
 						blocks,
-						segments: vec![Segment::User(text)],
-					});
+						segments: vec![Segment::User { node: node.clone(), reaction: None }],
+					};
+					if accepts_reaction {
+						reaction_target = Some(targets.len());
+					} else {
+						reaction_target = None;
+					}
+					targets.push(target);
 				},
 				Tag::Known(KnownTag::Assistant) => {
 					targets.extend(open.take());
-					let text = live_text(dom, *handle, node, PropId::Text).unwrap_or_default();
+					let mut text = StrMut::new("");
 					let mut segments = Vec::new();
-					if show_thinking
-						&& let Some(thinking) = live_text(dom, *handle, node, PropId::Thinking)
-						&& !thinking.is_empty()
-					{
-						segments.push(Segment::Thinking(thinking));
+					let mut target = reaction_target.take();
+					let mut opening_text_seen = false;
+					for part in assistant_parts(dom, *handle, node) {
+						match part {
+							AssistantPart::Text { text: raw, .. } => {
+								text.push_str(raw.as_str());
+								let raw = Str::new(raw.trim());
+								if raw.is_empty() {
+									continue;
+								}
+								let display = if opening_text_seen {
+									raw
+								} else {
+									opening_text_seen = true;
+									match target.take() {
+										Some(target_index) => {
+											let split = reaction::split_reaction(raw.as_str());
+											if let Some(emoji) = split.emoji {
+												if let Some(CopyTarget { segments, .. }) =
+													targets.get_mut(target_index)
+													&& let Some(Segment::User { reaction, .. }) =
+														segments.first_mut()
+												{
+													*reaction = Some(Str::new(emoji));
+												}
+												Str::new(split.body)
+											} else {
+												raw
+											}
+										},
+										None => raw,
+									}
+								};
+								if !display.is_empty() {
+									segments.push(Segment::Assistant(display));
+								}
+							},
+							AssistantPart::Thinking { text: raw, .. } if show_thinking => {
+								let display = thinking::display_thinking(&raw, prose_only);
+								let display = Str::new(display.trim());
+								if thinking::is_displayable(raw.as_str(), display.as_str()) {
+									segments.push(Segment::Thinking(display));
+								}
+							},
+							AssistantPart::Thinking { .. } => {},
+							AssistantPart::Artifact { uri, mime, kind, .. } => {
+								segments.push(Segment::Artifact { uri, mime, kind });
+							},
+						}
 					}
-					if !text.is_empty() {
-						segments.push(Segment::Assistant(text.clone()));
-					}
+					let text = text.freeze();
 					let mut blocks = Vec::new();
 					push_markdown_blocks(&mut blocks, text.as_str());
 					let trimmed = Str::new(text.trim());
@@ -655,6 +841,27 @@ pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 						content: trimmed,
 						blocks,
 						segments,
+					});
+				},
+				Tag::Known(KnownTag::Notice)
+					if prop_text(node, PropId::Kind).is_some_and(|kind| kind.as_str() == "irc") =>
+				{
+					reaction_target = None;
+					targets.extend(open.take());
+					if !show_tools {
+						continue;
+					}
+					let Some(traffic) = irc::traffic(node) else {
+						continue;
+					};
+					let body = traffic.body.clone();
+					let mut blocks = Vec::new();
+					push_markdown_blocks(&mut blocks, body.as_str());
+					targets.push(CopyTarget {
+						label: Str::new_static("message"),
+						content: body,
+						blocks,
+						segments: vec![Segment::IrcTraffic(traffic)],
 					});
 				},
 				// pi `targetCopy` `custom | hookMessage`: the framed message is
@@ -700,6 +907,47 @@ pub fn collect_targets(dom: &Dom, show_thinking: bool) -> Vec<CopyTarget> {
 					});
 				},
 				Tag::Custom(tool) => {
+					if let Some(run) = local::execution(dom, *handle, node) {
+						targets.extend(open.take());
+						let command_kind = CommandKind::from(run.kind);
+						let language = match command_kind {
+							CommandKind::Bash => Str::new_static("bash"),
+							CommandKind::Eval => Str::new_static("python"),
+						};
+						let mut blocks = vec![CopyBlock {
+							label:    Str::new(command_kind.noun()),
+							content:  run.command.clone(),
+							language: Some(language),
+							href:     None,
+						}];
+						if !run.output.trim().is_empty() {
+							blocks.push(CopyBlock {
+								label:    Str::new_static("output"),
+								content:  run.output.clone(),
+								language: None,
+								href:     None,
+							});
+						}
+						if let Some(artifact) = &run.artifact {
+							blocks.push(CopyBlock {
+								label:    Str::new_static("output artifact"),
+								content:  artifact.clone(),
+								language: None,
+								href:     Some(artifact.clone()),
+							});
+						}
+						let label: &'static str = run.kind.into();
+						targets.push(CopyTarget {
+							label: Str::new_static(label),
+							content: run.copy_text(),
+							blocks,
+							segments: vec![Segment::Local(run)],
+						});
+						continue;
+					}
+					if !show_tools {
+						continue;
+					}
 					let Some(input) = child(dom, *handle, KnownTag::Input) else {
 						continue;
 					};
@@ -787,17 +1035,19 @@ pub fn last_code_block(dom: &Dom) -> Option<CopyBlock> {
 			if node.tag != Tag::Known(KnownTag::Assistant) {
 				continue;
 			}
-			let Some(text) = live_text(dom, *handle, node, PropId::Text) else {
-				continue;
-			};
-			let mut blocks = Vec::new();
-			push_markdown_blocks(&mut blocks, text.as_str());
-			if let Some(block) = blocks
-				.into_iter()
-				.rev()
-				.find(|block| block.language.is_some() || block.label.ends_with("code"))
-			{
-				last = Some(block);
+			for part in assistant_parts(dom, *handle, node) {
+				let AssistantPart::Text { text, .. } = part else {
+					continue;
+				};
+				let mut blocks = Vec::new();
+				push_markdown_blocks(&mut blocks, text.as_str());
+				if let Some(block) = blocks
+					.into_iter()
+					.rev()
+					.find(|block| block.language.is_some() || block.label.ends_with("code"))
+				{
+					last = Some(block);
+				}
 			}
 		}
 	}
@@ -965,13 +1215,13 @@ fn push_code_and_quotes(blocks: &mut Vec<CopyBlock>, text: &str) {
 	while index < lines.len() {
 		let line = lines[index];
 		index += 1;
-		if let Some(rest) = line.trim_start().strip_prefix("```")
+		if let Some(rest) = line.strip_prefix("```")
 			&& let Some(close) = lines[index..]
 				.iter()
-				.position(|line| line.trim_start().starts_with("```"))
+				.position(|line| line.starts_with("```"))
 		{
 			flush_quote(&mut quote, blocks);
-			let language = rest.trim().split_whitespace().next().unwrap_or_default();
+			let language = rest.trim();
 			let label = if language.is_empty() {
 				Str::new_static("code")
 			} else {
@@ -986,7 +1236,7 @@ fn push_code_and_quotes(blocks: &mut Vec<CopyBlock>, text: &str) {
 			index += close + 1;
 			continue;
 		}
-		if let Some(rest) = line.trim_start().strip_prefix('>') {
+		if let Some(rest) = line.strip_prefix('>') {
 			let body = quote.get_or_insert_with(|| StrMut::new(""));
 			body.push_str(rest.strip_prefix(' ').unwrap_or(rest));
 			body.push_str("\n");
@@ -1004,14 +1254,6 @@ fn child<'a>(dom: &'a Dom, parent: omp_dom::Handle, tag: KnownTag) -> Option<&'a
 		.find(|node| node.tag == Tag::Known(tag))
 }
 
-fn live_text(dom: &Dom, handle: omp_dom::Handle, node: &Node, prop: PropId) -> Option<Str> {
-	let key: omp_dom::PropKey = prop.into();
-	match dom.stream_text(handle, &key) {
-		Some(text) => Some(Str::new(text)),
-		None => prop_text(node, prop),
-	}
-}
-
 fn prop_text(node: &Node, prop: PropId) -> Option<Str> {
 	node
 		.prop(&prop.into())
@@ -1021,7 +1263,10 @@ fn prop_text(node: &Node, prop: PropId) -> Option<Str> {
 
 #[cfg(test)]
 mod tests {
-	use omp_session::{ComponentRegistry, Session};
+	use omp_dom::{NodeSpec, Op, PropKey, Txn};
+	use omp_session::{
+		ASSISTANT_CONTENT_TAG, ComponentRegistry, PROVIDER_BLOCK_INDEX_PROP, Session,
+	};
 	use omp_tui::{Mods, Mouse, MouseButton, frame_text};
 
 	use super::*;
@@ -1092,10 +1337,41 @@ mod tests {
 		session
 	}
 
+	fn insert_mixed_part(
+		session: &mut Session,
+		assistant: omp_dom::Handle,
+		index: i64,
+		kind: &str,
+		text: &str,
+	) {
+		let node = (if kind == "artifact" {
+			NodeSpec::new(Tag::Custom(Str::new_static("artifact")))
+				.with_prop(PropId::Blob, Value::Str(Str::new(text)))
+				.with_prop(PropId::Mime, Value::Str(Str::new_static("image/png")))
+				.with_prop(PropId::Kind, Value::Str(Str::new_static("image")))
+		} else {
+			NodeSpec::new(Tag::Custom(Str::new_static(ASSISTANT_CONTENT_TAG)))
+				.with_prop(PropId::Kind, Value::Str(Str::new(kind)))
+				.with_prop(PropId::Text, Value::Str(Str::new(text)))
+		})
+		.with_prop(PropKey::Custom(Str::new_static(PROVIDER_BLOCK_INDEX_PROP)), Value::Int(index));
+		session
+			.patch(Txn {
+				cause: session.head().expect("head"),
+				label: None,
+				ops:   vec![Op::Ins {
+					parent: assistant,
+					after: session.dom().children(assistant).last().copied(),
+					node,
+				}],
+			})
+			.expect("mixed part");
+	}
+
 	#[test]
 	fn right_descends_into_the_code_block_and_enter_copies_it() {
 		let session = session(false);
-		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		let mut panel = CopySelector::open(session.dom(), true, true, true, &UiContext::default());
 		assert_eq!(panel.id(), "copy");
 		assert_eq!(panel.target_count(), 2);
 		let text = frame_text(panel.frame(Size { width: 80, height: 24 }));
@@ -1118,7 +1394,7 @@ mod tests {
 	#[test]
 	fn click_selects_a_message_and_wheel_scrolls_the_copy_viewport() {
 		let session = session(false);
-		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		let mut panel = CopySelector::open(session.dom(), true, true, true, &UiContext::default());
 		let full = Size { width: 80, height: 24 };
 		let text = frame_text(panel.frame(full));
 		let (col, row) = point(&text, "show me main");
@@ -1129,7 +1405,7 @@ mod tests {
 		assert_eq!(panel.selected, 0);
 		assert!(panel.hint().starts_with("1/2"), "clicked message must become the selection");
 
-		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		let mut panel = CopySelector::open(session.dom(), true, true, true, &UiContext::default());
 		let size = Size { width: 80, height: 8 };
 		let before = frame_text(panel.frame(size));
 		let (col, row) = point(&before, "show me main");
@@ -1142,12 +1418,82 @@ mod tests {
 	}
 
 	#[test]
+	fn copy_preview_keeps_mixed_assistant_parts_interleaved() {
+		let directory = tempfile::tempdir().expect("temp directory");
+		let mut session =
+			Session::create(directory.path().join("mixed-copy.oms"), ComponentRegistry::standard())
+				.expect("session");
+		session.begin_turn().expect("turn");
+		session.user("show the sequence", Vec::new()).expect("user");
+		session
+			.assistant_start("test/model", "test", "test/model")
+			.expect("assistant");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		let assistant = *session.dom().children(turn).last().expect("assistant");
+		insert_mixed_part(&mut session, assistant, 0, "text", "before");
+		insert_mixed_part(
+			&mut session,
+			assistant,
+			1,
+			"artifact",
+			"artifact://sha256/0101010101010101010101010101010101010101010101010101010101010101",
+		);
+		insert_mixed_part(&mut session, assistant, 2, "text", "after");
+		insert_mixed_part(&mut session, assistant, 3, "thinking", "first thought");
+		insert_mixed_part(
+			&mut session,
+			assistant,
+			4,
+			"artifact",
+			"artifact://sha256/0202020202020202020202020202020202020202020202020202020202020202",
+		);
+		insert_mixed_part(&mut session, assistant, 5, "thinking", "second thought");
+		insert_mixed_part(
+			&mut session,
+			assistant,
+			6,
+			"artifact",
+			"artifact://sha256/0303030303030303030303030303030303030303030303030303030303030303",
+		);
+
+		let targets = collect_targets(session.dom(), true, true, false);
+		let target = targets.last().expect("assistant target");
+		assert_eq!(target.content, "beforeafter", "whole-message copy retains pi's text contract");
+		let order = target
+			.segments
+			.iter()
+			.map(|segment| match segment {
+				Segment::Assistant(text) => sf!("text:{text}"),
+				Segment::Thinking(text) => sf!("thinking:{text}"),
+				Segment::Artifact { uri, .. } => sf!("artifact:{uri}"),
+				other => panic!("unexpected segment: {other:?}"),
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(order, [
+			"text:before",
+			"artifact:artifact://sha256/\
+			 0101010101010101010101010101010101010101010101010101010101010101",
+			"text:after",
+			"thinking:first thought",
+			"artifact:artifact://sha256/\
+			 0202020202020202020202020202020202020202020202020202020202020202",
+			"thinking:second thought",
+			"artifact:artifact://sha256/\
+			 0303030303030303030303030303030303030303030303030303030303030303",
+		]);
+	}
+
+	#[test]
 	fn whole_message_copy_and_escape_ladder() {
 		let session = session(true);
-		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		let mut panel = CopySelector::open(session.dom(), true, true, true, &UiContext::default());
 		assert_eq!(panel.key(Key::Up), PanelEvent::Consumed);
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Copy(Str::new_static("show me main")));
-		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		let mut panel = CopySelector::open(session.dom(), true, true, true, &UiContext::default());
 		assert_eq!(panel.key(Key::Right), PanelEvent::Consumed);
 		assert_eq!(panel.key(Key::Esc), PanelEvent::Consumed);
 		assert_eq!(panel.key(Key::Esc), PanelEvent::Close);
@@ -1225,7 +1571,7 @@ mod tests {
 		session.stream_close(text).expect("close");
 		session.assistant_end("stop").expect("end");
 
-		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		let mut panel = CopySelector::open(session.dom(), true, true, true, &UiContext::default());
 		panel.opener = record;
 		let blocks = &panel.targets.last().expect("assistant target").blocks;
 		assert_eq!(
@@ -1256,7 +1602,7 @@ mod tests {
 		fn record(href: &str) {
 			OPENED.lock().push(href.to_owned());
 		}
-		let mut panel = CopySelector::open(session.dom(), true, &UiContext::default());
+		let mut panel = CopySelector::open(session.dom(), true, true, true, &UiContext::default());
 		panel.opener = record;
 		assert_eq!(panel.key(Key::Right), PanelEvent::Consumed);
 		assert_eq!(panel.key(Key::Char('o')), PanelEvent::Consumed);
@@ -1353,7 +1699,7 @@ mod tests {
 		notice("tangent", &[(PropId::Id, "tan-1"), (PropId::Label, "check the docs")], None);
 		notice("info", &[], Some("controller chatter pi never lists"));
 
-		let targets = collect_targets(session.dom(), false);
+		let targets = collect_targets(session.dom(), false, true, true);
 		let labels = targets
 			.iter()
 			.map(|target| target.label.as_str())
@@ -1381,7 +1727,7 @@ mod tests {
 		assert_eq!(targets[4].content, "src/lib.rs:3:5 [error] unused variable");
 		assert_eq!(targets[5].content, "Tangent dispatched [task] tan-1 — check the docs");
 
-		let mut picker = CopySelector::open(session.dom(), false, &UiContext::default());
+		let mut picker = CopySelector::open(session.dom(), false, true, true, &UiContext::default());
 		for _ in 0..4 {
 			assert_eq!(picker.key(Key::Up), PanelEvent::Consumed);
 		}

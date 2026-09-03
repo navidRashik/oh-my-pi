@@ -6,7 +6,7 @@ use omp_con::ConError;
 use omp_core::Str;
 use omp_tui::Icon;
 
-use super::{CommandAction, GoalOp, PaletteEntry, post, rest};
+use super::{CommandAction, GoalOp, LoopLimit, PaletteEntry, post, rest};
 
 /// Palette icons for this module's commands.
 pub const PALETTE: &[PaletteEntry] = &[
@@ -15,6 +15,7 @@ pub const PALETTE: &[PaletteEntry] = &[
 	PaletteEntry { name: "guided-goal", icon: Icon::Goal },
 	PaletteEntry { name: "loop", icon: Icon::Loop },
 	PaletteEntry { name: "force", icon: Icon::Bolt },
+	PaletteEntry { name: "force:", icon: Icon::Bolt },
 	PaletteEntry { name: "pause", icon: Icon::Pause },
 ];
 
@@ -22,31 +23,115 @@ pub const PALETTE: &[PaletteEntry] = &[
 pub const LOOP_USAGE: &str =
 	"Usage: /loop [count|duration]. Examples: /loop 10, /loop 10m, /loop 10min.";
 
-/// Splits `/loop [count] [prompt]`: a leading positive integer is the cap,
-/// the rest is the prompt re-sent each iteration. A leading duration
-/// (`10m`) is pi's time limit; the Director counts iterations, so it is
-/// reported as unsupported rather than silently treated as a prompt.
-pub fn loop_args(words: Option<Str>) -> Result<(Option<u32>, Option<Str>), ConError> {
+/// Parses `/loop [count|duration] [prompt]` exactly like pi
+/// `modes/loop-limit.ts`. Prose starts an unbounded loop; a limit-shaped
+/// token that cannot be parsed is a usage error.
+pub fn loop_args(words: Option<Str>) -> Result<(Option<LoopLimit>, Option<Str>), ConError> {
 	let Some(words) = words else {
 		return Ok((None, None));
 	};
 	let text = words.as_str().trim();
+	if text.is_empty() {
+		return Ok((None, None));
+	}
 	let (first, remainder) = text
 		.split_once(char::is_whitespace)
-		.map_or((text, ""), |(first, remainder)| (first, remainder.trim_start()));
+		.map_or((text, ""), |(first, remainder)| (first, remainder.trim()));
 	let prompt = |rest: &str| (!rest.is_empty()).then(|| Str::new(rest));
-	if let Ok(limit) = first.parse::<u32>() {
-		if limit == 0 {
-			return Err(usage("Loop count must be a positive integer."));
+	let token = first.to_ascii_lowercase();
+
+	if !limit_shaped(&token) {
+		return Ok((None, prompt(text)));
+	}
+
+	if token.bytes().all(|byte| byte.is_ascii_digit()) {
+		let amount = positive(&token, "Loop count must be a positive integer.")?;
+		if !remainder.is_empty() {
+			let (unit, rest) = remainder
+				.split_once(char::is_whitespace)
+				.map_or((remainder, ""), |(unit, rest)| (unit, rest.trim()));
+			if let Some(unit_ms) = time_unit_ms(unit) {
+				let duration = amount
+					.checked_mul(unit_ms)
+					.ok_or_else(|| usage("Loop duration must be positive."))?;
+				return Ok((Some(LoopLimit::DurationMs(duration)), prompt(rest)));
+			}
 		}
-		return Ok((Some(limit), prompt(remainder)));
+		let iterations =
+			u32::try_from(amount).map_err(|_| usage("Loop count must be a positive integer."))?;
+		return Ok((Some(LoopLimit::Iterations(iterations)), prompt(remainder)));
 	}
-	let looks_like_duration = first.chars().next().is_some_and(|ch| ch.is_ascii_digit())
-		&& first.chars().all(|ch| ch.is_ascii_alphanumeric());
-	if looks_like_duration {
-		return Err(usage(LOOP_USAGE));
+
+	if token.bytes().all(|byte| byte.is_ascii_alphanumeric())
+		&& token.bytes().any(|byte| byte.is_ascii_alphabetic())
+	{
+		return Ok((Some(LoopLimit::DurationMs(compound_duration_ms(&token)?)), prompt(remainder)));
 	}
-	Ok((None, prompt(text)))
+
+	Err(usage(LOOP_USAGE))
+}
+
+fn limit_shaped(token: &str) -> bool {
+	let mut bytes = token.bytes();
+	match bytes.next() {
+		Some(b'+' | b'-') => bytes.next().is_some_and(|byte| byte.is_ascii_digit()),
+		Some(byte) => byte.is_ascii_digit(),
+		None => false,
+	}
+}
+
+fn positive(text: &str, message: &'static str) -> Result<u64, ConError> {
+	text
+		.parse::<u64>()
+		.ok()
+		.filter(|value| *value > 0)
+		.ok_or_else(|| usage(message))
+}
+
+fn time_unit_ms(unit: &str) -> Option<u64> {
+	match unit.to_ascii_lowercase().as_str() {
+		"s" | "sec" | "secs" | "second" | "seconds" => Some(1_000),
+		"m" | "min" | "mins" | "minute" | "minutes" => Some(60_000),
+		"h" | "hr" | "hrs" | "hour" | "hours" => Some(3_600_000),
+		_ => None,
+	}
+}
+
+fn compound_duration_ms(token: &str) -> Result<u64, ConError> {
+	let bytes = token.as_bytes();
+	let mut at = 0;
+	let mut total = 0_u64;
+	while at < bytes.len() {
+		let amount_start = at;
+		while at < bytes.len() && bytes[at].is_ascii_digit() {
+			at += 1;
+		}
+		if amount_start == at {
+			return Err(usage(LOOP_USAGE));
+		}
+		let unit_start = at;
+		while at < bytes.len() && bytes[at].is_ascii_alphabetic() {
+			at += 1;
+		}
+		if unit_start == at {
+			return Err(usage(LOOP_USAGE));
+		}
+		let amount = positive(&token[amount_start..unit_start], "Loop duration must be positive.")?;
+		let unit = &token[unit_start..at];
+		let unit_ms = time_unit_ms(unit)
+			.ok_or_else(|| usage("Loop duration unit must be seconds, minutes, or hours."))?;
+		total = total
+			.checked_add(
+				amount
+					.checked_mul(unit_ms)
+					.ok_or_else(|| usage("Loop duration must be positive."))?,
+			)
+			.ok_or_else(|| usage("Loop duration must be positive."))?;
+	}
+	if total == 0 {
+		return Err(usage("Loop duration must be positive."));
+	}
+	Ok(total)
 }
 
 /// Parses `/goal …` words into one [`GoalOp`].
@@ -102,14 +187,19 @@ omp_con::cmd! {
 		post(ctx, CommandAction::GuidedGoal { initial: rest(args, 0) })
 	};
 
-	/// Repeats the prompt after each turn: `/loop [count] [prompt]`; again to disable.
-	"loop"(?count: Str, ?prompt: Str) = |ctx, args| {
+	/// Repeats the prompt after each turn: `/loop [count|duration] [prompt]`; again to disable.
+	"loop"(?limit: Str, ?prompt: Str) = |ctx, args| {
 		let (limit, prompt) = loop_args(rest(args, 0))?;
 		post(ctx, CommandAction::Loop { limit, prompt })
 	};
 
 	/// Forces the next turn to call the named tool: `/force <tool> [prompt]`.
 	force(tool @ "sv::tool": Str, ?prompt: Str) = |ctx, args| {
+		post(ctx, CommandAction::Force { tool: args.get::<Str>(0)?, prompt: rest(args, 1) })
+	};
+
+	/// Alias of `/force`, preserved for pi's terse `/force:<tool>` palette path.
+	"force:"(tool @ "sv::tool": Str, ?prompt: Str) = |ctx, args| {
 		post(ctx, CommandAction::Force { tool: args.get::<Str>(0)?, prompt: rest(args, 1) })
 	};
 
@@ -130,17 +220,32 @@ mod tests {
 	#[test]
 	fn loop_arguments_split_a_leading_count_from_the_prompt() {
 		assert_eq!(loop_args(None).unwrap(), (None, None));
-		assert_eq!(loop_args(Some(Str::new_static("5"))).unwrap(), (Some(5), None));
+		assert_eq!(
+			loop_args(Some(Str::new_static("5"))).unwrap(),
+			(Some(LoopLimit::Iterations(5)), None)
+		);
 		assert_eq!(
 			loop_args(Some(Str::new_static("5 run the tests"))).unwrap(),
-			(Some(5), Some(Str::new_static("run the tests")))
+			(Some(LoopLimit::Iterations(5)), Some(Str::new_static("run the tests")))
 		);
 		assert_eq!(
 			loop_args(Some(Str::new_static("run the tests"))).unwrap(),
 			(None, Some(Str::new_static("run the tests")))
 		);
 		assert!(loop_args(Some(Str::new_static("0"))).is_err());
-		assert!(loop_args(Some(Str::new_static("10m fix"))).is_err());
+		assert_eq!(
+			loop_args(Some(Str::new_static("10m fix"))).unwrap(),
+			(Some(LoopLimit::DurationMs(600_000)), Some(Str::new_static("fix")))
+		);
+		assert_eq!(
+			loop_args(Some(Str::new_static("1h30m keep going"))).unwrap(),
+			(Some(LoopLimit::DurationMs(5_400_000)), Some(Str::new_static("keep going")))
+		);
+		assert_eq!(
+			loop_args(Some(Str::new_static("10 minutes fix"))).unwrap(),
+			(Some(LoopLimit::DurationMs(600_000)), Some(Str::new_static("fix")))
+		);
+		assert!(loop_args(Some(Str::new_static("10fortnights"))).is_err());
 	}
 
 	#[test]

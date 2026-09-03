@@ -6,7 +6,7 @@
 
 use omp_core::{Str, sf};
 use omp_tui::{Frame, Key, Size, Ui, UiContext, dom};
-use strum::{EnumCount, VariantArray};
+use strum::{EnumCount, EnumProperty, IntoStaticStr, VariantArray};
 
 use super::{Panel, PanelAnchor, PanelEvent, Services, services::ServiceError};
 
@@ -14,32 +14,40 @@ use super::{Panel, PanelAnchor, PanelEvent, Services, services::ServiceError};
 pub const ID: &str = "paste-menu";
 
 /// How the user asked to land a large paste.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, EnumCount, VariantArray)]
+#[derive(
+	Clone, Copy, Debug, Eq, PartialEq, EnumCount, EnumProperty, IntoStaticStr, VariantArray,
+)]
 pub enum PasteChoice {
 	/// Chip whose submitted form is the text wrapped in `<attachment>` tags.
+	#[strum(
+		to_string = "Attach as a wrapped block",
+		props(description = "Wrap the text in <attachment> tags, collapsed to a marker")
+	)]
 	Wrapped,
 	/// Text saved under the session's `local://` root; the draft gets the
 	/// URL.
+	#[strum(
+		to_string = "Attach as local file",
+		props(description = "Save the text to a local://paste file")
+	)]
 	LocalFile,
 	/// Plain chip (the default paste behavior).
+	#[strum(
+		to_string = "Paste inline",
+		props(description = "Collapse the text to an inline paste marker")
+	)]
 	Inline,
 }
 
 impl PasteChoice {
-	const fn label(self) -> &'static str {
-		match self {
-			Self::Wrapped => "Attach as a wrapped block",
-			Self::LocalFile => "Attach as local file",
-			Self::Inline => "Paste inline",
-		}
+	fn label(self) -> &'static str {
+		self.into()
 	}
 
-	const fn description(self) -> &'static str {
-		match self {
-			Self::Wrapped => "Wrap the text in <attachment> tags, collapsed to a marker",
-			Self::LocalFile => "Save the text to a local://paste file",
-			Self::Inline => "Collapse the text to an inline paste marker",
-		}
+	fn description(self) -> &'static str {
+		self
+			.get_str("description")
+			.expect("every paste choice declares a description")
 	}
 }
 
@@ -57,7 +65,10 @@ pub fn wrap_in_attachment_block(text: &str) -> String {
 /// `local://paste-N.md` of the live session and returns the URL. The host
 /// inserts it into the draft; a failed write falls back to a chip.
 pub fn save_paste_file(services: &dyn Services, text: &str) -> Result<Str, ServiceError> {
-	let taken = services.list_local(".md").unwrap_or_default();
+	// Failure to inspect the local store is not evidence that `paste-1.md`
+	// is free. Propagate it so the caller can restore the inline chip rather
+	// than risk replacing an earlier paste.
+	let taken = services.list_local(".md")?;
 	let mut counter = 0_u32;
 	let name = loop {
 		counter += 1;
@@ -144,7 +155,9 @@ impl Panel for PasteMenu {
 
 	fn key(&mut self, key: Key) -> PanelEvent {
 		match key {
-			// pi: cancelling keeps the default chip so nothing is lost.
+			// Pi restores the held paste as the default inline chip when the
+			// selector is cancelled, so neither the pending content nor the
+			// draft around its insertion point is lost.
 			Key::Esc | Key::Ctrl('c') => self.choose(PasteChoice::Inline),
 			Key::Up => {
 				self.step(-1);
@@ -161,6 +174,12 @@ impl Panel for PasteMenu {
 			},
 			_ => PanelEvent::Consumed,
 		}
+	}
+
+	fn paste(&mut self, _text: &str) -> PanelEvent {
+		// This selector is modal. A second paste must not leak into the
+		// hidden composer while the first remains pending.
+		PanelEvent::Consumed
 	}
 
 	fn frame(&mut self, viewport: Size) -> &Frame {
@@ -223,6 +242,16 @@ mod tests {
 	}
 
 	#[test]
+	fn modal_menu_refuses_a_second_paste_without_changing_the_pending_choice() {
+		let mut panel = menu();
+		assert_eq!(panel.paste("must not reach the composer"), PanelEvent::Consumed);
+		assert_eq!(panel.key(Key::Enter), PanelEvent::Paste {
+			text:   panel.text.clone(),
+			choice: PasteChoice::Wrapped,
+		});
+	}
+
+	#[test]
 	fn wrapped_block_matches_pi() {
 		assert_eq!(wrap_in_attachment_block("a\nb"), "<attachment>\na\nb\n</attachment>");
 	}
@@ -257,5 +286,21 @@ mod tests {
 		let files = store.files.lock();
 		assert_eq!(files[0], (Str::new_static("paste-1.md"), Str::new_static("one")));
 		assert_eq!(files[1], (Str::new_static("paste-2.md"), Str::new_static("two")));
+	}
+
+	struct UnreadableStore;
+
+	impl Services for UnreadableStore {
+		fn list_local(&self, _suffix: &str) -> ServiceResult<Vec<Str>> {
+			Err(ServiceError::Unavailable("local store"))
+		}
+	}
+
+	#[test]
+	fn local_file_never_guesses_a_free_name_when_listing_fails() {
+		assert_eq!(
+			save_paste_file(&UnreadableStore, "replacement"),
+			Err(ServiceError::Unavailable("local store"))
+		);
 	}
 }

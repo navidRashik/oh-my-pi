@@ -2,7 +2,126 @@
 
 use super::*;
 
+const BLOB_BACKEND_CHOICES: &[UiOption] = &[
+	UiOption::new("imgur", "Imgur", "Uploads require either an Imgur access token or client ID."),
+	UiOption::new("imageshack", "ImageShack", "The API requires a paid subscription."),
+	UiOption::new("flickr", "Flickr", "image-host"),
+	UiOption::new("chevereto", "Chevereto", "self-hosted"),
+	UiOption::new("vgyme", "vgy.me", "image-host"),
+	UiOption::new("dropbox", "Dropbox", "cloud-files"),
+	UiOption::new("ftp", "FTP / FTPS / SFTP", "file-transfer"),
+	UiOption::new("onedrive", "OneDrive", "cloud-files"),
+	UiOption::new("google-drive", "Google Drive", "cloud-files"),
+	UiOption::new(
+		"puush",
+		"puush-compatible endpoint",
+		"The public service is defunct; a replacement endpoint is required.",
+	),
+	UiOption::new("box", "Box", "cloud-files"),
+	UiOption::new("amazon-s3", "Amazon S3", "s3"),
+	UiOption::new("google-cloud-storage", "Google Cloud Storage", "object-storage"),
+	UiOption::new("azure-storage", "Azure Blob Storage", "object-storage"),
+	UiOption::new(
+		"backblaze-b2",
+		"Backblaze B2",
+		"Configure either native B2 application keys or S3-compatible access keys.",
+	),
+	UiOption::new("owncloud", "ownCloud / Nextcloud", "webdav"),
+	UiOption::new(
+		"mediafire",
+		"MediaFire-compatible endpoint",
+		"The public API is deprecated; a replacement endpoint is required.",
+	),
+	UiOption::new(
+		"sendspace",
+		"SendSpace-compatible endpoint",
+		"The public discovery API is deprecated; a replacement endpoint is required.",
+	),
+	UiOption::new(
+		"localhostr",
+		"Hostr-compatible endpoint",
+		"The public service is offline; a replacement endpoint is required.",
+	),
+	UiOption::new(
+		"lambda",
+		"Lambda-compatible endpoint",
+		"The public service is offline; a replacement endpoint is required.",
+	),
+	UiOption::new("pomf", "Pomf", "pomf"),
+	UiOption::new("uguu", "Uguu", "Public uploads expire after approximately three hours."),
+	UiOption::new("seafile", "Seafile", "cloud-files"),
+	UiOption::new("s-ul", "s-ul", "file-host"),
+	UiOption::new(
+		"lobfile",
+		"LobFile-compatible endpoint",
+		"The public service is offline; a replacement endpoint is required.",
+	),
+	UiOption::new(
+		"transfer-sh",
+		"transfer.sh-compatible endpoint",
+		"The defunct public endpoint is blocked; a self-hosted replacement is required.",
+	),
+	UiOption::new("plik", "Plik", "self-hosted"),
+	UiOption::new("shared-folder", "Shared folder", "filesystem"),
+	UiOption::new("catbox", "Catbox", "anonymous-host"),
+	UiOption::new("litterbox", "Litterbox", "Uploads are temporary."),
+	UiOption::new(
+		"0x0",
+		"0x0.st",
+		"Public uploads expire after a retention window determined by file size.",
+	),
+	UiOption::new("tmpfiles", "tmpfiles.org", "Public uploads are temporary."),
+	UiOption::new("discord", "Discord", "messaging"),
+	UiOption::new(
+		"provider-files",
+		"Model provider files",
+		"Provider file references are API-local rather than public image URLs.",
+	),
+	UiOption::new("direct", "Direct public URL", "local-serving"),
+	UiOption::new("cloudflared", "Cloudflare quick tunnel", "tunnel"),
+	UiOption::new("ngrok", "ngrok", "tunnel"),
+	UiOption::new("tailscale", "Tailscale Funnel", "tunnel"),
+	UiOption::new("ssh", "SSH reverse tunnel", "tunnel"),
+	UiOption::new("command", "Uploader command", "external-command"),
+	UiOption::new("localhost-run", "localhost.run", "tunnel"),
+	UiOption::new("pinggy", "Pinggy", "tunnel"),
+	UiOption::new(
+		"devtunnel",
+		"Microsoft dev tunnel",
+		"The devtunnel CLI must be logged in locally.",
+	),
+	UiOption::new("zrok", "zrok", "The local zrok environment must be enabled."),
+	UiOption::new("bore", "bore", "tunnel"),
+	UiOption::new("named-cloudflared", "Named Cloudflare Tunnel", "tunnel"),
+	UiOption::new("r2", "Cloudflare R2", "s3"),
+	UiOption::new("tigris", "Tigris", "s3"),
+	UiOption::new("minio", "MinIO", "s3"),
+	UiOption::new("garage", "Garage", "s3"),
+];
+
 pub(super) const ENTRIES: &[UiSpec] = &[
+	ui!(
+		"theme.dark",
+		"cl_theme_dark",
+		Appearance,
+		"Theme",
+		"Dark Theme",
+		"Theme used when the terminal has a dark background",
+		UiWidget::RuntimeSubmenu(UiRuntimeOptions::Themes),
+		None,
+		Identity
+	),
+	ui!(
+		"theme.light",
+		"cl_theme_light",
+		Appearance,
+		"Theme",
+		"Light Theme",
+		"Theme used when the terminal has a light background",
+		UiWidget::RuntimeSubmenu(UiRuntimeOptions::Themes),
+		None,
+		Identity
+	),
 	ui!(
 		"symbolPreset",
 		"cl_charset",
@@ -19,6 +138,118 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Identity
 	),
 	ui!(
+		"colorBlindMode",
+		"cl_color_blind_mode",
+		Appearance,
+		"Theme",
+		"Color-Blind Mode",
+		"Use blue instead of green for diff additions",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"composer.shape",
+		"cl_composer_shape",
+		Appearance,
+		"Composer",
+		"Composer Shape",
+		"Visual layout of the input editor and status line",
+		UiWidget::RuntimeSubmenu(UiRuntimeOptions::ComposerShapes),
+		None,
+		Identity
+	),
+	ui!(
+		"statusLine.preset",
+		"cl_status_line_preset",
+		Appearance,
+		"Status Line",
+		"Status Line Preset",
+		"Pre-built status line configurations",
+		UiWidget::Submenu(&[
+			UiOption::new("default", "Default", "Model, path, git, context, tokens, cost"),
+			UiOption::new("minimal", "Minimal", "Path and git only"),
+			UiOption::new("compact", "Compact", "Model, git, cost, context"),
+			UiOption::new("full", "Full", "All segments including time"),
+			UiOption::new("nerd", "Nerd", "Maximum info with Nerd Font icons"),
+			UiOption::new("ascii", "ASCII", "No special characters"),
+			UiOption::new("custom", "Custom", "User-defined segments")
+		]),
+		None,
+		Identity
+	),
+	ui!(
+		"statusLine.separator",
+		"cl_status_line_separator",
+		Appearance,
+		"Status Line",
+		"Status Line Separator",
+		"Style of separators between segments",
+		UiWidget::Submenu(&[
+			UiOption::new("powerline", "Powerline", "Solid arrows (Nerd Font)"),
+			UiOption::new("powerline-thin", "Thin chevron", "Thin arrows (Nerd Font)"),
+			UiOption::new("slash", "Slash", "Forward slashes"),
+			UiOption::new("pipe", "Pipe", "Vertical pipes"),
+			UiOption::new("block", "Block", "Solid blocks"),
+			UiOption::new("none", "None", "Space only"),
+			UiOption::new("ascii", "ASCII", "Greater-than signs")
+		]),
+		None,
+		Identity
+	),
+	ui!(
+		"statusLine.contextLine",
+		"cl_status_line_context_line",
+		Appearance,
+		"Status Line",
+		"Context-Reactive Line",
+		"How the line between the left and right segments reflects context usage (box composer only)",
+		UiWidget::Submenu(&[
+			UiOption::new("off", "Off", "Solid accent line, no context feedback"),
+			UiOption::new(
+				"percentage",
+				"Percentage",
+				"Used portion in accent color, remainder dimmed"
+			),
+			UiOption::new(
+				"annotated",
+				"Annotated",
+				"Percentage plus ticks at the speculative and auto-compaction boundaries"
+			),
+			UiOption::new(
+				"embedded",
+				"Embedded",
+				"Annotated line with the context percentage and window embedded in the gauge"
+			)
+		]),
+		None,
+		Identity
+	),
+	ui!(
+		"statusLine.sessionAccent",
+		"cl_status_line_session_accent",
+		Appearance,
+		"Status Line",
+		"Session Accent",
+		"Use the session name color for the editor border and status line gap",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"statusLine.transparent",
+		"cl_status_line_transparent",
+		Appearance,
+		"Status Line",
+		"Transparent Status Line",
+		"Use the terminal's default background for the status line instead of the theme's \
+		 `statusLineBg`. Powerline end caps are dropped because they need a contrasting fill to \
+		 bridge into the surrounding terminal.",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
 		"statusLine.compactThinkingLevel",
 		"cl_status_compact_thinking",
 		Appearance,
@@ -26,6 +257,17 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		"Compact Thinking Level",
 		"Show the thinking level as a single icon on the model name instead of a separate ` · \
 		 <level>` suffix.",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"statusLine.showHookStatus",
+		"cl_status_line_show_hook_status",
+		Appearance,
+		"Status Line",
+		"Show Hook Status",
+		"Display hook status messages below the status line",
 		UiWidget::Boolean,
 		None,
 		Identity
@@ -58,6 +300,51 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Identity
 	),
 	ui!(
+		"terminal.showProgress",
+		"cl_show_progress",
+		Appearance,
+		"Display",
+		"Native Terminal Progress",
+		"Emit OSC 9;4 indeterminate progress while the agent or context maintenance is running",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"tui.textSizing",
+		"cl_tui_text_sizing",
+		Appearance,
+		"Display",
+		"Large Headings (Kitty)",
+		"Render Markdown H1 headings at 2x scale using Kitty's OSC 66 text-sizing protocol. Only \
+		 takes effect on Kitty terminals; ignored everywhere else. Off by default.",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"tui.renderMermaid",
+		"cl_tui_render_mermaid",
+		Appearance,
+		"Display",
+		"Render Mermaid Diagrams",
+		"Render Mermaid fenced code blocks as ASCII diagrams",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"tui.reactions",
+		"cl_tui_reactions",
+		Appearance,
+		"Display",
+		"Agent Reactions",
+		"Invite the agent to react to your message with an emoji badge on its bubble",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
 		"tui.codexResetFireworks",
 		"cl_codex_fireworks",
 		Appearance,
@@ -66,6 +353,57 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		"Celebrate unscheduled Codex weekly usage resets and newly banked saved resets with a \
 		 top-third fireworks overlay that remains until Escape",
 		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"tui.titleState",
+		"cl_title_state",
+		Appearance,
+		"Display",
+		"Terminal Title Run State",
+		"Show the agent run state in the terminal title's separator — an animated spinner while \
+		 working (a static ':' on Windows), '>' when it's your turn, '!' when the agent is waiting \
+		 on you",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"tui.hyperlinks",
+		"cl_tui_hyperlinks",
+		Appearance,
+		"Display",
+		"Terminal Hyperlinks",
+		"Wrap paths and URLs in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect \
+		 support; off: never; always: unconditional)",
+		UiWidget::Enum(&["off", "auto", "always"]),
+		None,
+		Identity
+	),
+	ui!(
+		"tui.tight",
+		"cl_tui_tight",
+		Appearance,
+		"Display",
+		"Tight Layout",
+		"Remove the 1-character horizontal padding from the left and right of the terminal output",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"display.shimmer",
+		"cl_display_shimmer",
+		Appearance,
+		"Display",
+		"Shimmer",
+		"Animation style for working/loading messages",
+		UiWidget::Submenu(&[
+			UiOption::new("classic", "Classic", "Soft cosine wave sweeping across the text"),
+			UiOption::new("kitt", "KITT Scanner", "Knight Rider 1982 red light bouncing left-right"),
+			UiOption::new("disabled", "Disabled", "No animation; static muted text")
+		]),
 		None,
 		Identity
 	),
@@ -92,6 +430,62 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		InvertedBoolean
 	),
 	ui!(
+		"display.showTokenUsage",
+		"cl_display_show_token_usage",
+		Appearance,
+		"Display",
+		"Show Token Usage",
+		"Show per-turn token usage on assistant messages",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"display.showTurnTime",
+		"cl_display_show_turn_time",
+		Appearance,
+		"Display",
+		"Show Turn Time",
+		"Show the total prompt-to-yield time (including tool calls) on assistant message usage rows",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"display.cacheMissMarker",
+		"cl_display_cache_miss_marker",
+		Appearance,
+		"Display",
+		"Cache Miss Marker",
+		"Show a divider after an assistant turn whose request lost (missed) the prompt cache",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"display.collapseCompacted",
+		"cl_display_collapse_compacted",
+		Appearance,
+		"Display",
+		"Collapse Compacted History",
+		"Collapse pre-compaction history behind the summary divider on the live transcript; disable \
+		 to keep the full transcript inline with dividers at each compaction point",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"showHardwareCursor",
+		"cl_show_hardware_cursor",
+		Appearance,
+		"Display",
+		"Show Hardware Cursor",
+		"Show terminal cursor for IME support",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
 		"tui.imeSafeCursor",
 		"cl_ime_safe_cursor",
 		Appearance,
@@ -114,6 +508,17 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Identity
 	),
 	ui!(
+		"terminal.showImages",
+		"cl_terminal_show_images",
+		Appearance,
+		"Images",
+		"Show Inline Images",
+		"Render images inline in the terminal",
+		UiWidget::Boolean,
+		Some(UiCondition::HasImageProtocol),
+		Identity
+	),
+	ui!(
 		"images.autoResize",
 		"sv_images_auto_resize",
 		Appearance,
@@ -125,21 +530,24 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Identity
 	),
 	ui!(
+		"images.blockImages",
+		"sv_images_block_images",
+		Appearance,
+		"Images",
+		"Block Images",
+		"Prevent images from being sent to LLM providers",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
 		"defaultThinkingLevel",
 		"ai_default_thinking",
 		Model,
 		"Thinking",
 		"Thinking Level",
 		"Reasoning depth for thinking-capable models",
-		UiWidget::Submenu(&[
-			UiOption::new("auto", "auto", "Auto-detect per prompt"),
-			UiOption::new("minimal", "min", "Very brief reasoning (~1k tokens)"),
-			UiOption::new("low", "low", "Light reasoning (~2k tokens)"),
-			UiOption::new("medium", "medium", "Moderate reasoning (~8k tokens)"),
-			UiOption::new("high", "high", "Deep reasoning (~16k tokens)"),
-			UiOption::new("xhigh", "xhigh", "Extended reasoning (~32k tokens)"),
-			UiOption::new("max", "max", "Maximum reasoning the model supports")
-		]),
+		UiWidget::RuntimeSubmenu(UiRuntimeOptions::ThinkingLevels),
 		None,
 		Identity
 	),
@@ -162,6 +570,98 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		"Prose Only Thinking",
 		"Omit code blocks from thinking summaries and replace them with an ellipsis",
 		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"omitThinking",
+		"ai_omit_thinking",
+		Model,
+		"Thinking",
+		"Omit Thinking summaries",
+		"Instruct upstream providers to completely omit thinking summaries from responses (where \
+		 supported)",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui_warn!(
+		"externalThinking",
+		"ai_external_thinking",
+		Model,
+		"Thinking",
+		"External Thinking",
+		"Private scratchpad; not shown to user. Disables supported GPT, Claude, and Gemini reasoning",
+		"At your own risk: providers have flagged this request shape as abuse, up to account-level \
+		 enforcement",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"model.loopGuard.enabled",
+		"ai_model_loop_guard_enabled",
+		Model,
+		"Thinking",
+		"Loop Guard",
+		"Enable automatic stream loop detection for model reasoning and prose",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"model.loopGuard.checkAssistantContent",
+		"ai_model_loop_guard_check_assistant_content",
+		Model,
+		"Thinking",
+		"Loop Guard Scan Prose",
+		"Apply loop guard to assistant prose messages in addition to thinking logs",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"model.loopGuard.toolCallReminder",
+		"ai_model_loop_guard_tool_call_reminder",
+		Model,
+		"Thinking",
+		"Loop Guard Tool-Call Reminder",
+		"When a Gemini reasoning stream emits many consecutive planning headers without calling a \
+		 tool, interrupt it and inject a reminder to issue a tool call (requires Loop Guard)",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"model.toolCallLoopGuard.enabled",
+		"ai_model_tool_call_loop_guard_enabled",
+		Model,
+		"Thinking",
+		"Tool-Call Loop Guard",
+		"Detect consecutive identical tool calls across turns and inject a corrective steer",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"model.toolCallLoopGuard.threshold",
+		"ai_model_tool_call_loop_guard_threshold",
+		Model,
+		"Thinking",
+		"Tool-Call Loop Threshold",
+		"Consecutive identical tool calls required before the corrective steer is injected",
+		UiWidget::ConfigOnly,
+		None,
+		Identity
+	),
+	ui!(
+		"model.toolCallLoopGuard.exemptTools",
+		"ai_model_tool_call_loop_guard_exempt_tools",
+		Model,
+		"Thinking",
+		"Tool-Call Loop Exempt Tools",
+		"Tool names that may repeat consecutively without triggering the cross-turn loop guard",
+		UiWidget::ConfigOnly,
 		None,
 		Identity
 	),
@@ -207,6 +707,22 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 				"LFM2 1.2B",
 				"Fastest load; solid all-rounder, slightly noisier extraction labels."
 			)
+		]),
+		Some(UiCondition::AutoThinkingActive),
+		Identity
+	),
+	ui!(
+		"providers.autoThinkingMaxEffort",
+		"ai_providers_auto_thinking_max_effort",
+		Model,
+		"Thinking",
+		"Auto Thinking Ceiling",
+		"Highest effort the `auto` classifier may resolve. `xhigh` keeps the classifier one tier \
+		 below the top, so only an explicit `ultrathink` reaches `max`; `max` lets a turn the \
+		 classifier judges exceptional bill the top tier on models that expose it.",
+		UiWidget::Submenu(&[
+			UiOption::new("xhigh", "xhigh", "Classifier stops at xhigh (default)"),
+			UiOption::new("max", "max", "Classifier may resolve max where the model supports it")
 		]),
 		Some(UiCondition::AutoThinkingActive),
 		Identity
@@ -409,6 +925,91 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Identity
 	),
 	ui!(
+		"inlineToolDescriptors",
+		"ai_inline_tool_descriptors",
+		Model,
+		"Prompt",
+		"Inline Tool Descriptors",
+		"Render full tool descriptors in the system prompt and strip top-level/nested descriptions \
+		 from provider tool schemas so descriptor text is sent once. Auto enables this for Gemini \
+		 models and disables it otherwise",
+		UiWidget::Submenu(&[
+			UiOption::new(
+				"auto",
+				"Auto",
+				"Inline descriptors for Gemini models; keep them in tool schemas otherwise"
+			),
+			UiOption::new("on", "On", "Always inline descriptors in the system prompt"),
+			UiOption::new("off", "Off", "Keep descriptors in provider tool schemas only")
+		]),
+		None,
+		Identity
+	),
+	ui!(
+		"includeModelInPrompt",
+		"ai_include_model_in_prompt",
+		Model,
+		"Prompt",
+		"Include Model in Prompt",
+		"Surface the active model identifier in the system prompt so the agent knows which model it \
+		 is",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"includeWorkspaceTree",
+		"ai_include_workspace_tree",
+		Model,
+		"Prompt",
+		"Include Workspace Tree",
+		"Render the workspace directory tree in the system prompt. WARNING: This can bust prompt \
+		 caching across sessions when files are modified.",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"skillful",
+		"ai_skillful",
+		Model,
+		"Prompt",
+		"List Skills in Prompt",
+		"List available skills in the system prompt; disable to save context and toggle per-session \
+		 with /skillful",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"personality",
+		"ai_personality",
+		Model,
+		"Prompt",
+		"Personality",
+		"Communication style rendered into the system prompt's personality block",
+		UiWidget::Submenu(&[
+			UiOption::new(
+				"default",
+				"Default",
+				"Terse, evidence-first engineer; dense, action-oriented replies"
+			),
+			UiOption::new(
+				"friendly",
+				"Friendly",
+				"Warm, encouraging collaborator focused on momentum and morale"
+			),
+			UiOption::new(
+				"pragmatic",
+				"Pragmatic",
+				"Direct, efficient engineer focused on clarity and rigor"
+			),
+			UiOption::new("none", "None", "Omit the personality block entirely")
+		]),
+		None,
+		Identity
+	),
+	ui!(
 		"retry.maxRetries",
 		"ai_retry_max_retries",
 		Model,
@@ -422,6 +1023,20 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 			UiOption::new("5", "5 retries", ""),
 			UiOption::new("10", "10 retries", "")
 		]),
+		None,
+		Identity
+	),
+	ui!(
+		"retry.maxDelayMs",
+		"ai_retry_max_delay_ms",
+		Model,
+		"Retry & Fallback",
+		"Max Retry Delay",
+		"Maximum wait between retries, in ms. When the provider asks us to wait longer than this \
+		 and no credential or model fallback succeeds, the request fails fast instead of sleeping \
+		 (e.g. 3-hour Anthropic rate-limit windows). 0 disables the ceiling — to let the session \
+		 auto-resume through provider-stated quota resets.",
+		UiWidget::ConfigOnly,
 		None,
 		Identity
 	),
@@ -540,6 +1155,169 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		 retry it on Claude Opus 4.8 server-side (Anthropic `server-side-fallback-2026-06-01` \
 		 beta). Opt-in — leaving this off preserves the pre-fallback behavior for every request.",
 		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"advisor.enabled",
+		"ai_advisor_enabled",
+		Model,
+		"Advisor",
+		"Enable Advisor",
+		"Pair a second model (assigned to the 'advisor' role) that passively reviews each turn and \
+		 injects notes.",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"advisor.syncBacklog",
+		"ai_advisor_sync_backlog",
+		Model,
+		"Advisor",
+		"Advisor Sync Backlog",
+		"Pause the main agent for up to 30 seconds if the advisor falls behind by this many turns. \
+		 Off disables catch-up delays.",
+		UiWidget::Enum(&["off", "1", "3", "5"]),
+		Some(UiCondition::AdvisorEnabled),
+		Identity
+	),
+	ui!(
+		"advisor.immuneTurns",
+		"ai_advisor_immune_turns",
+		Model,
+		"Advisor",
+		"Advisor Immune Turns",
+		"After an advisor concern or blocker interrupts, route further concerns/blockers \
+		 non-interruptingly for this many primary turns.",
+		UiWidget::Submenu(&[
+			UiOption::new("0", "0 turns", "Allow every concern/blocker to interrupt."),
+			UiOption::new("1", "1 turn", ""),
+			UiOption::new("2", "2 turns", ""),
+			UiOption::new("3", "3 turns", "Default."),
+			UiOption::new("4", "4 turns", ""),
+			UiOption::new("5", "5 turns", "")
+		]),
+		Some(UiCondition::AdvisorEnabled),
+		Identity
+	),
+	ui!(
+		"prewalk.enabled",
+		"ai_prewalk_enabled",
+		Model,
+		"Prewalk",
+		"Enable Prewalk",
+		"Start on the active model, then switch to a fast/cheap model (default the 'smol' role) at \
+		 the first edit/write after the plan nudge's todo list exists — the strong model plans, \
+		 commits the todos, and starts the implementation before handing off. Overridable per \
+		 session with --prewalk / --no-prewalk.",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"images.describeForTextModels",
+		"sv_images_describe_for_text_models",
+		Model,
+		"Vision",
+		"Describe Images for Text Models",
+		"When an image is attached to a model without vision support, save it under local:// and \
+		 inject a description from a vision-capable model instead of dropping it",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"images.urls.enabled",
+		"sv_images_urls_enabled",
+		Model,
+		"Vision",
+		"Serve Images as URLs",
+		"Publish outgoing images through the configured backend chain and send URL-fetching \
+		 providers short URLs instead of inline base64. Falls back to inline automatically when \
+		 every backend or a provider fetch fails",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"images.urls.backends",
+		"sv_images_urls_backends",
+		Model,
+		"Vision",
+		"Image URL Backends",
+		"Ordered destinations tried when publishing images for provider access",
+		UiWidget::MultiSelect { options: BLOB_BACKEND_CHOICES, ordered: true },
+		None,
+		Identity
+	),
+	ui!(
+		"images.urls.command",
+		"sv_images_urls_command",
+		Model,
+		"Vision",
+		"Image Upload Command",
+		"Argv template for the command backend; {file} is the image path, {mime}/{ext} optional. \
+		 The last URL printed on stdout is used (e.g. pasta -b -f {file})",
+		UiWidget::Text { secret: false },
+		None,
+		Identity
+	),
+	ui!(
+		"images.urls.publicBaseUrl",
+		"sv_images_urls_public_base_url",
+		Model,
+		"Vision",
+		"Image URL Public Base",
+		"Externally reachable base URL fronting the blob server (required for ssh, optional for \
+		 direct)",
+		UiWidget::Text { secret: false },
+		None,
+		Identity
+	),
+	ui!(
+		"images.urls.ttlHours",
+		"sv_images_urls_ttl_hours",
+		Model,
+		"Vision",
+		"Image URL Lifetime (hours)",
+		"Serving window for locally hosted image URLs, measured from the last time a conversation \
+		 sent them; resuming a conversation re-arms the window at the same link. 0 keeps links \
+		 alive while the broker runs",
+		UiWidget::ConfigOnly,
+		None,
+		Identity
+	),
+	ui!(
+		"images.urls.bindHost",
+		"sv_images_urls_bind_host",
+		Model,
+		"Vision",
+		"Image URL Bind Host",
+		"Host the blob server binds to; loopback for tunnels, 0.0.0.0 for direct serving",
+		UiWidget::Text { secret: false },
+		None,
+		Identity
+	),
+	ui!(
+		"images.urls.sshTarget",
+		"sv_images_urls_ssh_target",
+		Model,
+		"Vision",
+		"Image URL SSH Target",
+		"user@host destination for the ssh reverse forward",
+		UiWidget::Text { secret: false },
+		None,
+		Identity
+	),
+	ui!(
+		"images.urls.sshRemotePort",
+		"sv_images_urls_ssh_remote_port",
+		Model,
+		"Vision",
+		"Image URL SSH Remote Port",
+		"Remote listen port of the ssh reverse forward that your web server proxies to",
+		UiWidget::ConfigOnly,
 		None,
 		Identity
 	),

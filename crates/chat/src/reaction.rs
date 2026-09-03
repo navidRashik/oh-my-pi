@@ -1,9 +1,10 @@
-//! Agent reactions (pi `modes/components/reaction.ts`). A reply whose text
-//! opens with a lone emoji line (`<emoji>\n`) is reacting to the transcript
-//! block before it: the emoji is lifted out of the prose and shown as a badge
-//! on that block instead. While the reply streams, the opening run is
-//! withheld until it either completes a reaction line or proves to be
-//! ordinary text, so the emoji never flashes inside the reply.
+//! Agent reactions (pi `modes/components/reaction.ts`). A reply whose first
+//! line contains only an emoji grapheme reacts to the transcript block before
+//! it: the emoji and its line ending are lifted out of the prose and shown as
+//! a badge on that block instead. An emoji followed by prose remains prose.
+//! While the reply streams, an
+//! incomplete emoji run is withheld until it resolves or proves to be ordinary
+//! text, so the emoji never flashes inside the reply.
 //!
 //! Reactions are derived from the journaled assistant text, never stored, so
 //! a rebuilt transcript reproduces them exactly (ADR 0005).
@@ -46,7 +47,7 @@ static REACTION_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
 /// The reaction line split off the front of assistant text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReactionSplit<'a> {
-	/// The reaction emoji when the text opens with `<emoji>\n`.
+	/// The reaction emoji when the text opens with an emoji grapheme.
 	pub emoji:   Option<&'a str>,
 	/// Text with the reaction line removed; the input when there is none.
 	pub body:    &'a str,
@@ -55,25 +56,51 @@ pub struct ReactionSplit<'a> {
 	pub pending: bool,
 }
 
-/// Splits a reaction line off the front of assistant text (pi
-/// `splitReaction`). Leading whitespace and trailing blanks on the emoji
-/// line are tolerated; anything else on that line makes it ordinary prose.
+/// Splits a standalone opening reaction emoji off assistant text.
+/// Leading whitespace is tolerated. The emoji must occupy the whole first
+/// line; an emoji followed by prose remains part of the assistant body.
 #[must_use]
 pub fn split_reaction(text: &str) -> ReactionSplit<'_> {
 	let start = text.len() - text.trim_start().len();
-	let Some(newline) = text[start..].find('\n').map(|at| at + start) else {
-		let head = &text[start..];
-		return ReactionSplit {
-			emoji:   None,
-			body:    text,
-			pending: units(head) <= MAX_REACTION_UNITS && REACTION_PREFIX.is_match(head),
-		};
+	let head = &text[start..];
+	if head.is_empty() {
+		return ReactionSplit { emoji: None, body: text, pending: true };
+	}
+	let Some(emoji) = xutf::graphemes_str(head).next() else {
+		return ReactionSplit { emoji: None, body: text, pending: true };
 	};
-	let head = text[start..newline].trim_end();
-	if head.is_empty() || units(head) > MAX_REACTION_UNITS || !REACTION.is_match(head) {
+	if REACTION.is_match(emoji) {
+		let rest = &head[emoji.len()..];
+		if let Some(body) = standalone_reaction_body(rest) {
+			return ReactionSplit { emoji: Some(emoji), body, pending: false };
+		}
+		// An emoji followed by prose is prose, not a reaction badge. Keeping
+		// the whole input also lets a streamed `👍 ` grow into `👍 sure`
+		// without silently deleting its first grapheme.
 		return ReactionSplit { emoji: None, body: text, pending: false };
 	}
-	ReactionSplit { emoji: Some(head), body: &text[newline + 1..], pending: false }
+	ReactionSplit {
+		emoji:   None,
+		body:    text,
+		pending: units(head) <= MAX_REACTION_UNITS && REACTION_PREFIX.is_match(head),
+	}
+}
+
+/// Returns the body after a standalone opening emoji: the emoji may occupy
+/// the whole reply or its own line, with horizontal padding around the line.
+/// Horizontal whitespace followed by prose does not make the emoji a reaction.
+fn standalone_reaction_body(rest: &str) -> Option<&str> {
+	let horizontal = rest
+		.bytes()
+		.take_while(|byte| matches!(byte, b' ' | b'\t'))
+		.count();
+	let after = &rest[horizontal..];
+	if after.is_empty() {
+		return Some(after);
+	}
+	after
+		.strip_prefix("\r\n")
+		.or_else(|| after.strip_prefix('\n'))
 }
 
 /// UTF-16 code units, pi's length measure.
@@ -107,30 +134,46 @@ mod tests {
 		}
 	}
 
-	/// Anything else on the first line makes it prose: words, two emoji,
-	/// punctuation, or an over-long run.
+	/// Ordinary prose does not react. Once an opening emoji is complete, any
+	/// following non-whitespace is the reply body (including another emoji or
+	/// punctuation), matching pi's prefix split.
 	#[test]
-	fn prose_first_lines_are_not_reactions() {
-		for text in ["Sure 👍\nDone.", "👍👍\nDone.", "👍!\nDone.", "hello\nworld", "\nDone."]
-		{
+	fn prose_stays_plain_and_content_after_an_emoji_becomes_the_body() {
+		for text in ["Sure 👍\nDone.", "hello\nworld", "\nDone."] {
 			let split = split_reaction(text);
 			assert_eq!(split.emoji, None, "{text:?}");
 			assert_eq!(split.body, text);
 			assert!(!split.pending);
 		}
-		let long = format!("{}\nbody", "👍".repeat(17));
-		assert_eq!(split_reaction(&long).emoji, None, "over the 32-unit budget");
+		assert_eq!(split_reaction("👍👍\nDone."), ReactionSplit {
+			emoji:   Some("👍"),
+			body:    "👍\nDone.",
+			pending: false,
+		});
+		assert_eq!(split_reaction("👍!\nDone."), ReactionSplit {
+			emoji:   Some("👍"),
+			body:    "!\nDone.",
+			pending: false,
+		});
 	}
 
-	/// While streaming (no newline yet), an emoji-only run is pending and
-	/// withheld; a run that proves to be text is not.
+	/// A complete emoji resolves immediately even without a newline. Only an
+	/// incomplete emoji-prefix run remains pending and withheld.
 	#[test]
-	fn newline_less_emoji_runs_are_pending_until_they_prove_otherwise() {
-		assert!(split_reaction("👍").pending);
-		assert!(split_reaction("  👍 ").pending);
+	fn newline_less_complete_emoji_resolves_immediately() {
+		assert_eq!(split_reaction("👍"), ReactionSplit {
+			emoji:   Some("👍"),
+			body:    "",
+			pending: false,
+		});
+		assert_eq!(split_reaction("  👍 "), ReactionSplit {
+			emoji:   Some("👍"),
+			body:    "",
+			pending: false,
+		});
 		assert!(split_reaction("").pending, "an empty stream may still open with a reaction");
 		assert!(!split_reaction("👍 yes").pending);
+		assert_eq!(split_reaction("👍 yes").body, "yes");
 		assert!(!split_reaction("Sure").pending);
-		assert_eq!(split_reaction("👍").body, "👍");
 	}
 }

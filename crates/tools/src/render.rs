@@ -230,36 +230,27 @@ fn debug_label(value: impl fmt::Debug) -> String {
 	format!("{value:?}").to_ascii_lowercase()
 }
 
-/// Accumulates whole UTF-8 fragments without splitting a caller-owned unit.
+/// Accumulates complete UTF-8 fragments for the central dispatcher.
+///
+/// Tool implementations never apply byte limits or synthesize truncation
+/// markers. The call-outcome path bounds the resulting parts once and retains
+/// the complete projection in the artifact store (ADR 0009).
 pub struct TextProjection {
-	text:      String,
-	max_bytes: usize,
-	truncated: bool,
+	text: String,
 }
 
 impl TextProjection {
 	pub(crate) fn new(caps: PromptCaps) -> Option<Self> {
-		(caps.maximum_parts != 0 && caps.maximum_text_bytes != 0).then(|| Self {
-			text:      String::new(),
-			max_bytes: usize::try_from(caps.maximum_text_bytes).unwrap_or(usize::MAX),
-			truncated: false,
-		})
+		(caps.maximum_parts != 0 && caps.maximum_text_bytes != 0)
+			.then(|| Self { text: String::new() })
 	}
 
 	pub(crate) fn push(&mut self, fragment: &str) -> bool {
-		if self.text.len().saturating_add(fragment.len()) > self.max_bytes {
-			self.truncated = true;
-			return false;
-		}
 		self.text.push_str(fragment);
 		true
 	}
 
-	pub(crate) fn finish(mut self) -> Vec<Part> {
-		const MARKER: &str = "\n[truncated]";
-		if self.truncated && self.text.len().saturating_add(MARKER.len()) <= self.max_bytes {
-			self.text.push_str(MARKER);
-		}
+	pub(crate) fn finish(self) -> Vec<Part> {
 		if self.text.is_empty() {
 			Vec::new()
 		} else {

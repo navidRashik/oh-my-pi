@@ -123,7 +123,10 @@ impl Card for WebSearchCard {
 				.and_then(Value::as_str)
 				.map(domain_of)
 				.filter(|domain| !domain.is_empty());
-			let href = source.get("url").and_then(Value::as_str).unwrap_or_default();
+			let href = source
+				.get("url")
+				.and_then(Value::as_str)
+				.unwrap_or_default();
 			let age = source_age(source).map(|age| match age {
 				SourceAge::Relative(ms) => {
 					dom! { <row gap=1 fg=muted><text>{"·"}</text><time kind="relative" ms={ms}/></row> }
@@ -173,7 +176,7 @@ impl Card for WebSearchCard {
 				<col>
 					<row gap=0><text fg=output>{"Query:"}</text><text wrap=pre>{format!(" {query}")}</text></row>
 					<hr title="Answer" title_pad=3 bc=muted/>
-					<pre>{answer}</pre>
+					<md>{answer}</md>
 					<hr title="Sources" title_pad=3 bc=muted/>
 					{source_rows}
 					<hr title="Metadata" title_pad=3 bc=muted/>

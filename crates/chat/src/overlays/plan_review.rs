@@ -10,9 +10,9 @@
 //! (with undo), and annotates them with feedback that feeds the Refine
 //! branch (pi `plan-review-overlay.ts:8-17`).
 //!
-//! Every choice leaves as a console line (ADR 0014): `plan_approve <role>
-//! [compact|keep]`, `plan` (save and quit), or a composer recall carrying
-//! the refinement feedback.
+//! Execution choices leave as a console line (ADR 0014), refinement recalls
+//! the composed feedback, and “Save and quit” opens the native destination
+//! editor with the exact reviewed plan contents.
 
 use std::fmt::Write as _;
 
@@ -397,7 +397,7 @@ impl PlanReviewPanel {
 					PanelEvent::Recall(feedback)
 				}
 			},
-			_ => PanelEvent::Finish(Str::new_static("plan")),
+			_ => PanelEvent::OpenPlanSave { content: self.plan(), title: self.title.clone() },
 		}
 	}
 
@@ -1497,7 +1497,10 @@ mod tests {
 		panel.key(Key::Down);
 		assert_eq!(
 			panel.key(Key::Enter),
-			PanelEvent::Finish(Str::new_static("plan")),
+			PanelEvent::OpenPlanSave {
+				content: Str::new_static(PLAN),
+				title:   Str::new_static("Auth-plan"),
+			},
 			"cursor clamps at the last option"
 		);
 	}

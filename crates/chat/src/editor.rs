@@ -30,6 +30,9 @@ impl Default for EditorOptions<'_> {
 /// Failure to resolve or run an external editor.
 #[derive(Debug, Error)]
 pub enum EditorError {
+	/// No POSIX editor is configured in `VISUAL` or `EDITOR`.
+	#[error("No editor configured. Set $VISUAL or $EDITOR environment variable.")]
+	NotConfigured,
 	/// Temporary extension contains a path separator or unsupported character.
 	#[error("external editor temporary extension is invalid")]
 	InvalidExtension,
@@ -46,12 +49,14 @@ pub enum EditorError {
 	},
 }
 
-/// Resolves `VISUAL`, then `EDITOR`, then the platform's baseline editor.
+/// Resolves `VISUAL`, then `EDITOR`, then Windows' baseline editor.
 ///
 /// Environment values are trimmed and otherwise handed verbatim to the
 /// user's shell (pi `openInEditor`): `code --wait`, `emacsclient -nw -a ""`,
 /// a shell function, or `$MY_EDITOR` all work exactly as they do from git.
-pub fn resolve_editor_command() -> String {
+/// POSIX deliberately has no fallback: launching `vi` unexpectedly would
+/// consume the user's terminal when they have not configured this feature.
+pub fn resolve_editor_command() -> Option<String> {
 	resolve_editor_command_from(
 		env::var("VISUAL").ok().as_deref(),
 		env::var("EDITOR").ok().as_deref(),
@@ -59,13 +64,13 @@ pub fn resolve_editor_command() -> String {
 }
 
 /// Deterministic resolution helper used by settings and tests.
-pub fn resolve_editor_command_from(visual: Option<&str>, editor: Option<&str>) -> String {
+pub fn resolve_editor_command_from(visual: Option<&str>, editor: Option<&str>) -> Option<String> {
 	visual
 		.map(str::trim)
 		.filter(|value| !value.is_empty())
 		.or_else(|| editor.map(str::trim).filter(|value| !value.is_empty()))
-		.unwrap_or(platform_editor())
-		.to_owned()
+		.or_else(|| cfg!(windows).then_some("notepad"))
+		.map(str::to_owned)
 }
 
 /// Opens `content` in the selected editor and returns a replacement only after
@@ -76,7 +81,8 @@ pub fn edit_draft<T: ExternalEditorTerminal + ?Sized>(
 	content: &str,
 	options: EditorOptions<'_>,
 ) -> Result<Option<String>, EditorError> {
-	edit_draft_with(terminal, &resolve_editor_command(), content, options)
+	let editor = resolve_editor_command().ok_or(EditorError::NotConfigured)?;
+	edit_draft_with(terminal, &editor, content, options)
 }
 
 /// Runs one already resolved editor command line. This is useful when a
@@ -111,8 +117,9 @@ pub fn edit_draft_detached(
 	content: &str,
 	options: EditorOptions<'_>,
 ) -> Result<Option<String>, EditorError> {
+	let editor = resolve_editor_command().ok_or(EditorError::NotConfigured)?;
 	let mut draft = prepared_draft(content, options.extension)?;
-	let status = launch_editor(&resolve_editor_command(), draft.path())?;
+	let status = launch_editor(&editor, draft.path())?;
 	finish_draft(&mut draft, status, options.trim_trailing_newline)
 }
 
@@ -175,10 +182,6 @@ fn finish_draft(
 		edited.pop();
 	}
 	Ok(Some(edited))
-}
-
-const fn platform_editor() -> &'static str {
-	if cfg!(windows) { "notepad" } else { "vi" }
 }
 
 #[must_use]
@@ -282,10 +285,16 @@ mod tests {
 	}
 
 	#[test]
-	fn resolution_prefers_visual_then_editor_then_platform() {
-		assert_eq!(resolve_editor_command_from(Some(" code --wait "), Some("vim")), "code --wait");
-		assert_eq!(resolve_editor_command_from(Some(" "), Some("vim")), "vim");
-		assert_eq!(resolve_editor_command_from(None, None), platform_editor());
+	fn resolution_prefers_visual_then_editor_then_windows_default() {
+		assert_eq!(
+			resolve_editor_command_from(Some(" code --wait "), Some("vim")).as_deref(),
+			Some("code --wait")
+		);
+		assert_eq!(resolve_editor_command_from(Some(" "), Some("vim")).as_deref(), Some("vim"));
+		assert_eq!(
+			resolve_editor_command_from(None, None).as_deref(),
+			cfg!(windows).then_some("notepad")
+		);
 	}
 
 	#[cfg(unix)]

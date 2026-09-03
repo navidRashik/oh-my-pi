@@ -13,7 +13,11 @@ use omp_tui::{
 
 use crate::overlays::ModelRow;
 pub use crate::{
-	status_band::{PathLabel, StatusBand, StatusFacts, display_path},
+	status_band::{
+		AccountUsage, AdvisorBadge, AdvisorHealth, CollabBadge, ContextLine, GitStatus, GoalState,
+		LoopLimit, ModeChip, PathLabel, PullRequest, Speculation, StatusAppearance, StatusBand,
+		StatusFacts, StatusPreset, StatusSeparator, UsageWindow, WorktreeLabel, display_path,
+	},
 	welcome::{Welcome, tip_for},
 };
 
@@ -129,13 +133,14 @@ pub enum TitleState {
 /// composed text is deduplicated so a terminal sees one OSC per change.
 #[derive(Clone, Debug, Default)]
 pub struct TerminalTitle {
-	label:   Option<Str>,
-	state:   TitleState,
-	enabled: bool,
+	label:     Option<Str>,
+	override_: Option<Str>,
+	state:     TitleState,
+	enabled:   bool,
 	/// Title last handed to the terminal.
-	sent:    String,
+	sent:      String,
 	/// Composition scratch, reused per frame.
-	text:    String,
+	text:      String,
 }
 
 impl TerminalTitle {
@@ -148,9 +153,16 @@ impl TerminalTitle {
 	/// Sets the session label: `name` sanitized when present, else the base
 	/// name of `cwd` (pi `setSessionTerminalTitle`).
 	pub fn set_label(&mut self, name: Option<&str>, cwd: &str) {
+		self.override_ = None;
 		self.label = name
 			.and_then(sanitize_title_part)
 			.or_else(|| fallback_title(cwd));
+	}
+
+	/// Gives an extension temporary verbatim ownership of the terminal title.
+	/// The next authoritative [`Self::set_label`] clears it.
+	pub fn set_extension_title(&mut self, title: &str) {
+		self.override_ = Some(sanitize_title_part(title).unwrap_or_else(|| Str::new_static("π")));
 	}
 
 	/// Sets the run state (pi `setTerminalTitleState`).
@@ -175,7 +187,18 @@ impl TerminalTitle {
 	/// means the terminal already shows this title.
 	pub fn emit(&mut self, charset: Charset, now: Duration) -> Option<&str> {
 		self.text.clear();
-		compose_title(&mut self.text, self.label.as_deref(), self.state, self.enabled, charset, now);
+		if let Some(title) = &self.override_ {
+			self.text.push_str(title);
+		} else {
+			compose_title(
+				&mut self.text,
+				self.label.as_deref(),
+				self.state,
+				self.enabled,
+				charset,
+				now,
+			);
+		}
 		if self.text == self.sent {
 			return None;
 		}
@@ -187,20 +210,27 @@ impl TerminalTitle {
 	/// When the title next changes on its own: the spinner frame after
 	/// `now` while working with the run state enabled.
 	#[must_use]
-	pub fn next_wake(&self, charset: Charset, now: Duration) -> Option<Duration> {
-		(self.enabled && self.state == TitleState::Working && !cfg!(windows))
-			.then(|| charset.spinner().next_change(now))
+	pub fn next_wake(&self, _charset: Charset, now: Duration) -> Option<Duration> {
+		(self.override_.is_none()
+			&& self.enabled
+			&& self.state == TitleState::Working
+			&& !cfg!(windows))
+		.then(|| {
+			let step = u128::from(TITLE_SPINNER_STEP.as_millis() as u64);
+			let next = (now.as_millis() / step + 1) * step;
+			Duration::from_millis(u64::try_from(next).unwrap_or(u64::MAX))
+		})
 	}
 }
 
-/// The brand at the head of the title: `π`, or `pi` for an ASCII terminal
-/// (the window-system font renders the title, so never a Nerd Font glyph).
-const fn title_brand(charset: Charset) -> &'static str {
-	match charset {
-		Charset::Ascii => "pi",
-		Charset::Unicode | Charset::NerdFont => "π",
-	}
+/// The title is window-system chrome, so it always uses plain Unicode rather
+/// than the terminal charset's Nerd Font or ASCII substitutions.
+const fn title_brand(_charset: Charset) -> &'static str {
+	"π"
 }
+
+const TITLE_SPINNER_STEP: Duration = Duration::from_millis(80);
+const TITLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// pi `buildTerminalTitleWithState`, written into `out`.
 fn compose_title(
@@ -222,7 +252,12 @@ fn compose_title(
 	out.push(' ');
 	match state {
 		TitleState::Working if cfg!(windows) => out.push(':'),
-		TitleState::Working => out.push_str(charset.spinner().at(now)),
+		TitleState::Working => {
+			let frame = usize::try_from(now.as_millis() / TITLE_SPINNER_STEP.as_millis())
+				.unwrap_or(usize::MAX)
+				% TITLE_SPINNER.len();
+			out.push_str(TITLE_SPINNER[frame]);
+		},
 		TitleState::Attention => out.push('!'),
 		TitleState::Idle => out.push('>'),
 	}
@@ -387,7 +422,7 @@ mod tests {
 		let mut bare = TerminalTitle::new();
 		bare.set_label(None, "/");
 		assert_eq!(bare.emit(charset, Duration::ZERO), Some("π >"), "no label: separator trails");
-		assert_eq!(bare.emit(Charset::Ascii, Duration::ZERO), Some("pi >"));
+		assert_eq!(bare.emit(Charset::Ascii, Duration::ZERO), None);
 	}
 
 	/// pi `sanitizeTerminalTitlePart` / `getFallbackTerminalTitle`: control

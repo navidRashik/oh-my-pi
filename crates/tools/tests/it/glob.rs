@@ -1,17 +1,11 @@
 //! `glob@1` schema, traversal, and model-facing output contracts.
 
-use std::{future, str, sync::Arc};
+use std::{future, sync::Arc};
 
-use bytes::Bytes;
 use futures::{StreamExt, executor::block_on};
 use omp_core::{Str, sf};
-use omp_tool::{
-	BlobRef, CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
-};
-use omp_tools::{
-	glob, grep,
-	read::{Fault as ReadFault, ReadBlobs, StoredArtifact},
-};
+use omp_tool::{CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal};
+use omp_tools::{glob, grep};
 use parking_lot::Mutex;
 use serde_json::json;
 
@@ -29,6 +23,10 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 		future::ready(Err(grep::Fault::Workspace { message: sf!("unused fake search boundary") }))
 	}
 
+	fn stage_snapshots(&self, _snapshots: Vec<grep::SearchSnapshot>) -> Result<(), grep::Fault> {
+		Err(grep::Fault::Workspace { message: sf!("unused fake snapshot boundary") })
+	}
+
 	fn record_snapshots(&self, _records: Vec<grep::SnapshotRecord>) -> Result<(), grep::Fault> {
 		Err(grep::Fault::Workspace { message: sf!("unused fake snapshot boundary") })
 	}
@@ -42,42 +40,6 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 		async move {
 			seen.lock().push(request);
 			result
-		}
-	}
-}
-
-#[derive(Clone, Default)]
-struct RecordingBlobs {
-	stored: Arc<Mutex<Vec<Bytes>>>,
-}
-
-impl ReadBlobs for RecordingBlobs {
-	fn store(
-		&self,
-		bytes: Bytes,
-		media_type: Str,
-	) -> impl Future<Output = Result<BlobRef, ReadFault>> + Send + '_ {
-		let stored = Arc::clone(&self.stored);
-		async move {
-			let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-			stored.lock().push(bytes);
-			Ok(BlobRef { hash: sf!("glob-full"), media_type, byte_len })
-		}
-	}
-
-	fn store_artifact(
-		&self,
-		bytes: Bytes,
-		media_type: Str,
-	) -> impl Future<Output = Result<StoredArtifact, ReadFault>> + Send + '_ {
-		let stored = Arc::clone(&self.stored);
-		async move {
-			let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-			stored.lock().push(bytes);
-			Ok(StoredArtifact {
-				blob: BlobRef { hash: sf!("glob-full"), media_type, byte_len },
-				uri:  sf!("artifact://1"),
-			})
 		}
 	}
 }
@@ -108,8 +70,8 @@ const fn directory(path: &'static str, modified_ms: u64) -> glob::WalkMatch {
 	glob::WalkMatch { path: sf!(path), modified_ms, is_dir: true }
 }
 
-fn invoke_with_blobs(workspace: FakeWorkspace, raw: &str, blobs: RecordingBlobs) -> Invocation {
-	let tool = glob::tool(workspace, blobs);
+fn invoke(workspace: FakeWorkspace, raw: &str) -> Invocation {
+	let tool = glob::tool(workspace);
 	let (feed, params) = IncomingParams::channel();
 	feed
 		.args_committed(Str::new(raw))
@@ -123,7 +85,7 @@ fn invoke_with_blobs(workspace: FakeWorkspace, raw: &str, blobs: RecordingBlobs)
 		&PromptCaps::for_tool(
 			CapsBase {
 				maximum_parts:      1,
-				maximum_text_bytes: 64 * 1024,
+				maximum_text_bytes: u32::MAX,
 				media:              false,
 				model_class:        ModelClass::Standard,
 			},
@@ -141,15 +103,11 @@ fn invoke_with_blobs(workspace: FakeWorkspace, raw: &str, blobs: RecordingBlobs)
 	Invocation { result: result.clone(), useless: *useless, text }
 }
 
-fn invoke(workspace: FakeWorkspace, raw: &str) -> Invocation {
-	invoke_with_blobs(workspace, raw, RecordingBlobs::default())
-}
-
 #[test]
 fn schema_and_defaults_are_exact() {
 	let workspace = fake(walk(Vec::new()));
 	let seen = Arc::clone(&workspace.seen);
-	let tool = glob::tool(workspace.clone(), RecordingBlobs::default());
+	let tool = glob::tool(workspace.clone());
 	let actual: serde_json::Value =
 		serde_json::from_slice(&tool.spec().schema).expect("glob schema is JSON");
 	assert_eq!(
@@ -360,7 +318,7 @@ fn timeout_without_matches_is_not_reported_as_proof_of_absence() {
 }
 
 #[test]
-fn oversized_projection_spills_complete_output_with_truthful_footer() {
+fn oversized_projection_remains_complete_for_central_dispatch() {
 	let matches = (0..200)
 		.map(|index| glob::WalkMatch {
 			path:        sf!("dir/{index:03}-{}.rs", "x".repeat(400)),
@@ -368,30 +326,17 @@ fn oversized_projection_spills_complete_output_with_truthful_footer() {
 			is_dir:      false,
 		})
 		.collect();
-	let blobs = RecordingBlobs::default();
-	let invocation = invoke_with_blobs(fake(walk(matches)), r#"{"path":"dir/*.rs"}"#, blobs.clone());
+	let invocation = invoke(fake(walk(matches)), r#"{"path":"dir/*.rs"}"#);
 	let payload = invocation
 		.result
 		.as_ref()
 		.expect("large glob output succeeds");
-	let stored = blobs.stored.lock();
-	let [full] = stored.as_slice() else {
-		panic!("glob must store exactly one complete pre-truncation output");
-	};
-	let full = str::from_utf8(full).expect("rendered glob output is UTF-8");
-	assert!(full.starts_with("# dir/\n199-"));
-	assert!(full.to_ascii_lowercase().ends_with(".rs"));
-	assert_eq!(payload.output_total_lines, 201);
-	assert!(payload.output_shown_lines < payload.output_total_lines);
-	assert_eq!(payload.output_blob.as_ref().map(|blob| blob.hash.as_str()), Some("glob-full"));
-	assert_eq!(payload.output_artifact_uri.as_deref(), Some("artifact://1"));
-	let expected_footer = format!(
-		"[truncated: {} of {} lines shown; read artifact://1 for full output]",
-		payload.output_shown_lines, payload.output_total_lines
-	);
-	assert!(invocation.text.ends_with(expected_footer.as_str()));
+	assert!(invocation.text.starts_with("# dir/\n199-"));
+	assert!(invocation.text.to_ascii_lowercase().ends_with(".rs"));
+	assert!(!invocation.text.contains("[truncated"));
+	assert_eq!(payload.matches.len(), 200);
 
-	let zero_tool = glob::tool(fake(walk(Vec::new())), RecordingBlobs::default());
+	let zero_tool = glob::tool(fake(walk(Vec::new())));
 	let zero = zero_tool.prompt(
 		Ok(payload),
 		&PromptCaps::for_tool(

@@ -29,7 +29,7 @@
 //!   dropped and it binds to the next positional exactly like a bare literal.
 //!
 //! Required properties are validated after every source has been applied, so
-//! `dyn report_issue "$session" "$device" --rev 1 --verdict '{"ok":false}'`
+//! `dyn report_issue "$session" "$device" --rev 1 --verdict '{"summary":"result contradicted docs"}'`
 //! and `dyn report_issue "$session" "$device" 1 --verdict @verdict.json` bind
 //! identically.
 
@@ -1215,8 +1215,8 @@ mod tests {
 	use super::{ArgError, DynOutput, DynSchema, parse_args, render_help, write_output};
 	use crate::graphics::extract_image_passthrough;
 
-	/// `report_issue@1` as `dyn` sees it: three required strings, one required
-	/// free-form object.
+	/// `report_issue@1` as `dyn` sees it: three required strings and one
+	/// required closed verdict object.
 	fn report_issue_schema() -> Value {
 		json!({
 			"type": "object",
@@ -1232,7 +1232,31 @@ mod tests {
 				"session_id": { "type": "string", "description": "Session filing the report." },
 				"device": { "type": "string", "description": "Device whose result was inconsistent." },
 				"rev": { "type": "string", "description": "Observed device revision." },
-				"verdict": { "type": "object", "description": "Structured verdict." }
+				"verdict": {
+					"type": "object",
+					"description": "Bounded structured verdict.",
+					"properties": {
+						"summary": { "type": "string" },
+						"expected": { "type": "string" },
+						"observed": { "type": "string" },
+						"evidence": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {
+									"kind": { "type": "string" },
+									"detail": { "type": "string" }
+								},
+								"required": ["kind", "detail"],
+								"additionalProperties": false
+							}
+						},
+						"outcome": { "type": "object" },
+						"fault": { "type": "object" }
+					},
+					"required": ["summary"],
+					"additionalProperties": false
+				}
 			},
 			"required": ["i", "session_id", "device", "rev", "verdict"]
 		})
@@ -1267,13 +1291,13 @@ mod tests {
 	fn positionals_bind_required_scalars_in_declaration_order() {
 		let parsed = parse(
 			&report_issue_schema(),
-			&["sess-1", "read", "3", "--verdict", r#"{"ok":false}"#],
+			&["sess-1", "read", "3", "--verdict", r#"{"summary":"mismatch"}"#],
 			"",
 		)
 		.expect("positionals bind");
 		assert_eq!(
 			Value::Object(parsed),
-			json!({ "session_id": "sess-1", "device": "read", "rev": "3", "verdict": { "ok": false } })
+			json!({ "session_id": "sess-1", "device": "read", "rev": "3", "verdict": { "summary": "mismatch" } })
 		);
 	}
 
@@ -1281,7 +1305,7 @@ mod tests {
 	fn autoqa_prompt_invocation_binds() {
 		let parsed = parse(
 			&report_issue_schema(),
-			&["sess-1", "read", "--rev", "1", "--verdict", r#"{"observed":"x","expected":"y"}"#],
+			&["sess-1", "read", "--rev", "1", "--verdict", r#"{"summary":"mismatch","observed":"x","expected":"y"}"#],
 			"",
 		)
 		.expect("AutoQA-shaped command binds");
@@ -1291,7 +1315,7 @@ mod tests {
 				"session_id": "sess-1",
 				"device": "read",
 				"rev": "1",
-				"verdict": { "observed": "x", "expected": "y" }
+				"verdict": { "summary": "mismatch", "observed": "x", "expected": "y" }
 			})
 		);
 	}
@@ -1366,13 +1390,13 @@ mod tests {
 	fn raw_json_merges_and_positionals_still_apply() {
 		let parsed = parse(
 			&report_issue_schema(),
-			&["-j", r#"{"verdict":{"ok":true},"rev":"2"}"#, "sess", "dev"],
+			&["-j", r#"{"verdict":{"summary":"mismatch"},"rev":"2"}"#, "sess", "dev"],
 			"",
 		)
 		.expect("json merge plus positionals");
 		assert_eq!(
 			Value::Object(parsed),
-			json!({ "verdict": { "ok": true }, "rev": "2", "session_id": "sess", "device": "dev" })
+			json!({ "verdict": { "summary": "mismatch" }, "rev": "2", "session_id": "sess", "device": "dev" })
 		);
 		let error = parse(&report_issue_schema(), &["--json", "[1]"], "").expect_err("not object");
 		assert!(matches!(error, ArgError::NotObject { .. }));
@@ -1502,11 +1526,14 @@ mod tests {
 	#[test]
 	fn file_and_stdin_are_valid_flag_and_raw_json_values_and_flags_win() {
 		let root = tempfile::tempdir().expect("tempdir");
-		std::fs::write(root.path().join("verdict.json"), r#"{"observed":"bad"}"#)
+		std::fs::write(
+			root.path().join("verdict.json"),
+			r#"{"summary":"mismatch","observed":"bad"}"#,
+		)
 			.expect("write verdict");
 		std::fs::write(
 			root.path().join("args.json"),
-			r#"{"session_id":"file-session","device":"read","rev":"1","verdict":{"ok":false}}"#,
+			r#"{"session_id":"file-session","device":"read","rev":"1","verdict":{"summary":"mismatch"}}"#,
 		)
 		.expect("write args");
 		let parsed = parse_in(
@@ -1521,14 +1548,14 @@ mod tests {
 				"session_id": "file-session",
 				"device": "bash",
 				"rev": "1",
-				"verdict": { "observed": "bad" }
+				"verdict": { "summary": "mismatch", "observed": "bad" }
 			})
 		);
 
 		let parsed = parse(
 			&report_issue_schema(),
 			&["session", "read", "1", "--verdict", "-"],
-			r#"{"expected":"complete"}"#,
+			r#"{"summary":"mismatch","expected":"complete"}"#,
 		)
 		.expect("stdin flag value binds");
 		assert_eq!(
@@ -1537,7 +1564,7 @@ mod tests {
 				"session_id": "session",
 				"device": "read",
 				"rev": "1",
-				"verdict": { "expected": "complete" }
+				"verdict": { "summary": "mismatch", "expected": "complete" }
 			})
 		);
 	}

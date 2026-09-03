@@ -18,6 +18,7 @@ use omp_core::Str;
 
 use crate::{
 	commands::CommandAction,
+	extension_status::ExtensionStatusEvent,
 	overlays::{PanelCall, PanelOpener},
 };
 
@@ -76,6 +77,62 @@ impl PartialEq for EscapeHook {
 }
 
 impl Eq for EscapeHook {}
+
+/// Stable failure class for local streaming speech recognition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SttFailureKind {
+	/// Model catalog, cache, download, or runtime initialization failed.
+	Setup,
+	/// The microphone lease or native capture device failed.
+	Microphone,
+	/// Captured audio exceeded the bounded session duration.
+	AudioLimit,
+	/// The realtime audio producer outran the bounded recognition queue.
+	Backpressure,
+	/// The local recognizer failed while decoding speech.
+	Recognition,
+}
+
+/// One typed observer update from the application-owned streaming recognizer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SttUiEvent {
+	/// A first-use model download is in progress.
+	SetupProgress {
+		/// Stable selected model id.
+		model:            Str,
+		/// Verified or downloaded bytes so far.
+		downloaded_bytes: u64,
+		/// Total manifest bytes.
+		total_bytes:      u64,
+	},
+	/// The microphone is open and audio is streaming.
+	Recording,
+	/// Capture ended and queued final segments are being decoded.
+	Transcribing,
+	/// Volatile text replacing the recognizer's prior preview at the caret.
+	Partial(Str),
+	/// One finalized segment to commit exactly once at the caret.
+	Segment(Str),
+	/// The stream ended normally after every finalized segment was delivered.
+	Finished {
+		/// Whether at least one non-empty segment was recognized.
+		had_speech:    bool,
+		/// Graphemes to remove from the committed suffix for a spoken submit
+		/// trigger.
+		trim_trailing: usize,
+		/// Whether the resulting composer draft should be submitted.
+		submit:        bool,
+	},
+	/// Capture and recognition were cancelled; volatile text must be discarded.
+	Cancelled,
+	/// Capture or recognition failed; volatile text must be discarded.
+	Failed {
+		/// Stable category suitable for presentation and telemetry.
+		kind:    SttFailureKind,
+		/// Secret-free diagnostic rendered at the actor boundary.
+		message: Str,
+	},
+}
 
 /// One observer-local request posted by a console command.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,11 +222,22 @@ pub enum HostAction {
 		/// `true` when recording begins, `false` when the bar is released.
 		active: bool,
 	},
-	/// Text recognized by speech-to-text, inserted at the caret.
-	InsertText(Str),
-	/// Submit the complete composer draft after a speech transcript was
-	/// inserted; mailbox order keeps insertion and submission atomic to input.
-	SubmitDraft,
+	/// Observer-only state from the application-owned realtime voice session.
+	LiveEvent(crate::overlays::live::LiveUiEvent),
+	/// A finalized live user utterance admitted by the application-owned
+	/// realtime transport. The actor forwards it to the controller without
+	/// touching the composer or transcript; the controller owns journaling.
+	LiveDelegation {
+		/// Transport request identity used to correlate streamed replies.
+		id:      Str,
+		/// Final recognized user text.
+		request: Str,
+	},
+	/// Ordered streaming speech-recognition state and editor updates.
+	SttEvent(SttUiEvent),
+	/// Insert, replace, clear, or reset one observer-local extension/hook
+	/// status contribution.
+	ExtensionStatus(ExtensionStatusEvent),
 	/// Register (or replace) an observer-local Esc hook.
 	EscapeHook(EscapeHook),
 	/// Remove an Esc hook by id.

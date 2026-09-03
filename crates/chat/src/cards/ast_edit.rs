@@ -70,8 +70,7 @@ impl Card for AstEditCard {
 			.to_owned();
 		let fault = diag_text(view).unwrap_or_default();
 		let proposal = state.unwrap_or("proposed");
-		let summary =
-			format!("{replacements} replacements · {file_count} files · in {scope}");
+		let summary = format!("{replacements} replacements · {file_count} files · in {scope}");
 		dom! {
 			<col>
 				match view.status {

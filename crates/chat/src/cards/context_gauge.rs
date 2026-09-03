@@ -143,7 +143,9 @@ impl TuiComponent for GaugeRows {
 			unused,
 		);
 		x = pc.frame.put(x, rect.y + 1, left_cap, cap_style);
-		let split = right.find(|ch: char| ch.is_ascii_digit()).unwrap_or(right.len());
+		let split = right
+			.find(|ch: char| ch.is_ascii_digit())
+			.unwrap_or(right.len());
 		x = pc.frame.put(x, rect.y + 1, &right[..split], right_style);
 		pc.frame.put(x, rect.y + 1, &right[split..], percent_style);
 		if rect.height < 3 {
@@ -173,7 +175,11 @@ impl TuiComponent for GaugeRows {
 					x,
 					rect.y + 2,
 					text,
-					if gauge.overflowed() { Style::new().fg(theme.err) } else { used },
+					if gauge.overflowed() {
+						Style::new().fg(theme.err)
+					} else {
+						used
+					},
 				),
 				GaugeCell::Window(text) => pc.frame.put(x, rect.y + 2, text, boundary_style),
 			};

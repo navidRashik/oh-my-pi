@@ -9,7 +9,7 @@
 //! on those engines. Every method has a default that reports the feature
 //! as unavailable, so a headless or test host needs no implementation.
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use flume::{Receiver, Sender};
 use omp_core::Str;
@@ -39,6 +39,59 @@ pub type ServiceResult<T> = Result<T, ServiceError>;
 /// Completion of an asynchronous service request: the host polls it from
 /// a panel's `tick`, never blocking the actor.
 pub type Pending<T> = Receiver<ServiceResult<T>>;
+
+/// Route whose exact active account usage the status actor requests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveUsageRequest {
+	/// Provider identifier from the live route.
+	pub provider: Str,
+	/// Model identifier from the live route.
+	pub model:    Str,
+}
+
+/// Non-secret identity of the exact account serving a route.
+///
+/// Every available identifier is retained so accounts sharing an email or a
+/// provider-native id cannot share a status cache accidentally.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountIdentity {
+	/// Provider identifier.
+	pub provider:            Str,
+	/// Stable broker account identifier.
+	pub account:             Str,
+	/// Broker principal identity, when available.
+	pub principal:           Option<Str>,
+	/// Provider-native account identifier.
+	pub provider_account_id: Option<Str>,
+	/// Provider account email.
+	pub email:               Option<Str>,
+	/// Provider project identifier.
+	pub project_id:          Option<Str>,
+	/// Provider organization identifier.
+	pub organization_id:     Option<Str>,
+}
+
+/// Usage windows for the exact account serving [`ActiveUsageRequest`].
+///
+/// The application resolves account affinity and provider/model/tier scope
+/// before returning this DTO. The actor must never aggregate sibling accounts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveAccountUsage {
+	/// Requested route; stale asynchronous deliveries are rejected against it.
+	pub request:   ActiveUsageRequest,
+	/// Exact account identity used by the provider fetch.
+	pub identity:  AccountIdentity,
+	/// Selected model/account tier or plan label.
+	pub tier:      Option<Str>,
+	/// Five-hour request window.
+	pub five_hour: Option<crate::status_band::UsageWindow>,
+	/// Daily request window.
+	pub daily:     Option<crate::status_band::UsageWindow>,
+	/// Seven-day request window.
+	pub seven_day: Option<crate::status_band::UsageWindow>,
+	/// Monthly request window.
+	pub monthly:   Option<crate::status_band::UsageWindow>,
+}
 
 /// One quota window on a provider account (pi `UsageWindow`).
 #[derive(Clone, Debug, PartialEq)]
@@ -320,6 +373,30 @@ pub struct AccountRow {
 	pub active:        bool,
 }
 
+/// One runtime-supplied option in the curated settings selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsChoice {
+	/// Stored convar spelling.
+	pub value:       Str,
+	/// Human label.
+	pub label:       Str,
+	/// Optional explanatory copy.
+	pub description: Str,
+}
+
+/// Runtime rosters used by settings controls whose choices cannot be static.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SettingsInventory {
+	/// Themes discovered from command-line and user/project theme directories.
+	pub themes:          Vec<SettingsChoice>,
+	/// Built-in and extension-provided composer shapes.
+	pub composer_shapes: Vec<SettingsChoice>,
+	/// Thinking levels supported by the active model.
+	pub thinking_levels: Vec<SettingsChoice>,
+	/// Provider ids available to the active catalog.
+	pub providers:       Vec<Str>,
+}
+
 /// One provider offered by `/login` and `/setup`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderRow {
@@ -409,6 +486,42 @@ pub enum SideEvent {
 	Error(Str),
 }
 
+/// External coding-agent transcript source supported by the native importer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display, strum::EnumString)]
+#[strum(ascii_case_insensitive)]
+pub enum ForeignSessionSource {
+	/// Claude Code JSONL transcripts.
+	#[strum(to_string = "Claude", serialize = "claude")]
+	Claude,
+	/// OpenAI Codex rollout JSONL transcripts.
+	#[strum(to_string = "Codex", serialize = "codex")]
+	Codex,
+}
+
+/// Lightweight foreign transcript metadata used by the import picker. The
+/// complete transcript remains app-owned until the user confirms a row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForeignSessionRow {
+	/// Source that owns this transcript.
+	pub source:        ForeignSessionSource,
+	/// Stable source-local session identity.
+	pub id:            Str,
+	/// Source transcript path.
+	pub path:          PathBuf,
+	/// Project directory recorded by the source.
+	pub cwd:           PathBuf,
+	/// Source-provided title, when present.
+	pub title:         Option<Str>,
+	/// Creation time, Unix milliseconds.
+	pub created_ms:    u64,
+	/// Last modification, Unix milliseconds.
+	pub modified_ms:   u64,
+	/// User + assistant message count, when cheaply available.
+	pub messages:      u32,
+	/// First user message used for filtering and untitled rows.
+	pub first_message: Option<Str>,
+}
+
 /// One on-disk session (pi session picker row / agents hub child).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRow {
@@ -493,6 +606,79 @@ pub struct PluginsReport {
 	/// Configured marketplace sources with their URIs; the same set as
 	/// `marketplaces`, in the same order.
 	pub sources:      Vec<MarketplaceSource>,
+}
+
+/// Collaboration lifecycle operation sent through the controller command
+/// stream. The actor never owns relay or journal authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollabOp {
+	/// Host a fresh room and publish editor/viewer links.
+	Start {
+		/// Whether the advertised primary link is read-only.
+		read_only: bool,
+		/// Optional relay origin; the public relay is used when absent.
+		relay:     Option<Str>,
+	},
+	/// Join an existing room as a remote replica.
+	Join {
+		/// Compact or browser collaboration link.
+		link: Str,
+		/// Optional participant display name.
+		name: Option<Str>,
+	},
+	/// Leave or close the current room.
+	Leave,
+	/// Read current collaboration state without changing it.
+	Status,
+}
+
+/// Local role in a collaboration room.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
+#[strum(serialize_all = "lowercase")]
+pub enum CollabRole {
+	/// This process owns the authoritative journal.
+	Host,
+	/// This process consumes a remote replica.
+	Guest,
+}
+
+/// One collaboration participant row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollabParticipant {
+	/// Relay peer identity; zero is the local host.
+	pub id:        u32,
+	/// Sanitized visible name.
+	pub name:      Str,
+	/// Whether the participant owns the session.
+	pub host:      bool,
+	/// Whether mutation controls are disabled.
+	pub read_only: bool,
+}
+
+/// Typed collaboration state returned by the runtime owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollabState {
+	/// Local role, absent when disconnected.
+	pub role:         Option<CollabRole>,
+	/// Human connection state (`connecting`, `connected`, …).
+	pub connection:   Str,
+	/// Writable guest link while hosting.
+	pub editor_link:  Option<Str>,
+	/// Read-only guest link while hosting.
+	pub viewer_link:  Option<Str>,
+	/// Authenticated presence rows.
+	pub participants: Vec<CollabParticipant>,
+	/// Concise command response.
+	pub line:         Str,
+}
+
+/// Settled collaboration controller operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollabOutcome {
+	/// Operation that settled.
+	pub op:     CollabOp,
+	/// Current state or typed service failure.
+	pub result: ServiceResult<CollabState>,
 }
 
 /// `/memory` subcommands (pi `builtin-lifecycle.ts` `/memory`).
@@ -835,6 +1021,13 @@ pub enum Mutation {
 }
 
 impl Mutation {
+	/// Whether this mutation can change which account serves the active
+	/// route or the quota snapshot shown for it.
+	#[must_use]
+	pub const fn affects_active_account_usage(&self) -> bool {
+		matches!(self, Self::Logout { .. } | Self::PinAccount { .. } | Self::ResetUsage { .. })
+	}
+
 	/// Short verb for status lines (`enabled`, `installed`, …).
 	#[must_use]
 	pub const fn verb(&self) -> &'static str {
@@ -890,10 +1083,32 @@ impl Mutations for NoMutations {
 /// method defaults to [`ServiceError::Unavailable`]. Mutations live on
 /// [`Mutations`], which only the controller holds.
 pub trait Services: Send + Sync {
+	/// Runtime choice rosters for the curated settings selector.
+	fn settings_inventory(&self) -> ServiceResult<SettingsInventory> {
+		Ok(SettingsInventory::default())
+	}
+
+	/// Resolves a runtime theme choice for observer-local preview.
+	fn theme(&self, _name: &str) -> ServiceResult<Option<Arc<omp_tui::JsonTheme>>> {
+		Ok(None)
+	}
+
 	/// Provider quotas and local cost activity. Quota refreshes contact
 	/// every provider, so the report settles asynchronously.
 	fn usage(&self) -> ServiceResult<Pending<UsageReport>> {
 		Err(ServiceError::Unavailable("usage"))
+	}
+
+	/// Usage for the exact account serving `request`.
+	///
+	/// Implementations resolve account affinity and fetch on their runtime;
+	/// this call only returns a receiver and never performs provider I/O on
+	/// the actor or paint thread.
+	fn active_account_usage(
+		&self,
+		_request: ActiveUsageRequest,
+	) -> ServiceResult<Pending<Option<ActiveAccountUsage>>> {
+		Err(ServiceError::Unavailable("active account usage"))
 	}
 
 	/// Accounts with saved Codex reset credits. The controller performs the
@@ -938,6 +1153,16 @@ pub trait Services: Send + Sync {
 		Err(ServiceError::Unavailable("session index"))
 	}
 
+	/// Foreign transcripts available for one-shot import, newest first.
+	/// Implementations read only lightweight source metadata here; complete
+	/// conversion starts only after the picker confirms a row.
+	fn foreign_sessions(
+		&self,
+		_source: ForeignSessionSource,
+	) -> ServiceResult<Vec<ForeignSessionRow>> {
+		Err(ServiceError::Unavailable("foreign session index"))
+	}
+
 	/// The transcript of agent `id` (a `<meta><jobs>` child): a live
 	/// kernel's snapshot plus its patch stream, or a parked agent's
 	/// journal-derived snapshot. Settles asynchronously because a live
@@ -950,6 +1175,11 @@ pub trait Services: Send + Sync {
 	/// argument. `Failed` when the session is in-memory only.
 	fn live_session_id(&self) -> ServiceResult<Str> {
 		Err(ServiceError::Unavailable("live session id"))
+	}
+
+	/// Current collaboration role, links, and presence.
+	fn collaboration(&self) -> ServiceResult<CollabState> {
+		Err(ServiceError::Unavailable("collaboration"))
 	}
 
 	/// Reads a session-local artifact (`local://PLAN.md`) as text.

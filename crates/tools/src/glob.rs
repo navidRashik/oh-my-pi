@@ -6,9 +6,8 @@ use async_stream::stream;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
 use omp_core::{Str, sf};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, BlobRef, CommitError, Constraint, DocEffects, Effects, Ev,
-	IncomingParams, InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec,
-	ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DocEffects, Effects, Ev, IncomingParams,
+	InterruptWaitError, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -17,8 +16,7 @@ use tracing::Instrument as _;
 use crate::{
 	grep::WorkspaceSearch,
 	path::tracing_path_metadata,
-	read::ReadBlobs,
-	render::{TextProjection, paths::format_grouped_paths, truncate::spill_truncated_text},
+	render::{TextProjection, paths::format_grouped_paths},
 };
 
 /// Default number of paths returned by `glob@1`.
@@ -127,16 +125,6 @@ pub struct Payload {
 	pub partial_match_count:  u64,
 	/// Deadline used by this invocation, retained for exact timeout rendering.
 	pub timeout_ms:           u64,
-	/// Exact bounded model-facing text prepared before prompt projection.
-	pub projected_text:       Str,
-	/// Durable complete output when `projected_text` was pre-truncated.
-	pub output_blob:          Option<BlobRef>,
-	/// Resolver-valid address of `output_blob`.
-	pub output_artifact_uri:  Option<Str>,
-	/// Complete lines retained in `projected_text` before its footer.
-	pub output_shown_lines:   u64,
-	/// Complete line count in the pre-truncation output.
-	pub output_total_lines:   u64,
 }
 
 /// Ephemeral progress from `glob@1`; traversal has no durable updates.
@@ -188,12 +176,6 @@ pub enum Fault {
 		/// Stable resource-owned explanation.
 		message: Str,
 	},
-	/// Durable blob storage failed while preserving complete output.
-	#[error("{message}")]
-	Blob {
-		/// Stable blob-owned explanation.
-		message: Str,
-	},
 	/// The resource observed cancellation without an invocation interrupt.
 	#[error("{reason}")]
 	Cancelled {
@@ -209,11 +191,9 @@ fn join_strs(values: &[Str]) -> String {
 		.collect::<Vec<_>>()
 		.join(", ")
 }
-/// Generic `glob@1` executor over environment-owned workspace and blob
-/// resources.
-pub struct Glob<W, B> {
+/// Generic `glob@1` executor over an environment-owned workspace resource.
+pub struct Glob<W> {
 	workspace: W,
-	blobs:     B,
 	spec:      ToolSpec,
 }
 
@@ -251,12 +231,12 @@ pub fn spec() -> ToolSpec {
 	}
 }
 
-/// Constructs `glob@1` over `workspace` and the shared durable blob namespace.
-pub fn tool<W: WorkspaceSearch, B: ReadBlobs>(workspace: W, blobs: B) -> Glob<W, B> {
-	Glob { workspace, blobs, spec: spec() }
+/// Constructs `glob@1` over `workspace`.
+pub fn tool<W: WorkspaceSearch>(workspace: W) -> Glob<W> {
+	Glob { workspace, spec: spec() }
 }
 
-impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Glob<W, B> {
+impl<W: WorkspaceSearch> Tool for Glob<W> {
 	type Fault = Fault;
 	type Params = Params;
 	type Payload = Payload;
@@ -310,7 +290,7 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Glob<W, B> {
 				let resource = self.workspace.glob_resource(request.clone()).instrument(span.clone()).await;
 				match resource {
 					Some(Ok(result)) => {
-						yield done(prepare_payload(result, limit, DEFAULT_TIMEOUT_MS, &self.blobs).await);
+						yield done(Ok(payload(result, limit, DEFAULT_TIMEOUT_MS)));
 					},
 					Some(Err(fault)) => {
 						yield done(Err(fault));
@@ -323,7 +303,7 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Glob<W, B> {
 			}
 			let operation = async {
 				let result = self.workspace.glob(request).await?;
-				prepare_payload(result, limit, DEFAULT_TIMEOUT_MS, &self.blobs).await
+				Ok(payload(result, limit, DEFAULT_TIMEOUT_MS))
 			}.instrument(span.clone()).fuse();
 			let interruption = params.next_interrupt().fuse();
 			pin_mut!(operation, interruption);
@@ -342,18 +322,18 @@ impl<W: WorkspaceSearch, B: ReadBlobs> Tool for Glob<W, B> {
 		let Some(mut projection) = TextProjection::new(*caps) else {
 			return Vec::new();
 		};
-		let text = match view {
-			Ok(payload) => payload.projected_text.as_str(),
-			Err(fault) => {
-				let message = fault.to_string();
-				projection.push(&message);
-				return projection.finish();
+		match view {
+			Ok(payload) => {
+				let text = render_payload(payload);
+				for fragment in text.split_inclusive('\n') {
+					if !projection.push(fragment) {
+						break;
+					}
+				}
 			},
-		};
-		for fragment in text.split_inclusive('\n') {
-			if !projection.push(fragment) {
-				break;
-			}
+			Err(fault) => {
+				projection.push(&fault.to_string());
+			},
 		}
 		projection.finish()
 	}
@@ -446,30 +426,7 @@ fn payload(mut result: WalkResult, limit: u64, timeout_ms: u64) -> Payload {
 		result_limit_reached: (result.truncated || over_limit).then_some(limit),
 		partial_match_count,
 		timeout_ms,
-		projected_text: Str::new(""),
-		output_blob: None,
-		output_artifact_uri: None,
-		output_shown_lines: 0,
-		output_total_lines: 0,
 	}
-}
-
-async fn prepare_payload<B: ReadBlobs>(
-	result: WalkResult,
-	limit: u64,
-	timeout_ms: u64,
-	blobs: &B,
-) -> Result<Payload, Fault> {
-	let mut payload = payload(result, limit, timeout_ms);
-	let output = spill_truncated_text(render_payload(&payload), blobs)
-		.await
-		.map_err(|fault| Fault::Blob { message: fault.message().clone() })?;
-	payload.projected_text = output.content;
-	payload.output_blob = output.blob;
-	payload.output_artifact_uri = output.artifact_uri;
-	payload.output_shown_lines = output.shown_lines;
-	payload.output_total_lines = output.total_lines;
-	Ok(payload)
 }
 
 fn render_payload(payload: &Payload) -> String {

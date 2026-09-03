@@ -166,7 +166,7 @@ impl Panel for PendingPanel {
 	fn frame(&mut self, viewport: Size) -> &Frame {
 		let width = match self.anchor {
 			PanelAnchor::Center | PanelAnchor::Full => viewport.width,
-			PanelAnchor::Bottom | PanelAnchor::Side => viewport.width,
+			PanelAnchor::Bottom | PanelAnchor::BottomCenter | PanelAnchor::Side => viewport.width,
 		};
 		if width != self.width {
 			self.rebuild(width);

@@ -12,16 +12,19 @@ use std::{
 use omp_agent::Up;
 use omp_chat::{
 	HostAction, HostCommand, HostOptions, NativeEffect, NativeHost,
-	actions::{EscapeHook, EscapeRung},
+	actions::{EscapeHook, EscapeRung, SttUiEvent},
 	composer::{SPACE_HOLD_RELEASE, SpaceHold, SpaceHoldEvent},
-	overlays::{NoServices, Panel, PanelAction, PanelAnchor, PanelCall, PanelEvent, PanelOpener},
+	overlays::{
+		NoServices, Panel, PanelAction, PanelAnchor, PanelCall, PanelEvent, PanelOpener,
+		live::LiveControl,
+	},
 };
 use omp_core::Str;
 use omp_dom::{KnownTag, NodeSpec, Op, PropId, Tag, Txn, Value};
 use omp_session::{ComponentRegistry, Session};
 use omp_tui::{
 	Chord, Frame, Key, KeyEvent, Mods, Mouse, MouseButton, MouseReport, Size, UiContext,
-	paste::ClipboardRead, slots::ResizePolicy,
+	paste::{Clipboard, ClipboardRead, ClipboardReadOutcome}, slots::ResizePolicy,
 };
 use tempfile::tempdir;
 
@@ -118,6 +121,15 @@ fn type_text(host: &mut NativeHost, text: &str) {
 	for character in text.chars() {
 		host.key(Key::Char(character)).expect("type");
 	}
+}
+
+fn real_png(width: u32, height: u32) -> Vec<u8> {
+	let image = image::DynamicImage::new_rgba8(width, height);
+	let mut output = std::io::Cursor::new(Vec::new());
+	image
+		.write_to(&mut output, image::ImageFormat::Png)
+		.expect("encode png");
+	output.into_inner()
 }
 
 fn engage_director(session: &mut Session, family: &'static str) {
@@ -276,9 +288,20 @@ fn escape_in_bash_or_eval_prefix_mode_clears_the_draft_instead_of_interrupting()
 	h.host.key(Key::Esc).expect("esc");
 	assert_eq!(h.host.composer_text(), "");
 	assert!(h.commands.try_recv().is_err(), "prefix mode wins over the streaming rung");
-	type_text(&mut h.host, "$1+1");
+	type_text(&mut h.host, "$ 1+1");
 	h.host.key(Key::Esc).expect("esc");
 	assert_eq!(h.host.composer_text(), "");
+}
+
+#[test]
+fn escape_preserves_dollar_prefixed_prose() {
+	for draft in ["$HOME", "${x}"] {
+		let mut h = harness(idle_session());
+		type_text(&mut h.host, draft);
+		h.host.key(Key::Esc).expect("esc");
+		assert_eq!(h.host.composer_text(), draft);
+		assert!(h.commands.try_recv().is_err());
+	}
 }
 
 #[test]
@@ -584,10 +607,10 @@ fn queue_shorthand_starts_immediately_when_idle_else_queues() {
 /// with its attachments when the agent is idle.
 #[test]
 fn follow_up_and_queue_shorthand_keep_image_attachments() {
-	let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03";
+	let png = real_png(200, 200);
 	let dir = tempdir().expect("image directory");
 	let path = dir.path().join("shot.png");
-	std::fs::write(&path, png).expect("write png");
+	std::fs::write(&path, &png).expect("write png");
 	let source = path.to_str().expect("utf-8 path");
 
 	// Both configured follow-up chords while streaming: queued with the
@@ -603,10 +626,10 @@ fn follow_up_and_queue_shorthand_keep_image_attachments() {
 			Ok(HostCommand::Queue { prompt, attachments }) => (prompt, attachments),
 			other => panic!("follow-up with an image chip queues it, got {other:?}"),
 		};
-		assert_eq!(prompt, "[Image #1, 4x3] what is this?");
+		assert_eq!(prompt, "[Image #1, 200x200] what is this?");
 		assert_eq!(attachments.len(), 1);
 		assert_eq!(attachments[0].mime, "image/png");
-		assert_eq!(attachments[0].bytes.as_ref(), png);
+		assert_eq!(attachments[0].bytes.as_ref(), png.as_slice());
 		assert!(h.commands.try_recv().is_err(), "queued once, never also steered");
 		assert!(h.up.try_recv().is_err());
 		assert_eq!(h.host.notice(), Some("Queued message for when the agent yields"));
@@ -623,7 +646,7 @@ fn follow_up_and_queue_shorthand_keep_image_attachments() {
 	assert!(matches!(
 		h.commands.try_recv(),
 		Ok(HostCommand::Queue { prompt, attachments })
-			if prompt == "[Image #1, 4x3] and this" && attachments.len() == 1
+			if prompt == "[Image #1, 200x200] and this" && attachments.len() == 1
 	));
 
 	// Idle with an empty queue: the shorthand submits with the image.
@@ -635,10 +658,59 @@ fn follow_up_and_queue_shorthand_keep_image_attachments() {
 	assert!(matches!(
 		h.commands.try_recv(),
 		Ok(HostCommand::SubmitWithAttachments { text, attachments })
-			if text == "[Image #1, 4x3] now" && attachments.len() == 1
+			if text == "[Image #1, 200x200] now" && attachments.len() == 1
 	));
 	assert!(h.host.turn_active());
 	assert_eq!(h.host.notice(), Some("Sent queued message"));
+}
+
+#[test]
+fn compaction_follow_up_keeps_normalized_media_and_exact_marker() {
+	let png = real_png(200, 200);
+	let dir = tempdir().expect("image directory");
+	let path = dir.path().join("shot.png");
+	std::fs::write(&path, &png).expect("write png");
+
+	let mut session = idle_session();
+	open_turn(&mut session);
+	engage_director(&mut session, "compaction");
+	let mut h = harness(session);
+	h.host
+		.paste(path.to_str().expect("utf-8 path"));
+	type_text(&mut h.host, "after compaction");
+	h.host.key(Key::FollowUp).expect("follow up");
+	let (prompt, attachments) = match h.commands.try_recv() {
+		Ok(HostCommand::Queue { prompt, attachments }) => (prompt, attachments),
+		other => panic!("compaction follow-up should queue, got {other:?}"),
+	};
+	assert_eq!(prompt, "[Image #1, 200x200] after compaction");
+	assert_eq!(attachments.len(), 1);
+	assert_eq!(attachments[0].mime, "image/png");
+	assert_eq!(attachments[0].bytes.as_ref(), png.as_slice());
+}
+
+#[test]
+fn commands_with_media_refuse_without_losing_draft_or_chip() {
+	let png = real_png(200, 200);
+	let dir = tempdir().expect("image directory");
+	let path = dir.path().join("shot.png");
+	std::fs::write(&path, png).expect("write png");
+	let source = path.to_str().expect("utf-8 path");
+
+	for (draft, notice) in [
+		("/goal inspect ", "Slash commands do not accept media attachments"),
+		("!echo hi ", "Local commands do not accept media attachments"),
+		("$print('hi') ", "Local commands do not accept media attachments"),
+	] {
+		let mut h = harness(idle_session());
+		type_text(&mut h.host, draft);
+		h.host.paste(source);
+		let before = h.host.composer_text();
+		h.host.key(Key::Enter).expect("submit command with media");
+		assert_eq!(h.host.notice(), Some(notice));
+		assert_eq!(h.host.composer_text(), before);
+		assert!(h.commands.try_recv().is_err(), "refused command emits nothing");
+	}
 }
 
 #[test]
@@ -719,8 +791,10 @@ fn paste_chords_request_the_matching_clipboard_read_and_deliver_it() {
 	h.host.key(Key::PasteRaw).expect("ctrl+shift+v");
 	assert_eq!(h.host.take_clipboard_read(), Some(ClipboardRead::Text));
 	// Raw text keeps its newlines verbatim.
-	h.host
-		.deliver_clipboard(Some(omp_tui::paste::Clipboard::Text("a\nb".into())), true);
+	h.host.deliver_clipboard(
+		ClipboardReadOutcome::Payload(Clipboard::Text("a\nb".into())),
+		true,
+	);
 	assert_eq!(h.host.composer_text(), "a\nb");
 	// An image persists to a temp file and lands as an attachment chip whose
 	// submitted form is pi's positional marker (the file travels as the
@@ -736,7 +810,7 @@ fn paste_chords_request_the_matching_clipboard_read_and_deliver_it() {
 	.expect("png header");
 	h.host.key(Key::Ctrl('c')).expect("clear");
 	h.host
-		.deliver_clipboard(Some(omp_tui::paste::Clipboard::Image(png)), false);
+		.deliver_clipboard(ClipboardReadOutcome::Payload(Clipboard::Image(png)), false);
 	let text = h.host.composer_text();
 	assert_eq!(text, "[Image #1, 1x1] ", "chip expands to the wire marker: {text:?}");
 	let image = omp_tui::Charset::default().icon(omp_tui::Icon::Image);
@@ -745,8 +819,82 @@ fn paste_chords_request_the_matching_clipboard_read_and_deliver_it() {
 		"the composer shows the chip"
 	);
 	h.host.key(Key::Ctrl('c')).expect("clear");
-	h.host.deliver_clipboard(None, false);
+	h.host.deliver_clipboard(ClipboardReadOutcome::Empty, false);
 	assert_eq!(h.host.notice(), Some("Clipboard is empty"));
+}
+
+#[test]
+fn typed_clipboard_misses_report_exactly_without_mutating_the_composer() {
+	let cases = [
+		(ClipboardReadOutcome::Empty, false, "Clipboard is empty"),
+		(
+			ClipboardReadOutcome::Empty,
+			true,
+			"No text in clipboard to paste raw",
+		),
+		(
+			ClipboardReadOutcome::PermissionDenied,
+			false,
+			"Clipboard access was denied",
+		),
+		(
+			ClipboardReadOutcome::UnsupportedFormat,
+			false,
+			"Clipboard format is not supported",
+		),
+		(
+			ClipboardReadOutcome::ReadFailure,
+			false,
+			"Failed to read clipboard",
+		),
+		(
+			ClipboardReadOutcome::ReadFailure,
+			true,
+			"Failed to paste raw text from clipboard",
+		),
+	];
+	for (outcome, raw, notice) in cases {
+		let mut h = harness(idle_session());
+		type_text(&mut h.host, "draft");
+		h.host.deliver_clipboard(outcome, raw);
+		assert_eq!(h.host.composer_text(), "draft");
+		assert_eq!(h.host.notice(), Some(notice));
+	}
+}
+
+#[test]
+fn extension_status_actions_project_sorted_hide_by_config_and_reset() {
+	let mut h = harness(idle_session());
+	for (key, text) in [("z", "zed-hook"), ("a", "alpha-hook")] {
+		h.host
+			.act(HostAction::ExtensionStatus(omp_chat::ExtensionStatusEvent::Set {
+				key:  Str::new(key),
+				text: Str::new(text),
+			}))
+			.expect("extension status");
+	}
+	let shown = omp_tui::frame_text(h.host.frame());
+	let alpha = shown.find("alpha-hook").expect("alpha status");
+	let zed = shown.find("zed-hook").expect("zed status");
+	assert!(alpha < zed, "status contributions stay key-sorted: {shown}");
+
+	h.con
+		.run("cl_status_line_show_hook_status 0")
+		.expect("hide extension status");
+	h.host.tick(Duration::ZERO);
+	let hidden = omp_tui::frame_text(h.host.frame());
+	assert!(!hidden.contains("alpha-hook") && !hidden.contains("zed-hook"), "{hidden}");
+
+	h.con
+		.run("cl_status_line_show_hook_status 1")
+		.expect("show extension status");
+	h.host.tick(Duration::ZERO);
+	assert!(omp_tui::frame_text(h.host.frame()).contains("alpha-hook"));
+	let head = h.session.head().expect("session head");
+	h.session.rewind(head).expect("publish DOM reset");
+	h.host.poll().expect("apply DOM reset");
+	let reset = omp_tui::frame_text(h.host.frame());
+	assert!(!reset.contains("alpha-hook") && !reset.contains("zed-hook"), "{reset}");
 }
 
 // ---------------------------------------------------------------- panels
@@ -930,6 +1078,28 @@ fn paste_reaches_the_active_side_panel_before_the_composer() {
 	h.host.paste("hello");
 	assert_eq!(h.host.take_clipboard().as_deref(), Some("pasted:hello"));
 	assert_eq!(h.host.composer_text(), "", "the composer never sees the paste");
+}
+
+#[test]
+fn clipboard_payload_keeps_focused_panel_routing_and_refuses_hidden_media_mutation() {
+	let mut h = harness(idle_session());
+	open_probe(&mut h.host, "btw", PanelAnchor::Side);
+	h.host.deliver_clipboard(
+		ClipboardReadOutcome::Payload(Clipboard::Text("hello".into())),
+		true,
+	);
+	assert_eq!(h.host.take_clipboard().as_deref(), Some("pasted:hello"));
+	assert_eq!(h.host.composer_text(), "", "raw text stays in the focused panel");
+
+	h.host.deliver_clipboard(
+		ClipboardReadOutcome::Payload(Clipboard::Paths(vec![Str::new_static("/tmp/a.png")])),
+		false,
+	);
+	assert_eq!(
+		h.host.notice(),
+		Some("Close the current panel before pasting images or files")
+	);
+	assert_eq!(h.host.composer_text(), "", "media refusal cannot mutate the hidden composer");
 }
 
 /// Terminal mouse tracking follows every stacked overlay, side panels
@@ -1147,7 +1317,7 @@ fn a_held_space_bar_starts_recording_and_release_stops_it() {
 	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::PushToTalk { active: false })));
 	// The recognizer's text lands at the caret.
 	h.host
-		.act(HostAction::InsertText(Str::new_static(" there")))
+		.act(HostAction::SttEvent(SttUiEvent::Segment(Str::new_static(" there"))))
 		.expect("insert");
 	assert_eq!(h.host.composer_text(), "hi there");
 }
@@ -1160,10 +1330,16 @@ fn live_toggle_flips_the_session_and_stops_push_to_talk_first() {
 	h.host.act(HostAction::LiveToggle).expect("live");
 	assert!(!h.host.recording());
 	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::PushToTalk { active: false })));
-	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::LiveVoice { active: true })));
-	assert_eq!(h.host.notice(), Some("Live voice on · Ctrl+L to stop"));
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Overlay { ref id, open: true }) if id == "live"
+	));
+	assert_eq!(h.host.overlay_id(), Some("live"));
+	assert!(h.host.tick(h.host.clock().elapsed()));
+	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::LiveVoice(LiveControl::Start))));
 	h.host.act(HostAction::LiveToggle).expect("live");
-	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::LiveVoice { active: false })));
+	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::LiveVoice(LiveControl::Stop))));
+	assert_eq!(h.host.overlay_id(), None);
 }
 
 // ---------------------------------------------------------------- console

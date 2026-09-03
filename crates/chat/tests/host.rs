@@ -504,6 +504,15 @@ fn type_text(host: &mut NativeHost, text: &str) {
 	}
 }
 
+fn real_png(width: u32, height: u32) -> Vec<u8> {
+	let image = image::DynamicImage::new_rgba8(width, height);
+	let mut output = std::io::Cursor::new(Vec::new());
+	image
+		.write_to(&mut output, image::ImageFormat::Png)
+		.expect("encode png");
+	output.into_inner()
+}
+
 /// pi `internal-url-autocomplete.ts`: typing `scheme://` offers the
 /// resources the host can name — `local://` artifacts from the services
 /// seam and `agent://` ids from the live `<meta><jobs>` roster, which
@@ -967,7 +976,7 @@ fn hook_message_is_a_journaled_notice_that_replays_rewinds_and_copies() {
 	let replayed_blocks = block_views(replayed.dom(), true);
 	assert_eq!(replayed_blocks.last().map(|block| block.text.as_str()), Some(hook.text.as_str()));
 	// The copy selector offers it as pi's `message` outline target.
-	let targets = omp_chat::overlays::copy::collect_targets(session.dom(), true);
+	let targets = omp_chat::overlays::copy::collect_targets(session.dom(), true, true, true);
 	let message = targets.last().expect("copy target");
 	assert_eq!(message.label, "message");
 	assert_eq!(message.content, "Ran **3** checks\n\n- lint ok");
@@ -1282,17 +1291,17 @@ fn a_refused_local_run_restores_the_draft_and_rolls_back_activity() {
 }
 
 /// Dropping or pasting an image stages a `#1` chip; Enter submits the draft
-/// with pi's positional `[Image #1, WxH]` marker and the image bytes typed
-/// from their header, the controller content-addresses them beside the
+/// with pi's positional `[Image #1, WxH]` marker and normalized image bytes;
+/// the controller content-addresses them beside the
 /// journaled prompt, and the transcript bubble shows the same compact chip
 /// the composer used.
 #[test]
 fn pasted_image_chip_submits_attachments_and_the_bubble_shows_the_chip() {
 	let (mut host, commands, mut session) = bound_host_with_session(vec![row("test/model", &[])]);
-	let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03";
+	let png = real_png(200, 200);
 	let dir = tempdir().expect("image directory");
 	let path = dir.path().join("shot.png");
-	std::fs::write(&path, png).expect("write png");
+	std::fs::write(&path, &png).expect("write png");
 	let image_icon = omp_tui::Charset::default().icon(omp_tui::Icon::Image);
 
 	assert_eq!(host.paste(path.to_str().expect("utf-8 path")), NativeEffect::Consumed);
@@ -1306,10 +1315,10 @@ fn pasted_image_chip_submits_attachments_and_the_bubble_shows_the_chip() {
 		HostCommand::SubmitWithAttachments { text, attachments } => (text, attachments),
 		other => panic!("image chips submit attachments, got {other:?}"),
 	};
-	assert_eq!(text, "[Image #1, 4x3] what is this?");
+	assert_eq!(text, "[Image #1, 200x200] what is this?");
 	assert_eq!(attachments.len(), 1);
 	assert_eq!(attachments[0].mime, "image/png");
-	assert_eq!(attachments[0].bytes.as_ref(), png);
+	assert_eq!(attachments[0].bytes.as_ref(), png.as_slice());
 	assert!(host.take_clipboard().is_none());
 
 	// The controller's side of the seam: content-address and journal.

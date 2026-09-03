@@ -134,7 +134,7 @@ impl Card for BashCard {
 					<col pad-x=1>
 						if let Some((marker, lines)) = settled {
 							if let Some(marker) = marker { <text fg=muted truncate>{marker}</text> }
-							<text wrap=word fg=output>{lines}</text>
+							<pre fg=output>{lines}</pre>
 						}
 						if let Some(message) = fault {
 							<pre fg=output>{message}</pre>
@@ -253,6 +253,7 @@ mod tests {
 			input:   &input,
 			result:  None,
 			diag:    None,
+			notices: smallvec::SmallVec::new(),
 			usage:   None,
 			status:  CardStatus::InProgress,
 			output:  Some(&output),
@@ -316,6 +317,7 @@ mod tests {
 			input:   &input,
 			result:  Some(&result),
 			diag:    None,
+			notices: smallvec::SmallVec::new(),
 			usage:   None,
 			status:  CardStatus::Done,
 			output:  None,
@@ -355,6 +357,7 @@ mod tests {
 			input:   &input,
 			result:  None,
 			diag:    Some(&diag),
+			notices: smallvec::SmallVec::new(),
 			usage:   None,
 			status:  CardStatus::Failed,
 			output:  None,

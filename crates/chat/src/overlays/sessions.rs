@@ -21,7 +21,7 @@ use omp_tui::{Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, dom};
 
 use super::{
 	Outcome, Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent, PanelNote,
-	services::{SessionRow, SessionScope},
+	services::{ForeignSessionRow, ForeignSessionSource, ServiceResult, SessionRow, SessionScope},
 };
 use crate::host::HostCommand;
 
@@ -32,6 +32,9 @@ const LIST_HINT: &str =
 	"[Tab scope · Del · Enter · Ctrl+P path · Ctrl+S sort · Ctrl+R rename · Esc]";
 const RENAME_HINT: &str = "[Enter save · Esc cancel]";
 const CONFIRM_HINT: &str = "[y delete · n/Esc keep]";
+/// Foreign import pickers use the same filter/select controls but expose no
+/// native-session mutation chords.
+const IMPORT_HINT: &str = "[Enter import · Esc cancel]";
 /// pi `session-selector.ts:559` empty-state wording.
 const NO_SESSIONS: &str = "No sessions found";
 /// Border, hint rule, hint, and blank rows around the list.
@@ -83,6 +86,17 @@ struct Shown {
 	child: bool,
 }
 
+/// Result of a controller-owned foreign transcript import.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForeignSessionImportOutcome {
+	/// Source that owned the selected transcript.
+	pub source:   ForeignSessionSource,
+	/// Selected source transcript.
+	pub selected: std::path::PathBuf,
+	/// Native `.oms` journal or the typed app error.
+	pub result:   ServiceResult<std::path::PathBuf>,
+}
+
 /// Result of a controller-owned project/global session-index read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionIndexOutcome {
@@ -90,6 +104,248 @@ pub struct SessionIndexOutcome {
 	pub scope:  SessionScope,
 	/// Detached rows or the controller's failure.
 	pub result: Result<Vec<SessionRow>, Str>,
+}
+
+/// Retained `/resume @claude|@codex` picker. It owns only detached metadata;
+/// conversion and persistence remain controller-owned.
+pub struct ForeignSessionPicker {
+	ui:      Ui,
+	ctx:     UiContext,
+	zone:    TimeZone,
+	source:  ForeignSessionSource,
+	rows:    Vec<ForeignSessionRow>,
+	cursor:  Option<usize>,
+	query:   Str,
+	pending: Option<std::path::PathBuf>,
+	width:   u16,
+	height:  u16,
+}
+
+impl ForeignSessionPicker {
+	/// Reads lightweight source metadata and opens the matching import picker.
+	pub fn open(source: ForeignSessionSource, cx: &PanelCx<'_>) -> Result<Self, Str> {
+		let mut rows = cx
+			.services
+			.foreign_sessions(source)
+			.map_err(|error| sf!("Failed to list {source} sessions: {error}"))?;
+		rows.retain(|row| row.source == source);
+		if rows.is_empty() {
+			return Err(sf!("No {source} sessions found"));
+		}
+		let mut picker = Self {
+			ui: Ui::from_root(dom! { <col/> }, cx.viewport.width, cx.ui.clone()),
+			ctx: cx.ui.clone(),
+			zone: TimeZone::system(),
+			source,
+			rows,
+			cursor: None,
+			query: Str::default(),
+			pending: None,
+			width: cx.viewport.width,
+			height: SessionPicker::list_rows_for(cx.viewport),
+		};
+		picker.rebuild();
+		Ok(picker)
+	}
+
+	fn title(&self) -> Str {
+		sf!("Import {} Session", self.source)
+	}
+
+	fn stamp(&self, ms: u64) -> Str {
+		i64::try_from(ms)
+			.ok()
+			.and_then(|ms| Timestamp::from_millisecond(ms).ok())
+			.and_then(|stamp| strtime::format(STAMP_FORMAT, &stamp.to_zoned(self.zone.clone())).ok())
+			.map_or_else(|| Str::new_static(NO_STAMP), Str::new)
+	}
+
+	fn display_name(row: &ForeignSessionRow) -> &str {
+		row.title
+			.as_deref()
+			.or_else(|| {
+				row.first_message
+					.as_deref()
+					.and_then(|message| message.lines().find(|line| !line.trim().is_empty()))
+			})
+			.unwrap_or(row.id.as_str())
+	}
+
+	fn cursor_to(&mut self, value: &str) {
+		self.cursor = self
+			.rows
+			.iter()
+			.position(|row| row.path.to_string_lossy() == value);
+	}
+
+	fn rebuild(&mut self) {
+		struct Line {
+			value:    Str,
+			label:    Str,
+			stamp:    Str,
+			messages: Str,
+			name:     Str,
+			cwd:      Str,
+		}
+		let lines = self
+			.rows
+			.iter()
+			.map(|row| {
+				let path = row.path.to_string_lossy();
+				let cwd = row.cwd.to_string_lossy();
+				let mut label = StrMut::with_capacity(128);
+				if let Some(title) = &row.title {
+					label.push_str(title.as_str());
+					label.push(' ');
+				}
+				if let Some(first) = &row.first_message {
+					label.push_str(first.as_str());
+					label.push(' ');
+				}
+				label.push_str(row.id.as_str());
+				label.push(' ');
+				label.push_str(&path);
+				label.push(' ');
+				label.push_str(&cwd);
+				Line {
+					value:    Str::new(path),
+					label:    label.freeze(),
+					stamp:    self.stamp(row.modified_ms),
+					messages: sf!("{} msgs", row.messages),
+					name:     Str::new(Self::display_name(row)),
+					cwd:      Str::new(cwd),
+				}
+			})
+			.collect::<Vec<_>>();
+		let title = self.title();
+		let height = self.height.saturating_add(1);
+		let query = self.query.clone();
+		let tree = dom! {
+			<box border=round title={title} pad-x=1>
+				<col>
+					<select id="foreign-sessions" filter={query} h={height}>
+						for line in lines {
+							<option value={line.value} label={line.label}>
+								<td><pre fg=muted>{line.stamp}</pre></td>
+								<td align=end><pre fg=muted>{line.messages}</pre></td>
+								<td truncate grow><pre>{line.name}</pre></td>
+								<td truncate=start><pre fg=muted>{line.cwd}</pre></td>
+							</option>
+						}
+					</select>
+					<hr border=round/>
+					<text fg=muted truncate>{IMPORT_HINT}</text>
+				</col>
+			</box>
+		};
+		self.ui = Ui::from_root(tree, self.width, self.ctx.clone());
+		if let UiEvent::Highlighted { value, .. } = self.ui.handle_key(Key::Home) {
+			self.cursor_to(&value);
+		}
+	}
+
+	fn ui_event(&mut self, event: UiEvent) -> PanelEvent {
+		match event {
+			UiEvent::Cancel => PanelEvent::Close,
+			UiEvent::Highlighted { value, .. } => {
+				self.cursor_to(&value);
+				PanelEvent::Consumed
+			},
+			UiEvent::Filtered { query, value, .. } => {
+				self.query = query;
+				match value {
+					Some(value) => self.cursor_to(&value),
+					None => self.cursor = None,
+				}
+				PanelEvent::Consumed
+			},
+			UiEvent::Changed { value, .. } => {
+				self.cursor_to(&value);
+				let Some(index) = self.cursor else {
+					return PanelEvent::Consumed;
+				};
+				let path = self.rows[index].path.clone();
+				self.pending = Some(path.clone());
+				PanelEvent::Command(HostCommand::ForeignSessionImport { source: self.source, path })
+			},
+			_ => PanelEvent::Consumed,
+		}
+	}
+}
+
+impl Panel for ForeignSessionPicker {
+	fn id(&self) -> &'static str {
+		"foreign-sessions"
+	}
+
+	fn anchor(&self) -> PanelAnchor {
+		PanelAnchor::Bottom
+	}
+
+	fn action(&mut self, _action: PanelAction) -> PanelEvent {
+		PanelEvent::Ignored
+	}
+
+	fn key(&mut self, key: Key) -> PanelEvent {
+		if self.pending.is_some() {
+			return PanelEvent::Consumed;
+		}
+		if key == Key::Esc {
+			return PanelEvent::Close;
+		}
+		let event = self.ui.handle_key(key);
+		self.ui_event(event)
+	}
+
+	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
+		let PanelNote::Outcome(Outcome::ForeignSessionImport(outcome)) = note else {
+			return PanelEvent::Ignored;
+		};
+		if outcome.source != self.source || self.pending.as_ref() != Some(&outcome.selected) {
+			return PanelEvent::Ignored;
+		}
+		self.pending = None;
+		match &outcome.result {
+			Ok(path) if path.extension().and_then(|extension| extension.to_str()) == Some("oms") => {
+				PanelEvent::FinishCommand(HostCommand::SessionOpen { path: path.clone() })
+			},
+			Ok(_) => PanelEvent::CloseNotice(sf!("Failed to persist {} session", self.source)),
+			Err(error) => PanelEvent::CloseNotice(Str::new(error.to_string())),
+		}
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		if self.pending.is_some() {
+			return PanelEvent::Consumed;
+		}
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		self.ui_event(event)
+	}
+
+	fn paste(&mut self, text: &str) -> PanelEvent {
+		if self.pending.is_some() {
+			return PanelEvent::Consumed;
+		}
+		let event = self.ui.handle_paste(text);
+		self.ui_event(event)
+	}
+
+	fn frame(&mut self, viewport: Size) -> &Frame {
+		let height = SessionPicker::list_rows_for(viewport);
+		if height != self.height {
+			self.height = height;
+			self
+				.ui
+				.set_prop("foreign-sessions", Prop::H, height.saturating_add(1));
+		}
+		if viewport.width != self.width {
+			self.width = viewport.width;
+			self.rebuild();
+		}
+		self.ui.frame()
+	}
 }
 
 /// Retained `/resume` picker.

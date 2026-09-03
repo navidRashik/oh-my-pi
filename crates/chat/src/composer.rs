@@ -13,7 +13,10 @@ use omp_tui::{
 
 use crate::{
 	autocomplete::{PromptAction, PromptActions, UrlCompleter, composer_chain},
-	chrome::{COMPOSER_ID, GAP_ID, STATUS_ID, StatusBand, StatusFacts, composer_ui, top_gap_shown},
+	chrome::{
+		COMPOSER_ID, GAP_ID, STATUS_ID, StatusAppearance, StatusBand, StatusFacts, composer_ui,
+		top_gap_shown,
+	},
 };
 
 /// Editor row budget for a terminal of `rows` rows (pi
@@ -36,6 +39,27 @@ pub fn editor_max_rows(rows: u16) -> u16 {
 		.max(MIN_RENDERED_ROWS)
 }
 
+/// Kind of a composer-staged media source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComposerMediaKind {
+	/// A directly supported image container.
+	Image,
+	/// A supported video container.
+	Video,
+}
+
+/// One ordered media source drained from the composer's attachment band.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComposerMediaSource {
+	/// Producer-side classification used by the host materializer.
+	pub kind:   ComposerMediaKind,
+	/// Local source path and retry link, resolved relative to the chat process.
+	///
+	/// Normalization may replace the encoded bytes handed to the model but
+	/// never this source, so a refused or restored draft keeps its image link.
+	pub source: Str,
+}
+
 /// Result of applying a composer key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComposerAction {
@@ -43,26 +67,32 @@ pub enum ComposerAction {
 	Changed,
 	/// Submit the current draft as a prompt.
 	Submit(Str),
-	/// Submit the draft with the image chips it references (pi
-	/// `pendingImages`): `[Image #N]` in `text` is positional against
-	/// `images[N-1]`, each an image file path the host reads once.
-	SubmitWithImages {
+	/// Submit the draft with the media chips it references (pi
+	/// `pendingImages`): `[Image #N]` / `[Video #N]` in `text` is positional
+	/// against `media[N-1]`, each a local source the host reads once.
+	SubmitWithMedia {
 		/// The draft with chips expanded to their wire markers.
-		text:   Str,
-		/// Staged image sources in marker order.
-		images: Vec<Str>,
+		text:  Str,
+		/// Staged media sources in marker order.
+		media: Vec<ComposerMediaSource>,
 	},
 	/// Run a submitted `/…` line as the console statement after the slash.
-	Command(Str),
+	Command {
+		/// Console statement after the leading slash.
+		statement: Str,
+		/// Media still referenced by the command draft. Commands that do not
+		/// accept media refuse before commit instead of silently dropping it.
+		media:     Vec<ComposerMediaSource>,
+	},
 	/// Queue the draft behind the active turn (pi `->` / `=>` yield-queue
 	/// shorthand): the body runs when the agent yields, or at once when it
-	/// is idle with an empty queue. Image chips travel with it exactly as
-	/// they do for [`ComposerAction::SubmitWithImages`].
+	/// is idle with an empty queue. Media chips travel with it exactly as
+	/// they do for [`ComposerAction::SubmitWithMedia`].
 	Queue {
 		/// The body behind the sigil, chips expanded to their wire markers.
-		text:   Str,
-		/// Staged image sources in marker order.
-		images: Vec<Str>,
+		text:  Str,
+		/// Staged media sources in marker order.
+		media: Vec<ComposerMediaSource>,
 	},
 	/// Write text to the clipboard (the host owns OSC 52 / native access).
 	Copy(Str),
@@ -70,12 +100,12 @@ pub enum ComposerAction {
 	Ignored,
 }
 
-/// pi `compactImageMarkers`: the submitted images are the visible chips in
-/// marker order, so `[Image #M…]` for the K-th surviving marker `M` is
-/// rewritten to `[Image #K…]` — the positional `[Image #N] ↔ images[N-1]`
-/// contract holds after chips were deleted from the draft. Markers already
-/// dense (the common case) leave the text untouched.
-fn compact_image_markers(text: &str, markers: &[usize]) -> String {
+/// pi `compactImageMarkers`: submitted media are the visible chips in marker
+/// order, so `[Image #M…]` or `[Video #M…]` for the K-th surviving marker M
+/// is rewritten to K. A matching legacy `attachment://M` link moves with the
+/// marker. The positional marker-to-source contract therefore survives chip
+/// deletion without disturbing image/video classification or source links.
+fn compact_media_markers(text: &str, markers: &[usize]) -> String {
 	if markers
 		.iter()
 		.enumerate()
@@ -83,26 +113,80 @@ fn compact_image_markers(text: &str, markers: &[usize]) -> String {
 	{
 		return text.to_owned();
 	}
-	const PREFIX: &str = "[Image #";
+	rewrite_media_markers(text, |old| {
+		markers
+			.iter()
+			.position(|marker| *marker == old)
+			.map(|index| index + 1)
+	})
+}
+
+fn rewrite_media_markers(
+	text: &str,
+	mut mapped: impl FnMut(usize) -> Option<usize>,
+) -> String {
+	const PREFIXES: [&str; 2] = ["[Image #", "[Video #"];
+	const LEGACY: &str = " attachment://";
 	let mut out = String::with_capacity(text.len());
 	let mut rest = text;
-	while let Some(at) = rest.find(PREFIX) {
-		let (before, tail) = rest.split_at(at + PREFIX.len());
-		out.push_str(before);
-		let digits = tail
-			.find(|c: char| !c.is_ascii_digit())
-			.unwrap_or(tail.len());
-		match tail[..digits]
-			.parse::<usize>()
-			.ok()
-			.and_then(|old| markers.iter().position(|marker| *marker == old))
-		{
-			Some(index) if digits > 0 => {
-				let _ = write!(out, "{}", index + 1);
-			},
-			_ => out.push_str(&tail[..digits]),
+	loop {
+		let next = PREFIXES
+			.into_iter()
+			.filter_map(|prefix| rest.find(prefix).map(|at| (at, prefix)))
+			.min_by_key(|(at, _)| *at);
+		let Some((at, prefix)) = next else {
+			break;
+		};
+		out.push_str(&rest[..at]);
+		let marker = &rest[at..];
+		let digits_start = prefix.len();
+		let digits_len = marker[digits_start..]
+			.bytes()
+			.take_while(u8::is_ascii_digit)
+			.count();
+		let digits_end = digits_start + digits_len;
+		let valid = digits_len > 0
+			&& marker.as_bytes().get(digits_start) != Some(&b'0')
+			&& marker[digits_end..]
+				.find(['\n', ']'])
+				.is_some_and(|end| marker.as_bytes().get(digits_end + end) == Some(&b']'));
+		if !valid {
+			out.push_str(prefix);
+			rest = &marker[prefix.len()..];
+			continue;
 		}
-		rest = &tail[digits..];
+		let close = digits_end
+			+ marker[digits_end..]
+				.find(']')
+				.expect("validated marker has a closing bracket");
+		let Some(old) = marker[digits_start..digits_end].parse::<usize>().ok() else {
+			out.push_str(&marker[..=close]);
+			rest = &marker[close + 1..];
+			continue;
+		};
+		let Some(new) = mapped(old) else {
+			out.push_str(&marker[..=close]);
+			rest = &marker[close + 1..];
+			continue;
+		};
+		out.push_str(prefix);
+		let _ = write!(out, "{new}");
+		out.push_str(&marker[digits_end..=close]);
+		rest = &marker[close + 1..];
+		if let Some(link) = rest.strip_prefix(LEGACY) {
+			let link_digits = link.bytes().take_while(u8::is_ascii_digit).count();
+			let link_is_exact = link_digits > 0
+				&& link[..link_digits].parse::<usize>().ok() == Some(old)
+				&& !link
+					.as_bytes()
+					.get(link_digits)
+					.is_some_and(u8::is_ascii_digit);
+			if link_is_exact {
+				out.push_str(LEGACY);
+				let _ = write!(out, "{new}");
+				rest = &link[link_digits..];
+			}
+		}
 	}
 	out.push_str(rest);
 	out
@@ -120,6 +204,16 @@ pub fn parse_queue_shorthand(text: &str) -> Option<&str> {
 		.iter()
 		.find_map(|prefix| text.strip_prefix(prefix))
 		.map(str::trim)
+}
+
+/// Context carried by the terminal input batch that produced a paste.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PasteOptions {
+	/// A submit key followed the bracketed paste in the same terminal read.
+	///
+	/// The paste must land synchronously instead of opening a modal that
+	/// would consume that key (pi `PasteOptions.submitAfterPaste`).
+	pub submit_after_paste: bool,
 }
 
 /// What [`Composer::paste`] did with the text.
@@ -207,6 +301,42 @@ pub struct LocalInput {
 	/// Keep the run out of the model's context.
 	pub exclude: bool,
 }
+
+/// Selector opened by a completed empty-composer double-Esc gesture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DoubleEscapeTarget {
+	/// The transcript rewind selector (pi `doubleEscapeAction=rewind`).
+	Rewind,
+	/// The session tree selector (pi `doubleEscapeAction=tree`).
+	Tree,
+}
+
+/// Composer-local outcome of one rung in pi's Esc ladder.
+///
+/// Host-owned rungs (maintenance, speech, loop mode, collaboration, and
+/// running work) stay outside the composer. The host executes them in order,
+/// then uses this result to perform only the requested global transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComposerEscape {
+	/// The autocomplete popup consumed Esc and was dismissed.
+	DismissedCompletion,
+	/// A focused-session draft was cleared.
+	ClearedFocusedDraft,
+	/// The focused session has an empty composer and should be unfocused.
+	UnfocusSession,
+	/// An idle `!` / `$` prefix draft was cleared.
+	ClearedPrefix,
+	/// A non-empty prose draft was preserved.
+	PreservedDraft,
+	/// The first empty-composer Esc armed the timing window.
+	Armed,
+	/// The second empty-composer Esc completed the gesture.
+	Open(DoubleEscapeTarget),
+	/// This local rung did not consume Esc.
+	NotHandled,
+}
+
+const DOUBLE_ESCAPE_WINDOW: Duration = Duration::from_millis(500);
 
 /// pi `pythonCommandPrefixLength`: `$` / `$$` starts eval mode only when
 /// followed by whitespace or the end of input, so `$HOME is set` and `${x}`
@@ -503,23 +633,25 @@ impl SpaceHold {
 /// The hardware caret is the editor's insertion point; the host places the
 /// terminal cursor from [`Composer::frame`].
 pub struct Composer {
-	ui:       Ui,
-	width:    u16,
+	ui:          Ui,
+	width:       u16,
 	/// Active chrome shape: the band at rest, the rail while the plan
 	/// Director is engaged.
-	shape:    ComposerStyle,
+	shape:       ComposerStyle,
 	/// Whether the host paints a status/notice row directly above the
 	/// composer (drives pi's `EditorTopGap`).
-	occupied: bool,
+	occupied:    bool,
 	/// IME-safe caret-row layout (`cl_ime_safe_cursor`).
-	ime_safe: bool,
+	ime_safe:    bool,
 	/// Native spelling gates applied to the editor (`cl_spelling_*`).
-	spelling: SpellingFeatures,
+	spelling:    SpellingFeatures,
 	/// Dropdown, emoji, and large-paste knobs (`cl_autocomplete_max_visible`,
 	/// `cl_emoji_autocomplete`, `cl_paste_large_menu_threshold`).
-	settings: ComposerSettings,
+	settings:    ComposerSettings,
 	/// Prompt action accepted from the `#` menu, applied after the key.
-	pending:  Rc<Cell<Option<PromptAction>>>,
+	pending:     Rc<Cell<Option<PromptAction>>>,
+	/// First empty-composer Esc, measured on the host's monotonic clock.
+	last_escape: Option<Duration>,
 }
 
 impl Composer {
@@ -558,6 +690,7 @@ impl Composer {
 			spelling: SpellingFeatures::default(),
 			settings: ComposerSettings::default(),
 			pending,
+			last_escape: None,
 		}
 	}
 
@@ -696,6 +829,93 @@ impl Composer {
 			.unwrap_or(false)
 	}
 
+	/// Gives Esc to autocomplete before the host starts the global ladder.
+	///
+	/// Pi deliberately lets the editor's base handler dismiss autocomplete:
+	/// the same Esc must never also cancel maintenance or a streaming turn.
+	pub fn dismiss_completion_on_escape(&mut self) -> ComposerEscape {
+		if !self.popup_open() {
+			return ComposerEscape::NotHandled;
+		}
+		let _ = self.ui.handle_key_claimed(Key::Esc);
+		ComposerEscape::DismissedCompletion
+	}
+
+	/// Applies the focused-session composer rung.
+	///
+	/// A focused subagent is never interrupted by Esc. Typed text is cleared;
+	/// an already-empty composer asks the host to return to the main session.
+	pub fn escape_focused(&mut self) -> ComposerEscape {
+		if self.draft_blank() {
+			ComposerEscape::UnfocusSession
+		} else {
+			self.clear();
+			ComposerEscape::ClearedFocusedDraft
+		}
+	}
+
+	/// Clears an idle local-command prefix draft.
+	///
+	/// The caller must check a running local command first and interrupt that
+	/// execution through its typed cancellation path. Only pi's real prefix
+	/// grammar is cleared here: prose such as `$HOME` remains a draft.
+	pub fn clear_prefix_on_escape(&mut self) -> ComposerEscape {
+		if self.prefix_mode().is_none() {
+			return ComposerEscape::NotHandled;
+		}
+		self.clear();
+		ComposerEscape::ClearedPrefix
+	}
+
+	/// Applies the final draft/double-Esc rungs after every host-owned rung.
+	///
+	/// `now` comes from the host's monotonic clock. A draft is never erased;
+	/// pressing Esc over one only disarms a prior empty-composer tap.
+	pub fn escape_draft(
+		&mut self,
+		now: Duration,
+		target: Option<DoubleEscapeTarget>,
+	) -> ComposerEscape {
+		if !self.draft_blank() {
+			self.last_escape = None;
+			return ComposerEscape::PreservedDraft;
+		}
+		let Some(target) = target else {
+			return ComposerEscape::NotHandled;
+		};
+		let doubled = self
+			.last_escape
+			.and_then(|prior| now.checked_sub(prior))
+			.is_some_and(|elapsed| elapsed < DOUBLE_ESCAPE_WINDOW);
+		if doubled {
+			self.last_escape = None;
+			ComposerEscape::Open(target)
+		} else {
+			self.last_escape = Some(now);
+			ComposerEscape::Armed
+		}
+	}
+
+	/// Disarms a pending empty-composer double-Esc gesture.
+	///
+	/// Speech cancellation and focus changes call this because pi resets the
+	/// gesture at those transitions.
+	pub fn reset_escape_sequence(&mut self) {
+		self.last_escape = None;
+	}
+
+	/// Whether the visible draft is blank, without materializing the
+	/// attachment-expanded submission value.
+	#[must_use]
+	pub fn draft_blank(&self) -> bool {
+		self
+			.ui
+			.with_component::<EditorPane, _>(COMPOSER_ID, |pane| {
+				pane.displayed_text().trim().is_empty()
+			})
+			.unwrap_or(true)
+	}
+
 	/// Replaces the draft, leaving the caret at its end.
 	pub fn set_text(&mut self, text: &str) {
 		self.ui.set_text(COMPOSER_ID, text);
@@ -759,8 +979,17 @@ impl Composer {
 	/// `handleLargePaste`), which lands the text through
 	/// [`Composer::paste_chip`] once the user chooses.
 	pub fn paste(&mut self, text: &str) -> PasteOutcome {
+		self.paste_with_options(text, PasteOptions::default())
+	}
+
+	/// Applies a paste with terminal-batch context.
+	///
+	/// When the same read already carries Submit, the normal collapsed chip
+	/// lands synchronously. Opening the menu would hand that Submit to the
+	/// selector and leave the composer idle.
+	pub fn paste_with_options(&mut self, text: &str, options: PasteOptions) -> PasteOutcome {
 		let threshold = usize::try_from(self.settings.paste_large_menu_lines).unwrap_or(0);
-		if threshold > 0 && marker_sized_paste(text) {
+		if !options.submit_after_paste && threshold > 0 && marker_sized_paste(text) {
 			let lines = text.split('\n').count();
 			if lines >= threshold {
 				return PasteOutcome::Menu { lines };
@@ -790,6 +1019,31 @@ impl Composer {
 		let _ = self.ui.handle_paste_raw(text);
 	}
 
+	/// Shows or replaces the streaming recognizer's volatile preview at the
+	/// current caret without adding undo entries.
+	pub fn set_volatile_text(&mut self, text: &str) {
+		self
+			.ui
+			.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| pane.set_volatile_text(text));
+		self.ui.resize(self.width);
+	}
+
+	/// Discards the streaming recognizer's current volatile preview.
+	pub fn clear_volatile_text(&mut self) {
+		self
+			.ui
+			.with_component_mut::<EditorPane, _>(COMPOSER_ID, EditorPane::clear_volatile_text);
+		self.ui.resize(self.width);
+	}
+
+	/// Commits one finalized recognition segment exactly once at the caret.
+	pub fn commit_volatile_text(&mut self, text: &str) {
+		self
+			.ui
+			.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| pane.commit_volatile_text(text));
+		self.ui.resize(self.width);
+	}
+
 	/// Inserts pasted text verbatim (pi `app.clipboard.pasteTextRaw`): no
 	/// chip collapse, no drop classification, newlines kept.
 	pub fn paste_raw(&mut self, text: &str) {
@@ -800,7 +1054,10 @@ impl Composer {
 	/// `isBashMode` / `isPythonMode`).
 	#[must_use]
 	pub fn prefix_mode(&self) -> Option<PrefixMode> {
-		prefix_mode_of(&self.text())
+		self
+			.ui
+			.with_component::<EditorPane, _>(COMPOSER_ID, |pane| prefix_mode_of(pane.displayed_text()))
+			.flatten()
 	}
 
 	/// Current composer line, for `cl_copy_line`.
@@ -819,33 +1076,124 @@ impl Composer {
 		}
 	}
 
-	/// Applies one terminal key.
+	/// Applies one terminal key, committing a submitted draft immediately.
+	///
+	/// Hosts that can refuse a submission use [`Composer::preview_key`]
+	/// instead and call [`Composer::commit_submission`] only after accepting
+	/// the returned action.
 	pub fn key(&mut self, key: Key) -> ComposerAction {
+		let action = self.preview_key(key);
+		if matches!(
+			&action,
+			ComposerAction::Submit(_)
+				| ComposerAction::SubmitWithMedia { .. }
+				| ComposerAction::Command { .. }
+				| ComposerAction::Queue { .. }
+		) {
+			let _ = self.commit_submission();
+		}
+		action
+	}
+
+	/// Applies one terminal key without clearing a submitted draft.
+	///
+	/// This is the refusal-safe host path: validation and dispatch happen
+	/// against the returned action while the exact editor buffer, attachment
+	/// atoms, caret, and media order remain intact.
+	pub fn preview_key(&mut self, key: Key) -> ComposerAction {
 		let (event, claimed) = self.ui.handle_key_claimed(key);
 		if let Some(action) = self.pending.take() {
 			return self.apply_prompt_action(action);
 		}
 		match event {
-			UiEvent::Submit => self.take_submission(),
+			UiEvent::Submit => self.preview_submission(),
 			UiEvent::Copied(text) => ComposerAction::Copy(text),
 			_ if claimed => ComposerAction::Changed,
 			_ => ComposerAction::Ignored,
 		}
 	}
 
-	/// Submits the draft: clears the editor, drops staged paste chips, records
-	/// the line for Up/Down recall (pi `addToHistory`, skipping secret-bearing
-	/// commands), and classifies it as a prompt or a `/` console statement.
-	/// `Ignored` when the draft is blank.
+	/// Classifies the current draft without mutating it.
+	///
+	/// Collapsed text attachments are expanded, surviving media markers are
+	/// compacted, and media sources retain composer order. The host may
+	/// validate or refuse the action with no rollback work.
+	#[must_use]
+	pub fn preview_submission(&self) -> ComposerAction {
+		self
+			.prepared_submission()
+			.map_or(ComposerAction::Ignored, |(_, action)| action)
+	}
+
+	/// Commits the current previewed submission.
+	///
+	/// Clears the editor and attachment band and records history. Returns
+	/// `false` when there is no non-blank draft to commit.
+	pub fn commit_submission(&mut self) -> bool {
+		let Some((history, _)) = self.prepared_submission() else {
+			return false;
+		};
+		self.commit_prepared_submission(&history);
+		true
+	}
+
+	/// Submits the draft immediately.
+	///
+	/// This compatibility path is equivalent to
+	/// [`Composer::preview_submission`] followed by
+	/// [`Composer::commit_submission`]. Refusal-capable hosts use those two
+	/// phases separately so cancellation restores the exact draft for free.
 	pub fn take_submission(&mut self) -> ComposerAction {
+		let Some((history, action)) = self.prepared_submission() else {
+			return ComposerAction::Ignored;
+		};
+		self.commit_prepared_submission(&history);
+		action
+	}
+
+	fn prepared_submission(&self) -> Option<(Str, ComposerAction)> {
 		let text = self.text();
 		if text.trim().is_empty() {
-			return ComposerAction::Ignored;
+			return None;
 		}
+		let staged = self
+			.ui
+			.with_component::<EditorPane, _>(COMPOSER_ID, |pane| pane.attachments().snapshot())
+			.unwrap_or_default();
+		let (markers, media): (Vec<usize>, Vec<ComposerMediaSource>) = staged
+			.into_iter()
+			.filter_map(|attachment| {
+				let kind_and_source = match attachment.content {
+					AttachmentContent::Image { source, .. } => Some((ComposerMediaKind::Image, source)),
+					AttachmentContent::Video { source } => Some((ComposerMediaKind::Video, source)),
+					AttachmentContent::Text { .. } => None,
+				};
+				kind_and_source
+					.map(|(kind, source)| (attachment.marker, ComposerMediaSource { kind, source }))
+			})
+			.unzip();
+		let text = Str::from(compact_media_markers(&text, &markers));
+		// pi `parseQueueShorthand` runs before slash commands: `-> body`
+		// queues `body` for the next yield.
+		let action = if let Some(body) = parse_queue_shorthand(&text) {
+			ComposerAction::Queue { text: Str::new(body), media }
+		} else {
+			// pi: a leading `/` line is a command, never a prompt.
+			match text.trim_start().strip_prefix("/") {
+				Some(command) if !command.starts_with('/') => ComposerAction::Command {
+					statement: Str::new(command.trim()),
+					media,
+				},
+				_ if !media.is_empty() => ComposerAction::SubmitWithMedia { text: text.clone(), media },
+				_ => ComposerAction::Submit(text.clone()),
+			}
+		};
+		Some((text, action))
+	}
+
+	fn commit_prepared_submission(&mut self, history: &str) {
 		self.ui.set_text(COMPOSER_ID, "");
-		// Chips leave the band with the draft: a large paste already expanded
-		// into the text, an image expanded into its `[Image #N]` marker and
-		// travels beside it as the N-th source.
+		// Chips leave the band only after the host accepts the action.
 		let staged = self
 			.ui
 			.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| pane.attachments().take())
@@ -853,33 +1201,10 @@ impl Composer {
 		if !staged.is_empty() {
 			self.ui.resize(self.width);
 		}
-		let (markers, images): (Vec<usize>, Vec<Str>) = staged
-			.into_iter()
-			.filter_map(|attachment| match attachment.content {
-				AttachmentContent::Image { source, .. } => Some((attachment.marker, source)),
-				AttachmentContent::Text { .. } => None,
-			})
-			.unzip();
-		let text = compact_image_markers(&text, &markers);
-		if !should_skip_history(text.trim_start()) {
+		if !should_skip_history(history.trim_start()) {
 			self
 				.ui
-				.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| pane.add_to_history(&text));
-		}
-		// pi `parseQueueShorthand` runs before slash commands: `-> body`
-		// queues `body` for the next yield.
-		if let Some(body) = parse_queue_shorthand(&text) {
-			return ComposerAction::Queue { text: Str::new(body), images };
-		}
-		// pi: a leading `/` line is a command, never a prompt.
-		match text.trim_start().strip_prefix('/') {
-			Some(command) if !command.starts_with('/') => {
-				ComposerAction::Command(Str::new(command.trim()))
-			},
-			_ if !images.is_empty() => {
-				ComposerAction::SubmitWithImages { text: Str::new(text), images }
-			},
-			_ => ComposerAction::Submit(Str::new(text)),
+				.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| pane.add_to_history(history));
 		}
 	}
 
@@ -944,6 +1269,13 @@ impl Composer {
 		self
 			.ui
 			.update_component::<StatusBand>(STATUS_ID, |band| band.set_facts(facts))
+	}
+
+	/// Applies a retained status appearance, including settings previews.
+	pub fn set_status_appearance(&mut self, appearance: StatusAppearance) -> bool {
+		self
+			.ui
+			.update_component::<StatusBand>(STATUS_ID, |band| band.set_appearance(appearance))
 	}
 
 	/// Advances chrome animations (the working spinner).
@@ -1022,6 +1354,29 @@ mod tests {
 		assert_eq!(composer.frame().cursor(), Some((3, 2)));
 	}
 
+	#[test]
+	fn streaming_stt_replaces_volatile_text_and_commits_segments_at_the_caret() {
+		let mut composer = composer();
+		type_text(&mut composer, "note: tail");
+		for _ in 0..4 {
+			composer.key(Key::Left);
+		}
+		composer.set_volatile_text("hel");
+		assert_eq!(composer.text(), "note: heltail");
+		assert_eq!(composer.frame().cursor(), Some((12, 2)));
+
+		composer.set_volatile_text("hello");
+		assert_eq!(composer.text(), "note: hellotail");
+		assert_eq!(composer.frame().cursor(), Some((14, 2)));
+
+		composer.commit_volatile_text("hello");
+		composer.set_volatile_text(" wor");
+		assert_eq!(composer.text(), "note: hello wortail");
+		composer.clear_volatile_text();
+		assert_eq!(composer.text(), "note: hellotail");
+		assert_eq!(composer.frame().cursor(), Some((14, 2)));
+	}
+
 	/// pi `addToHistory` + `navigateHistory`: every submission (prompt,
 	/// `/command`, `!shell`) is recalled by Up on an empty draft; Down walks
 	/// back to the draft the user was writing.
@@ -1033,7 +1388,7 @@ mod tests {
 		type_text(&mut composer, "first prompt");
 		assert!(matches!(composer.key(Key::Enter), ComposerAction::Submit(_)));
 		type_text(&mut composer, "/help");
-		assert!(matches!(composer.key(Key::Enter), ComposerAction::Command(_)));
+		assert!(matches!(composer.key(Key::Enter), ComposerAction::Command { .. }));
 		type_text(&mut composer, "!ls");
 		assert!(matches!(composer.key(Key::Enter), ComposerAction::Submit(_)));
 		assert_eq!(composer.text(), "");
@@ -1077,7 +1432,7 @@ mod tests {
 		assert!(!should_skip_history("login secret"));
 		let mut composer = composer();
 		type_text(&mut composer, "/login secret-code");
-		assert!(matches!(composer.key(Key::Enter), ComposerAction::Command(_)));
+		assert!(matches!(composer.key(Key::Enter), ComposerAction::Command { .. }));
 		type_text(&mut composer, "safe");
 		assert!(matches!(composer.key(Key::Enter), ComposerAction::Submit(_)));
 		composer.key(Key::Up);
@@ -1152,7 +1507,10 @@ mod tests {
 		for character in "help".chars() {
 			composer.key(Key::Char(character));
 		}
-		assert_eq!(composer.key(Key::Enter), ComposerAction::Command(Str::new_static("help")));
+		assert_eq!(composer.key(Key::Enter), ComposerAction::Command {
+			statement: Str::new_static("help"),
+			media:     Vec::new(),
+		});
 		assert_eq!(composer.text(), "");
 	}
 
@@ -1452,8 +1810,8 @@ mod tests {
 		let mut composer = composer();
 		type_text(&mut composer, "-> /help later");
 		assert_eq!(composer.key(Key::Enter), ComposerAction::Queue {
-			text:   Str::new_static("/help later"),
-			images: Vec::new(),
+			text:  Str::new_static("/help later"),
+			media: Vec::new(),
 		});
 		assert_eq!(composer.text(), "");
 		assert_eq!(composer.key(Key::Up), ComposerAction::Changed);
@@ -1461,15 +1819,15 @@ mod tests {
 		composer.clear();
 		type_text(&mut composer, "=> second");
 		assert_eq!(composer.key(Key::Enter), ComposerAction::Queue {
-			text:   Str::new_static("second"),
-			images: Vec::new(),
+			text:  Str::new_static("second"),
+			media: Vec::new(),
 		});
 		type_text(&mut composer, "plain -> not shorthand");
 		assert!(matches!(composer.key(Key::Enter), ComposerAction::Submit(_)));
 	}
 
 	/// pi `#queueForYield(text, { images })`: the yield-queue shorthand
-	/// carries the staged image chips with the body, positional against the
+	/// carries staged media chips with the body, positional against the
 	/// markers that survive the stripped sigil.
 	#[test]
 	fn queue_shorthand_keeps_image_chips() {
@@ -1481,8 +1839,11 @@ mod tests {
 		composer.paste(&format!("'{}'", image.display()));
 		type_text(&mut composer, "later");
 		assert_eq!(composer.key(Key::Enter), ComposerAction::Queue {
-			text:   Str::new_static("[Image #1] later"),
-			images: vec![Str::new(image.to_string_lossy())],
+			text:  Str::new_static("[Image #1] later"),
+			media: vec![ComposerMediaSource {
+				kind:   ComposerMediaKind::Image,
+				source: Str::new(image.to_string_lossy()),
+			}],
 		});
 	}
 
@@ -1515,6 +1876,13 @@ mod tests {
 		});
 		assert_eq!(composer.paste(&twelve), PasteOutcome::Menu { lines: 12 });
 		assert_eq!(composer.text(), "", "the menu holds the text; nothing landed");
+		assert_eq!(
+			composer.paste_with_options(&twelve, PasteOptions { submit_after_paste: true }),
+			PasteOutcome::Inserted,
+			"a Submit in the same input batch bypasses the menu"
+		);
+		assert!(composer.text_displayed().contains("#1"), "same-batch Submit gets the default chip");
+		composer.replace_edited("");
 		composer.set_settings(ComposerSettings {
 			paste_large_menu_lines: 13,
 			..ComposerSettings::default()
@@ -1549,42 +1917,192 @@ mod tests {
 		assert_eq!(composer.text(), "local://paste-1.md");
 	}
 
-	/// pi `compactImageMarkers`: surviving markers renumber densely against
-	/// the images actually submitted; dense drafts and foreign brackets stay
-	/// untouched.
+	/// pi `compactImageMarkers`: surviving media markers renumber densely
+	/// against the sources actually submitted without changing their kind.
 	#[test]
-	fn image_markers_compact_to_the_submitted_image_order() {
+	fn media_markers_compact_to_the_submitted_source_order() {
 		assert_eq!(
-			compact_image_markers("[Image #2, 4x3] then [Image #3] x", &[2, 3]),
-			"[Image #1, 4x3] then [Image #2] x"
+			compact_media_markers(
+				"[Image #2, 4x3] attachment://2 then [Video #3] attachment://3 x",
+				&[2, 3],
+			),
+			"[Image #1, 4x3] attachment://1 then [Video #2] attachment://2 x"
 		);
-		assert_eq!(compact_image_markers("[Image #1] [Image #2]", &[1, 2]), "[Image #1] [Image #2]");
+		assert_eq!(compact_media_markers("[Image #1] [Video #2]", &[1, 2]), "[Image #1] [Video #2]");
 		assert_eq!(
-			compact_image_markers("[Image #9] [Image #] [x]", &[3]),
-			"[Image #9] [Image #] [x]"
+			compact_media_markers("[Image #9] [Video #] [x]", &[3]),
+			"[Image #9] [Video #] [x]"
 		);
-		assert_eq!(compact_image_markers("no markers", &[]), "no markers");
+		assert_eq!(compact_media_markers("no markers", &[]), "no markers");
 	}
 
-	/// Dropping an image stages a chip whose submission carries the source
-	/// beside pi's wire marker; a text-only draft still submits plainly.
+	/// Raw paste bypasses both the large-paste selector and attachment-chip
+	/// collapse while retaining every newline in the submitted draft.
 	#[test]
-	fn image_chips_submit_their_sources_in_marker_order() {
+	fn raw_paste_stays_inline_above_the_large_paste_threshold() {
+		let mut composer = composer();
+		composer.set_settings(ComposerSettings {
+			paste_large_menu_lines: 2,
+			..ComposerSettings::default()
+		});
+		let text = "one\ntwo\nthree\nfour";
+		composer.paste_raw(text);
+		assert_eq!(composer.text_displayed(), text);
+		assert_eq!(composer.text(), text);
+	}
+
+	/// Pi's follow-up path reads expanded composer text, not the visible
+	/// `[Paste]` chip label (issue #3737).
+	#[test]
+	fn follow_up_queue_expands_collapsed_paste_text() {
+		let mut composer = composer();
+		type_text(&mut composer, "-> before ");
+		composer.paste_chip("line one\nline two", None);
+		type_text(&mut composer, "after");
+		assert_eq!(composer.key(Key::Enter), ComposerAction::Queue {
+			text:  Str::new_static("before line one\nline two after"),
+			media: Vec::new(),
+		});
+	}
+
+	/// A host may preview and refuse an action without reconstructing the
+	/// draft: text chips, their atom expansions, and the caret stay live
+	/// until the host explicitly commits.
+	#[test]
+	fn refused_preview_preserves_the_exact_collapsed_draft() {
+		let mut composer = composer();
+		type_text(&mut composer, "before ");
+		composer.paste_chip("line one\nline two", None);
+		type_text(&mut composer, "after");
+		let displayed = composer.text_displayed();
+		let expanded = composer.text();
+
+		assert_eq!(composer.preview_submission(), ComposerAction::Submit(Str::new(expanded.clone())));
+		assert_eq!(composer.text_displayed(), displayed);
+		assert_eq!(composer.text(), expanded, "the chip atom still expands after refusal");
+		assert!(composer.commit_submission());
+		assert_eq!(composer.text(), "");
+		assert!(!composer.commit_submission(), "the accepted draft commits once");
+	}
+
+	/// Slash/local commands carry their referenced media through validation.
+	/// A host that cannot consume command attachments can refuse without
+	/// committing, rather than silently dropping the image and its link.
+	#[test]
+	fn local_command_preview_retains_media_and_atoms() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let image = dir.path().join("command.png");
+		std::fs::write(&image, b"\x89PNG\r\n\x1a\n").expect("fixture");
+		let mut composer = composer();
+		type_text(&mut composer, "/goal inspect ");
+		composer.paste(&format!("'{}'", image.display()));
+		let displayed = composer.text_displayed();
+		assert_eq!(composer.preview_submission(), ComposerAction::Command {
+			statement: Str::new_static("goal inspect [Image #1]"),
+			media:     vec![ComposerMediaSource {
+				kind:   ComposerMediaKind::Image,
+				source: Str::new(image.to_string_lossy()),
+			}],
+		});
+		assert_eq!(composer.text_displayed(), displayed, "preview/refusal keeps the media atom");
+	}
+
+	/// Media materialization is a typed pre-commit gate: an invalid source
+	/// refuses the whole action while the exact media chip atom, link, and
+	/// expanded marker remain staged for retry.
+	#[test]
+	fn typed_media_refusal_keeps_the_atom_backed_draft() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let image = dir.path().join("broken.png");
+		std::fs::write(&image, b"not an image").expect("fixture");
+		let mut composer = composer();
+		composer.paste(&format!("'{}'", image.display()));
+		type_text(&mut composer, " inspect");
+		let displayed = composer.text_displayed();
+		let expanded = composer.text();
+		let ComposerAction::SubmitWithMedia { media, .. } = composer.preview_submission() else {
+			panic!("media action");
+		};
+
+		let error = crate::media::prepare_media_sources(&media).expect_err("typed refusal");
+		assert!(matches!(error, crate::media::MediaInputError::UnsupportedImage { .. }));
+		assert_eq!(composer.text_displayed(), displayed);
+		assert_eq!(composer.text(), expanded);
+		assert_eq!(composer.preview_submission(), ComposerAction::SubmitWithMedia {
+			text: Str::new(expanded),
+			media,
+		});
+	}
+
+	/// Dropping media stages chips whose submission carries classified sources
+	/// in pasted order; a text-only draft still submits plainly.
+	#[test]
+	fn media_chips_submit_classified_sources_in_paste_order() {
 		let dir = tempfile::tempdir().expect("tempdir");
 		let first = dir.path().join("one.png");
-		let second = dir.path().join("two.png");
+		let second = dir.path().join("two.mp4");
 		std::fs::write(&first, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03").expect("png");
-		std::fs::write(&second, b"\x89PNG\r\n\x1a\n").expect("png");
+		std::fs::write(&second, b"video").expect("video");
 		let mut composer = composer();
 		composer.paste(&format!("'{}' '{}'", first.display(), second.display()));
 		assert!(composer.text_displayed().contains("#1") && composer.text_displayed().contains("#2"));
 		type_text(&mut composer, "compare");
-		assert_eq!(composer.key(Key::Enter), ComposerAction::SubmitWithImages {
-			text:   Str::new("[Image #1, 4x3] [Image #2] compare"),
-			images: vec![Str::new(first.to_string_lossy()), Str::new(second.to_string_lossy())],
+		assert_eq!(composer.key(Key::Enter), ComposerAction::SubmitWithMedia {
+			text:  Str::new("[Image #1, 4x3] [Video #2] compare"),
+			media: vec![
+				ComposerMediaSource {
+					kind:   ComposerMediaKind::Image,
+					source: Str::new(first.to_string_lossy()),
+				},
+				ComposerMediaSource {
+					kind:   ComposerMediaKind::Video,
+					source: Str::new(second.to_string_lossy()),
+				},
+			],
 		});
 		assert_eq!(composer.text(), "");
 		type_text(&mut composer, "plain");
 		assert_eq!(composer.key(Key::Enter), ComposerAction::Submit(Str::new_static("plain")));
+	}
+
+	/// Text attachments expand in their exact draft position while the
+	/// out-of-band media vector retains image/video source order.
+	#[test]
+	fn submission_preserves_interleaved_text_and_media_order() {
+		let dir = tempfile::tempdir().expect("tempdir");
+		let image = dir.path().join("first.png");
+		let video = dir.path().join("second.mp4");
+		std::fs::write(&image, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x02\0\0\0\x01").expect("png");
+		std::fs::write(&video, b"video").expect("video");
+		let mut composer = composer();
+		type_text(&mut composer, "lead ");
+		composer.paste(&format!("'{}'", image.display()));
+		type_text(&mut composer, " middle ");
+		composer.paste_chip("pasted\ntext", None);
+		type_text(&mut composer, " then ");
+		composer.paste(&format!("'{}'", video.display()));
+		type_text(&mut composer, " tail");
+
+		let displayed = composer.text_displayed();
+		assert_eq!(composer.preview_submission(), ComposerAction::SubmitWithMedia {
+			text:  Str::new_static("lead [Image #1, 2x1]  middle pasted\ntext  then [Video #2]  tail"),
+			media: vec![
+				ComposerMediaSource {
+					kind:   ComposerMediaKind::Image,
+					source: Str::new(image.to_string_lossy()),
+				},
+				ComposerMediaSource {
+					kind:   ComposerMediaKind::Video,
+					source: Str::new(video.to_string_lossy()),
+				},
+			],
+		});
+		assert_eq!(
+			composer.text_displayed(),
+			displayed,
+			"validation/refusal leaves every interleaved chip in place"
+		);
+		assert!(composer.commit_submission());
+		assert_eq!(composer.text(), "");
 	}
 }

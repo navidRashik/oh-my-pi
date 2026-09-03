@@ -186,12 +186,8 @@ impl<B: SearchBackend> Tool for WebSearch<B> {
 			Ok(payload) => render_response(&payload.response),
 			Err(fault) => fault.to_string(),
 		};
-		let mut end = text.len().min(caps.maximum_text_bytes as usize);
-		while end != 0 && !text.is_char_boundary(end) {
-			end -= 1;
-		}
-		(end != 0)
-			.then(|| Part::Text { text: Str::new(&text[..end]) })
+		(caps.maximum_parts != 0 && caps.maximum_text_bytes != 0 && !text.is_empty())
+			.then(|| Part::Text { text: Str::new(text) })
 			.into_iter()
 			.collect()
 	}

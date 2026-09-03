@@ -95,16 +95,16 @@ impl Card for AskCard {
 			} else {
 				format!("[{id}] · options:{}", options.len())
 			};
-			question_rows.push(
-				dom! { <hr title={divider} title_pad=3 bc=border fg=muted/> }.into_component(),
-			);
+			question_rows
+				.push(dom! { <hr title={divider} title_pad=3 bc=border fg=muted/> }.into_component());
 			let question_text = Str::new(
 				question
 					.get("question")
 					.and_then(Value::as_str)
 					.unwrap_or_default(),
 			);
-			question_rows.push(dom! { <text pad-x=1 fg=accent>{question_text}</text> }.into_component());
+			question_rows
+				.push(dom! { <text pad-x=1 fg=accent>{question_text}</text> }.into_component());
 			for option in options {
 				let label = Str::new(
 					option

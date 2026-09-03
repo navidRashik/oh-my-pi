@@ -60,11 +60,8 @@ const MCP_HELP: &str =
 	 disable <name>` — Disable an MCP server\n`/mcp reconnect <name>` — Reconnect to a specific \
 	 MCP server\n`/mcp reload` — Force reload MCP runtime tools\n`/mcp resources` — List available \
 	 resources from connected servers\n`/mcp prompts` — List available prompts from connected \
-	 servers\n`/mcp notifications` — Show notification capabilities and subscriptions\n`/mcp \
-	 smithery-search <keyword>`, `/mcp smithery-login`, `/mcp smithery-logout` — Smithery registry \
-	 (not available on this host)\n`/mcp help` — Show this message";
-const SMITHERY_UNAVAILABLE: &str =
-	"Smithery registry integration is not available on this host; add servers with /mcp add.";
+	 servers\n`/mcp notifications` — Show notification capabilities and subscriptions\n`/mcp help` \
+	 — Show this message";
 
 const fn usage(message: &'static str) -> ConError {
 	ConError::Usage(Str::new_static(message))
@@ -143,6 +140,7 @@ pub fn transcript_text(dom: &omp_dom::Dom) -> Str {
 			BlockKind::Assistant => "Assistant",
 			BlockKind::Thinking => "Thinking",
 			BlockKind::Tool => "Tool",
+			BlockKind::Local => "Local",
 			BlockKind::Notice => "Notice",
 			BlockKind::Usage | BlockKind::Divider | BlockKind::Welcome => continue,
 		};
@@ -188,8 +186,6 @@ pub enum McpCommand {
 	Help,
 	/// A runnable operation.
 	Run(McpOp),
-	/// Smithery subcommands: reported as unavailable.
-	Smithery,
 }
 
 /// pi `MCPCommandController.handle` dispatch.
@@ -236,7 +232,6 @@ pub fn mcp_command(words: &[&str]) -> Result<McpCommand, ConError> {
 			McpCommand::Run(McpOp::Remove(name, scope(&tail[1..])?))
 		},
 		"add" => McpCommand::Run(McpOp::Add(parse_add(tail)?)),
-		"smithery-search" | "smithery-login" | "smithery-logout" => McpCommand::Smithery,
 		_ => {
 			return Err(ConError::Usage(sf!("Unknown subcommand: {verb}. Type /mcp help for usage.")));
 		},
@@ -390,7 +385,6 @@ omp_con::cmd! {
 			McpCommand::Help => open(ctx, PanelOpener::new(|cx| {
 				Ok(Box::new(ReportPanel::new("mcp", "MCP Server Management", MCP_HELP, cx.ui)))
 			})),
-			McpCommand::Smithery => call(ctx, PanelCall::new(|_cx| notice(SMITHERY_UNAVAILABLE))),
 			McpCommand::Run(op) => open(ctx, mcp_panel(op)),
 		}
 	};
@@ -411,7 +405,7 @@ mod tests {
 	}
 
 	#[test]
-	fn mcp_words_dispatch_every_pi_subcommand() {
+	fn mcp_words_dispatch_every_backed_subcommand() {
 		assert_eq!(mcp_command(&[]).unwrap(), McpCommand::Help);
 		assert_eq!(mcp_command(&["help"]).unwrap(), McpCommand::Help);
 		assert_eq!(mcp_command(&["list"]).unwrap(), McpCommand::Run(McpOp::List));
@@ -451,7 +445,7 @@ mod tests {
 				command: Vec::new(),
 			}))
 		);
-		assert_eq!(mcp_command(&["smithery-login"]).unwrap(), McpCommand::Smithery);
+		assert!(mcp_command(&["smithery-login"]).is_err());
 		assert_eq!(
 			mcp_command(&["test"]).unwrap_err().to_string(),
 			"Server name required. Usage: /mcp test <name>"

@@ -79,7 +79,11 @@ omp_con::cmd! {
 		match copy_op(rest(args, 0))? {
 			CopyOp::Picker => post(ctx, HostAction::Open(PanelOpener::new(|cx| {
 				let show_thinking = omp_con::CL_SHOWTHINKING.try_get(cx.con).unwrap_or(true);
-				let panel = CopySelector::open(cx.dom, show_thinking, cx.ui);
+				let show_tools = crate::actions::CL_SHOWTOOLS.try_get(cx.con).unwrap_or(true);
+				let prose_only =
+					crate::transcript::CL_THINKING_PROSE_ONLY.try_get(cx.con).unwrap_or(true);
+				let panel =
+					CopySelector::open(cx.dom, show_thinking, show_tools, prose_only, cx.ui);
 				if panel.target_count() == 0 {
 					return Err(Str::new_static("Nothing to copy yet."));
 				}
