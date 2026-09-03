@@ -32,10 +32,11 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use omp_core::Str;
 use omp_tui::{
 	CellContent, Charset, DecorKind, Frame, Graphics, Key, Keymap, Mouse, MouseButton, MouseReport,
 	Size, Style, UiContext,
-	paste::{self, ClipboardRead, ClipboardReadOutcome},
+	paste::{self, ClipboardRead, ClipboardReadOutcome, ClipboardWriteOutcome},
 };
 use smallvec::SmallVec;
 use winit::{
@@ -136,6 +137,8 @@ pub fn run<S: Scene>(config: HostConfig, build: impl Fn(&UiContext) -> S) {
 enum UserEvent {
 	/// A background clipboard read completed for one window's pane.
 	Clipboard(WindowId, PaneId, ClipboardReadOutcome, ClipboardRead),
+	/// A background clipboard write completed for one window's pane.
+	ClipboardWrite(WindowId, PaneId, ClipboardWriteOutcome),
 }
 
 /// One overlay band of the last paint, in viewport cells: `(x, y, w, rows)`.
@@ -932,7 +935,7 @@ impl<S: Scene> WindowHost<S> {
 			let frame = pane.scene.render().frame;
 			selection_text(frame, selection)
 		};
-		write_clipboard_detached(text);
+		write_clipboard_detached(text.into());
 	}
 
 	fn select_all(&mut self, id: PaneId) {
@@ -1344,7 +1347,26 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 			Effect::Ignored | Effect::Consumed => {},
 			Effect::Quit => self.close_pane(el, window, pane),
 			Effect::Clipboard(scope) => self.request_clipboard(window, pane, scope),
-			Effect::SetClipboard(text) => write_clipboard_detached(text.to_string()),
+			Effect::SetClipboard(text) => self.request_clipboard_write(window, pane, text),
+		}
+	}
+
+	fn request_clipboard_write(&self, window: WindowId, pane: PaneId, text: Str) {
+		let proxy = self.proxy.clone();
+		let worker_proxy = proxy.clone();
+		if thread::Builder::new()
+			.name("clipboard-write".into())
+			.spawn(move || {
+				let outcome = paste::write_clipboard_text(&text);
+				let _ = worker_proxy.send_event(UserEvent::ClipboardWrite(window, pane, outcome));
+			})
+			.is_err()
+		{
+			let _ = proxy.send_event(UserEvent::ClipboardWrite(
+				window,
+				pane,
+				ClipboardWriteOutcome::WriteFailure,
+			));
 		}
 	}
 
@@ -1916,6 +1938,27 @@ impl<S: Scene, F: Fn(&UiContext) -> S> ApplicationHandler<UserEvent> for Shell<S
 					win.window.request_redraw();
 				}
 			},
+			UserEvent::ClipboardWrite(window, pane, outcome) => {
+				let Some(widx) = self.window_index(window) else {
+					return;
+				};
+				let effect = {
+					let win = &mut self.windows[widx];
+					let Some(target) = win
+						.tabs
+						.iter_mut()
+						.flat_map(|tab| tab.panes.iter_mut())
+						.find(|p| p.id == pane)
+					else {
+						return;
+					};
+					target.scene.clipboard_write(outcome)
+				};
+				self.handle_effect(el, window, pane, effect);
+				if let Some(win) = self.windows.iter().find(|w| w.id == window) {
+					win.window.request_redraw();
+				}
+			},
 		}
 	}
 
@@ -1978,9 +2021,7 @@ impl<S: Scene, F: Fn(&UiContext) -> S> ApplicationHandler<UserEvent> for Shell<S
 	}
 }
 
-/// Writes clipboard text on a detached thread: the native backend's CLI
-/// bridges may block for seconds and must never stall the event loop.
-fn write_clipboard_detached(text: String) {
+fn write_clipboard_detached(text: Str) {
 	let _ = thread::Builder::new()
 		.name("clipboard-write".into())
 		.spawn(move || {

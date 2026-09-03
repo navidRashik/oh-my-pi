@@ -5,7 +5,7 @@ use std::time::Duration;
 use omp_core::Str;
 use omp_tui::{
 	Frame, Key, Layer, MouseReport, Size,
-	paste::{Clipboard, ClipboardRead, ClipboardReadOutcome},
+	paste::{Clipboard, ClipboardRead, ClipboardReadOutcome, ClipboardWriteOutcome},
 };
 use smallvec::SmallVec;
 
@@ -96,6 +96,14 @@ pub trait Scene {
 			| ClipboardReadOutcome::ReadFailure => return Effect::Ignored,
 		};
 		self.paste(&text, raw)
+	}
+
+	/// Routes one typed system-clipboard write result.
+	///
+	/// Chat scenes override this to surface success, permission, availability,
+	/// and backend-failure notices. Other actors may deliberately ignore it.
+	fn clipboard_write(&mut self, _outcome: ClipboardWriteOutcome) -> Effect {
+		Effect::Ignored
 	}
 
 	/// Pumps host-external state before the next paint.
