@@ -95,6 +95,14 @@ pub enum VoiceError {
 		#[source]
 		source: Arc<io::Error>,
 	},
+	/// An established native media peer reported a classified terminal failure.
+	#[cfg(feature = "realtime-media")]
+	#[error("realtime media failed: {source}")]
+	LiveMedia {
+		/// Typed media-path failure.
+		#[source]
+		source: live::LiveMediaFailure,
+	},
 	/// Live voice could not acquire the shared microphone/TTS authority.
 	#[error(transparent)]
 	Coordinator {

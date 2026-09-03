@@ -14,6 +14,7 @@ use std::{
 	time::Duration,
 };
 
+use omp_core::Str;
 use windows_sys::{
 	Win32::{
 		Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
@@ -36,8 +37,6 @@ use windows_sys::{
 	core::{GUID, HRESULT, IUnknown_Vtbl},
 };
 
-use omp_core::Str;
-
 use super::{
 	AudioDevice, CaptureSink, DeviceConfig, DeviceSnapshot, MicrophonePermission, PlaybackFill,
 };
@@ -55,7 +54,7 @@ const DEVICE_STATE_ACTIVE: u32 = 1;
 const STGM_READ: u32 = 0;
 const VT_LPWSTR: u16 = 31;
 const PKEY_DEVICE_FRIENDLY_NAME: PropertyKey = PropertyKey {
-	format_id: GUID::from_u128(0xa45c_254e_df1c_4efd_8020_67d1_46a8_50e0),
+	format_id:   GUID::from_u128(0xa45c_254e_df1c_4efd_8020_67d1_46a8_50e0),
 	property_id: 14,
 };
 
@@ -334,7 +333,8 @@ impl Drop for ComApartment {
 
 fn create_enumerator() -> VoiceResult<ComPtr<MmDeviceEnumeratorVtable>> {
 	let mut enumerator_raw = null_mut();
-	// SAFETY: all pointers are valid and the output receives the requested interface.
+	// SAFETY: all pointers are valid and the output receives the requested
+	// interface.
 	let hr = unsafe {
 		CoCreateInstance(
 			&CLSID_MMDEVICE_ENUMERATOR,
@@ -376,20 +376,14 @@ fn endpoint_id(device: &ComPtr<MmDeviceVtable>) -> VoiceResult<Str> {
 fn endpoint_label(device: &ComPtr<MmDeviceVtable>) -> VoiceResult<Str> {
 	let mut store_raw = null_mut();
 	// SAFETY: device is live and output receives an IPropertyStore interface.
-	let hr = unsafe {
-		(device.vtable().open_property_store)(device.as_void(), STGM_READ, &mut store_raw)
-	};
+	let hr =
+		unsafe { (device.vtable().open_property_store)(device.as_void(), STGM_READ, &mut store_raw) };
 	check_hresult(hr, "IMMDevice::OpenPropertyStore")?;
-	let store: ComPtr<PropertyStoreVtable> =
-		ComPtr::new(store_raw, "IMMDevice::OpenPropertyStore")?;
+	let store: ComPtr<PropertyStoreVtable> = ComPtr::new(store_raw, "IMMDevice::OpenPropertyStore")?;
 	let mut value = MaybeUninit::<PropVariant>::zeroed();
 	// SAFETY: store is live and output points to zeroed PROPVARIANT storage.
 	let hr = unsafe {
-		(store.vtable().get_value)(
-			store.as_void(),
-			&PKEY_DEVICE_FRIENDLY_NAME,
-			value.as_mut_ptr(),
-		)
+		(store.vtable().get_value)(store.as_void(), &PKEY_DEVICE_FRIENDLY_NAME, value.as_mut_ptr())
 	};
 	check_hresult(hr, "IPropertyStore::GetValue(PKEY_Device_FriendlyName)")?;
 	// SAFETY: GetValue initialized the PROPVARIANT on success.
@@ -398,10 +392,7 @@ fn endpoint_label(device: &ComPtr<MmDeviceVtable>) -> VoiceResult<Str> {
 		// SAFETY: VT_LPWSTR selects the matching union member.
 		wide_string(unsafe { value.value.wide })
 	} else {
-		Err(format!(
-			"WASAPI friendly-name property has unexpected type {}",
-			value.value_type
-		))
+		Err(format!("WASAPI friendly-name property has unexpected type {}", value.value_type))
 	};
 	// SAFETY: GetValue successfully initialized this PROPVARIANT.
 	let clear = unsafe { PropVariantClear(&raw mut value) };
@@ -426,10 +417,8 @@ fn default_endpoint_id(
 		)
 	};
 	check_hresult(hr, "IMMDeviceEnumerator::GetDefaultAudioEndpoint")?;
-	let device = ComPtr::<MmDeviceVtable>::new(
-		device_raw,
-		"IMMDeviceEnumerator::GetDefaultAudioEndpoint",
-	)?;
+	let device =
+		ComPtr::<MmDeviceVtable>::new(device_raw, "IMMDeviceEnumerator::GetDefaultAudioEndpoint")?;
 	endpoint_id(&device)
 }
 
@@ -461,8 +450,7 @@ fn endpoints(
 	for index in 0..count {
 		let mut device_raw = null_mut();
 		// SAFETY: index is within GetCount and output receives one IMMDevice.
-		let hr =
-			unsafe { (collection.vtable().item)(collection.as_void(), index, &mut device_raw) };
+		let hr = unsafe { (collection.vtable().item)(collection.as_void(), index, &mut device_raw) };
 		check_hresult(hr, "IMMDeviceCollection::Item")?;
 		let device = ComPtr::<MmDeviceVtable>::new(device_raw, "IMMDeviceCollection::Item")?;
 		let id = endpoint_id(&device)?;
@@ -487,8 +475,8 @@ pub(super) fn snapshot() -> VoiceResult<DeviceSnapshot> {
 	let default_input = default_endpoint_id(&enumerator, eCapture)?;
 	let default_output = default_endpoint_id(&enumerator, eRender)?;
 	Ok(DeviceSnapshot {
-		input: endpoints(&enumerator, eCapture, default_input.as_str())?,
-		output: endpoints(&enumerator, eRender, default_output.as_str())?,
+		input:                 endpoints(&enumerator, eCapture, default_input.as_str())?,
+		output:                endpoints(&enumerator, eRender, default_output.as_str())?,
 		microphone_permission: microphone_permission(),
 	})
 }
@@ -518,30 +506,25 @@ impl BaseStream {
 			.as_deref()
 			.map(|device_id| device_id.encode_utf16().chain(Some(0)).collect::<Vec<_>>());
 		let (operation, hr) = if let Some(selected) = selected.as_ref() {
-			// SAFETY: enumerator is live, selected is NUL-terminated, and output is writable.
-			(
-				"IMMDeviceEnumerator::GetDevice",
-				unsafe {
-					(enumerator.vtable().get_device)(
-						enumerator.as_void(),
-						selected.as_ptr(),
-						&mut device_raw,
-					)
-				},
-			)
+			// SAFETY: enumerator is live, selected is NUL-terminated, and output is
+			// writable.
+			("IMMDeviceEnumerator::GetDevice", unsafe {
+				(enumerator.vtable().get_device)(
+					enumerator.as_void(),
+					selected.as_ptr(),
+					&mut device_raw,
+				)
+			})
 		} else {
 			// SAFETY: enumerator is live and output receives the default endpoint.
-			(
-				"IMMDeviceEnumerator::GetDefaultAudioEndpoint",
-				unsafe {
-					(enumerator.vtable().get_default_audio_endpoint)(
-						enumerator.as_void(),
-						data_flow,
-						eConsole,
-						&mut device_raw,
-					)
-				},
-			)
+			("IMMDeviceEnumerator::GetDefaultAudioEndpoint", unsafe {
+				(enumerator.vtable().get_default_audio_endpoint)(
+					enumerator.as_void(),
+					data_flow,
+					eConsole,
+					&mut device_raw,
+				)
+			})
 		};
 		check_hresult(hr, operation)?;
 		let device: ComPtr<MmDeviceVtable> = ComPtr::new(device_raw, operation)?;
@@ -739,7 +722,8 @@ pub struct PlaybackDevice {
 }
 
 impl PlaybackDevice {
-	/// Open shared-mode playback on the selected endpoint or default console endpoint.
+	/// Open shared-mode playback on the selected endpoint or default console
+	/// endpoint.
 	pub fn start(config: DeviceConfig, fill: PlaybackFill) -> VoiceResult<Self> {
 		let stop = Arc::new(AtomicBool::new(false));
 		let worker_stop = Arc::clone(&stop);
@@ -782,7 +766,8 @@ pub struct CaptureDevice {
 }
 
 impl CaptureDevice {
-	/// Open shared-mode capture on the selected endpoint or default console endpoint.
+	/// Open shared-mode capture on the selected endpoint or default console
+	/// endpoint.
 	pub fn start(config: DeviceConfig, sink: CaptureSink) -> VoiceResult<Self> {
 		let stop = Arc::new(AtomicBool::new(false));
 		let worker_stop = Arc::clone(&stop);

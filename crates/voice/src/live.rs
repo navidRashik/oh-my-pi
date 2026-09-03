@@ -24,6 +24,7 @@ use webrtc::{
 		media_engine::{MIME_TYPE_OPUS, MediaEngine},
 	},
 	data_channel::{RTCDataChannel, data_channel_message::DataChannelMessage},
+	ice_transport::ice_connection_state::RTCIceConnectionState,
 	interceptor::registry::Registry,
 	media::Sample,
 	peer_connection::{
@@ -71,11 +72,31 @@ const OPUS_CAPABILITY: RTCRtpCodecCapability = RTCRtpCodecCapability {
 	rtcp_feedback: Vec::new(),
 };
 
+/// Typed terminal failure from an established native media peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LiveMediaFailure {
+	/// ICE could not retain a viable UDP media path.
+	#[error("WebRTC ICE connectivity failed")]
+	Ice,
+	/// The WebRTC peer connection failed independently of ICE state.
+	#[error("the WebRTC peer connection failed")]
+	WebRtc,
+	/// The authenticated WebRTC data channel failed or closed.
+	#[error("the WebRTC data channel failed")]
+	DataChannel,
+	/// Local or negotiated audio encoding failed.
+	#[error("the realtime audio codec failed")]
+	Codec,
+	/// Audio RTP transmission, receipt, or playback failed.
+	#[error("the realtime audio stream failed")]
+	Audio,
+}
+
 #[derive(Clone, Debug)]
 enum PeerSignal {
 	Connecting,
 	Open,
-	Failed(String),
+	Failed(LiveMediaFailure),
 	Closed,
 }
 
@@ -94,8 +115,8 @@ pub struct LiveCallbacks {
 	pub input_level:  Box<dyn Fn(f64) + Send + Sync>,
 	/// RMS output level in `[0, 1]`, one report per level window.
 	pub output_level: Box<dyn Fn(f64) + Send + Sync>,
-	/// Terminal transport failure; reported at most once per peer.
-	pub failure:      Box<dyn Fn(String) + Send + Sync>,
+	/// Typed terminal transport failure; reported at most once per peer.
+	pub failure:      Box<dyn Fn(LiveMediaFailure) + Send + Sync>,
 }
 
 struct LiveResources {
@@ -119,7 +140,8 @@ pub struct LiveMediaSession {
 }
 
 impl LiveMediaSession {
-	/// Acquire audio ownership, start the peer, and use both system-default endpoints.
+	/// Acquire audio ownership, start the peer, and use both system-default
+	/// endpoints.
 	pub async fn start(
 		coordinator: &AudioCoordinator,
 		callbacks: LiveCallbacks,
@@ -127,7 +149,8 @@ impl LiveMediaSession {
 		Self::start_on(coordinator, callbacks, None, None).await
 	}
 
-	/// Acquire audio ownership and start the peer on stable platform endpoint IDs.
+	/// Acquire audio ownership and start the peer on stable platform endpoint
+	/// IDs.
 	///
 	/// An omitted ID follows the corresponding system default.
 	pub async fn start_on(
@@ -140,22 +163,19 @@ impl LiveMediaSession {
 		let peer = Arc::new(LivePeerCore::new(callbacks));
 		let offer = peer.create_offer_on(output_device_id).await?;
 		let weak_peer = Arc::downgrade(&peer);
-		let capture = match CaptureStream::start_on(
-			INPUT_SAMPLE_RATE,
-			input_device_id,
-			move |samples| {
+		let capture =
+			match CaptureStream::start_on(INPUT_SAMPLE_RATE, input_device_id, move |samples| {
 				if let Some(peer) = weak_peer.upgrade() {
 					peer.report_input_level(rms(samples));
 					let _ = peer.push_audio(samples);
 				}
-			},
-		) {
-			Ok(capture) => capture,
-			Err(error) => {
-				peer.close().await;
-				return Err(error);
-			},
-		};
+			}) {
+				Ok(capture) => capture,
+				Err(error) => {
+					peer.close().await;
+					return Err(error);
+				},
+			};
 		let session = Arc::new(Self {
 			peer,
 			capture: Mutex::new(Some(capture)),
@@ -372,25 +392,23 @@ impl LivePeerCore {
 				let signal = signal_rx.borrow().clone();
 				match signal {
 					PeerSignal::Open => return Ok(()),
-					PeerSignal::Failed(message) => return Err(message.into()),
+					PeerSignal::Failed(source) => return Err(crate::VoiceError::LiveMedia { source }),
 					PeerSignal::Closed => {
-						return Err(
-							"Native live WebRTC peer closed before opening"
-								.to_owned()
-								.into(),
-						);
+						return Err(crate::VoiceError::LiveMedia {
+							source: LiveMediaFailure::DataChannel,
+						});
 					},
 					PeerSignal::Connecting => {},
 				}
 				signal_rx
 					.changed()
 					.await
-					.map_err(|_| "Native live WebRTC peer stopped before opening".to_owned())?;
+					.map_err(|_| crate::VoiceError::LiveMedia { source: LiveMediaFailure::WebRtc })?;
 			}
 		};
 		time::timeout(Duration::from_millis(u64::from(timeout_ms)), wait)
 			.await
-			.map_err(|_| "Timed out waiting for the live data channel to open".to_owned())?
+			.map_err(|_| crate::VoiceError::LiveMedia { source: LiveMediaFailure::Ice })?
 	}
 
 	/// Queue 16 kHz mono PCM for Opus transmission. Silently drops audio while
@@ -469,15 +487,13 @@ impl LivePeerCore {
 		}
 	}
 
-	fn report_failure(&self, message: String) {
+	fn report_failure(&self, failure: LiveMediaFailure) {
 		if self.closing.load(Ordering::Acquire) || self.failure_reported.swap(true, Ordering::AcqRel)
 		{
 			return;
 		}
-		self
-			.signal_tx
-			.send_replace(PeerSignal::Failed(message.clone()));
-		(self.callbacks.failure)(message);
+		self.signal_tx.send_replace(PeerSignal::Failed(failure));
+		(self.callbacks.failure)(failure);
 	}
 
 	/// Close media, the data channel, the peer connection, and speaker
@@ -549,9 +565,7 @@ fn install_peer_callbacks(
 			}
 			let Some(output_sender) = output_sender else {
 				if let Some(core) = core.upgrade() {
-					core.report_failure(
-						"Codex live returned more than one remote audio track".to_owned(),
-					);
+					core.report_failure(LiveMediaFailure::Audio);
 				}
 				return;
 			};
@@ -560,8 +574,9 @@ fn install_peer_callbacks(
 	}));
 
 	let peer_for_state = Arc::downgrade(peer);
+	let core_for_state = core.clone();
 	peer.on_peer_connection_state_change(Box::new(move |state| {
-		let core = core.clone();
+		let core = core_for_state.clone();
 		let peer = peer_for_state.clone();
 		Box::pin(async move {
 			let Some(core) = core.upgrade() else {
@@ -569,17 +584,49 @@ fn install_peer_callbacks(
 			};
 			match state {
 				RTCPeerConnectionState::Failed => {
-					core.report_failure("Live WebRTC peer connection failed".to_owned());
+					let failure = if peer
+						.upgrade()
+						.is_some_and(|peer| peer.ice_connection_state() == RTCIceConnectionState::Failed)
+					{
+						LiveMediaFailure::Ice
+					} else {
+						LiveMediaFailure::WebRtc
+					};
+					core.report_failure(failure);
 				},
 				RTCPeerConnectionState::Closed if !core.closing.load(Ordering::Acquire) => {
-					core.report_failure("Live WebRTC peer connection closed unexpectedly".to_owned());
+					core.report_failure(LiveMediaFailure::WebRtc);
 				},
 				RTCPeerConnectionState::Disconnected => {
 					time::sleep(DISCONNECT_GRACE).await;
 					if peer.upgrade().is_some_and(|peer| {
 						peer.connection_state() == RTCPeerConnectionState::Disconnected
+							&& peer.ice_connection_state() != RTCIceConnectionState::Disconnected
 					}) {
-						core.report_failure("Live WebRTC peer connection disconnected".to_owned());
+						core.report_failure(LiveMediaFailure::WebRtc);
+					}
+				},
+				_ => {},
+			}
+		})
+	}));
+
+	let peer_for_ice = Arc::downgrade(peer);
+	peer.on_ice_connection_state_change(Box::new(move |state| {
+		let core = core.clone();
+		let peer = peer_for_ice.clone();
+		Box::pin(async move {
+			let Some(core) = core.upgrade() else {
+				return;
+			};
+			match state {
+				RTCIceConnectionState::Failed => core.report_failure(LiveMediaFailure::Ice),
+				RTCIceConnectionState::Disconnected => {
+					time::sleep(DISCONNECT_GRACE).await;
+					if peer.upgrade().is_some_and(|peer| {
+						peer.ice_connection_state() == RTCIceConnectionState::Disconnected
+					}) {
+						core.report_failure(LiveMediaFailure::Ice);
 					}
 				},
 				_ => {},
@@ -618,16 +665,16 @@ fn install_data_channel_callbacks(data_channel: &Arc<RTCDataChannel>, core: Weak
 		let core = core_for_close.clone();
 		Box::pin(async move {
 			if let Some(core) = core.upgrade() {
-				core.report_failure("Live data channel closed unexpectedly".to_owned());
+				core.report_failure(LiveMediaFailure::DataChannel);
 			}
 		})
 	}));
 
-	data_channel.on_error(Box::new(move |error| {
+	data_channel.on_error(Box::new(move |_error| {
 		let core = core.clone();
 		Box::pin(async move {
 			if let Some(core) = core.upgrade() {
-				core.report_failure(format!("Live data channel failed: {error}"));
+				core.report_failure(LiveMediaFailure::DataChannel);
 			}
 		})
 	}));
@@ -641,15 +688,17 @@ async fn run_input_audio(
 	let mut encoder = match Encoder::new(INPUT_SAMPLE_RATE, Channels::Mono, Application::Voip) {
 		Ok(encoder) => encoder,
 		Err(error) => {
+			tracing::warn!(error = %error, "failed to initialize live Opus encoder");
 			if let Some(core) = core.upgrade() {
-				core.report_failure(format!("Failed to initialize the live Opus encoder: {error}"));
+				core.report_failure(LiveMediaFailure::Codec);
 			}
 			return;
 		},
 	};
 	if let Err(error) = encoder.set_inband_fec(true) {
+		tracing::warn!(error = %error, "failed to configure live Opus encoder");
 		if let Some(core) = core.upgrade() {
-			core.report_failure(format!("Failed to configure the live Opus encoder: {error}"));
+			core.report_failure(LiveMediaFailure::Codec);
 		}
 		return;
 	}
@@ -709,8 +758,9 @@ async fn run_input_audio(
 				let encoded_len = match encoder.encode_float(&frame, &mut encoded) {
 					Ok(encoded_len) => encoded_len,
 					Err(error) => {
+						tracing::warn!(error = %error, "failed to encode live microphone audio");
 						if let Some(core) = core.upgrade() {
-							core.report_failure(format!("Failed to encode live microphone audio: {error}"));
+							core.report_failure(LiveMediaFailure::Codec);
 						}
 						return;
 					},
@@ -720,9 +770,9 @@ async fn run_input_audio(
 					duration: INPUT_FRAME_DURATION,
 					..Default::default()
 				};
-				if let Err(error) = track.write_sample(&sample).await {
+				if track.write_sample(&sample).await.is_err() {
 					if let Some(core) = core.upgrade() {
-						core.report_failure(format!("Failed to send live microphone audio: {error}"));
+						core.report_failure(LiveMediaFailure::Audio);
 					}
 					return;
 				}
@@ -747,18 +797,16 @@ async fn receive_output_audio(
 		.eq_ignore_ascii_case(MIME_TYPE_OPUS)
 	{
 		if let Some(core) = core.upgrade() {
-			core.report_failure(format!(
-				"Codex live negotiated unsupported audio codec {}",
-				track.codec().capability.mime_type
-			));
+			core.report_failure(LiveMediaFailure::Codec);
 		}
 		return;
 	}
 	let mut decoder = match Decoder::new(OUTPUT_SAMPLE_RATE, Channels::Mono) {
 		Ok(decoder) => decoder,
 		Err(error) => {
+			tracing::warn!(error = %error, "failed to initialize live Opus decoder");
 			if let Some(core) = core.upgrade() {
-				core.report_failure(format!("Failed to initialize the live Opus decoder: {error}"));
+				core.report_failure(LiveMediaFailure::Codec);
 			}
 			return;
 		},
@@ -770,11 +818,11 @@ async fn receive_output_audio(
 	loop {
 		let packet = match track.read_rtp().await {
 			Ok((packet, _attributes)) => packet,
-			Err(error) => {
+			Err(_) => {
 				if let Some(core) = core.upgrade()
 					&& !core.closing.load(Ordering::Acquire)
 				{
-					core.report_failure(format!("Live remote audio track failed: {error}"));
+					core.report_failure(LiveMediaFailure::Audio);
 				}
 				return;
 			},
@@ -813,8 +861,9 @@ async fn receive_output_audio(
 				level.observe(&decoded[..samples], &core);
 			},
 			Err(error) => {
+				tracing::warn!(error = %error, "failed to decode live speaker audio");
 				if let Some(core) = core.upgrade() {
-					core.report_failure(format!("Failed to decode live speaker audio: {error}"));
+					core.report_failure(LiveMediaFailure::Codec);
 				}
 				return;
 			},
@@ -830,7 +879,7 @@ fn write_output(playback_tx: &PlaybackWriter, samples: &[f32], core: &Weak<LiveP
 			if let Some(core) = core.upgrade()
 				&& !core.closing.load(Ordering::Acquire)
 			{
-				core.report_failure(format!("Live speaker playback failed: {error}"));
+				core.report_failure(LiveMediaFailure::Audio);
 			}
 			false
 		},

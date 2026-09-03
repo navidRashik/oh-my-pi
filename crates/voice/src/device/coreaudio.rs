@@ -242,9 +242,7 @@ fn scalar_property<T: Copy>(
 		)
 	};
 	if status != 0 || size as usize != size_of::<T>() {
-		return Err(format!(
-			"CoreAudio property query failed (OSStatus {status}, size {size})"
-		));
+		return Err(format!("CoreAudio property query failed (OSStatus {status}, size {size})"));
 	}
 	// SAFETY: CoreAudio reported success and initialized the complete scalar.
 	Ok(unsafe { value.assume_init() })
@@ -260,22 +258,26 @@ fn cf_string_property(
 	}
 	// SAFETY: the property returned a valid CFString for the duration of this call.
 	let length = unsafe { CFStringGetLength(value) };
-	// SAFETY: `value` is a live CFString and UTF-8 is a supported CoreFoundation encoding.
+	// SAFETY: `value` is a live CFString and UTF-8 is a supported CoreFoundation
+	// encoding.
 	let capacity = unsafe { CFStringGetMaximumSizeForEncoding(length, UTF8_ENCODING) }
 		.checked_add(1)
 		.filter(|capacity| *capacity > 0)
 		.ok_or_else(|| "CoreAudio device string is too large".to_owned())?;
-	let capacity_usize = usize::try_from(capacity)
-		.map_err(|_| "CoreAudio device string is too large".to_owned())?;
+	let capacity_usize =
+		usize::try_from(capacity).map_err(|_| "CoreAudio device string is too large".to_owned())?;
 	let mut buffer = vec![0_u8; capacity_usize];
-	// SAFETY: buffer has the advertised writable capacity and `value` is a live CFString.
-	let copied = unsafe {
-		CFStringGetCString(value, buffer.as_mut_ptr().cast(), capacity, UTF8_ENCODING)
-	};
+	// SAFETY: buffer has the advertised writable capacity and `value` is a live
+	// CFString.
+	let copied =
+		unsafe { CFStringGetCString(value, buffer.as_mut_ptr().cast(), capacity, UTF8_ENCODING) };
 	if copied == 0 {
 		return Err("CoreAudio device string is not valid UTF-8".to_owned());
 	}
-	let length = buffer.iter().position(|byte| *byte == 0).unwrap_or(buffer.len());
+	let length = buffer
+		.iter()
+		.position(|byte| *byte == 0)
+		.unwrap_or(buffer.len());
 	let text = std::str::from_utf8(&buffer[..length])
 		.map_err(|_| "CoreAudio device string is not valid UTF-8".to_owned())?;
 	Ok(Str::from(text))
@@ -329,7 +331,8 @@ pub(super) fn microphone_permission() -> MicrophonePermission {
 	if media_type.is_null() {
 		return MicrophonePermission::Unknown;
 	}
-	// SAFETY: this stable AVFoundation class method accepts an AVMediaType NSString.
+	// SAFETY: this stable AVFoundation class method accepts an AVMediaType
+	// NSString.
 	let status: isize = unsafe { msg_send![class, authorizationStatusForMediaType: media_type] };
 	match status {
 		0 => MicrophonePermission::Unknown,
@@ -345,25 +348,7 @@ pub(super) async fn request_microphone_permission() -> VoiceResult<MicrophonePer
 	if current != MicrophonePermission::Unknown {
 		return Ok(current);
 	}
-	let class =
-		AnyClass::get(c"AVCaptureDevice").ok_or_else(|| "AVCaptureDevice is unavailable".to_owned())?;
-	// SAFETY: AVFoundation exports this process-lifetime media-type constant.
-	let media_type = unsafe { AVMediaTypeAudio };
-	if media_type.is_null() {
-		return Err("AVMediaTypeAudio is unavailable".to_owned());
-	}
-	let (sender, receiver) = flume::bounded(1);
-	let completion = RcBlock::new(move |granted: Bool| {
-		let _ = sender.send(granted.as_bool());
-	});
-	// SAFETY: this stable AVFoundation method copies the completion block before returning.
-	let (): () = unsafe {
-		msg_send![
-			class,
-			requestAccessForMediaType: media_type,
-			completionHandler: &*completion
-		]
-	};
+	let receiver = start_microphone_permission_request()?;
 	let granted = receiver
 		.recv_async()
 		.await
@@ -378,12 +363,36 @@ pub(super) async fn request_microphone_permission() -> VoiceResult<MicrophonePer
 	})
 }
 
+fn start_microphone_permission_request() -> VoiceResult<flume::Receiver<bool>> {
+	let class = AnyClass::get(c"AVCaptureDevice")
+		.ok_or_else(|| "AVCaptureDevice is unavailable".to_owned())?;
+	// SAFETY: AVFoundation exports this process-lifetime media-type constant.
+	let media_type = unsafe { AVMediaTypeAudio };
+	if media_type.is_null() {
+		return Err("AVMediaTypeAudio is unavailable".to_owned());
+	}
+	let (sender, receiver) = flume::bounded(1);
+	let completion = RcBlock::new(move |granted: Bool| {
+		let _ = sender.send(granted.as_bool());
+	});
+	// SAFETY: this stable AVFoundation method copies the completion block before
+	// returning.
+	let (): () = unsafe {
+		msg_send![
+			class,
+			requestAccessForMediaType: media_type,
+			completionHandler: &*completion
+		]
+	};
+	Ok(receiver)
+}
+
 pub(super) fn snapshot() -> VoiceResult<DeviceSnapshot> {
 	let default_input = default_device(DEFAULT_INPUT_DEVICE)?;
 	let default_output = default_device(DEFAULT_OUTPUT_DEVICE)?;
 	Ok(DeviceSnapshot {
-		input: endpoints(SCOPE_INPUT, default_input)?,
-		output: endpoints(SCOPE_OUTPUT, default_output)?,
+		input:                 endpoints(SCOPE_INPUT, default_input)?,
+		output:                endpoints(SCOPE_OUTPUT, default_output)?,
 		microphone_permission: microphone_permission(),
 	})
 }
@@ -395,15 +404,8 @@ impl OwnedCfString {
 		let length = CFIndex::try_from(value.len())
 			.map_err(|_| "CoreAudio device ID is too large".to_owned())?;
 		// SAFETY: bytes remain live during construction and CoreFoundation copies them.
-		let string = unsafe {
-			CFStringCreateWithBytes(
-				ptr::null(),
-				value.as_ptr(),
-				length,
-				UTF8_ENCODING,
-				0,
-			)
-		};
+		let string =
+			unsafe { CFStringCreateWithBytes(ptr::null(), value.as_ptr(), length, UTF8_ENCODING, 0) };
 		if string.is_null() {
 			return Err("CoreAudio could not encode the selected device ID".to_owned());
 		}

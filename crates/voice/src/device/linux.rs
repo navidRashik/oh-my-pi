@@ -137,23 +137,22 @@ type SndPcmRecover = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int;
 type SndPcmWait = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type SndPcmControl = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SndStrerror = unsafe extern "C" fn(c_int) -> *const c_char;
-type SndDeviceNameHint =
-	unsafe extern "C" fn(c_int, *const c_char, *mut *mut *mut c_void) -> c_int;
+type SndDeviceNameHint = unsafe extern "C" fn(c_int, *const c_char, *mut *mut *mut c_void) -> c_int;
 type SndDeviceNameGetHint = unsafe extern "C" fn(*const c_void, *const c_char) -> *mut c_char;
 type SndDeviceNameFreeHint = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
 
 struct AlsaApi {
-	pcm_open:       SndPcmOpen,
-	pcm_set_params: SndPcmSetParams,
-	pcm_writei:     SndPcmIo,
-	pcm_readi:      SndPcmIo,
-	pcm_recover:    SndPcmRecover,
-	pcm_wait:       SndPcmWait,
-	pcm_start:      SndPcmControl,
-	pcm_close:           SndPcmControl,
-	strerror:            SndStrerror,
-	device_name_hint:    SndDeviceNameHint,
-	device_name_get_hint: SndDeviceNameGetHint,
+	pcm_open:              SndPcmOpen,
+	pcm_set_params:        SndPcmSetParams,
+	pcm_writei:            SndPcmIo,
+	pcm_readi:             SndPcmIo,
+	pcm_recover:           SndPcmRecover,
+	pcm_wait:              SndPcmWait,
+	pcm_start:             SndPcmControl,
+	pcm_close:             SndPcmControl,
+	strerror:              SndStrerror,
+	device_name_hint:      SndDeviceNameHint,
+	device_name_get_hint:  SndDeviceNameGetHint,
 	device_name_free_hint: SndDeviceNameFreeHint,
 }
 
@@ -199,10 +198,7 @@ impl AlsaApi {
 			unsafe { mem::transmute::<*mut c_void, SndStrerror>(symbol(library, c"snd_strerror")?) };
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
 		let device_name_hint = unsafe {
-			mem::transmute::<*mut c_void, SndDeviceNameHint>(symbol(
-				library,
-				c"snd_device_name_hint",
-			)?)
+			mem::transmute::<*mut c_void, SndDeviceNameHint>(symbol(library, c"snd_device_name_hint")?)
 		};
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
 		let device_name_get_hint = unsafe {
@@ -309,8 +305,8 @@ pub(super) async fn request_microphone_permission() -> VoiceResult<MicrophonePer
 
 pub(super) fn snapshot() -> VoiceResult<DeviceSnapshot> {
 	Ok(DeviceSnapshot {
-		input: alsa_endpoints("Input")?,
-		output: alsa_endpoints("Output")?,
+		input:                 alsa_endpoints("Input")?,
+		output:                alsa_endpoints("Output")?,
 		microphone_permission: microphone_permission(),
 	})
 }
@@ -421,8 +417,8 @@ impl AlsaStream {
 			let name = device_id
 				.strip_prefix("alsa:")
 				.ok_or_else(|| format!("unsupported Linux audio device ID `{device_id}`"))?;
-			let name = CString::new(name)
-				.map_err(|_| "ALSA device ID contains an interior NUL".to_owned())?;
+			let name =
+				CString::new(name).map_err(|_| "ALSA device ID contains an interior NUL".to_owned())?;
 			return Self::open_named(api, config, direction, latency, &name)
 				.map_err(|error| error.message().to_owned());
 		}
@@ -903,7 +899,8 @@ fn finish(
 		.map_or(Ok(()), Err)
 }
 
-/// Running `PulseAudio` or ALSA playback worker for a selected or default endpoint.
+/// Running `PulseAudio` or ALSA playback worker for a selected or default
+/// endpoint.
 pub struct PlaybackDevice {
 	device: Arc<RunningDevice>,
 	thread: Option<JoinHandle<()>>,
@@ -911,10 +908,12 @@ pub struct PlaybackDevice {
 }
 
 impl PlaybackDevice {
-	/// Opens the selected or default playback device and starts its worker thread.
+	/// Opens the selected or default playback device and starts its worker
+	/// thread.
 	pub fn start(config: DeviceConfig, mut fill: PlaybackFill) -> VoiceResult<Self> {
 		let samples = config.period_samples();
-		let attr = pulse_attr(config.clone(), PA_STREAM_PLAYBACK, pulse_latency_ms(config.period_ms))?;
+		let attr =
+			pulse_attr(config.clone(), PA_STREAM_PLAYBACK, pulse_latency_ms(config.period_ms))?;
 		let timeout_ms = c_int::try_from(config.period_ms)
 			.unwrap_or(c_int::MAX)
 			.max(1);
@@ -940,8 +939,9 @@ impl PlaybackDevice {
 						api.ok_or_else(|| "explicit device selection bypasses PulseAudio".to_owned())
 					})
 					.and_then(|api| {
-					PulseStream::open(api, &config, PA_STREAM_PLAYBACK, &attr).map(|stream| (api, stream))
-				}) {
+						PulseStream::open(api, &config, PA_STREAM_PLAYBACK, &attr)
+							.map(|stream| (api, stream))
+					}) {
 					Ok((api, stream)) => {
 						let _ = opened_tx.send(Ok(()));
 						if let Err(error) = pulse_playback_loop(
@@ -1009,7 +1009,8 @@ impl Drop for PlaybackDevice {
 	}
 }
 
-/// Running `PulseAudio` or ALSA capture worker for a selected or default endpoint.
+/// Running `PulseAudio` or ALSA capture worker for a selected or default
+/// endpoint.
 pub struct CaptureDevice {
 	device: Arc<RunningDevice>,
 	thread: Option<JoinHandle<()>>,
@@ -1017,7 +1018,8 @@ pub struct CaptureDevice {
 }
 
 impl CaptureDevice {
-	/// Opens the selected or default capture device and starts its worker thread.
+	/// Opens the selected or default capture device and starts its worker
+	/// thread.
 	pub fn start(config: DeviceConfig, mut sink: CaptureSink) -> VoiceResult<Self> {
 		let samples = config.period_samples();
 		let attr = pulse_attr(config.clone(), PA_STREAM_RECORD, pulse_latency_ms(config.period_ms))?;
@@ -1046,8 +1048,9 @@ impl CaptureDevice {
 						api.ok_or_else(|| "explicit device selection bypasses PulseAudio".to_owned())
 					})
 					.and_then(|api| {
-					PulseStream::open(api, &config, PA_STREAM_RECORD, &attr).map(|stream| (api, stream))
-				}) {
+						PulseStream::open(api, &config, PA_STREAM_RECORD, &attr)
+							.map(|stream| (api, stream))
+					}) {
 					Ok((api, stream)) => {
 						let _ = opened_tx.send(Ok(()));
 						if let Err(error) = pulse_capture_loop(

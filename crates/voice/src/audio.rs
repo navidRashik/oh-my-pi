@@ -224,7 +224,8 @@ impl PlaybackStream {
 		Self::start_on(sample_rate, None)
 	}
 
-	/// Open and start a stable speaker endpoint, or the system default when omitted.
+	/// Open and start a stable speaker endpoint, or the system default when
+	/// omitted.
 	#[tracing::instrument(
 		level = "debug",
 		name = "device_open",

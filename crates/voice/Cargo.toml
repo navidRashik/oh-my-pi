@@ -16,7 +16,7 @@ readme = "README.md"
 default = ["native-audio"]
 native-audio = ["dep:libc", "dep:windows-sys", "dep:block2", "dep:objc2"]
 realtime-media = ["dep:audiopus_sys", "dep:bytes",  "dep:opus", "dep:webrtc"]
-realtime-transport = ["realtime-media", "device-attestation", "dep:futures", "dep:http", "dep:serde", "dep:serde_json", "dep:tokio-tungstenite", "dep:url"]
+realtime-transport = ["realtime-media", "device-attestation", "dep:futures", "dep:http", "dep:serde", "dep:serde_json", "dep:tokio-tungstenite", "dep:url", "dep:zeroize"]
 device-attestation = ["dep:block2", "dep:objc2", "dep:objc2-foundation"]
 
 [lints]
@@ -37,6 +37,7 @@ tokio.workspace = true
 tracing.workspace = true
 tokio-tungstenite = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true, optional = true }

@@ -1,4 +1,5 @@
-//! Direct native audio-device discovery, permission, hot-plug, and stream backends.
+//! Direct native audio-device discovery, permission, hot-plug, and stream
+//! backends.
 //!
 //! Backends invoke callbacks on their own realtime threads, and guarantee that
 //! an externally initiated `stop` waits out any in-flight callback. Queue depth
@@ -28,9 +29,7 @@ mod unsupported {
 
 	use std::env::consts;
 
-	use super::{
-		CaptureSink, DeviceConfig, DeviceSnapshot, MicrophonePermission, PlaybackFill,
-	};
+	use super::{CaptureSink, DeviceConfig, DeviceSnapshot, MicrophonePermission, PlaybackFill};
 	use crate::{VoiceError, VoiceResult};
 
 	pub(super) fn snapshot() -> VoiceResult<DeviceSnapshot> {
@@ -73,12 +72,6 @@ mod unsupported {
 		}
 	}
 }
-#[cfg(not(all(
-	feature = "native-audio",
-	any(target_os = "macos", target_os = "windows", target_os = "linux")
-)))]
-use unsupported as imp;
-
 use std::{
 	sync::{
 		Arc,
@@ -90,6 +83,11 @@ use std::{
 
 use flume::Receiver;
 use omp_core::Str;
+#[cfg(not(all(
+	feature = "native-audio",
+	any(target_os = "macos", target_os = "windows", target_os = "linux")
+)))]
+use unsupported as imp;
 
 #[cfg(feature = "native-audio")]
 use crate::VoiceError;
@@ -161,7 +159,8 @@ pub fn snapshot() -> VoiceResult<DeviceSnapshot> {
 	}
 }
 
-/// Returns the latest operating-system microphone authorization without prompting.
+/// Returns the latest operating-system microphone authorization without
+/// prompting.
 #[must_use]
 pub fn microphone_permission() -> MicrophonePermission {
 	imp::microphone_permission()
@@ -195,7 +194,8 @@ pub struct DeviceWatcher {
 }
 
 impl DeviceWatcher {
-	/// Waits for the first snapshot and every subsequent endpoint or permission change.
+	/// Waits for the first snapshot and every subsequent endpoint or permission
+	/// change.
 	pub async fn changed(&mut self) -> Option<VoiceResult<DeviceSnapshot>> {
 		self.receiver.recv_async().await.ok()
 	}
@@ -211,7 +211,8 @@ impl Drop for DeviceWatcher {
 	}
 }
 
-/// Starts a hot-plug observer. Every delivered row came from native enumeration.
+/// Starts a hot-plug observer. Every delivered row came from native
+/// enumeration.
 pub fn watch() -> VoiceResult<DeviceWatcher> {
 	let initial = snapshot()?;
 	let (sender, receiver) = flume::unbounded();

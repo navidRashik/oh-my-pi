@@ -7,16 +7,21 @@ use http::{
 	Request,
 	header::{HeaderName, HeaderValue},
 };
-use omp_core::{FastHashSet, FastState, Str};
+use omp_core::{FastHashSet, FastState, Str, base64};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::{net::TcpStream, time};
+use tokio::{
+	io::{AsyncReadExt as _, AsyncWriteExt as _},
+	net::TcpStream,
+	time,
+};
 use tokio_tungstenite::{
-	MaybeTlsStream, WebSocketStream, connect_async,
+	MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
 	tungstenite::{self, Message, client::IntoClientRequest as _},
 };
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::{
 	VoiceError,
@@ -30,6 +35,7 @@ pub const SIGNALING_URL: &str =
 	"https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas";
 const SIDEBAND_ATTEMPTS: usize = 5;
 const SIDEBAND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const PROXY_RESPONSE_LIMIT: usize = 8 * 1024;
 const CONTEXT_CHUNK_BYTES: usize = 500;
 const DEDUP_WINDOW: usize = 4_096;
 const AGENT_FINAL_MESSAGE_HEADER: &str = "\"Agent Final Message\":\n\n";
@@ -48,6 +54,76 @@ pub struct LiveOAuthAccess {
 	pub account_id:    Option<Str>,
 }
 
+/// A sanitized HTTP CONNECT proxy route shared by live signaling and sideband.
+///
+/// User information is removed from the URL at construction time. Proxy
+/// credentials survive only as a sensitive HTTP header, so derived diagnostics
+/// cannot expose the raw username or password.
+#[derive(Clone, Eq, PartialEq)]
+pub struct LiveProxy {
+	endpoint:      Url,
+	authorization: Option<HeaderValue>,
+}
+
+impl std::fmt::Debug for LiveProxy {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("LiveProxy")
+			.field("scheme", &self.endpoint.scheme())
+			.field("host", &self.endpoint.host_str())
+			.field("port", &self.endpoint.port_or_known_default())
+			.field("authenticated", &self.authorization.is_some())
+			.finish()
+	}
+}
+
+/// Proxy credential normalization failures.
+#[derive(Debug, Error)]
+pub enum LiveProxyError {
+	/// Percent-encoded proxy credentials were malformed.
+	#[error("the live proxy credentials are malformed")]
+	InvalidCredentials,
+	/// The generated proxy authorization header was invalid.
+	#[error("the live proxy authorization header is invalid")]
+	InvalidAuthorization {
+		/// Typed header source.
+		#[source]
+		source: http::header::InvalidHeaderValue,
+	},
+	/// The sanitized URL could not accept an empty username.
+	#[error("the live proxy URL cannot be sanitized")]
+	UnsanitizableUrl,
+}
+
+impl LiveProxy {
+	/// Retains user information as a sensitive Basic proxy-authorization header
+	/// and reduces `url` to the proxy origin used by CONNECT.
+	pub fn from_url(mut url: Url) -> Result<Self, LiveProxyError> {
+		let authorization = proxy_authorization(&url)?;
+		url.set_username("")
+			.map_err(|()| LiveProxyError::UnsanitizableUrl)?;
+		url.set_password(None)
+			.map_err(|()| LiveProxyError::UnsanitizableUrl)?;
+		url.set_path("");
+		url.set_query(None);
+		url.set_fragment(None);
+		Ok(Self { endpoint: url, authorization })
+	}
+
+	/// Sanitized proxy origin without user information, path, query, or
+	/// fragment.
+	#[must_use]
+	pub fn endpoint(&self) -> &Url {
+		&self.endpoint
+	}
+
+	/// Sensitive `Proxy-Authorization` value, when credentials were supplied.
+	#[must_use]
+	pub fn authorization(&self) -> Option<&HeaderValue> {
+		self.authorization.as_ref()
+	}
+}
+
 /// Inputs required to establish one live transport.
 #[derive(Clone, Debug)]
 pub struct LiveTransportOptions {
@@ -61,8 +137,8 @@ pub struct LiveTransportOptions {
 	pub voice:            Str,
 	/// Codex client version header.
 	pub client_version:   Str,
-	/// Optional proxy selected by the network authority.
-	pub proxy:            Option<Url>,
+	/// Optional sanitized proxy selected by the network authority.
+	pub proxy:            Option<LiveProxy>,
 	/// Data-channel open timeout.
 	pub open_timeout:     Duration,
 }
@@ -91,8 +167,8 @@ pub struct LiveSignalingRequest {
 	pub headers: Vec<(Str, HeaderValue)>,
 	/// JSON request body containing SDP and the session payload.
 	pub body:    Vec<u8>,
-	/// Proxy selected for this provider, if any.
-	pub proxy:   Option<Url>,
+	/// Sanitized proxy selected for this provider, if any.
+	pub proxy:   Option<LiveProxy>,
 }
 
 /// Accepted SDP answer and server-assigned `rtc_*` call identity.
@@ -119,9 +195,9 @@ pub trait LiveSignalingClient {
 	) -> impl Future<Output = Result<LiveSignalingResponse, Self::Error>> + Send;
 }
 
-/// Sideband connection abstraction. The default implementation is direct;
-/// application network composition can replace it with an HTTP/SOCKS proxy
-/// connector while preserving the exact request and retry policy.
+/// Sideband connection abstraction. Applications select either the direct
+/// connector or the HTTP CONNECT-capable connector while preserving one
+/// request and retry policy.
 pub trait SidebandConnector {
 	/// Connected websocket type.
 	type Socket;
@@ -132,7 +208,7 @@ pub trait SidebandConnector {
 	fn connect(
 		&mut self,
 		request: Request<()>,
-		proxy: Option<&Url>,
+		proxy: Option<&LiveProxy>,
 	) -> impl Future<Output = Result<Self::Socket, Self::Error>> + Send;
 }
 
@@ -162,7 +238,7 @@ impl SidebandConnector for DirectSidebandConnector {
 	fn connect(
 		&mut self,
 		request: Request<()>,
-		proxy: Option<&Url>,
+		proxy: Option<&LiveProxy>,
 	) -> impl Future<Output = Result<Self::Socket, Self::Error>> + Send {
 		async move {
 			if proxy.is_some() {
@@ -173,6 +249,222 @@ impl SidebandConnector for DirectSidebandConnector {
 				.map(|(socket, _)| socket)
 				.map_err(|source| DirectSidebandError::WebSocket { source })
 		}
+	}
+}
+
+/// HTTP CONNECT-capable rustls sideband connector.
+///
+/// The application resolves proxy policy once and passes the selected route to
+/// both signaling and this connector, so the authenticated sideband cannot
+/// accidentally bypass the signaling proxy.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProxySidebandConnector;
+
+/// Network layer at which a live sideband connection failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SidebandFailureLayer {
+	/// TCP connection or I/O.
+	Tcp,
+	/// TLS negotiation.
+	Tls,
+	/// HTTP CONNECT proxy policy or transport.
+	Proxy,
+	/// WebSocket framing or connection lifecycle.
+	WebSocket,
+	/// Invalid local connector configuration.
+	Configuration,
+}
+
+/// Proxy-capable sideband connection failures.
+#[derive(Debug, Error)]
+pub enum ProxySidebandError {
+	/// The configured proxy URL has no authority.
+	#[error("the live sideband proxy URL has no host")]
+	MissingProxyHost,
+	/// Only an HTTP CONNECT proxy can carry the WebSocket TLS stream.
+	#[error("the live sideband proxy must use the http scheme")]
+	UnsupportedProxyScheme,
+	/// Opening the TCP stream to the proxy failed.
+	#[error("the live sideband proxy connection failed")]
+	ProxyConnect {
+		/// Typed socket source.
+		#[source]
+		source: io::Error,
+	},
+	/// The bounded HTTP CONNECT exchange failed.
+	#[error("the live sideband proxy CONNECT exchange failed")]
+	ProxyIo {
+		/// Typed socket source.
+		#[source]
+		source: io::Error,
+	},
+	/// The proxy response exceeded the bounded header buffer.
+	#[error("the live sideband proxy CONNECT response exceeded its header limit")]
+	ProxyResponseTooLarge,
+	/// The proxy declined the CONNECT request.
+	#[error("the live sideband proxy rejected CONNECT with status {status:?}")]
+	ProxyRejected {
+		/// Parsed HTTP status when the response supplied one.
+		status: Option<u16>,
+	},
+	/// WebSocket or TLS negotiation failed.
+	#[error("live sideband websocket failed")]
+	WebSocket {
+		/// Typed tungstenite source.
+		#[source]
+		source: tungstenite::Error,
+	},
+}
+
+impl ProxySidebandError {
+	/// Returns the typed network layer that rejected the sideband connection.
+	#[must_use]
+	pub fn layer(&self) -> SidebandFailureLayer {
+		match self {
+			Self::ProxyConnect { .. } | Self::ProxyIo { .. } | Self::ProxyRejected { .. } => {
+				SidebandFailureLayer::Proxy
+			},
+			Self::WebSocket { source: tungstenite::Error::Io(_) } => SidebandFailureLayer::Tcp,
+			Self::WebSocket { source: tungstenite::Error::Tls(_) } => SidebandFailureLayer::Tls,
+			Self::WebSocket { .. } => SidebandFailureLayer::WebSocket,
+			Self::MissingProxyHost | Self::UnsupportedProxyScheme | Self::ProxyResponseTooLarge => {
+				SidebandFailureLayer::Configuration
+			},
+		}
+	}
+}
+
+impl SidebandConnector for ProxySidebandConnector {
+	type Error = ProxySidebandError;
+	type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+	fn connect(
+		&mut self,
+		request: Request<()>,
+		proxy: Option<&LiveProxy>,
+	) -> impl Future<Output = Result<Self::Socket, Self::Error>> + Send {
+		let proxy = proxy.cloned();
+		async move {
+			let Some(proxy) = proxy else {
+				return connect_async(request)
+					.await
+					.map(|(socket, _)| socket)
+					.map_err(|source| ProxySidebandError::WebSocket { source });
+			};
+			if proxy.endpoint().scheme() != "http" {
+				return Err(ProxySidebandError::UnsupportedProxyScheme);
+			}
+			let proxy_host = proxy
+				.endpoint()
+				.host_str()
+				.ok_or(ProxySidebandError::MissingProxyHost)?
+				.to_owned();
+			let proxy_port = proxy.endpoint().port().unwrap_or(80);
+			let target_host = request
+				.uri()
+				.host()
+				.ok_or(ProxySidebandError::MissingProxyHost)?
+				.to_owned();
+			let target_port = request.uri().port_u16().unwrap_or(443);
+			let mut stream = TcpStream::connect((proxy_host.as_str(), proxy_port))
+				.await
+				.map_err(|source| ProxySidebandError::ProxyConnect { source })?;
+			let authority = if target_host.contains(':') {
+				format!("[{target_host}]:{target_port}")
+			} else {
+				format!("{target_host}:{target_port}")
+			};
+			let authorization =
+				Zeroizing::new(proxy.authorization().map_or_else(String::new, |value| {
+					let value = value
+						.to_str()
+						.expect("Basic proxy authorization is always visible ASCII");
+					format!("Proxy-Authorization: {value}\r\n")
+				}));
+			let tunnel = Zeroizing::new(format!(
+				"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{}Proxy-Connection: \
+				 Keep-Alive\r\n\r\n",
+				authorization.as_str(),
+			));
+			stream
+				.write_all(tunnel.as_bytes())
+				.await
+				.map_err(|source| ProxySidebandError::ProxyIo { source })?;
+			let mut response = Vec::with_capacity(256);
+			let mut byte = [0_u8; 1];
+			while response.len() < PROXY_RESPONSE_LIMIT && !response.ends_with(b"\r\n\r\n") {
+				stream
+					.read_exact(&mut byte)
+					.await
+					.map_err(|source| ProxySidebandError::ProxyIo { source })?;
+				response.push(byte[0]);
+			}
+			if !response.ends_with(b"\r\n\r\n") {
+				return Err(ProxySidebandError::ProxyResponseTooLarge);
+			}
+			let status = response
+				.split(|byte| *byte == b'\n')
+				.next()
+				.and_then(|line| std::str::from_utf8(line).ok())
+				.and_then(|line| line.split_ascii_whitespace().nth(1))
+				.and_then(|status| status.parse::<u16>().ok());
+			if status != Some(200) {
+				return Err(ProxySidebandError::ProxyRejected { status });
+			}
+			client_async_tls_with_config(request, stream, None, None)
+				.await
+				.map(|(socket, _)| socket)
+				.map_err(|source| ProxySidebandError::WebSocket { source })
+		}
+	}
+}
+
+fn proxy_authorization(proxy: &Url) -> Result<Option<HeaderValue>, LiveProxyError> {
+	if proxy.username().is_empty() && proxy.password().is_none() {
+		return Ok(None);
+	}
+	let username =
+		Zeroizing::new(percent_decode(proxy.username()).ok_or(LiveProxyError::InvalidCredentials)?);
+	let password = Zeroizing::new(
+		percent_decode(proxy.password().unwrap_or_default())
+			.ok_or(LiveProxyError::InvalidCredentials)?,
+	);
+	let mut credentials = Zeroizing::new(Vec::with_capacity(username.len() + password.len() + 1));
+	credentials.extend_from_slice(&username);
+	credentials.push(b':');
+	credentials.extend_from_slice(&password);
+	let encoded = Zeroizing::new(base64::encode(&credentials).into_string());
+	let authorization = Zeroizing::new(format!("Basic {}", encoded.as_str()));
+	let mut value = HeaderValue::from_str(authorization.as_str())
+		.map_err(|source| LiveProxyError::InvalidAuthorization { source })?;
+	value.set_sensitive(true);
+	Ok(Some(value))
+}
+
+fn percent_decode(value: &str) -> Option<Vec<u8>> {
+	let bytes = value.as_bytes();
+	let mut output = Vec::with_capacity(bytes.len());
+	let mut index = 0;
+	while index < bytes.len() {
+		if bytes[index] != b'%' {
+			output.push(bytes[index]);
+			index += 1;
+			continue;
+		}
+		let high = proxy_hex_digit(*bytes.get(index + 1)?)?;
+		let low = proxy_hex_digit(*bytes.get(index + 2)?)?;
+		output.push((high << 4) | low);
+		index += 3;
+	}
+	Some(output)
+}
+
+const fn proxy_hex_digit(byte: u8) -> Option<u8> {
+	match byte {
+		b'0'..=b'9' => Some(byte - b'0'),
+		b'a'..=b'f' => Some(byte - b'a' + 10),
+		b'A'..=b'F' => Some(byte - b'A' + 10),
+		_ => None,
 	}
 }
 
@@ -917,7 +1209,7 @@ fn event_id(payload: &str) -> Option<Str> {
 		.map(Str::from)
 }
 
-/// Sends one JSON event over a connected direct sideband socket.
+/// Sends one JSON event over a connected sideband socket.
 pub async fn send_sideband(
 	socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
 	value: &impl Serialize,
@@ -946,4 +1238,91 @@ pub async fn receive_sideband(
 		}
 	}
 	Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn live_proxy_sanitizes_and_redacts_url_credentials() {
+		let proxy = LiveProxy::from_url(
+			Url::parse("http://user%40example:p%3Ass@proxy.example:8080/tunnel?token=also-secret")
+				.expect("proxy URL"),
+		)
+		.expect("sanitized live proxy");
+		assert_eq!(proxy.endpoint().as_str(), "http://proxy.example:8080/");
+		assert_eq!(
+			proxy
+				.authorization()
+				.expect("proxy authorization")
+				.to_str()
+				.expect("ASCII authorization"),
+			"Basic dXNlckBleGFtcGxlOnA6c3M="
+		);
+		let debug = format!("{proxy:?}");
+		assert!(!debug.contains("user"));
+		assert!(!debug.contains("p%3Ass"));
+		assert!(!debug.contains("also-secret"));
+		assert!(debug.contains("authenticated: true"));
+		let authorization_debug = format!("{:?}", proxy.authorization());
+		assert!(!authorization_debug.contains("dXNlckBleGFtcGxlOnA6c3M="));
+	}
+
+	#[test]
+	fn sideband_errors_retain_the_failed_network_layer() {
+		let tcp = ProxySidebandError::WebSocket {
+			source: tungstenite::Error::Io(io::Error::new(
+				io::ErrorKind::ConnectionRefused,
+				"closed test endpoint",
+			)),
+		};
+		assert_eq!(tcp.layer(), SidebandFailureLayer::Tcp);
+		assert_eq!(
+			ProxySidebandError::ProxyRejected { status: Some(407) }.layer(),
+			SidebandFailureLayer::Proxy
+		);
+		assert_eq!(ProxySidebandError::MissingProxyHost.layer(), SidebandFailureLayer::Configuration);
+	}
+
+	#[test]
+	fn signaling_request_keeps_the_sanitized_proxy_route() {
+		let mut options = LiveTransportOptions::new(
+			Str::new_static("session"),
+			Str::new_static("instructions"),
+			Str::new_static("voice"),
+			Str::new_static("version"),
+		);
+		options.proxy = Some(
+			LiveProxy::from_url(
+				Url::parse("http://employee:secret@proxy.example:8080").expect("proxy URL"),
+			)
+			.expect("sanitized proxy"),
+		);
+		let request = signaling_request::<io::Error, io::Error>(&options, "offer", None)
+			.expect("signaling request");
+		assert_eq!(request.proxy, options.proxy);
+		let debug = format!("{request:?}");
+		assert!(!debug.contains("employee"));
+		assert!(!debug.contains("secret"));
+	}
+
+	#[test]
+	fn delegation_identity_is_never_admitted_twice() {
+		let mut bridge = LiveDelegationBridge::default();
+		assert!(matches!(
+			bridge.admit(Str::new_static("call-1"), Str::new_static("inspect the repository")),
+			LiveDelegationAdmission::Start(_)
+		));
+		assert_eq!(
+			bridge.admit(Str::new_static("call-1"), Str::new_static("inspect the repository")),
+			LiveDelegationAdmission::Ignored
+		);
+	}
+
+	#[test]
+	fn malformed_proxy_credentials_are_rejected() {
+		let proxy = Url::parse("http://bad%ZZ:secret@proxy.example:8080").expect("proxy URL");
+		assert!(matches!(LiveProxy::from_url(proxy), Err(LiveProxyError::InvalidCredentials)));
+	}
 }
