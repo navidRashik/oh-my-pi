@@ -439,9 +439,10 @@ async fn notrunc_disables_the_per_line_clamp() {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExternalObserved {
-	call_id: Str,
-	args:    Str,
-	route:   ToolRoute,
+	session_id: Str,
+	call_id:    Str,
+	args:       Str,
+	route:      ToolRoute,
 }
 
 struct ScriptedExternal {
@@ -451,9 +452,10 @@ struct ScriptedExternal {
 impl ExternalToolExecutor for ScriptedExternal {
 	fn invoke(&self, request: ExternalDispatchRequest) -> ExternalDispatchStream {
 		self.observed.lock().push(ExternalObserved {
-			call_id: request.call_id,
-			args:    Str::new(request.args.get()),
-			route:   request.route,
+			session_id: request.session_id,
+			call_id:    request.call_id,
+			args:       Str::new(request.args.get()),
+			route:      request.route,
 		});
 		let update = serde_json::value::to_raw_value(&serde_json::json!({
 			"text": "external progress"
@@ -714,9 +716,14 @@ async fn worker_routed_tools_use_the_injected_external_executor() {
 	assert!(!report.is_error);
 	assert_eq!(result_text(&session, "worker-1"), ["external result"]);
 	assert_eq!(observed.lock().as_slice(), [ExternalObserved {
-		call_id: Str::new_static("worker-1"),
-		args:    Str::new_static("{}"),
-		route:   ToolRoute::Worker {
+		session_id: {
+			let path = directory.path().join("worker.oms");
+			let digest = omp_core::Hash32::sum(path.as_os_str().as_encoded_bytes()).to_hex();
+			Str::new(digest.as_str())
+		},
+		call_id:    Str::new_static("worker-1"),
+		args:       Str::new_static("{}"),
+		route:      ToolRoute::Worker {
 			site: omp_tool::WorkerSiteKind::Env,
 			name: Str::new_static("worker"),
 		},

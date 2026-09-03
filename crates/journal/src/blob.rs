@@ -18,17 +18,18 @@
 
 use std::{
 	fmt::{self, Display},
-	fs::{self, File, OpenOptions},
+	fs::{self, File, FileTimes, OpenOptions},
 	io::{self, Read, Seek, SeekFrom, Write},
 	path::{Path, PathBuf},
 	process,
 	sync::atomic::{AtomicU64, Ordering},
+	time::{Duration, SystemTime},
 };
 
 use bytes::Bytes;
 use cap_std::{ambient_authority, fs::Dir};
 use omp_ar::{Archive, Format};
-use omp_core::{Hash32, Str, encoding::hex::ArrayStr, hash32::Hasher};
+use omp_core::{FastHashSet, Hash32, Str, encoding::hex::ArrayStr, hash32::Hasher};
 use serde::{
 	Deserialize, Deserializer, Serialize, Serializer,
 	de::{self, Visitor},
@@ -236,6 +237,41 @@ impl BlobRange {
 	}
 }
 
+/// Safety window for a blob put that has completed but whose journal entry has
+/// not committed yet. Collection keeps younger files even when a concurrent
+/// journal scan cannot see their root.
+pub const DEFAULT_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Policy for one mark-and-sweep pass over a blob namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GcPolicy {
+	/// Minimum age of an unreferenced final blob before removal.
+	pub unreferenced_grace: Duration,
+	/// Minimum age of an abandoned staging file or directory before removal.
+	pub temporary_grace:    Duration,
+}
+
+impl Default for GcPolicy {
+	fn default() -> Self {
+		Self { unreferenced_grace: DEFAULT_GC_GRACE, temporary_grace: DEFAULT_GC_GRACE }
+	}
+}
+
+/// Storage reclaimed by one blob collection pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GcReport {
+	/// Final blob files inspected.
+	pub blobs_examined:            usize,
+	/// Unreferenced final blob files removed.
+	pub blobs_removed:             usize,
+	/// Bytes removed from final blob files.
+	pub blob_bytes_reclaimed:      u64,
+	/// Abandoned staging files or directories removed.
+	pub temporaries_removed:       usize,
+	/// Bytes removed from abandoned staging files.
+	pub temporary_bytes_reclaimed: u64,
+}
+
 /// A filesystem-backed, content-addressed blob store.
 #[derive(Clone, Debug)]
 pub struct BlobStore {
@@ -269,6 +305,71 @@ impl BlobStore {
 	/// Returns the filesystem root that owns this blob namespace.
 	pub fn root(&self) -> &Path {
 		&self.root
+	}
+
+	/// Removes old unreferenced final blobs and abandoned staging content.
+	///
+	/// The namespace lock serializes final placement with collection. A
+	/// successful deduplicated put refreshes the existing file's modification
+	/// time, so `unreferenced_grace` also protects the put-before-journal
+	/// transaction window. Callers may use a zero grace only while the store is
+	/// quiescent (for example, in a test or an offline maintenance command).
+	///
+	/// # Errors
+	///
+	/// Returns [`Error::Io`] when the namespace cannot be locked, enumerated,
+	/// inspected, or cleaned.
+	pub fn collect_unreferenced(
+		&self,
+		retained: &FastHashSet<Hash32>,
+		policy: GcPolicy,
+	) -> Result<GcReport, Error> {
+		let _lock = self.lock_namespace()?;
+		let now = SystemTime::now();
+		let mut report = GcReport::default();
+		self.collect_blob_files(
+			&self.blobs_dir(),
+			retained,
+			policy.unreferenced_grace,
+			now,
+			&mut report,
+		)?;
+		self.collect_temporaries(policy.temporary_grace, now, &mut report)?;
+		Ok(report)
+	}
+
+	/// Copies the selected content identities into another namespace.
+	///
+	/// Each source is streamed once through the destination's normal
+	/// content-addressing path and its digest is checked. Existing destination
+	/// content deduplicates without rewriting bytes.
+	///
+	/// # Errors
+	///
+	/// Returns [`Error::NotFound`] for a missing selected source,
+	/// [`Error::DigestMismatch`] if stored bytes do not match their path, or a
+	/// typed filesystem error.
+	pub fn copy_retained_to(
+		&self,
+		destination: &Self,
+		retained: &FastHashSet<Hash32>,
+	) -> Result<usize, Error> {
+		let mut copied = 0usize;
+		for expected in retained {
+			let probe = BlobRef { hash: *expected, size: 0 };
+			let source = File::open(self.path(&probe)).map_err(map_read_error)?;
+			let actual = destination.put_reader(source)?;
+			if actual.hash != *expected {
+				return Err(Error::DigestMismatch { expected: *expected, actual: actual.hash });
+			}
+			let destination_bytes = destination.get(&actual)?;
+			let stored = Hash32::sum(&destination_bytes);
+			if stored != *expected {
+				return Err(Error::DigestMismatch { expected: *expected, actual: stored });
+			}
+			copied += 1;
+		}
+		Ok(copied)
 	}
 
 	/// Stores an in-memory blob and returns its content-derived reference.
@@ -516,6 +617,127 @@ impl BlobStore {
 		self.root.join("tmp")
 	}
 
+	fn lock_namespace(&self) -> Result<NamespaceLock, Error> {
+		let file = OpenOptions::new()
+			.create(true)
+			.read(true)
+			.write(true)
+			.open(self.root.join(".blobs.lock"))?;
+		file.lock()?;
+		Ok(NamespaceLock { _file: file })
+	}
+
+	fn collect_blob_files(
+		&self,
+		directory: &Path,
+		retained: &FastHashSet<Hash32>,
+		grace: Duration,
+		now: SystemTime,
+		report: &mut GcReport,
+	) -> Result<bool, Error> {
+		let entries = match fs::read_dir(directory) {
+			Ok(entries) => entries,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+			Err(error) => return Err(error.into()),
+		};
+		let mut empty = true;
+		for entry in entries {
+			let entry = entry?;
+			let file_type = entry.file_type()?;
+			let path = entry.path();
+			if file_type.is_dir() {
+				if self.collect_blob_files(&path, retained, grace, now, report)?
+					&& path != self.blobs_dir()
+				{
+					match fs::remove_dir(&path) {
+						Ok(()) => {},
+						Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+							empty = false;
+						},
+						Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+						Err(error) => return Err(error.into()),
+					}
+				} else {
+					empty = false;
+				}
+				continue;
+			}
+			if !file_type.is_file() {
+				empty = false;
+				continue;
+			}
+			report.blobs_examined += 1;
+			let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+				empty = false;
+				continue;
+			};
+			let Ok(hash) = parse_hash(name) else {
+				empty = false;
+				continue;
+			};
+			let metadata = entry.metadata()?;
+			if retained.contains(&hash) || !old_enough(&metadata, now, grace) {
+				empty = false;
+				continue;
+			}
+			let bytes = metadata.len();
+			match fs::remove_file(&path) {
+				Ok(()) => {
+					report.blobs_removed += 1;
+					report.blob_bytes_reclaimed = report.blob_bytes_reclaimed.saturating_add(bytes);
+				},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+				Err(error) => return Err(error.into()),
+			}
+		}
+		Ok(empty)
+	}
+
+	fn collect_temporaries(
+		&self,
+		grace: Duration,
+		now: SystemTime,
+		report: &mut GcReport,
+	) -> Result<(), Error> {
+		let entries = match fs::read_dir(self.tmp_dir()) {
+			Ok(entries) => entries,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+			Err(error) => return Err(error.into()),
+		};
+		for entry in entries {
+			let entry = entry?;
+			let file_type = entry.file_type()?;
+			if !file_type.is_file() && !file_type.is_dir() {
+				continue;
+			}
+			let metadata = entry.metadata()?;
+			if !old_enough(&metadata, now, grace) {
+				continue;
+			}
+			let path = entry.path();
+			let bytes = if file_type.is_file() {
+				metadata.len()
+			} else {
+				directory_bytes(&path)?
+			};
+			let removed = if file_type.is_dir() {
+				fs::remove_dir_all(&path)
+			} else {
+				fs::remove_file(&path)
+			};
+			match removed {
+				Ok(()) => {
+					report.temporaries_removed += 1;
+					report.temporary_bytes_reclaimed =
+						report.temporary_bytes_reclaimed.saturating_add(bytes);
+				},
+				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+				Err(error) => return Err(error.into()),
+			}
+		}
+		Ok(())
+	}
+
 	fn prepare_destination(destination: &Path) -> Result<(), Error> {
 		let parent = destination
 			.parent()
@@ -603,7 +825,10 @@ impl BlobStage {
 
 		let reference = BlobRef { hash: self.hasher.finalize(), size: self.size };
 		let destination = self.store.path(&reference);
+		let _lock = self.store.lock_namespace()?;
 		if destination.try_exists()? {
+			let file = OpenOptions::new().write(true).open(&destination)?;
+			file.set_times(FileTimes::new().set_modified(SystemTime::now()))?;
 			return Ok(reference);
 		}
 
@@ -664,6 +889,10 @@ impl Write for BlobStage {
 	}
 }
 
+struct NamespaceLock {
+	_file: File,
+}
+
 struct TemporaryPath {
 	path: Option<PathBuf>,
 }
@@ -688,6 +917,32 @@ impl Drop for TemporaryPath {
 			let _ = fs::remove_file(path);
 		}
 	}
+}
+
+fn old_enough(metadata: &fs::Metadata, now: SystemTime, grace: Duration) -> bool {
+	metadata
+		.modified()
+		.ok()
+		.and_then(|modified| now.duration_since(modified).ok())
+		.is_some_and(|age| age >= grace)
+}
+
+fn directory_bytes(path: &Path) -> Result<u64, Error> {
+	let mut bytes = 0_u64;
+	for entry in fs::read_dir(path)? {
+		let entry = entry?;
+		let file_type = entry.file_type()?;
+		if !file_type.is_file() && !file_type.is_dir() {
+			continue;
+		}
+		let metadata = entry.metadata()?;
+		bytes = bytes.saturating_add(if file_type.is_dir() {
+			directory_bytes(&entry.path())?
+		} else {
+			metadata.len()
+		});
+	}
+	Ok(bytes)
 }
 
 fn is_store_component(value: &str) -> bool {

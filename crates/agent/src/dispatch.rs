@@ -186,6 +186,8 @@ pub struct DispatchRequest {
 pub struct ExternalDispatchRequest {
 	/// Exact selected tool identity.
 	pub identity:       ToolIdentity,
+	/// Stable durable session identity owning this call.
+	pub session_id:     Str,
 	/// Stable provider call identity.
 	pub call_id:        Str,
 	/// Canonical committed argument object.
@@ -363,6 +365,14 @@ impl CallControl {
 				steering::queue_steering(session, text, &attachments)?;
 				Ok(Received::Steering)
 			},
+			Up::SteerAuthored { text, attachments, author } => {
+				steering::queue_authored_steering(session, text, &attachments, author)?;
+				Ok(Received::Steering)
+			},
+			Up::SkillPrompt(prompt) => {
+				session.skill_prompt(prompt)?;
+				Ok(Received::Steering)
+			},
 			Up::Peer(text) => {
 				steering::queue_peer(session, text)?;
 				Ok(Received::None)
@@ -390,6 +400,17 @@ impl CallControl {
 			},
 			Up::Env(event) => {
 				Ok(journal_env_event(session, event)?.map_or(Received::None, Received::Rewound))
+			},
+			Up::Autoreply { payload, committed } => {
+				let result = session
+					.dom()
+					.children(session.dom().body())
+					.last()
+					.copied()
+					.ok_or(SessionError::NoActiveTurn)
+					.and_then(|turn| crate::append_irc_traffic(session, turn, &payload));
+				let _ = committed.send(result.is_ok());
+				result.map(|()| Received::None)
 			},
 			Up::Approval(request) => {
 				if let Err(error) = self.approvals.file(session, request.clone()) {
@@ -1561,6 +1582,11 @@ impl Dispatcher {
 					let executor = Arc::clone(executor);
 					let request = ExternalDispatchRequest {
 						identity: call.identity.clone(),
+						session_id: {
+							let digest =
+								Hash32::sum(session.journal_path().as_os_str().as_encoded_bytes()).to_hex();
+							Str::new(digest.as_str())
+						},
 						call_id: call.call_id.clone(),
 						args,
 						route: route.clone(),

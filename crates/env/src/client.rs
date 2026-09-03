@@ -1508,6 +1508,43 @@ impl EnvClient {
 			.await
 	}
 
+	/// Reads policy-authorized metadata for an exact environment path.
+	pub async fn stat_path(&self, path: &EnvPath) -> Result<document::PathMetadata, ClientError> {
+		let response = self
+			.data_request_owned(document_request(document_op::Op::Stat(document::StatPathRequest {
+				uri:             self.path_uri(path)?,
+				follow_symlinks: document::FollowSymlinks::Yes as i32,
+			})))
+			.await?;
+		document_result(response, "StatPathResponse", |result| {
+			let document_result::Result::Stat(stat) = result else {
+				return None;
+			};
+			stat.metadata
+		})
+	}
+
+	/// Lists policy-authorized immediate children of an exact environment path.
+	pub async fn list_directory(
+		&self,
+		path: &EnvPath,
+	) -> Result<Vec<document::DirectoryEntry>, ClientError> {
+		let response = self
+			.data_request_owned(document_request(document_op::Op::ListDirectory(
+				document::ListDirectoryRequest {
+					uri:             self.path_uri(path)?,
+					follow_symlinks: document::FollowSymlinks::Yes as i32,
+				},
+			)))
+			.await?;
+		document_result(response, "ListDirectoryResponse", |result| {
+			let document_result::Result::Directory(directory) = result else {
+				return None;
+			};
+			Some(directory.entries)
+		})
+	}
+
 	/// Commits an idempotent owner document transaction.
 	///
 	/// The epoch-qualified transaction id is retained before transmission so a
@@ -2057,6 +2094,26 @@ impl EnvClient {
 		let stream = self
 			.open(client_frame::Body::BlobGet(request.clone()), None)
 			.await?;
+		Ok(BlobDownload { request, stream })
+	}
+
+	/// Starts a streaming blob download attributed to one tool invocation.
+	///
+	/// The durable session principal bound by [`Self::with_principal`] and the
+	/// invocation id travel in the outer frame scope. A remote blob authority
+	/// uses that provenance to release exactly the matching delivery lease
+	/// after a complete or resumed transfer; generic hash reads never release a
+	/// detached-job lease.
+	pub async fn blob_get_for_invocation(
+		&self,
+		invocation_id: &str,
+		request: GetRequest,
+	) -> Result<BlobDownload, ClientError> {
+		let scope = self.grant.wire(invocation_id, self.principal.as_ref());
+		let (stream, guard) = self
+			.open_guarded_wire(client_frame::Body::BlobGet(request.clone()), Some(scope))
+			.await?;
+		guard.relinquish();
 		Ok(BlobDownload { request, stream })
 	}
 
@@ -4495,6 +4552,49 @@ async fn read_extension_frame_length<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn invocation_blob_get_carries_stable_delivery_provenance() {
+		let (client, transport) = EnvClient::in_process(0);
+		let client = client
+			.with_principal("session-a", "agent-a")
+			.expect("valid principal");
+		let request = tokio::spawn({
+			let client = client.clone();
+			async move {
+				client
+					.blob_get_for_invocation("call-a", GetRequest {
+						hash:   Bytes::from_static(&[7; 32]),
+						offset: 12,
+						length: 34,
+					})
+					.await
+			}
+		});
+		let frame = transport.recv().await.expect("receive blob request");
+		assert!(matches!(
+			&frame.body,
+			Some(client_frame::Body::BlobGet(GetRequest {
+				hash,
+				offset: 12,
+				length: 34,
+			})) if hash.as_ref() == [7; 32]
+		));
+		assert_eq!(
+			frame.scope,
+			Some(InvocationScope {
+				invocation_id: "call-a".into(),
+				session_id: "session-a".into(),
+				agent_id: "agent-a".into(),
+				..InvocationScope::default()
+			})
+		);
+		request
+			.await
+			.expect("blob request task")
+			.expect("open blob download")
+			.cancel();
+	}
 
 	#[tokio::test]
 	async fn reset_eval_uses_one_correlated_typed_request() {

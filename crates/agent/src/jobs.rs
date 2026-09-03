@@ -155,13 +155,13 @@ pub const ORPHANED_TOOL_JOB: &str =
 /// Rebuilding preserves a live execution unit by durable `id`, remaps it to
 /// the newly-derived handle, and cancels units absent from the new tree.
 pub struct JobBoard {
-	jobs:         Mutex<FastHashMap<Handle, RuntimeJob>>,
-	factories:    Mutex<FastHashMap<Str, std::sync::Arc<JobFactory>>>,
-	hooks:        Mutex<Option<crate::LifecycleHooks>>,
+	jobs:           Mutex<FastHashMap<Handle, RuntimeJob>>,
+	factories:      Mutex<FastHashMap<Str, std::sync::Arc<JobFactory>>>,
+	hooks:          Mutex<Option<crate::LifecycleHooks>>,
 	/// Largest settlement output published inline on a job element; larger
 	/// outputs are spilled to the session blob store (ADR 0009: the DOM and
 	/// every patch it emits stay bounded, the full result lives in the CAS).
-	output_bound:  AtomicUsize,
+	output_bound:   AtomicUsize,
 	/// Dispatcher spill namespace. A detached artifact is copied into the
 	/// session namespace before its durable job settlement references it.
 	artifact_store: Mutex<Option<BlobStore>>,
@@ -170,10 +170,10 @@ pub struct JobBoard {
 impl Default for JobBoard {
 	fn default() -> Self {
 		Self {
-			jobs:         Mutex::default(),
-			factories:    Mutex::default(),
-			hooks:        Mutex::default(),
-			output_bound:  AtomicUsize::new(crate::DispatchPolicy::DEFAULT_MAX_OUTPUT_BYTES),
+			jobs:           Mutex::default(),
+			factories:      Mutex::default(),
+			hooks:          Mutex::default(),
+			output_bound:   AtomicUsize::new(crate::DispatchPolicy::DEFAULT_MAX_OUTPUT_BYTES),
 			artifact_store: Mutex::default(),
 		}
 	}
@@ -363,9 +363,8 @@ impl JobBoard {
 					_detached: None,
 				}
 			});
-			let retained_live_owner = is_live_status(job.record.status.as_str())
-				&& !job.orphaned
-				&& job.recovered.is_none();
+			let retained_live_owner =
+				is_live_status(job.record.status.as_str()) && !job.orphaned && job.recovered.is_none();
 			job.record = record.clone();
 			if !is_live_status(record.status.as_str()) {
 				job.recovered = None;
@@ -387,7 +386,11 @@ impl JobBoard {
 			let jobs = self.jobs.lock();
 			jobs
 				.iter()
-				.filter_map(|(handle, job)| job.recovered.clone().map(|settlement| (*handle, settlement)))
+				.filter_map(|(handle, job)| {
+					job.recovered
+						.clone()
+						.map(|settlement| (*handle, settlement))
+				})
 				.collect::<Vec<_>>()
 		};
 		for (handle, settlement) in recovered {
@@ -536,7 +539,11 @@ impl JobBoard {
 			})
 			.transpose()?;
 		Ok(JobSettlement {
-			status: Str::new_static(if settlement.is_error { "failed" } else { "completed" }),
+			status: Str::new_static(if settlement.is_error {
+				"failed"
+			} else {
+				"completed"
+			}),
 			output,
 			error: settlement.error,
 			completion: None,
@@ -553,11 +560,13 @@ impl JobBoard {
 				return Ok(reference);
 			}
 			let bytes = session.blobs().get(&reference)?;
-			return Err(omp_journal::blob::Error::DigestMismatch {
-				expected: reference.hash,
-				actual:   omp_core::Hash32::sum(&bytes),
-			}
-			.into());
+			return Err(
+				omp_journal::blob::Error::DigestMismatch {
+					expected: reference.hash,
+					actual:   omp_core::Hash32::sum(&bytes),
+				}
+				.into(),
+			);
 		}
 		let source = self
 			.artifact_store
@@ -567,11 +576,9 @@ impl JobBoard {
 		let bytes = source.get(&reference)?;
 		let actual = omp_core::Hash32::sum(&bytes);
 		if actual != reference.hash {
-			return Err(omp_journal::blob::Error::DigestMismatch {
-				expected: reference.hash,
-				actual,
-			}
-			.into());
+			return Err(
+				omp_journal::blob::Error::DigestMismatch { expected: reference.hash, actual }.into(),
+			);
 		}
 		let pinned = session.blobs().put(&bytes)?;
 		Ok(pinned)

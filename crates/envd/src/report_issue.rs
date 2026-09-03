@@ -11,8 +11,8 @@ use futures::Stream;
 use omp_cache::telemetry_cache::{StoredIssue, TelemetryIndex};
 use omp_core::{Str, sf};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DevicePath, Effects, Ev,
-	IncomingParams, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DevicePath, Effects, Ev, IncomingParams,
+	ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -88,11 +88,11 @@ pub struct Evidence {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Payload {
 	/// Stable issue identifier.
-	pub issue_id: Str,
+	pub issue_id:    Str,
 	/// Exact reported `name@rev` identity.
-	pub target:   Str,
+	pub target:      Str,
 	/// Session that filed the issue.
-	pub session_id: Str,
+	pub session_id:  Str,
 	/// Persistence and delivery disposition after this call.
 	pub disposition: Disposition,
 }
@@ -112,7 +112,7 @@ pub enum Fault {
 	/// A field violated its closed contract.
 	Invalid {
 		/// Rejected field.
-		field: Field,
+		field:      Field,
 		/// Stable violated constraint.
 		constraint: ConstraintCode,
 	},
@@ -192,7 +192,9 @@ pub fn tool(store: Arc<TelemetryIndex>) -> ReportIssue {
 			name:            sf!("report_issue"),
 			rev:             Rev { family: Default::default(), n: 1 },
 			description:     sf!(
-				"Records a bounded structured AutoQA verdict against an exact device revision. Reports are kept locally; only a separate explicit user consent action may deliver them.",
+				"Records a bounded structured AutoQA verdict against an exact device revision. \
+				 Reports are kept locally; only a separate explicit user consent action may deliver \
+				 them.",
 			),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {
@@ -261,9 +263,7 @@ impl Tool for ReportIssue {
 				"disposition": "local_only",
 				"delivery": "requires_explicit_user_consent",
 			}),
-			Err(fault) => {
-				serde_json::to_value(fault).expect("typed AutoQA faults must serialize")
-			},
+			Err(fault) => serde_json::to_value(fault).expect("typed AutoQA faults must serialize"),
 		};
 		vec![Part::Text {
 			text: Str::from(
@@ -297,16 +297,11 @@ fn persist(
 		.map_err(|_| Fault::Storage { operation: StorageOperation::Encode })?;
 	let redacted = omp_observability::redact::redact_sensitive_credentials(&encoded);
 	let payload_len = u32::try_from(redacted.len()).map_err(|_| Fault::Invalid {
-		field: Field::Verdict,
+		field:      Field::Verdict,
 		constraint: ConstraintCode::TooLarge,
 	})?;
 	let payload_offset = store
-		.append(
-			params.session_id.as_str(),
-			"issue_report",
-			now,
-			redacted.as_bytes(),
-		)
+		.append(params.session_id.as_str(), "issue_report", now, redacted.as_bytes())
 		.map_err(|_| Fault::Storage { operation: StorageOperation::Append })?
 		.0;
 	let issue = StoredIssue {
@@ -338,24 +333,27 @@ fn persist(
 fn validate(params: &Params) -> Result<(DevicePath, Rev), Fault> {
 	let session = params.session_id.trim();
 	if session.is_empty() {
-		return Err(Fault::Invalid { field: Field::SessionId, constraint: ConstraintCode::Required });
+		return Err(Fault::Invalid {
+			field:      Field::SessionId,
+			constraint: ConstraintCode::Required,
+		});
 	}
 	if session.len() != params.session_id.len()
 		|| session.len() > MAX_SESSION_ID_BYTES
 		|| session.bytes().any(|byte| byte.is_ascii_control())
 	{
 		return Err(Fault::Invalid {
-			field: Field::SessionId,
+			field:      Field::SessionId,
 			constraint: ConstraintCode::InvalidFormat,
 		});
 	}
 	let device = DevicePath::parse(params.device.as_str()).map_err(|_| Fault::Invalid {
-		field: Field::Device,
+		field:      Field::Device,
 		constraint: ConstraintCode::InvalidFormat,
 	})?;
 	if device.claimant.is_some() || device.to_string().as_str() != params.device.as_str() {
 		return Err(Fault::Invalid {
-			field: Field::Device,
+			field:      Field::Device,
 			constraint: ConstraintCode::InvalidFormat,
 		});
 	}
@@ -363,24 +361,33 @@ fn validate(params: &Params) -> Result<(DevicePath, Rev), Fault> {
 		return Err(Fault::Invalid { field: Field::Rev, constraint: ConstraintCode::TooLarge });
 	}
 	let rev = params.rev.parse::<Rev>().map_err(|_| Fault::Invalid {
-		field: Field::Rev,
+		field:      Field::Rev,
 		constraint: ConstraintCode::InvalidFormat,
 	})?;
 	if rev.to_string().as_str() != params.rev.as_str() {
 		return Err(Fault::Invalid {
-			field: Field::Rev,
+			field:      Field::Rev,
 			constraint: ConstraintCode::InvalidFormat,
 		});
 	}
 	let summary = params.verdict.summary.trim();
 	if summary.is_empty() {
-		return Err(Fault::Invalid { field: Field::Summary, constraint: ConstraintCode::Required });
+		return Err(Fault::Invalid {
+			field:      Field::Summary,
+			constraint: ConstraintCode::Required,
+		});
 	}
 	if summary.bytes().any(|byte| matches!(byte, b'\n' | b'\r')) {
-		return Err(Fault::Invalid { field: Field::Summary, constraint: ConstraintCode::OneLine });
+		return Err(Fault::Invalid {
+			field:      Field::Summary,
+			constraint: ConstraintCode::OneLine,
+		});
 	}
 	if summary.len() > MAX_SUMMARY_BYTES {
-		return Err(Fault::Invalid { field: Field::Summary, constraint: ConstraintCode::TooLarge });
+		return Err(Fault::Invalid {
+			field:      Field::Summary,
+			constraint: ConstraintCode::TooLarge,
+		});
 	}
 	for (field, value) in [
 		(Field::Expected, params.verdict.expected.as_deref()),
@@ -391,27 +398,38 @@ fn validate(params: &Params) -> Result<(DevicePath, Rev), Fault> {
 		}
 	}
 	if params.verdict.evidence.len() > MAX_EVIDENCE_ITEMS {
-		return Err(Fault::Invalid { field: Field::Evidence, constraint: ConstraintCode::TooLarge });
+		return Err(Fault::Invalid {
+			field:      Field::Evidence,
+			constraint: ConstraintCode::TooLarge,
+		});
 	}
 	for evidence in &params.verdict.evidence {
 		if evidence.kind.trim().is_empty() || evidence.detail.trim().is_empty() {
-			return Err(Fault::Invalid { field: Field::Evidence, constraint: ConstraintCode::Required });
+			return Err(Fault::Invalid {
+				field:      Field::Evidence,
+				constraint: ConstraintCode::Required,
+			});
 		}
 		if evidence.kind.len() > 64 || evidence.detail.len() > MAX_EVIDENCE_BYTES {
-			return Err(Fault::Invalid { field: Field::Evidence, constraint: ConstraintCode::TooLarge });
+			return Err(Fault::Invalid {
+				field:      Field::Evidence,
+				constraint: ConstraintCode::TooLarge,
+			});
 		}
 	}
 	if params.verdict.outcome.is_some() && params.verdict.fault.is_some() {
 		return Err(Fault::Invalid {
-			field: Field::Verdict,
+			field:      Field::Verdict,
 			constraint: ConstraintCode::MutuallyExclusive,
 		});
 	}
-	let encoded = serde_json::to_vec(&params.verdict).map_err(|_| Fault::Storage {
-		operation: StorageOperation::Encode,
-	})?;
+	let encoded = serde_json::to_vec(&params.verdict)
+		.map_err(|_| Fault::Storage { operation: StorageOperation::Encode })?;
 	if encoded.len() > MAX_VERDICT_BYTES {
-		return Err(Fault::Invalid { field: Field::Verdict, constraint: ConstraintCode::TooLarge });
+		return Err(Fault::Invalid {
+			field:      Field::Verdict,
+			constraint: ConstraintCode::TooLarge,
+		});
 	}
 	Ok((device, rev))
 }
@@ -423,7 +441,9 @@ const fn done(result: Result<Payload, Fault>) -> Ev<(), Payload, Fault> {
 fn param_event(error: ParamError) -> Ev<(), Payload, Fault> {
 	match error {
 		ParamError::Args(issue) => Ev::Args(*issue),
-		ParamError::Interrupted(interrupt) => Ev::Aborted(Abort::Interrupted { reason: interrupt.reason }),
+		ParamError::Interrupted(interrupt) => {
+			Ev::Aborted(Abort::Interrupted { reason: interrupt.reason })
+		},
 		ParamError::Protocol(message) => Ev::Args(protocol_issue(message)),
 	}
 }
@@ -431,18 +451,20 @@ fn param_event(error: ParamError) -> Ev<(), Payload, Fault> {
 fn commit_event(error: CommitError) -> Ev<(), Payload, Fault> {
 	match error {
 		CommitError::Aborted => Ev::Aborted(Abort::InputDropped),
-		CommitError::Interrupted(interrupt) => Ev::Aborted(Abort::Interrupted { reason: interrupt.reason }),
+		CommitError::Interrupted(interrupt) => {
+			Ev::Aborted(Abort::Interrupted { reason: interrupt.reason })
+		},
 		CommitError::Protocol(message) => Ev::Args(protocol_issue(message)),
 	}
 }
 
 fn protocol_issue(message: Str) -> ArgIssue {
 	ArgIssue {
-		path: Vec::new(),
+		path:     Vec::new(),
 		expected: sf!("one committed JSON argument object"),
-		kind: ArgIssueKind::Protocol,
-		example: None,
-		found: Some(message),
+		kind:     ArgIssueKind::Protocol,
+		example:  None,
+		found:    Some(message),
 	}
 }
 
@@ -460,22 +482,17 @@ mod tests {
 	use super::*;
 
 	fn params(verdict: Verdict) -> Params {
-		Params {
-			session_id: sf!("session-a"),
-			device: sf!("read"),
-			rev: sf!("hl.3"),
-			verdict,
-		}
+		Params { session_id: sf!("session-a"), device: sf!("read"), rev: sf!("hl.3"), verdict }
 	}
 
 	fn verdict() -> Verdict {
 		Verdict {
-			summary: sf!("Result contradicted the documented selector semantics"),
+			summary:  sf!("Result contradicted the documented selector semantics"),
 			expected: Some(sf!("one selected range")),
 			observed: Some(sf!("an empty result")),
 			evidence: vec![Evidence { kind: sf!("parameters"), detail: sf!("path=a.rs:2-3") }],
-			outcome: Some(BTreeMap::from([("ranges".to_owned(), serde_json::json!([]))])),
-			fault: None,
+			outcome:  Some(BTreeMap::from([("ranges".to_owned(), serde_json::json!([]))])),
+			fault:    None,
 		}
 	}
 
@@ -531,7 +548,10 @@ mod tests {
 		both.fault = Some(BTreeMap::from([("code".to_owned(), serde_json::json!("failed"))]));
 		assert_eq!(
 			validate(&params(both)),
-			Err(Fault::Invalid { field: Field::Verdict, constraint: ConstraintCode::MutuallyExclusive })
+			Err(Fault::Invalid {
+				field:      Field::Verdict,
+				constraint: ConstraintCode::MutuallyExclusive,
+			})
 		);
 
 		assert!(

@@ -282,7 +282,9 @@ impl ArtifactMetadataStore {
 
 /// Durable delivery leases plus journal-derived roots for worker verdict blobs.
 ///
-/// Only blobs registered by [`BlobHost::retain_verdict`] participate in this
+/// Each lease is keyed by durable session plus invocation identity, so equal
+/// call ids or equal content in another session cannot acknowledge it. Only
+/// blobs registered by [`BlobHost::retain_verdict`] participate in this
 /// collector. Other environment CAS users keep their existing lifetime.
 struct VerdictRetention {
 	connection:        Mutex<Connection>,
@@ -313,7 +315,7 @@ impl VerdictRetention {
 			 created_ms INTEGER NOT NULL
 			 ) WITHOUT ROWID;
 			 CREATE TABLE IF NOT EXISTS verdict_lease (
-			 invocation_id TEXT PRIMARY KEY,
+			 delivery_key TEXT PRIMARY KEY,
 			 hash BLOB NOT NULL,
 			 deadline_ms INTEGER NOT NULL,
 			 downloaded INTEGER NOT NULL DEFAULT 0,
@@ -322,6 +324,19 @@ impl VerdictRetention {
 			 CREATE INDEX IF NOT EXISTS verdict_lease_hash
 			 ON verdict_lease(hash);",
 		)?;
+		let legacy_key = connection
+			.query_row(
+				"SELECT 1 FROM pragma_table_info('verdict_lease')
+				 WHERE name = 'invocation_id'",
+				[],
+				|row| row.get::<_, i64>(0),
+			)
+			.optional()?
+			.is_some();
+		if legacy_key {
+			connection
+				.execute("ALTER TABLE verdict_lease RENAME COLUMN invocation_id TO delivery_key", [])?;
+		}
 		Ok(Self {
 			connection: Mutex::new(connection),
 			sessions_dir,
@@ -385,9 +400,9 @@ impl VerdictRetention {
 		}
 		let provisional = provisional_lease_id(&reference.hash);
 		transaction.execute(
-			"INSERT INTO verdict_lease(invocation_id, hash, deadline_ms, downloaded)
+			"INSERT INTO verdict_lease(delivery_key, hash, deadline_ms, downloaded)
 			 VALUES (?1, ?2, ?3, 0)
-			 ON CONFLICT(invocation_id) DO UPDATE SET
+			 ON CONFLICT(delivery_key) DO UPDATE SET
 			 hash = excluded.hash,
 			 deadline_ms = excluded.deadline_ms,
 			 downloaded = 0",
@@ -404,6 +419,7 @@ impl VerdictRetention {
 	fn retain(
 		&self,
 		store: &BlobStore,
+		session_id: Option<&str>,
 		invocation_id: &str,
 		id: BlobId,
 		now_ms: i64,
@@ -440,15 +456,15 @@ impl VerdictRetention {
 			});
 		}
 		transaction.execute(
-			"INSERT INTO verdict_lease(invocation_id, hash, deadline_ms, downloaded)
+			"INSERT INTO verdict_lease(delivery_key, hash, deadline_ms, downloaded)
 			 VALUES (?1, ?2, ?3, 0)
-			 ON CONFLICT(invocation_id) DO UPDATE SET
+			 ON CONFLICT(delivery_key) DO UPDATE SET
 			 hash = excluded.hash,
 			 deadline_ms = excluded.deadline_ms,
 			 downloaded = 0",
-			params![invocation_id, id.hash.as_slice(), deadline],
+			params![delivery_key(session_id, invocation_id), id.hash.as_slice(), deadline],
 		)?;
-		transaction.execute("DELETE FROM verdict_lease WHERE invocation_id = ?1", [
+		transaction.execute("DELETE FROM verdict_lease WHERE delivery_key = ?1", [
 			provisional_lease_id(&reference.hash),
 		])?;
 		transaction.commit()?;
@@ -467,19 +483,36 @@ impl VerdictRetention {
 			.map_err(BlobError::from)
 	}
 
-	fn downloaded(&self, id: BlobId, now_ms: i64) -> Result<(), BlobError> {
-		let deadline = now_ms.saturating_add(VERDICT_DOWNLOAD_GRACE_MS);
-		self.connection.lock().execute(
-			"UPDATE verdict_lease SET deadline_ms = ?1, downloaded = 1
-			 WHERE invocation_id = (
-			   SELECT invocation_id FROM verdict_lease
-			   WHERE hash = ?2 AND downloaded = 0
-			   ORDER BY deadline_ms ASC, invocation_id ASC
-			   LIMIT 1
-			 )",
-			params![deadline, id.hash.as_slice()],
+	fn renew(
+		&self,
+		session_id: Option<&str>,
+		invocation_id: &str,
+		id: BlobId,
+		now_ms: i64,
+	) -> Result<bool, BlobError> {
+		let deadline = now_ms.saturating_add(VERDICT_PENDING_LEASE_MS);
+		let updated = self.connection.lock().execute(
+			"UPDATE verdict_lease SET deadline_ms = ?1
+			 WHERE delivery_key = ?2 AND hash = ?3 AND downloaded = 0",
+			params![deadline, delivery_key(session_id, invocation_id), id.hash.as_slice()],
 		)?;
-		Ok(())
+		Ok(updated != 0)
+	}
+
+	fn downloaded(
+		&self,
+		session_id: Option<&str>,
+		invocation_id: &str,
+		id: BlobId,
+		now_ms: i64,
+	) -> Result<bool, BlobError> {
+		let deadline = now_ms.saturating_add(VERDICT_DOWNLOAD_GRACE_MS);
+		let updated = self.connection.lock().execute(
+			"UPDATE verdict_lease SET deadline_ms = ?1, downloaded = 1
+			 WHERE delivery_key = ?2 AND hash = ?3 AND downloaded = 0",
+			params![deadline, delivery_key(session_id, invocation_id), id.hash.as_slice()],
+		)?;
+		Ok(updated != 0)
 	}
 
 	fn roots(&self) -> Result<FastHashSet<Hash32>, BlobError> {
@@ -646,6 +679,11 @@ impl VerdictRetention {
 	}
 }
 
+fn delivery_key(session_id: Option<&str>, invocation_id: &str) -> String {
+	let session_id = session_id.unwrap_or_default();
+	format!("v1:{}:{session_id}{invocation_id}", session_id.len())
+}
+
 fn provisional_lease_id(hash: &Hash32) -> String {
 	format!("pending:{}", hash.to_hex())
 }
@@ -787,16 +825,18 @@ impl BlobHost {
 			.map_err(BlobError::from)
 	}
 
-	/// Stores and durably retains an in-memory environment verdict.
+	/// Stores and durably retains an in-memory environment verdict for one
+	/// session-scoped delivery.
 	pub(crate) fn put_verdict_bytes(
 		&self,
+		session_id: Option<&str>,
 		invocation_id: &str,
 		data: &[u8],
 	) -> Result<thread_pb::Blob, BlobError> {
 		let mut stage = self.begin_worker_verdict()?;
 		io::Write::write_all(&mut stage, data).map_err(blob::Error::from)?;
 		let id = self.finish_worker_verdict(stage)?;
-		self.retain_verdict(invocation_id, id)?;
+		self.retain_verdict(session_id, invocation_id, id)?;
 		Ok(self.reference(id, sf!("application/json"), thread_pb::blob::Detail::Original))
 	}
 
@@ -812,25 +852,58 @@ impl BlobHost {
 	/// Retains a completed worker verdict until one full download has had time
 	/// to become a journaled `source_blob`.
 	///
-	/// Repeating the same invocation is idempotent. A managed host persists the
-	/// lease before publishing `env/v1 Verdict`; unmanaged hosts leave the
-	/// content under their caller-owned lifetime.
-	pub fn retain_verdict(&self, invocation_id: &str, id: BlobId) -> Result<(), BlobError> {
+	/// Repeating the same session/invocation pair is idempotent. Equal
+	/// invocation ids in different sessions remain independent. A managed host
+	/// persists the lease before publishing `env/v1 Verdict`; unmanaged hosts
+	/// leave the content under their caller-owned lifetime.
+	pub fn retain_verdict(
+		&self,
+		session_id: Option<&str>,
+		invocation_id: &str,
+		id: BlobId,
+	) -> Result<(), BlobError> {
 		let Some(retention) = &self.retention else {
 			return Ok(());
 		};
-		retention.retain(self.worker_verdict_store(), invocation_id, id, retention_now_ms()?)
+		retention.retain(
+			self.worker_verdict_store(),
+			session_id,
+			invocation_id,
+			id,
+			retention_now_ms()?,
+		)
 	}
 
-	/// Releases one matching delivery lease after a complete blob transfer.
-	///
-	/// The lease becomes a short crash window rather than disappearing
-	/// immediately. The next collection re-derives journal roots first.
-	pub(crate) fn verdict_downloaded(&self, id: BlobId) -> Result<(), BlobError> {
+	/// Renews an unfinished exact delivery when a client starts or resumes a
+	/// range.
+	pub(crate) fn renew_verdict_delivery(
+		&self,
+		session_id: Option<&str>,
+		invocation_id: &str,
+		id: BlobId,
+	) -> Result<bool, BlobError> {
 		let Some(retention) = &self.retention else {
-			return Ok(());
+			return Ok(false);
 		};
-		retention.downloaded(id, retention_now_ms()?)
+		retention.renew(session_id, invocation_id, id, retention_now_ms()?)
+	}
+
+	/// Acknowledges one exact session/invocation delivery after a complete blob
+	/// transfer.
+	///
+	/// The first acknowledgement converts the lease to a short crash window;
+	/// repeats and foreign-session acknowledgements are no-ops. The next
+	/// collection re-derives journal roots first.
+	pub(crate) fn verdict_downloaded(
+		&self,
+		session_id: Option<&str>,
+		invocation_id: &str,
+		id: BlobId,
+	) -> Result<bool, BlobError> {
+		let Some(retention) = &self.retention else {
+			return Ok(false);
+		};
+		retention.downloaded(session_id, invocation_id, id, retention_now_ms()?)
 	}
 
 	/// Collects unleased worker-verdict blobs not referenced by any live
@@ -1086,7 +1159,10 @@ mod tests {
 	use serde_json::value::RawValue;
 	use tempfile::TempDir;
 
-	use super::{BlobError, BlobHost, BlobId};
+	use super::{
+		BlobError, BlobHost, BlobId, VERDICT_DOWNLOAD_GRACE_MS, VERDICT_PENDING_LEASE_MS,
+		delivery_key, retention_now_ms,
+	};
 
 	fn open_host() -> (TempDir, BlobHost) {
 		let root = tempfile::tempdir().expect("temporary blob root");
@@ -1247,17 +1323,113 @@ mod tests {
 		let root = tempfile::tempdir().expect("project root");
 		let host = managed_host(root.path());
 		let id = put_verdict(&host, b"durable verdict");
-		host.retain_verdict("call-a", id).expect("retain verdict");
+		host
+			.retain_verdict(Some("session-a"), "call-a", id)
+			.expect("retain verdict");
 		drop(host);
 
 		let host = managed_host(root.path());
 		assert!(host.worker_verdict_store().has(&id.into()), "pending delivery survives reopen");
 		let retention = host.retention.as_ref().expect("managed retention");
-		retention.downloaded(id, 10).expect("mark full download");
+		assert!(
+			retention
+				.downloaded(Some("session-a"), "call-a", id, 10)
+				.expect("mark full download")
+		);
 		assert_eq!(
 			retention
 				.collect(host.worker_verdict_store(), 10 + super::VERDICT_DOWNLOAD_GRACE_MS)
 				.expect("collect after grace"),
+			1
+		);
+		assert!(!host.worker_verdict_store().has(&id.into()));
+	}
+
+	#[test]
+	fn delivery_ack_is_session_scoped_persistent_and_exactly_once() {
+		let root = tempfile::tempdir().expect("project root");
+		let host = managed_host(root.path());
+		let id = put_verdict(&host, b"shared detached verdict");
+		let now = retention_now_ms().expect("host clock");
+		let retention = host.retention.as_ref().expect("managed retention");
+		retention
+			.retain(host.worker_verdict_store(), Some("session-a"), "same-call", id, now)
+			.expect("retain first session");
+		retention
+			.retain(host.worker_verdict_store(), Some("session-b"), "same-call", id, now)
+			.expect("retain second session");
+		let resumed_at = now.saturating_add(VERDICT_PENDING_LEASE_MS - 1);
+		assert!(
+			retention
+				.renew(Some("session-a"), "same-call", id, resumed_at)
+				.expect("renew first transfer")
+		);
+		assert!(
+			retention
+				.renew(Some("session-b"), "same-call", id, resumed_at)
+				.expect("renew second transfer")
+		);
+		drop(host);
+
+		let host = managed_host(root.path());
+		let retention = host.retention.as_ref().expect("reopened retention");
+		assert_eq!(
+			retention
+				.collect(host.worker_verdict_store(), now.saturating_add(VERDICT_PENDING_LEASE_MS),)
+				.expect("collect after original deadline"),
+			0,
+			"resumed ranges renew their persisted leases"
+		);
+		assert!(
+			!retention
+				.downloaded(Some("session-c"), "same-call", id, now)
+				.expect("reject foreign session")
+		);
+		assert!(
+			retention
+				.downloaded(Some("session-a"), "same-call", id, now)
+				.expect("ack first session")
+		);
+		assert!(
+			!retention
+				.downloaded(Some("session-a"), "same-call", id, now)
+				.expect("repeat first ack")
+		);
+		let first_downloaded = retention
+			.connection
+			.lock()
+			.query_row(
+				"SELECT downloaded FROM verdict_lease WHERE delivery_key = ?1",
+				[delivery_key(Some("session-a"), "same-call")],
+				|row| row.get::<_, bool>(0),
+			)
+			.expect("first delivery row");
+		let second_downloaded = retention
+			.connection
+			.lock()
+			.query_row(
+				"SELECT downloaded FROM verdict_lease WHERE delivery_key = ?1",
+				[delivery_key(Some("session-b"), "same-call")],
+				|row| row.get::<_, bool>(0),
+			)
+			.expect("second delivery row");
+		assert!(first_downloaded);
+		assert!(!second_downloaded, "one session's ack released another session's lease");
+		assert_eq!(
+			retention
+				.collect(host.worker_verdict_store(), now.saturating_add(VERDICT_DOWNLOAD_GRACE_MS),)
+				.expect("collect with second delivery pending"),
+			0
+		);
+		assert!(
+			retention
+				.downloaded(Some("session-b"), "same-call", id, now)
+				.expect("ack second session")
+		);
+		assert_eq!(
+			retention
+				.collect(host.worker_verdict_store(), now.saturating_add(VERDICT_DOWNLOAD_GRACE_MS),)
+				.expect("collect after every delivery"),
 			1
 		);
 		assert!(!host.worker_verdict_store().has(&id.into()));
@@ -1269,22 +1441,26 @@ mod tests {
 		let host = managed_host(root.path());
 		let id = put_verdict(&host, b"shared verdict");
 		host
-			.retain_verdict("call-a", id)
+			.retain_verdict(Some("first"), "call-a", id)
 			.expect("retain first delivery");
 		host
-			.retain_verdict("call-b", id)
+			.retain_verdict(Some("second"), "call-b", id)
 			.expect("retain second delivery");
 		let (mut first, first_genesis) =
 			append_blob_root(&root.path().join("sessions/first.oms"), id, false);
 		let (mut second, second_genesis) =
 			append_blob_root(&root.path().join("sessions/nested/second.oms"), id, true);
 		let retention = host.retention.as_ref().expect("managed retention");
-		retention
-			.downloaded(id, 10)
-			.expect("complete first download");
-		retention
-			.downloaded(id, 10)
-			.expect("complete second download");
+		assert!(
+			retention
+				.downloaded(Some("first"), "call-a", id, 10)
+				.expect("complete first download")
+		);
+		assert!(
+			retention
+				.downloaded(Some("second"), "call-b", id, 10)
+				.expect("complete second download")
+		);
 		drop(host);
 
 		let host = managed_host(root.path());
@@ -1317,12 +1493,18 @@ mod tests {
 		let root = tempfile::tempdir().expect("project root");
 		let host = managed_host(root.path());
 		let id = put_verdict(&host, b"pinned verdict");
-		host.retain_verdict("call-a", id).expect("retain delivery");
+		host
+			.retain_verdict(Some("pinned"), "call-a", id)
+			.expect("retain delivery");
 		assert!(matches!(host.delete(&id.hash), Err(BlobError::VerdictPinned)));
 		let (_journal, _genesis) =
 			append_blob_root(&root.path().join("sessions/pinned.oms"), id, false);
 		let retention = host.retention.as_ref().expect("managed retention");
-		retention.downloaded(id, 10).expect("complete download");
+		assert!(
+			retention
+				.downloaded(Some("pinned"), "call-a", id, 10)
+				.expect("complete download")
+		);
 		assert!(matches!(
 			retention.delete(host.worker_verdict_store(), id.hash, i64::MAX),
 			Err(BlobError::VerdictPinned)
@@ -1354,12 +1536,14 @@ mod tests {
 		let verdict = put_verdict(&host, b"shared bytes");
 		assert_eq!(generic, verdict);
 		host
-			.retain_verdict("call-a", verdict)
+			.retain_verdict(Some("generic"), "call-a", verdict)
 			.expect("retain verdict");
 		let retention = host.retention.as_ref().expect("managed retention");
-		retention
-			.downloaded(verdict, 10)
-			.expect("complete download");
+		assert!(
+			retention
+				.downloaded(Some("generic"), "call-a", verdict, 10)
+				.expect("complete download")
+		);
 		assert_eq!(
 			retention
 				.collect(host.worker_verdict_store(), 10 + super::VERDICT_DOWNLOAD_GRACE_MS)
@@ -1384,25 +1568,29 @@ mod tests {
 		let second_id = put_verdict(&second, b"same verdict");
 		assert_eq!(first_id, second_id);
 		first
-			.retain_verdict("first-call", first_id)
+			.retain_verdict(Some("live"), "first-call", first_id)
 			.expect("retain first");
 		second
-			.retain_verdict("second-call", second_id)
+			.retain_verdict(Some("live"), "second-call", second_id)
 			.expect("retain second");
 		let (_journal, _genesis) =
 			append_blob_root(&first_root.join("sessions/live.oms"), first_id, false);
-		first
-			.retention
-			.as_ref()
-			.expect("first retention")
-			.downloaded(first_id, 10)
-			.expect("release first");
-		second
-			.retention
-			.as_ref()
-			.expect("second retention")
-			.downloaded(second_id, 10)
-			.expect("release second");
+		assert!(
+			first
+				.retention
+				.as_ref()
+				.expect("first retention")
+				.downloaded(Some("live"), "first-call", first_id, 10)
+				.expect("release first")
+		);
+		assert!(
+			second
+				.retention
+				.as_ref()
+				.expect("second retention")
+				.downloaded(Some("live"), "second-call", second_id, 10)
+				.expect("release second")
+		);
 		drop((first, second));
 
 		let first = managed_host(&first_root);

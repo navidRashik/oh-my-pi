@@ -1,15 +1,17 @@
 //! One upward mailbox for steering and cancellation.
 //!
 //! Steering is durable from the moment the kernel accepts it: every
-//! [`Up::Steer`] lands in `<queues><steering>` through `patch@1` at the
-//! mailbox drain that receives it, so a crash or session switch while
-//! inference or a tool runs never loses accepted input. The safe point then
-//! moves the queued items into the current turn in one atomic patch (pi
-//! `getSteeringMessages` dequeue).
+//! [`Up::Steer`] or [`Up::SteerAuthored`] lands in `<queues><steering>`
+//! through `patch@1` at the mailbox drain that receives it, so a crash or
+//! session switch while inference or a tool runs never loses accepted input.
+//! The safe point then moves the queued items into the current turn in one
+//! atomic patch (pi `getSteeringMessages` dequeue).
+
+use std::sync::Arc;
 
 use omp_core::Str;
 use omp_dom::{Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
-use omp_journal::data::Attachment;
+use omp_journal::data::{Attachment, IrcTraffic};
 use omp_session::{Session, SessionError};
 
 use crate::SteeringMode;
@@ -33,6 +35,21 @@ pub enum Up {
 		/// Media journaled beside it.
 		attachments: Vec<Attachment>,
 	},
+	/// Adds a host-authenticated remote user's steering aside.
+	///
+	/// Attribution is inserted atomically with the queued user node and moves
+	/// with it at the safe point; it never enters model-facing content.
+	SteerAuthored {
+		/// The aside.
+		text:        Str,
+		/// Media journaled beside it in relay order.
+		attachments: Vec<Attachment>,
+		/// Authenticated remote display name.
+		author:      Str,
+	},
+	/// Adds a discovered skill prompt at the next safe point while preserving
+	/// its source metadata and exact model-facing body.
+	SkillPrompt(omp_journal::data::SkillPrompt),
 	/// Queues a peer/hub message for explicit inbox consumption; unlike
 	/// steering, it does not redirect the active turn.
 	Peer(Str),
@@ -62,6 +79,14 @@ pub enum Up {
 	Cancel,
 	/// Delivers an environment observation or host-authority request.
 	Env(crate::EnvEvent),
+	/// Commits an automatic peer response observation before its producer
+	/// performs the one ordinary peer delivery.
+	Autoreply {
+		/// Authenticated producer payload.
+		payload:   Arc<IrcTraffic>,
+		/// `true` only after the controller journals the payload.
+		committed: flume::Sender<bool>,
+	},
 	/// A policy filed an approval prompt through the kernel-bound
 	/// [`crate::ApprovalRoute`]: journaled as a pending `<prompt>` at the
 	/// drain that receives it, answered by [`Up::Approve`].
@@ -103,6 +128,26 @@ pub(crate) fn queue_steering(
 	text: Str,
 	attachments: &[Attachment],
 ) -> Result<(), SessionError> {
+	queue_steering_with_author(session, text, attachments, None)
+}
+
+/// Journals one authenticated remote steering message with its author in the
+/// initial insertion.
+pub(crate) fn queue_authored_steering(
+	session: &mut Session,
+	text: Str,
+	attachments: &[Attachment],
+	author: Str,
+) -> Result<(), SessionError> {
+	queue_steering_with_author(session, text, attachments, Some(author))
+}
+
+fn queue_steering_with_author(
+	session: &mut Session,
+	text: Str,
+	attachments: &[Attachment],
+	author: Option<Str>,
+) -> Result<(), SessionError> {
 	let steering = steering_queue(session)?;
 	let cause = session.head().ok_or(SessionError::NoActiveTurn)?;
 	let mut node = NodeSpec::new(KnownTag::User)
@@ -111,6 +156,9 @@ pub(crate) fn queue_steering(
 	if !attachments.is_empty() {
 		node =
 			node.with_prop(PropId::Data, Value::Json(serde_json::value::to_raw_value(attachments)?));
+	}
+	if let Some(author) = author {
+		node = node.with_prop(PropId::Author, Value::Str(author));
 	}
 	session.patch(Txn {
 		cause,
@@ -280,7 +328,8 @@ pub(crate) fn consume_steering(
 		.filter_map(|handle| {
 			let node = session.dom().get(*handle)?;
 			let data = node.prop(&PropKey::from(PropId::Data)).cloned();
-			Some((*handle, node.content.clone()?, data))
+			let author = node.prop(&PropKey::from(PropId::Author)).cloned();
+			Some((*handle, node.content.clone()?, data, author))
 		})
 		.take(match mode {
 			SteeringMode::OneAtATime => 1,
@@ -297,17 +346,20 @@ pub(crate) fn consume_steering(
 	// Every insert anchors on the turn's current tail; inserting in reverse
 	// queue order therefore lands the items in queue order after it. The
 	// aside keeps its attachments (`data`) so the projection types them.
-	ops.extend(queued.iter().rev().map(|(_, text, data)| {
+	ops.extend(queued.iter().rev().map(|(_, text, data, author)| {
 		let mut node = NodeSpec::new(KnownTag::User)
 			.with_prop(PropKey::Custom(Str::new_static("steering")), Value::Bool(true))
 			.with_content(text.clone());
 		if let Some(data) = data {
 			node = node.with_prop(PropId::Data, data.clone());
 		}
+		if let Some(author) = author {
+			node = node.with_prop(PropId::Author, author.clone());
+		}
 		Op::Ins { parent: turn, after: tail, node }
 	}));
 	session.patch(Txn { cause, label: Some(Str::new_static("steering.safe-point")), ops })?;
-	Ok(queued.into_iter().map(|(_, text, _)| text).collect())
+	Ok(queued.into_iter().map(|(_, text, ..)| text).collect())
 }
 
 /// Removes every queued steering message (host `Unqueue`: the composer takes

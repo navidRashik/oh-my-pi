@@ -95,12 +95,12 @@ omp_con::var! {
 	};
 	/// Context lines before each grep match.
 	pub static SV_TOOLS_GREP_CONTEXT_BEFORE = sv_tools_grep_context_before: u16 {
-		default: 2,
+		default: 1,
 		flags: archive,
 	};
 	/// Context lines after each grep match.
 	pub static SV_TOOLS_GREP_CONTEXT_AFTER = sv_tools_grep_context_after: u16 {
-		default: 2,
+		default: 3,
 		flags: archive,
 	};
 	/// Named eval interpreter command overrides.
@@ -246,8 +246,8 @@ impl Default for ToolSettings {
 			read_max_bytes:       1024 * 1024,
 			read_summarize:       true,
 			read_line_numbers:    false,
-			grep_context_before:  2,
-			grep_context_after:   2,
+			grep_context_before:  1,
+			grep_context_after:   3,
 			eval_interpreters:    BTreeMap::new(),
 			output_spill_bytes:   64 * 1024,
 			output_max_bytes:     16 * 1024 * 1024,

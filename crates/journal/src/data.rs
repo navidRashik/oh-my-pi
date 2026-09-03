@@ -37,6 +37,59 @@ pub struct Attachment {
 	pub mime: Str,
 }
 
+/// Replay-stable payload for one auto-read file-mention group.
+///
+/// The file vector preserves the user's mention order. Each item carries one
+/// exhaustive result state so replay cannot reinterpret optional booleans.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileMentions {
+	/// Mentioned files, in prompt order.
+	pub files: Vec<MentionedFile>,
+}
+
+/// One file materialized from an `@path` mention.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MentionedFile {
+	/// User-facing path exactly as mentioned.
+	pub path:    Str,
+	/// Model-facing file body. Empty for image and skipped states.
+	pub content: Str,
+	/// Materialization result and its state-specific metadata.
+	#[serde(flatten)]
+	pub state:   MentionedFileState,
+}
+
+/// Exhaustive materialization state for one mentioned file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MentionedFileState {
+	/// A text resource was materialized.
+	Lines {
+		/// Count of materialized lines, absent when the producer could not
+		/// determine it.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		line_count: Option<u64>,
+	},
+	/// An image resource was materialized into the journal blob store.
+	Image {
+		/// Content-addressed media bytes and MIME type.
+		attachment: Attachment,
+	},
+	/// A binary resource was deliberately not injected.
+	SkippedBinary {
+		/// Resource size in bytes, absent when the host could not determine it.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		byte_size: Option<u64>,
+	},
+	/// A resource exceeded the auto-read limit.
+	TooLarge {
+		/// Resource size in bytes, absent when the host could not determine it.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		byte_size: Option<u64>,
+	},
+}
+
 /// `msg.user@1` payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgUser {
@@ -46,6 +99,12 @@ pub struct MsgUser {
 	/// `attachments[N-1]`.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub attachments: Vec<Attachment>,
+	/// Authenticated display name for a remotely authored user message.
+	///
+	/// Absent for local input. This is presentation metadata only: model
+	/// projection continues to consume `text` and `attachments`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub author:      Option<Str>,
 }
 
 /// One settled job in the typed payload of a journaled
@@ -91,6 +150,28 @@ pub enum AsyncJobStatus {
 pub struct AsyncResult {
 	/// Jobs delivered together, oldest first.
 	pub jobs: Vec<AsyncJobDelivery>,
+}
+
+/// Replay-stable payload of a user-invoked skill prompt.
+///
+/// The controller journals this on a `<user skill_prompt=true>` patch. The
+/// prompt body is also the element content so ordinary user-message
+/// projection continues to feed it to inference without a skill-specific
+/// model path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPrompt {
+	/// Discovered skill name.
+	pub name:        Str,
+	/// User-supplied invocation arguments, when present.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub args:        Option<Str>,
+	/// Absolute source `SKILL.md` path.
+	pub path:        Str,
+	/// Expanded prompt sent to the model.
+	pub prompt_body: Str,
+	/// Number of lines in the skill body before invocation framing.
+	pub line_count:  u64,
 }
 
 /// One supervised-process completion carried by a journaled
@@ -179,11 +260,121 @@ pub enum IrcDirection {
 	Workpool,
 }
 
+/// Scheduling transition emitted by a real work-pool producer.
+#[derive(
+	Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Display, EnumString, IntoStaticStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum WorkpoolMode {
+	/// A new persistent worker was admitted.
+	Spawned,
+	/// Work was assigned immediately to an idle worker.
+	Dispatched,
+	/// Work was queued behind an occupied worker.
+	Queued,
+	/// A queued group began a follow-up turn.
+	Batch,
+	/// The whole pool drained successfully.
+	Completed,
+	/// The pool was cancelled before every queued item ran.
+	Cancelled,
+}
+
+/// Fully typed work-pool observation before it enters the shared IRC envelope.
+///
+/// Unlike general IRC traffic, every attribution field is required here. The
+/// producer derives `from` from `pool`, resolves `to` through the live session
+/// authority, and accepts `reply_to` only through an opaque producer receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkpoolObservation {
+	/// Stable pool identity within its owning session.
+	pub pool:         Str,
+	/// Synthetic authenticated producer (`pool:<name>`).
+	pub from:         Str,
+	/// Live worker or pool-owner routing name.
+	pub to:           Str,
+	/// Transition body.
+	pub body:         Str,
+	/// Typed scheduling transition.
+	pub mode:         WorkpoolMode,
+	/// Producer-issued identity of the preceding transition.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reply_to:     Option<Str>,
+	/// Producer-observed Unix timestamp in milliseconds.
+	pub timestamp_ms: u64,
+}
+
+impl From<WorkpoolObservation> for IrcTraffic {
+	fn from(observation: WorkpoolObservation) -> Self {
+		Self {
+			direction:    IrcDirection::Workpool,
+			from:         Some(observation.from),
+			to:           Some(observation.to),
+			body:         observation.body,
+			reply_to:     observation.reply_to,
+			pool:         Some(observation.pool),
+			mode:         Some(Str::new(<&'static str>::from(observation.mode))),
+			timestamp_ms: observation.timestamp_ms,
+		}
+	}
+}
+
+/// Rejects an incomplete or non-work-pool IRC envelope.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkpoolObservationError {
+	/// The envelope is another IRC direction.
+	#[error("IRC envelope is not a workpool observation")]
+	WrongDirection,
+	/// One producer-authenticated field is absent.
+	#[error("workpool observation is missing `{field}`")]
+	Missing {
+		/// Stable field name.
+		field: &'static str,
+	},
+	/// The scheduling mode is outside the closed vocabulary.
+	#[error("workpool observation mode `{mode}` is invalid")]
+	InvalidMode {
+		/// Rejected mode.
+		mode: Str,
+	},
+}
+
+impl TryFrom<&IrcTraffic> for WorkpoolObservation {
+	type Error = WorkpoolObservationError;
+
+	fn try_from(traffic: &IrcTraffic) -> Result<Self, Self::Error> {
+		if traffic.direction != IrcDirection::Workpool {
+			return Err(WorkpoolObservationError::WrongDirection);
+		}
+		let field = |value: &Option<Str>, name| {
+			value
+				.clone()
+				.ok_or(WorkpoolObservationError::Missing { field: name })
+		};
+		let mode = field(&traffic.mode, "mode")?;
+		let mode = mode
+			.parse()
+			.map_err(|_| WorkpoolObservationError::InvalidMode { mode })?;
+		Ok(Self {
+			pool: field(&traffic.pool, "pool")?,
+			from: field(&traffic.from, "from")?,
+			to: field(&traffic.to, "to")?,
+			body: traffic.body.clone(),
+			mode,
+			reply_to: traffic.reply_to.clone(),
+			timestamp_ms: traffic.timestamp_ms,
+		})
+	}
+}
+
 /// Typed payload of a journaled IRC transcript observation.
 ///
 /// The controller records this payload on a `<notice kind=irc>` patch. The
 /// message body is duplicated as the element content so generic fallback and
-/// copy remain useful even when a future actor does not understand this revision.
+/// copy remain useful even when a future actor does not understand this
+/// revision.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IrcTraffic {
@@ -496,6 +687,7 @@ mod tests {
 				blob: BlobRef { hash: Hash32::new([0xab; 32]), size: 5 },
 				mime: Str::new_static("image/png"),
 			}],
+			author:      None,
 		};
 		let json = serde_json::to_string(&payload).unwrap();
 		assert_eq!(
@@ -509,6 +701,49 @@ mod tests {
 		assert_eq!(serde_json::from_str::<MsgUser>(&json).unwrap(), payload);
 		let bare: MsgUser = serde_json::from_str(r#"{"text":"hi"}"#).unwrap();
 		assert!(bare.attachments.is_empty());
+		assert!(bare.author.is_none());
+	}
+
+	#[test]
+	fn file_mentions_round_trip_order_and_exhaustive_states() {
+		let image = Attachment {
+			blob: BlobRef { hash: Hash32::new([0xcd; 32]), size: 17 },
+			mime: Str::new_static("image/png"),
+		};
+		let payload = FileMentions {
+			files: vec![
+				MentionedFile {
+					path:    Str::new_static("notes.md"),
+					content: Str::new_static("one\ntwo"),
+					state:   MentionedFileState::Lines { line_count: Some(2) },
+				},
+				MentionedFile {
+					path:    Str::new_static("shot.png"),
+					content: Str::default(),
+					state:   MentionedFileState::Image { attachment: image },
+				},
+				MentionedFile {
+					path:    Str::new_static("archive.bin"),
+					content: Str::default(),
+					state:   MentionedFileState::SkippedBinary { byte_size: Some(4_096) },
+				},
+				MentionedFile {
+					path:    Str::new_static("huge.txt"),
+					content: Str::default(),
+					state:   MentionedFileState::TooLarge { byte_size: None },
+				},
+			],
+		};
+		let json = serde_json::to_string(&payload).expect("mentions serialize");
+		assert_eq!(serde_json::from_str::<FileMentions>(&json).expect("mentions decode"), payload);
+		assert!(json.contains(r#""state":"skipped_binary","byte_size":4096"#));
+		assert!(json.contains(r#""state":"too_large""#));
+		assert!(
+			serde_json::from_str::<FileMentions>(
+				r#"{"files":[{"path":"x","content":"","state":"binary"}]}"#
+			)
+			.is_err()
+		);
 	}
 
 	#[test]
@@ -536,29 +771,30 @@ mod tests {
 
 	#[test]
 	fn irc_traffic_round_trips_every_directional_fact() {
-		let payload = IrcTraffic {
-			direction:    IrcDirection::Workpool,
-			from:         Some(Str::new_static("scheduler")),
-			to:           Some(Str::new_static("Scout")),
+		let payload = IrcTraffic::from(WorkpoolObservation {
+			pool:         Str::new_static("audit"),
+			from:         Str::new_static("pool:audit"),
+			to:           Str::new_static("Scout"),
 			body:         Str::new_static("inspect the parser"),
+			mode:         WorkpoolMode::Batch,
 			reply_to:     Some(Str::new_static("01K4A")),
-			pool:         Some(Str::new_static("audit")),
-			mode:         Some(Str::new_static("parallel")),
 			timestamp_ms: 1_777_777_777_000,
-		};
+		});
 		let json = serde_json::to_string(&payload).expect("traffic serializes");
-		assert_eq!(
-			serde_json::from_str::<IrcTraffic>(&json).expect("traffic decodes"),
-			payload
-		);
+		assert_eq!(serde_json::from_str::<IrcTraffic>(&json).expect("traffic decodes"), payload);
 		assert!(json.contains(r#""direction":"workpool""#));
 		assert!(json.contains(r#""reply_to":"01K4A""#));
+		assert!(json.contains(r#""mode":"batch""#));
+		assert_eq!(payload.from.as_deref(), Some("pool:audit"));
+		assert_eq!(
+			WorkpoolObservation::try_from(&payload)
+				.expect("typed workpool observation")
+				.mode,
+			WorkpoolMode::Batch,
+		);
 		assert!(
-			serde_json::from_str::<IrcTraffic>(&json.replace(
-				"}",
-				r#","untyped":"discard me"}"#,
-			))
-			.is_err()
+			serde_json::from_str::<IrcTraffic>(&json.replace("}", r#","untyped":"discard me"}"#,))
+				.is_err()
 		);
 	}
 

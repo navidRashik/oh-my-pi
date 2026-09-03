@@ -141,8 +141,7 @@ async fn jobs_restart_does_not_adopt_progress_as_a_terminal() {
 		.expect("progress");
 	drop(session);
 
-	let mut session =
-		Session::open(&path, ComponentRegistry::standard()).expect("restart session");
+	let mut session = Session::open(&path, ComponentRegistry::standard()).expect("restart session");
 	let board = JobBoard::new();
 	board.rebuild(&session);
 	let jobs = board.poll(&mut session).expect("orphan settlement");
@@ -346,7 +345,9 @@ async fn jobs_restart_adopts_terminal_artifact_and_settles_exactly_once() {
 	let full =
 		serde_json::value::to_raw_value(&serde_json::json!({"kind":"ok","value":{"text":"done"}}))
 			.expect("full outcome");
-	let artifact = runtime.put(full.get().as_bytes()).expect("runtime artifact");
+	let artifact = runtime
+		.put(full.get().as_bytes())
+		.expect("runtime artifact");
 	session
 		.settle_projected(
 			call,
@@ -368,8 +369,7 @@ async fn jobs_restart_adopts_terminal_artifact_and_settles_exactly_once() {
 		.expect("terminal result");
 	drop(session);
 
-	let mut session =
-		Session::open(&path, ComponentRegistry::standard()).expect("restart session");
+	let mut session = Session::open(&path, ComponentRegistry::standard()).expect("restart session");
 	assert!(
 		!session.blobs().has(&artifact),
 		"runtime and session stores are distinct before adoption"

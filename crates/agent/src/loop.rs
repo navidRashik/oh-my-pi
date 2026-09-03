@@ -1,6 +1,12 @@
 //! Journal-first agent turn kernel.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+	time::Instant,
+};
 
 use futures::StreamExt as _;
 use omp_core::{FastHashMap, Str};
@@ -13,7 +19,10 @@ use omp_inference::{
 use omp_journal::{
 	EntryId,
 	blob::BlobStore,
-	data::{AsyncJobDelivery, AsyncJobStatus, AsyncResult, Attachment, TurnReceipt},
+	data::{
+		AsyncJobDelivery, AsyncJobStatus, AsyncResult, Attachment, FileMentions, MentionedFile,
+		MentionedFileState, SkillPrompt, TurnReceipt,
+	},
 };
 use omp_proto::{
 	thread::v1::{Item, Message, Part as ThreadPart, Role, item, part},
@@ -28,16 +37,33 @@ use tower::Service;
 
 use crate::{
 	CallControl, CancelTree, Director as _, DirectorCx, DirectorError, DirectorRegistry,
-	DirectorStack, DispatchError, DispatchPolicy, Dispatcher, ExternalToolExecutor, KernelEvent,
-	LiveComponent, LiveComponentError, LoopDecision, MutDirectorCx, Prepared, PreparedCall,
-	Received, RouteFacts, SessionTool, ToolCancellation, TurnView, Up,
+	DirectorStack, DispatchError, DispatchPolicy, Dispatcher, ExternalToolExecutor,
+	FileMentionService, FileMentionSource, KernelEvent, LiveComponent, LiveComponentError,
+	LoopDecision, MaterializedFileMention, MutDirectorCx, Prepared, PreparedCall, Received,
+	ReplyObligations, RouteFacts, SessionTool, ToolCancellation, TurnView, Up,
 	directors::compaction::CompactionDirector,
+	parse_file_mentions,
 	steering::{
 		EMPTY_OUTPUT_RETRY_CAP, append_empty_output_cap_notice, append_empty_output_retry,
 		append_error_notice, append_interrupt_notice, append_named_notice, append_notice,
 		consume_steering, steering_pending,
 	},
 };
+
+struct TurnActivity(Arc<AtomicBool>);
+
+impl TurnActivity {
+	fn enter(active: Arc<AtomicBool>) -> Self {
+		active.store(true, Ordering::Release);
+		Self(active)
+	}
+}
+
+impl Drop for TurnActivity {
+	fn drop(&mut self) {
+		self.0.store(false, Ordering::Release);
+	}
+}
 
 /// Pure system-prompt projection from the authoritative session tree.
 pub trait PromptSource: Send + Sync {
@@ -344,10 +370,13 @@ pub struct Kernel<C> {
 	client:                C,
 	pub(crate) dispatcher: Dispatcher,
 	pub(crate) cancel:     CancelTree,
+	turn_active:           Arc<AtomicBool>,
+	reply_obligations:     ReplyObligations,
 	director_registry:     DirectorRegistry,
 	live_components:       Vec<Box<dyn LiveComponent>>,
 	lifecycle_hooks:       Option<crate::LifecycleHooks>,
 	state_bridges:         Vec<Arc<dyn SessionStateBridge>>,
+	file_mentions:         Option<FileMentionService>,
 	pub(crate) events:     crate::events::KernelEvents,
 	prompt:                Arc<dyn PromptSource>,
 	route:                 RouteFacts,
@@ -386,10 +415,13 @@ impl<C> Kernel<C> {
 			client,
 			dispatcher: Dispatcher::new(registry, policy).with_events(events.clone()),
 			cancel: CancelTree::new(),
+			turn_active: Arc::new(AtomicBool::new(false)),
+			reply_obligations: ReplyObligations::default(),
 			director_registry: DirectorRegistry::standard(),
 			live_components: Vec::new(),
 			lifecycle_hooks: None,
 			state_bridges: Vec::new(),
+			file_mentions: None,
 			approvals: crate::ApprovalDesk::new(events.clone()),
 			events,
 			prompt: Arc::new(prompt),
@@ -414,6 +446,14 @@ impl<C> Kernel<C> {
 		let hooks = crate::LifecycleHooks::new(gate);
 		self.dispatcher = self.dispatcher.with_lifecycle_hooks(hooks.clone());
 		self.lifecycle_hooks = Some(hooks);
+		self
+	}
+
+	/// Installs the existing Read/document authority used for submitted
+	/// `@path` materialization.
+	#[must_use]
+	pub fn with_file_mention_source<S: FileMentionSource>(mut self, source: S) -> Self {
+		self.file_mentions = Some(FileMentionService::spawn(source));
 		self
 	}
 
@@ -584,6 +624,28 @@ impl<C> Kernel<C> {
 		self.cancel.cancel_session();
 	}
 
+	/// Shared live-turn state for recipient-owned side-channel actors.
+	///
+	/// The signal is runtime-only: it determines whether ordinary recipient
+	/// execution is currently unavailable and never becomes session state.
+	#[must_use]
+	pub fn turn_activity(&self) -> Arc<AtomicBool> {
+		Arc::clone(&self.turn_active)
+	}
+
+	/// Session-bound cancellation for host-owned side-channel actors.
+	#[must_use]
+	pub fn session_cancellation(&self) -> CancellationToken {
+		self.cancel.session_child()
+	}
+
+	/// Reply obligations that keep this controller alive through side-channel
+	/// model delivery.
+	#[must_use]
+	pub fn reply_obligations(&self) -> ReplyObligations {
+		self.reply_obligations.clone()
+	}
+
 	/// Applies rewind/resume lifecycle work to every runtime execution unit.
 	pub fn apply_lifecycle(
 		&self,
@@ -663,6 +725,50 @@ impl<C> Kernel<C> {
 }
 
 impl<C: Inference> Kernel<C> {
+	async fn append_file_mentions(
+		&self,
+		session: &mut Session,
+		paths: Vec<Str>,
+	) -> Result<(), SessionError> {
+		let Some(source) = &self.file_mentions else {
+			return Ok(());
+		};
+		let mut files = Vec::with_capacity(paths.len());
+		for path in paths {
+			let Some(materialized) = source.materialize(path).await else {
+				continue;
+			};
+			let file = match materialized {
+				MaterializedFileMention::Lines { path, content, line_count } => {
+					MentionedFile { path, content, state: MentionedFileState::Lines { line_count } }
+				},
+				MaterializedFileMention::Image { path, media_type, bytes } => {
+					let attachment = session.store_attachment(media_type, &bytes)?;
+					MentionedFile {
+						path,
+						content: Str::new_static(""),
+						state: MentionedFileState::Image { attachment },
+					}
+				},
+				MaterializedFileMention::SkippedBinary { path, byte_size } => MentionedFile {
+					path,
+					content: Str::new_static(""),
+					state: MentionedFileState::SkippedBinary { byte_size },
+				},
+				MaterializedFileMention::TooLarge { path, byte_size } => MentionedFile {
+					path,
+					content: Str::new_static(""),
+					state: MentionedFileState::TooLarge { byte_size },
+				},
+			};
+			files.push(file);
+		}
+		if !files.is_empty() {
+			session.file_mentions(FileMentions { files })?;
+		}
+		Ok(())
+	}
+
 	/// Runs one explicit user turn through inference, tools, steering, and
 	/// Directors.
 	///
@@ -674,7 +780,51 @@ impl<C: Inference> Kernel<C> {
 	pub async fn run_turn(
 		&mut self,
 		session: &mut Session,
+		input: TurnInput,
+		control: RunControl,
+	) -> Result<TurnOutcome, KernelError> {
+		self
+			.run_explicit_turn(session, input, None, None, control)
+			.await
+	}
+
+	/// Runs one host-authenticated collaboration prompt as an ordinary user
+	/// turn.
+	///
+	/// The authenticated display name is committed with the initial user
+	/// insertion; it is presentation metadata and never changes the inference
+	/// content.
+	pub async fn run_authored_turn(
+		&mut self,
+		session: &mut Session,
+		input: TurnInput,
+		author: Str,
+		control: RunControl,
+	) -> Result<TurnOutcome, KernelError> {
+		self
+			.run_explicit_turn(session, input, Some(author), None, control)
+			.await
+	}
+
+	/// Runs a discovered skill invocation as one typed user turn.
+	pub async fn run_skill_turn(
+		&mut self,
+		session: &mut Session,
+		prompt: SkillPrompt,
+		control: RunControl,
+	) -> Result<TurnOutcome, KernelError> {
+		let input = TurnInput { text: prompt.prompt_body.clone(), attachments: Vec::new() };
+		self
+			.run_explicit_turn(session, input, None, Some(prompt), control)
+			.await
+	}
+
+	async fn run_explicit_turn(
+		&mut self,
+		session: &mut Session,
 		mut input: TurnInput,
+		author: Option<Str>,
+		mut skill_prompt: Option<SkillPrompt>,
 		control: RunControl,
 	) -> Result<TurnOutcome, KernelError> {
 		if control.is_expired() || self.cancel.is_session_cancelled() {
@@ -702,6 +852,9 @@ impl<C: Inference> Kernel<C> {
 				.await?;
 			if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
 				input.text = Str::new(text);
+				if let Some(prompt) = &mut skill_prompt {
+					prompt.prompt_body = input.text.clone();
+				}
 			}
 			hooks.notify(
 				HookEventId::HookEventAgentStart,
@@ -715,13 +868,60 @@ impl<C: Inference> Kernel<C> {
 		let turn_cancel = self.cancel.begin_turn();
 		session.begin_turn()?;
 		self.apply_live_components(session)?;
-		session.user(input.text, input.attachments)?;
+		match skill_prompt {
+			Some(prompt) => {
+				session.skill_prompt(prompt)?;
+			},
+			None => {
+				let mention_paths = parse_file_mentions(&input.text);
+				if let Some(author) = author {
+					session.user_authored(input.text, input.attachments, author)?;
+				} else {
+					session.user(input.text, input.attachments)?;
+				}
+				self.append_file_mentions(session, mention_paths).await?;
+			},
+		}
 		self.apply_live_components(session)?;
 		let turn = current_turn(session)?;
+		let _activity = TurnActivity::enter(Arc::clone(&self.turn_active));
 		let result = self
 			.run_turn_body(session, turn, &turn_cancel, &control, None)
 			.await;
+		self.turn_active.store(false, Ordering::Release);
+		self
+			.settle_reply_obligations(session, &turn_cancel, &control)
+			.await?;
 		self.finish_turn(session, turn, &submission_id, result)
+	}
+
+	async fn settle_reply_obligations(
+		&self,
+		session: &mut Session,
+		turn: &crate::TurnCancellation,
+		run: &RunControl,
+	) -> Result<(), KernelError> {
+		if !self.reply_obligations.is_pending() {
+			return Ok(());
+		}
+		let control = CallControl::new(
+			self.mailbox_rx.clone(),
+			turn.clone(),
+			self.cancel.clone(),
+			Some(run.clone()),
+			self.approvals.clone(),
+		);
+		while self.reply_obligations.is_pending() {
+			tokio::select! {
+				() = self.reply_obligations.wait() => {},
+				message = control.recv() => {
+					if let Received::Rewound(work) = control.handle(session, message)? {
+						self.dispatcher.jobs().apply_lifecycle(session, &work).await;
+					}
+				},
+			}
+		}
+		Ok(())
 	}
 
 	/// Journals how a turn ended, publishes `TurnEnded`, re-derives host

@@ -5055,12 +5055,23 @@ impl EnvServer {
 				if reject_duplicate_open(connection, frame.request_id, responses).await {
 					return;
 				}
+				let delivery = scope.as_ref().and_then(verdict_delivery_provenance);
 				if let Err(error) = connection.quotas.reserve_stream() {
 					send_policy_error(responses, frame.request_id, error).await;
 					return;
 				}
 				match self.blobs.get_request(&request) {
 					Ok(read) => {
+						if let Some(delivery) = delivery.as_ref()
+							&& let Err(error) = self.blobs.renew_verdict_delivery(
+								Some(delivery.session_id.as_str()),
+								delivery.invocation_id.as_str(),
+								read.id(),
+							) {
+							connection.quotas.release_stream();
+							send_blob_error(responses, frame.request_id, &error).await;
+							return;
+						}
 						let cancel = CancellationToken::new();
 						connection
 							.requests
@@ -5068,6 +5079,7 @@ impl EnvServer {
 						spawn_blob_get(
 							frame.request_id,
 							read,
+							delivery,
 							cancel,
 							responses.clone(),
 							finished.clone(),
@@ -7395,6 +7407,8 @@ impl EnvServer {
 					maximum_effects,
 					execution,
 					request_scope: scope.map(|scope| scope.pty_denied),
+					retention_session: principal
+						.map(|principal| Str::from(principal.session_id.as_str())),
 					output_request,
 					interrupt,
 					interrupts: Some(interrupts),
@@ -7573,6 +7587,7 @@ impl EnvServer {
 				cancel,
 				interrupts,
 				output_request,
+				retention_session,
 				..
 			}) => {
 				if *committed {
@@ -7624,6 +7639,7 @@ impl EnvServer {
 					cancel.clone(),
 					interrupts,
 					*output_request,
+					retention_session.clone(),
 					responses.clone(),
 					finished.clone(),
 					self.blobs.clone(),
@@ -8185,19 +8201,20 @@ enum InvocationState {
 		cancel:          CancellationToken,
 	},
 	Worker {
-		id:              Str,
-		owner:           HostKey,
-		invocation:      Option<WorkerInvocation>,
-		committed:       bool,
-		admission:       AdmissionGate,
-		pending_commit:  Option<pb::ArgsCommitted>,
-		maximum_effects: Effects,
-		execution:       InvocationExecutionPolicy,
-		request_scope:   Option<bool>,
-		output_request:  omp_tool::OutputRequest,
-		interrupt:       flume::Sender<pb::Interrupt>,
-		interrupts:      Option<Receiver<pb::Interrupt>>,
-		cancel:          CancellationToken,
+		id:                Str,
+		owner:             HostKey,
+		invocation:        Option<WorkerInvocation>,
+		committed:         bool,
+		admission:         AdmissionGate,
+		pending_commit:    Option<pb::ArgsCommitted>,
+		maximum_effects:   Effects,
+		execution:         InvocationExecutionPolicy,
+		request_scope:     Option<bool>,
+		retention_session: Option<Str>,
+		output_request:    omp_tool::OutputRequest,
+		interrupt:         flume::Sender<pb::Interrupt>,
+		interrupts:        Option<Receiver<pb::Interrupt>>,
+		cancel:            CancellationToken,
 	},
 }
 
@@ -8975,6 +8992,7 @@ async fn spawn_native_invocation(
 	finished: flume::Sender<Finished>,
 ) {
 	let (started, start) = flume::bounded(1);
+	let retention_session = session_id.clone();
 	tokio::spawn(with_invocation_scope(
 		pty_denied,
 		with_output_request_scope(
@@ -9016,6 +9034,7 @@ async fn spawn_native_invocation(
 														reason,
 														request_id,
 														&invocation_id,
+														retention_session.as_deref(),
 														&lifecycle,
 														output_request,
 														&blobs,
@@ -9071,6 +9090,7 @@ async fn spawn_native_invocation(
 													"",
 													request_id,
 													&invocation_id,
+													retention_session.as_deref(),
 													&lifecycle,
 													output_request,
 													&blobs,
@@ -9223,6 +9243,7 @@ async fn forward_native_event(
 	fallback_reason: &str,
 	request_id: u64,
 	invocation_id: &Str,
+	retention_session: Option<&str>,
 	lifecycle: &NativeLifecycle,
 	output_request: omp_tool::OutputRequest,
 	blobs: &BlobHost,
@@ -9251,32 +9272,46 @@ async fn forward_native_event(
 		Some(Ok(ErasedEv::Done(outcome))) => {
 			if lifecycle.claim_terminal() {
 				let (json, is_error, useless) = erased_outcome_wire(outcome);
-				let details_blob = match blobs.put_verdict_bytes(invocation_id, &json) {
-					Ok(reference) => reference,
-					Err(error) => {
-						tracing::error!(
-							%error,
-							invocation_id = %invocation_id,
-							"could not retain native verdict before publication"
-						);
-						let _ = send_invocation_error(
-							responses,
-							request_id,
-							pb::ProtocolErrorCode::Internal,
-							"native verdict could not be retained",
-						)
-						.await;
-						return NativeForward::Terminal;
-					},
+				let details_blob =
+					match blobs.put_verdict_bytes(retention_session, invocation_id, &json) {
+						Ok(reference) => reference,
+						Err(error) => {
+							tracing::error!(
+								%error,
+								invocation_id = %invocation_id,
+								"could not retain native verdict before publication"
+							);
+							let _ = send_invocation_error(
+								responses,
+								request_id,
+								pb::ProtocolErrorCode::Internal,
+								"native verdict could not be retained",
+							)
+							.await;
+							return NativeForward::Terminal;
+						},
+					};
+				let source_bytes = u64::try_from(json.len()).unwrap_or(u64::MAX);
+				let limit = match output_request {
+					omp_tool::OutputRequest::Bounded => DEFAULT_RESULT_PROJECTION_BYTES,
+					omp_tool::OutputRequest::Complete => COMPLETE_RESULT_PROJECTION_BYTES,
 				};
-				let projection =
-					output_projection(output_request, 0, 0, false, Some(details_blob.clone()));
+				let omitted = json.len() > limit;
+				let inline = if omitted { Bytes::new() } else { json };
+				let inline_bytes = u64::try_from(inline.len()).unwrap_or(u64::MAX);
+				let projection = output_projection(
+					output_request,
+					source_bytes,
+					inline_bytes,
+					omitted,
+					Some(details_blob.clone()),
+				);
 				send_invocation_terminal_body(
 					responses,
 					request_id,
 					server_frame::Body::Verdict(pb::Verdict {
 						invocation_id: invocation_id.to_string(),
-						json: Bytes::new(),
+						json: inline,
 						details_blob: Some(details_blob),
 						parts: Vec::new(),
 						is_error,
@@ -9336,6 +9371,7 @@ fn spawn_worker_invocation(
 	cancel: CancellationToken,
 	interrupts: Receiver<pb::Interrupt>,
 	output_request: omp_tool::OutputRequest,
+	retention_session: Option<Str>,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
 	blobs: BlobHost,
@@ -9431,9 +9467,11 @@ fn spawn_worker_invocation(
 								break;
 							},
 						};
-						if let Err(error) = blobs
-							.retain_verdict(invocation_id.as_str(), BlobId { hash, size: details.size })
-						{
+						if let Err(error) = blobs.retain_verdict(
+							retention_session.as_deref(),
+							invocation_id.as_str(),
+							BlobId { hash, size: details.size },
+						) {
 							tracing::error!(
 								%error,
 								invocation_id = %invocation_id,
@@ -10459,9 +10497,24 @@ fn send_workspace_stream_error_sync(
 	));
 }
 
+#[derive(Clone, Debug)]
+struct VerdictDeliveryProvenance {
+	session_id:    Str,
+	invocation_id: Str,
+}
+
+fn verdict_delivery_provenance(scope: &pb::InvocationScope) -> Option<VerdictDeliveryProvenance> {
+	(!scope.session_id.is_empty() && !scope.agent_id.is_empty() && !scope.invocation_id.is_empty())
+		.then(|| VerdictDeliveryProvenance {
+			session_id:    Str::from(scope.session_id.as_str()),
+			invocation_id: Str::from(scope.invocation_id.as_str()),
+		})
+}
+
 fn spawn_blob_get(
 	request_id: u64,
 	read: BlobRead,
+	delivery: Option<VerdictDeliveryProvenance>,
 	cancel: CancellationToken,
 	responses: flume::Sender<pb::ServerFrame>,
 	finished: flume::Sender<Finished>,
@@ -10540,25 +10593,35 @@ fn spawn_blob_get(
 		}
 
 		if complete && !cancel.is_cancelled() && sent == range_length {
-			send_body(
-				&responses,
-				request_id,
-				server_frame::Body::BlobGetComplete(pb::BlobGetComplete {
-					hash:       Bytes::copy_from_slice(&id.hash),
-					bytes_sent: sent,
-					props:      Default::default(),
-				}),
-			)
-			.await;
-			if range_offset == 0
-				&& sent == id.size
-				&& let Err(error) = blobs.verdict_downloaded(id)
+			let completion_delivered = responses
+				.send_async(checked_server_frame(
+					request_id,
+					server_frame::Body::BlobGetComplete(pb::BlobGetComplete {
+						hash:       Bytes::copy_from_slice(&id.hash),
+						bytes_sent: sent,
+						props:      Default::default(),
+					}),
+				))
+				.await
+				.is_ok();
+			if completion_delivered
+				&& range_offset.saturating_add(sent) == id.size
+				&& let Some(delivery) = delivery.as_ref()
 			{
-				tracing::warn!(
-					%error,
-					hash = %Hash32::new(id.hash),
-					"could not release completed verdict download lease"
-				);
+				match blobs.verdict_downloaded(
+					Some(delivery.session_id.as_str()),
+					delivery.invocation_id.as_str(),
+					id,
+				) {
+					Ok(_) => {},
+					Err(error) => tracing::warn!(
+						%error,
+						hash = %Hash32::new(id.hash),
+						session_id = %delivery.session_id,
+						invocation_id = %delivery.invocation_id,
+						"could not release completed verdict download lease"
+					),
+				}
 			}
 		}
 		let _ = finished

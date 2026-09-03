@@ -111,6 +111,7 @@ use super::{
 	search_backend::SearchBridgeHost,
 	security_scan::SecurityScanService,
 	ssh::{HostPaths, HostStore, SshService},
+	tool_ast_grep::AstSearchAuthority,
 	tool_debug::DocumentDebugControl,
 	tool_document::SessionReadBlobs,
 	tool_lsp::DocumentLspControl,
@@ -3327,9 +3328,25 @@ fn configured_model_edit_revision(ctx: &Ctx) -> Result<Option<Rev>, EnvdError> {
 }
 
 fn configured_model_identity(ctx: &Ctx) -> Option<Str> {
-	omp_catalog::settings::ModelSettings::from_con(ctx)
-		.role_selector("default")
-		.cloned()
+	let settings = omp_catalog::settings::ModelSettings::from_con(ctx);
+	let selected = omp_con::AI_MODEL.get(ctx);
+	if let Some(role) = selected.strip_prefix("@") {
+		return settings.role_selector(role.as_str()).cloned();
+	}
+	if !selected.is_empty() {
+		return Some(selected);
+	}
+	settings.role_selector("default").cloned()
+}
+
+fn image_config(ctx: &Ctx) -> media_devices::ImageConfig {
+	let provider_order = omp_inference::pi_settings::AI_PROVIDERS_IMAGE_ORDER
+		.get(ctx)
+		.into_iter()
+		.filter_map(|provider| provider.parse().ok())
+		.filter(|provider| *provider != media_devices::ImageProvider::Auto)
+		.collect();
+	media_devices::ImageConfig { provider_order, active_model: configured_model_identity(ctx) }
 }
 
 fn speech_config(ctx: &Ctx) -> SpeechConfig {
@@ -3425,6 +3442,7 @@ fn register_session_base(
 	state_dir: &Path,
 	telemetry: &Arc<TelemetryIndex>,
 	tool_settings: &ToolSettings,
+	image_config: media_devices::ImageConfig,
 	speech_config: SpeechConfig,
 	policy: ToolsPolicy,
 ) -> Result<SessionBaseOutput, EnvdError> {
@@ -3442,6 +3460,7 @@ fn register_session_base(
 	for device in [
 		media_devices::image_gen(
 			Arc::clone(&search_bridge),
+			image_config,
 			blobs.clone(),
 			project_root.to_path_buf(),
 		),
@@ -3925,6 +3944,7 @@ pub(crate) fn session_registry(
 		state_dir,
 		telemetry,
 		tool_settings,
+		image_config(con),
 		speech_config(con),
 		policy,
 	)?;
@@ -4067,6 +4087,7 @@ pub(crate) fn production_registry<
 			state_dir,
 			telemetry,
 			tool_settings,
+			image_config(con),
 			speech_config(con),
 			policy,
 		)?;
@@ -4086,7 +4107,8 @@ pub(crate) fn production_registry<
 		long_tail_presentation(policy),
 		builtin_device_claims(),
 	)?;
-	let security = SecurityScanService::new(workspace.root().to_path_buf(), state_dir);
+	let security = SecurityScanService::new(workspace.root().to_path_buf(), state_dir)
+		.with_credentials(Arc::clone(&github_credentials));
 	if tool_settings.enabled("security_scan") {
 		environment_registry(
 			&mut registry,
@@ -4429,7 +4451,7 @@ pub(crate) fn production_registry<
 	let search = WorkspaceSearchAdapter::new(
 		workspace.clone(),
 		documents.clone(),
-		read_sources,
+		read_sources.clone(),
 		Arc::clone(&resolvers),
 	);
 	let grep = omp_tools::grep::tool(
@@ -4445,9 +4467,15 @@ pub(crate) fn production_registry<
 		environment_registry(&mut registry, glob, essential_presentation(policy), core_claims())?;
 	}
 	if tool_settings.enabled("ast_grep") {
+		let ast_search = AstSearchAuthority::new(
+			workspace.clone(),
+			read_sources.clone(),
+			Arc::clone(&resolvers),
+			state_dir,
+		);
 		environment_registry(
 			&mut registry,
-			omp_tools::ast_grep::tool(workspace.root().to_path_buf()),
+			omp_tools::ast_grep::tool(ast_search),
 			long_tail_presentation(policy),
 			long_tail_claims(policy),
 		)?;

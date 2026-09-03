@@ -137,13 +137,26 @@ impl GithubCredentialBridge {
 
 	/// Leases one named provider credential when one is available.
 	pub async fn lease_for(&self, spec: &str) -> Result<Option<CredentialLease>, Fault> {
+		self.lease_for_account(spec, None).await
+	}
+
+	/// Leases one named provider credential, optionally pinned to its durable
+	/// account row.
+	pub async fn lease_for_account(
+		&self,
+		spec: &str,
+		account: Option<u64>,
+	) -> Result<Option<CredentialLease>, Fault> {
 		let Some(authority) = self.authority.get() else {
 			return Ok(None);
 		};
 		match authority
 			.provider_lease(CredentialNeed {
 				spec:        AuthSpecId::from(Str::new(spec)),
-				account:     Some(AccountId::from(sf!("{spec}:environment"))),
+				account:     Some(account.map_or_else(
+					|| AccountId::from(sf!("{spec}:environment")),
+					|account| AccountId::from(account.to_string()),
+				)),
 				principal:   Some(PrincipalId::from("environment")),
 				valid_after: SystemTime::now(),
 			})

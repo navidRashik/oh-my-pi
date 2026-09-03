@@ -5,6 +5,7 @@ use std::{
 	io::{self, Read as _},
 	path::{Component, Path, PathBuf},
 	sync::Arc,
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_stream::stream;
@@ -120,9 +121,100 @@ pub(crate) fn ask_vocalizer(
 }
 /// Largest `input_image` accepted for image-to-image generation (35 MiB).
 const MAX_INPUT_IMAGE_BYTES: u64 = 35 * 1024 * 1024;
+/// End-to-end image generation deadline, matching pi.
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+/// Maximum generated image retained by the host.
+const MAX_GENERATED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+/// xAI's maximum reference-image count for one edit.
+const MAX_XAI_EDIT_IMAGES: usize = 3;
 /// Longest `text` accepted by `tts`, in characters.
 const MAX_SPEECH_CHARS: usize = 15_000;
 const MAX_INPUT_IMAGE_BASE64_BYTES: usize = ((MAX_INPUT_IMAGE_BYTES as usize + 2) / 3) * 4;
+
+/// Image provider preference accepted by `image_gen`.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Deserialize,
+	Eq,
+	JsonSchema,
+	PartialEq,
+	Serialize,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum ImageProvider {
+	/// Select from configured, active-model, and built-in provider priorities.
+	Auto,
+	/// OpenAI hosted image generation.
+	Openai,
+	/// OpenAI hosted image generation through a ChatGPT/Codex subscription.
+	#[serde(rename = "openai-codex")]
+	#[strum(serialize = "openai-codex")]
+	OpenaiCodex,
+	/// Google Antigravity OAuth image generation.
+	Antigravity,
+	/// xAI Grok Imagine.
+	Xai,
+	/// OpenRouter chat-shaped image generation.
+	Openrouter,
+	/// Google Gemini native image generation.
+	Gemini,
+	/// DeepInfra's OpenAI-compatible image endpoint.
+	Deepinfra,
+}
+
+/// Supported image aspect ratios.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum ImageAspectRatio {
+	/// Square.
+	#[serde(rename = "1:1")]
+	OneOne,
+	/// Portrait.
+	#[serde(rename = "3:4")]
+	ThreeFour,
+	/// Landscape.
+	#[serde(rename = "4:3")]
+	FourThree,
+	/// Tall portrait.
+	#[serde(rename = "9:16")]
+	NineSixteen,
+	/// Wide landscape.
+	#[serde(rename = "16:9")]
+	SixteenNine,
+	/// xAI-only landscape.
+	#[serde(rename = "3:2")]
+	ThreeTwo,
+	/// xAI-only portrait.
+	#[serde(rename = "2:3")]
+	TwoThree,
+}
+
+/// Supported explicit generated-image dimensions.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum ImageSize {
+	/// 1024×1024.
+	#[serde(rename = "1024x1024")]
+	Square,
+	/// 1536×1024.
+	#[serde(rename = "1536x1024")]
+	Landscape,
+	/// 1024×1536.
+	#[serde(rename = "1024x1536")]
+	Portrait,
+}
+
+/// Immutable session routing inputs for `image_gen`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ImageConfig {
+	/// Configured `providers.imageOrder` after dropping unknown names.
+	pub(crate) provider_order: Vec<ImageProvider>,
+	/// Active catalog selector, used when its provider can generate images.
+	pub(crate) active_model:   Option<Str>,
+}
 
 /// One image-to-image input, provided either by contained path or inline data.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -158,13 +250,13 @@ pub struct MediaParams {
 	/// Edits to apply to supplied images.
 	pub changes:      Option<Vec<Str>>,
 	/// Image aspect ratio such as `1:1` or `16:9`.
-	pub aspect_ratio: Option<Str>,
+	pub aspect_ratio: Option<ImageAspectRatio>,
 	/// Requested image dimensions.
-	pub image_size:   Option<Str>,
+	pub image_size:   Option<ImageSize>,
 	/// Input images supplied by contained path or base64.
 	pub input:        Option<Vec<ImageInput>>,
 	/// Requested image provider.
-	pub provider:     Option<Str>,
+	pub provider:     Option<ImageProvider>,
 	/// Explicit provider voice ID.
 	pub voice_id:     Option<Str>,
 	/// BCP-47 speech language hint.
@@ -199,9 +291,12 @@ pub struct MediaPayload {
 	/// Effective audio codec.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub codec:       Option<Str>,
-	/// Effective speech backend.
+	/// Effective media backend.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub backend:     Option<Str>,
+	/// Effective provider model selector.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub model:       Option<Str>,
 	/// Effective sample rate when known.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub sample_rate: Option<u32>,
@@ -219,10 +314,29 @@ pub struct MediaFault {
 	pub message: Str,
 }
 
+/// Image-generation state published while provider attempts are live.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePhase {
+	/// The provider request is starting.
+	Request,
+	/// A failed provider is being replaced by the next eligible provider.
+	Fallback,
+}
+
 /// Incremental media production state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MediaUpdate {
+	/// One bounded provider attempt for image generation.
+	Image {
+		/// Attempt lifecycle phase.
+		phase:    ImagePhase,
+		/// Effective provider.
+		provider: ImageProvider,
+		/// Effective catalog model selector.
+		model:    Str,
+	},
 	/// Cumulative audio received or synthesized so far.
 	Audio {
 		/// Number of producer chunks observed.
@@ -243,21 +357,28 @@ pub struct MediaDevice {
 	spec:    ToolSpec,
 	kind:    MediaKind,
 	backend: Arc<SearchBridgeHost>,
+	image:   Option<ImageConfig>,
 	speech:  Option<Arc<SpeechProducer>>,
 	blobs:   BlobHost,
 	root:    PathBuf,
 }
 
-/// Creates the `image_gen@3` dynamic device.
-pub fn image_gen(backend: Arc<SearchBridgeHost>, blobs: BlobHost, root: PathBuf) -> MediaDevice {
+/// Creates the `image_gen@4` dynamic device.
+pub(crate) fn image_gen(
+	backend: Arc<SearchBridgeHost>,
+	config: ImageConfig,
+	blobs: BlobHost,
+	root: PathBuf,
+) -> MediaDevice {
 	media_device(
 		"image_gen",
 		"Generates images from a structured subject/action/scene/composition/lighting/style prompt. \
 		 `input` accepts contained workspace paths or base64 PNG/JPEG/GIF/WebP images up to 35 MiB; \
 		 `output_path` additionally writes the result atomically inside the workspace.",
 		MediaKind::Image,
-		3,
+		4,
 		backend,
+		Some(config),
 		None,
 		blobs,
 		root,
@@ -297,6 +418,7 @@ pub(crate) fn tts_with_config(
 		MediaKind::Speech,
 		4,
 		backend,
+		None,
 		Some(speech),
 		blobs,
 		root,
@@ -309,6 +431,7 @@ fn media_device(
 	kind: MediaKind,
 	rev: u16,
 	backend: Arc<SearchBridgeHost>,
+	image: Option<ImageConfig>,
 	speech: Option<Arc<SpeechProducer>>,
 	blobs: BlobHost,
 	root: PathBuf,
@@ -342,6 +465,7 @@ fn media_device(
 		},
 		kind,
 		backend,
+		image,
 		speech,
 		blobs,
 		root,
@@ -397,22 +521,16 @@ fn media_schema(kind: MediaKind) -> Bytes {
 }
 
 impl MediaDevice {
-	async fn generate_image(&self, params: &MediaParams) -> Result<MediaPayload, MediaFault> {
-		let output = params
-			.output_path
-			.as_deref()
-			.map(|path| OutputTarget::resolve(&self.root, path))
-			.transpose()?;
-		let request = image_request(&self.root, params)?;
-		let mut images = self
-			.backend
-			.generate_image(request)
-			.await
-			.map_err(media_backend_fault)?;
+	fn image_output(
+		&self,
+		output: Option<&OutputTarget>,
+		attempt: &ImageAttempt,
+		mut images: Vec<thread_pb::Blob>,
+	) -> Result<MediaPayload, MediaFault> {
 		let image = images.drain(..).next().ok_or_else(|| {
 			media_fault("image_empty", "inference", "image generation returned no artifact")
 		})?;
-		finish_image(&self.blobs, output.as_ref(), &image)
+		finish_image(&self.blobs, output, attempt, &image)
 	}
 
 	fn speech_input(params: &MediaParams) -> SpeechInput {
@@ -447,6 +565,7 @@ impl MediaDevice {
 			voice_id: Some(speech.voice_id),
 			codec: Some(Str::new_static(speech.codec)),
 			backend: Some(Str::new_static(speech.backend)),
+			model: None,
 			sample_rate: speech.sample_rate,
 		})
 	}
@@ -469,6 +588,18 @@ fn validate_image_params(params: &MediaParams) -> Result<(), MediaFault> {
 			"invalid_input_image",
 			"filesystem",
 			"each input image must provide exactly one of path or data",
+		));
+	}
+	if params.provider == Some(ImageProvider::Xai)
+		&& params
+			.input
+			.as_ref()
+			.is_some_and(|inputs| inputs.len() > MAX_XAI_EDIT_IMAGES)
+	{
+		return Err(media_fault(
+			"too_many_input_images",
+			"xai",
+			"xAI image edits accept at most three reference images",
 		));
 	}
 	Ok(())
@@ -503,6 +634,111 @@ fn validate_speech_params(params: &MediaParams) -> Result<(), MediaFault> {
 	Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ImageAttempt {
+	provider: ImageProvider,
+	model:    Str,
+}
+
+const AUTO_IMAGE_PROVIDER_ORDER: [ImageProvider; 7] = [
+	ImageProvider::Openai,
+	ImageProvider::OpenaiCodex,
+	ImageProvider::Antigravity,
+	ImageProvider::Xai,
+	ImageProvider::Openrouter,
+	ImageProvider::Gemini,
+	ImageProvider::Deepinfra,
+];
+
+fn active_provider(model: Option<&str>) -> Option<ImageProvider> {
+	match model?.split_once('/')?.0 {
+		"openai" => Some(ImageProvider::Openai),
+		"openai-codex" => Some(ImageProvider::OpenaiCodex),
+		"google-antigravity" => Some(ImageProvider::Antigravity),
+		"xai" | "xai-oauth" => Some(ImageProvider::Xai),
+		"openrouter" => Some(ImageProvider::Openrouter),
+		"deepinfra" => Some(ImageProvider::Deepinfra),
+		"google" => Some(ImageProvider::Gemini),
+		_ => None,
+	}
+}
+
+fn image_model(provider: ImageProvider, active_model: Option<&Str>) -> Option<Str> {
+	let active =
+		active_model.filter(|model| active_provider(Some(model.as_str())) == Some(provider));
+	if matches!(provider, ImageProvider::Openai) {
+		return active.cloned();
+	}
+	if matches!(provider, ImageProvider::OpenaiCodex)
+		&& let Some(active) = active
+	{
+		return Some(active.clone());
+	}
+	Some(sf!(match provider {
+		ImageProvider::Auto => return None,
+		ImageProvider::Antigravity => "google-antigravity/gemini-3-pro-image",
+		ImageProvider::Deepinfra => "deepinfra/black-forest-labs/FLUX-2-pro",
+		ImageProvider::Gemini => "google/gemini-3-pro-image-preview",
+		ImageProvider::Openai => return None,
+		ImageProvider::OpenaiCodex => "openai-codex/gpt-5.5",
+		ImageProvider::Openrouter => "openrouter/google/gemini-3-pro-image-preview",
+		ImageProvider::Xai => "xai/grok-imagine-image",
+	}))
+}
+
+fn image_attempts(config: &ImageConfig, params: &MediaParams) -> Vec<ImageAttempt> {
+	let mut providers = Vec::with_capacity(AUTO_IMAGE_PROVIDER_ORDER.len() + 2);
+	let mut push = |provider| {
+		if provider != ImageProvider::Auto && !providers.contains(&provider) {
+			providers.push(provider);
+		}
+	};
+	if let Some(provider) = params.provider {
+		push(provider);
+	}
+	for &provider in &config.provider_order {
+		push(provider);
+	}
+	if let Some(provider) = active_provider(config.active_model.as_deref()) {
+		push(provider);
+	}
+	for provider in AUTO_IMAGE_PROVIDER_ORDER {
+		push(provider);
+	}
+
+	let edit = params
+		.input
+		.as_ref()
+		.is_some_and(|inputs| !inputs.is_empty());
+	let mut attempts = Vec::new();
+	for provider in providers {
+		let supported = !matches!(
+			(params.aspect_ratio, provider),
+			(
+				Some(ImageAspectRatio::ThreeTwo | ImageAspectRatio::TwoThree),
+				ImageProvider::Antigravity
+					| ImageProvider::Deepinfra
+					| ImageProvider::Gemini
+					| ImageProvider::Openai
+					| ImageProvider::OpenaiCodex
+					| ImageProvider::Openrouter
+			)
+		) && !(edit && provider == ImageProvider::Deepinfra)
+			&& !(provider == ImageProvider::Xai
+				&& params
+					.input
+					.as_ref()
+					.is_some_and(|inputs| inputs.len() > MAX_XAI_EDIT_IMAGES));
+		if !supported {
+			continue;
+		}
+		if let Some(model) = image_model(provider, config.active_model.as_ref()) {
+			attempts.push(ImageAttempt { provider, model });
+		}
+	}
+	attempts
+}
+
 /// Builds the inference request for `image_gen`, loading the validated
 /// `input_image` from the workspace.
 fn image_request(
@@ -518,11 +754,11 @@ fn image_request(
 		.map(|input| load_image_input(root, input))
 		.collect::<Result<Vec<_>, _>>()?;
 	Ok(inference_pb::GenerateImageRequest {
-		model: params.provider.as_deref().unwrap_or_default().to_owned(),
+		model: String::new(),
 		prompt,
 		n: 1,
-		aspect_ratio: aspect_ratio(params.aspect_ratio.as_deref())?,
-		size: image_size(params.image_size.as_deref())?,
+		aspect_ratio: aspect_ratio(params.aspect_ratio),
+		size: image_size(params.image_size).or_else(|| image_aspect_size(params.aspect_ratio)),
 		quality: generate_image_request::Quality::Medium as i32,
 		format: image_format(),
 		background: generate_image_request::Background::Unspecified as i32,
@@ -533,68 +769,117 @@ fn image_request(
 	})
 }
 
-fn image_size(
-	value: Option<&str>,
-) -> Result<Option<generate_image_request::ImageSize>, MediaFault> {
-	Ok(match value {
+const fn image_size(value: Option<ImageSize>) -> Option<generate_image_request::ImageSize> {
+	match value {
 		None => None,
-		Some("1024x1024") => Some(generate_image_request::ImageSize { width: 1024, height: 1024 }),
-		Some("1536x1024") => Some(generate_image_request::ImageSize { width: 1536, height: 1024 }),
-		Some("1024x1536") => Some(generate_image_request::ImageSize { width: 1024, height: 1536 }),
-		Some(_) => {
-			return Err(media_fault("invalid_image_size", "image", "unsupported image size"));
+		Some(ImageSize::Square) => {
+			Some(generate_image_request::ImageSize { width: 1024, height: 1024 })
 		},
-	})
+		Some(ImageSize::Landscape) => {
+			Some(generate_image_request::ImageSize { width: 1536, height: 1024 })
+		},
+		Some(ImageSize::Portrait) => {
+			Some(generate_image_request::ImageSize { width: 1024, height: 1536 })
+		},
+	}
+}
+
+const fn image_aspect_size(
+	value: Option<ImageAspectRatio>,
+) -> Option<generate_image_request::ImageSize> {
+	match value {
+		None => None,
+		Some(ImageAspectRatio::OneOne) => image_size(Some(ImageSize::Square)),
+		Some(
+			ImageAspectRatio::ThreeFour | ImageAspectRatio::NineSixteen | ImageAspectRatio::TwoThree,
+		) => image_size(Some(ImageSize::Portrait)),
+		Some(
+			ImageAspectRatio::FourThree | ImageAspectRatio::SixteenNine | ImageAspectRatio::ThreeTwo,
+		) => image_size(Some(ImageSize::Landscape)),
+	}
 }
 
 fn assemble_image_prompt(params: &MediaParams) -> String {
-	let mut sentences = Vec::new();
-	let mut subject = params
-		.subject
-		.as_deref()
-		.expect("validated image subject")
-		.to_owned();
+	fn without_terminal_punctuation(value: &str) -> &str {
+		value.trim_end_matches(['.', '!', ',', ';', ':'])
+	}
+
+	let mut prompt = String::new();
+	prompt.push_str(without_terminal_punctuation(
+		params.subject.as_deref().expect("validated image subject"),
+	));
 	for detail in [params.action.as_deref(), params.scene.as_deref()]
 		.into_iter()
 		.flatten()
-		.filter(|detail| !detail.trim().is_empty())
 	{
-		subject.push_str(", ");
-		subject.push_str(detail);
+		prompt.push_str(", ");
+		prompt.push_str(without_terminal_punctuation(detail));
 	}
-	sentences.push(subject);
 	for detail in
 		[params.composition.as_deref(), params.lighting.as_deref(), params.style.as_deref()]
+			.into_iter()
+			.flatten()
 	{
-		if let Some(detail) = detail.filter(|detail| !detail.trim().is_empty()) {
-			sentences.push(detail.to_owned());
-		}
+		prompt.push_str(". ");
+		prompt.push_str(without_terminal_punctuation(detail));
 	}
-	if let Some(text) = params
-		.text
-		.as_deref()
-		.filter(|text| !text.trim().is_empty())
-	{
-		sentences.push(format!("Render this text exactly: {text}"));
+	prompt.push('.');
+	if let Some(text) = params.text.as_deref() {
+		prompt.push_str("\n\nText: ");
+		prompt.push_str(text);
 	}
 	if let Some(changes) = params
 		.changes
 		.as_deref()
 		.filter(|changes| !changes.is_empty())
 	{
-		sentences.push(format!(
-			"Apply these changes: {}. Preserve all unspecified details.",
-			changes.join("; ")
-		));
+		prompt.push_str("\n\nChanges:");
+		for change in changes {
+			prompt.push_str("\n- ");
+			prompt.push_str(change);
+		}
 	}
-	sentences.join(". ")
+	prompt
 }
 
 fn load_image_input(root: &Path, input: &ImageInput) -> Result<thread_pb::Blob, MediaFault> {
-	let image = if let Some(path) = input.path.as_deref() {
-		load_input_image(root, path)?
+	let (image, asserted_mime) = if let Some(path) = input.path.as_deref() {
+		(load_input_image(root, path)?, input.mime_type.as_deref())
 	} else {
-		let data = input.data.as_deref().expect("validated inline image");
+		let raw = input
+			.data
+			.as_deref()
+			.expect("validated inline image")
+			.trim();
+		let (data, data_url_mime) = if let Some(rest) = raw.strip_prefix("data:") {
+			let Some((mime, data)) = rest.split_once(";base64,") else {
+				return Err(media_fault(
+					"invalid_input_image",
+					"input",
+					"image data URL must use the base64 encoding",
+				));
+			};
+			if !mime.starts_with("image/") {
+				return Err(media_fault(
+					"input_image_unsupported",
+					"input",
+					"image data URL must declare an image MIME type",
+				));
+			}
+			(data, Some(mime))
+		} else {
+			(raw, input.mime_type.as_deref())
+		};
+		let Some(asserted_mime) = data_url_mime else {
+			return Err(media_fault(
+				"input_image_mime_required",
+				"input",
+				"mime_type is required with raw base64 image data",
+			));
+		};
+		if data.is_empty() {
+			return Err(media_fault("input_image_empty", "input", "image data is empty"));
+		}
 		if data.len() > MAX_INPUT_IMAGE_BASE64_BYTES {
 			return Err(media_fault(
 				"input_image_too_large",
@@ -607,13 +892,9 @@ fn load_image_input(root: &Path, input: &ImageInput) -> Result<thread_pb::Blob, 
 			.map_err(|_| {
 				media_fault("invalid_input_image", "input", "input image data is not valid base64")
 			})?;
-		image_blob(bytes)?
+		(image_blob(bytes)?, Some(asserted_mime))
 	};
-	if input
-		.mime_type
-		.as_deref()
-		.is_some_and(|asserted| asserted != image.mime)
-	{
+	if asserted_mime.is_some_and(|asserted| asserted != image.mime) {
 		return Err(media_fault(
 			"input_image_mime_mismatch",
 			"input",
@@ -628,6 +909,7 @@ fn load_image_input(root: &Path, input: &ImageInput) -> Result<thread_pb::Blob, 
 fn finish_image(
 	blobs: &BlobHost,
 	output: Option<&OutputTarget>,
+	attempt: &ImageAttempt,
 	image: &thread_pb::Blob,
 ) -> Result<MediaPayload, MediaFault> {
 	let (artifact_id, blob) = store_blob(blobs, image)?;
@@ -652,10 +934,15 @@ fn finish_image(
 		}),
 		output_path,
 		blob,
-		bytes: None,
+		bytes: Some(if image.inline.is_empty() {
+			image.size
+		} else {
+			u64::try_from(image.inline.len()).unwrap_or(u64::MAX)
+		}),
 		voice_id: None,
 		codec: None,
-		backend: None,
+		backend: Some(Str::new(<&'static str>::from(attempt.provider))),
+		model: Some(attempt.model.clone()),
 		sample_rate: None,
 	})
 }
@@ -763,6 +1050,13 @@ struct OutputTarget {
 	temporary: PathBuf,
 }
 
+fn now_ms() -> u128 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+}
+
 impl OutputTarget {
 	fn resolve(root: &Path, authored: &str) -> Result<Self, MediaFault> {
 		let Some(path) = workspace_relative(authored) else {
@@ -863,7 +1157,85 @@ impl Tool for MediaDevice {
 			}
 			match self.kind {
 				MediaKind::Image => {
-					yield media_done(self.generate_image(&params).await);
+					let output = match params
+						.output_path
+						.as_deref()
+						.map(|path| OutputTarget::resolve(&self.root, path))
+						.transpose()
+					{
+						Ok(output) => output,
+						Err(fault) => {
+							yield media_done(Err(fault));
+							return;
+						},
+					};
+					let mut request = match image_request(&self.root, &params) {
+						Ok(request) => request,
+						Err(fault) => {
+							yield media_done(Err(fault));
+							return;
+						},
+					};
+					let config = self.image.as_ref().expect("image devices carry routing config");
+					let attempts = image_attempts(config, &params);
+					if attempts.is_empty() {
+						yield media_done(Err(media_fault(
+							"image_route_unavailable",
+							"routing",
+							"no configured image provider can satisfy this request",
+						)));
+						return;
+					}
+					let deadline = tokio::time::sleep(IMAGE_TIMEOUT);
+					tokio::pin!(deadline);
+					let mut last_failure = None;
+					for (index, attempt) in attempts.iter().enumerate() {
+						request.model = attempt.model.to_string();
+						yield Ev::Update(MediaUpdate::Image {
+							phase: if index == 0 { ImagePhase::Request } else { ImagePhase::Fallback },
+							provider: attempt.provider,
+							model: attempt.model.clone(),
+						});
+						let generation = self.backend.generate_image(request.clone());
+						tokio::pin!(generation);
+						let result = tokio::select! {
+							biased;
+							interrupt = incoming.next_interrupt() => {
+								match interrupt {
+									Ok(interrupt) => yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason }),
+									Err(omp_tool::InterruptWaitError::Closed) => yield Ev::Aborted(Abort::InputDropped),
+									Err(omp_tool::InterruptWaitError::Protocol(message)) => {
+										yield Ev::Args(protocol_issue(message));
+									},
+								}
+								return;
+							},
+							() = &mut deadline => {
+								yield media_done(Err(media_fault(
+									"image_timeout",
+									"inference",
+									"image generation exceeded the three minute deadline",
+								)));
+								return;
+							},
+							result = &mut generation => result,
+						};
+						match result {
+							Ok(images) => {
+								yield media_done(self.image_output(output.as_ref(), attempt, images));
+								return;
+							},
+							Err(error) => last_failure = Some((attempt.provider, error)),
+						}
+					}
+					yield media_done(Err(last_failure.map_or_else(
+						|| media_fault(
+							"image_all_providers_failed",
+							"routing",
+							"image generation failed for every eligible provider",
+						),
+						|(provider, error)| image_backend_fault(provider, error),
+					)));
 				},
 				MediaKind::Speech => {
 					let producer = self
@@ -938,7 +1310,7 @@ impl Tool for MediaDevice {
 
 	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
 		let supported = match self.kind {
-			MediaKind::Image => matches!(from.n, 1 | 2),
+			MediaKind::Image => matches!(from.n, 1 | 2 | 3),
 			MediaKind::Speech => matches!(from.n, 1 | 2 | 3),
 		};
 		if !from.family.is_empty() || !supported {
@@ -978,17 +1350,16 @@ impl Tool for MediaDevice {
 
 /// Translates provider-neutral media vocabulary into the canonical inference
 /// wire.
-fn aspect_ratio(value: Option<&str>) -> Result<i32, MediaFault> {
-	Ok(match value.unwrap_or("1:1") {
-		"1:1" => 1,
-		"16:9" => 2,
-		"9:16" => 3,
-		"4:3" => 4,
-		"3:4" => 5,
-		"3:2" => 6,
-		"2:3" => 7,
-		_ => return Err(media_fault("invalid_aspect_ratio", "image", "unsupported aspect ratio")),
-	})
+const fn aspect_ratio(value: Option<ImageAspectRatio>) -> i32 {
+	match value {
+		None | Some(ImageAspectRatio::OneOne) => 1,
+		Some(ImageAspectRatio::SixteenNine) => 2,
+		Some(ImageAspectRatio::NineSixteen) => 3,
+		Some(ImageAspectRatio::FourThree) => 4,
+		Some(ImageAspectRatio::ThreeFour) => 5,
+		Some(ImageAspectRatio::ThreeTwo) => 6,
+		Some(ImageAspectRatio::TwoThree) => 7,
+	}
 }
 
 const fn image_format() -> i32 {
@@ -999,6 +1370,15 @@ fn store_blob(
 	blobs: &BlobHost,
 	blob: &thread_pb::Blob,
 ) -> Result<(Str, Option<omp_tool::BlobRef>), MediaFault> {
+	if blob.inline.len() > MAX_GENERATED_IMAGE_BYTES
+		|| blob.size > u64::try_from(MAX_GENERATED_IMAGE_BYTES).unwrap_or(u64::MAX)
+	{
+		return Err(media_fault(
+			"generated_image_too_large",
+			"inference",
+			"generated image exceeds the 64 MiB host limit",
+		));
+	}
 	if blob.inline.is_empty() {
 		let hash = <[u8; 32]>::try_from(blob.hash.as_ref()).map_err(|_| {
 			media_fault("invalid_image_artifact", "inference", "image artifact has no bytes or digest")
@@ -1029,8 +1409,15 @@ fn media_fault(code: &'static str, backend: &'static str, message: &'static str)
 	}
 }
 
-fn media_backend_fault(error: omp_tools::web_search::BackendError) -> MediaFault {
-	MediaFault { code: error.code, backend: sf!("inference"), message: error.message }
+fn image_backend_fault(
+	provider: ImageProvider,
+	error: omp_tools::web_search::BackendError,
+) -> MediaFault {
+	MediaFault {
+		code:    error.code,
+		backend: Str::new(<&'static str>::from(provider)),
+		message: error.message,
+	}
 }
 
 fn media_blob_fault(error: BlobError) -> MediaFault {
@@ -1171,8 +1558,10 @@ mod tests {
 		let root = tempdir().expect("root");
 		let blobs = BlobHost::open(root.path().join("blobs")).expect("blobs");
 		let backend = Arc::new(SearchBridgeHost::new(None));
-		let device = image_gen(backend, blobs, root.path().to_path_buf());
+		let device = image_gen(backend, ImageConfig::default(), blobs, root.path().to_path_buf());
 		let schema: Value = serde_json::from_slice(&device.spec().schema).expect("image schema");
+		assert_eq!(device.spec().name, "image_gen");
+		assert_eq!(device.spec().rev.n, 4);
 		assert_eq!(schema["required"], serde_json::json!(["i", "subject"]));
 		assert_eq!(
 			schema["properties"]
@@ -1208,8 +1597,8 @@ mod tests {
 		params.scene = Some(sf!("a pond"));
 		params.composition = Some(sf!("wide shot"));
 		params.changes = Some(vec![sf!("make the frog blue")]);
-		params.aspect_ratio = Some(sf!("16:9"));
-		params.image_size = Some(sf!("1536x1024"));
+		params.aspect_ratio = Some(ImageAspectRatio::SixteenNine);
+		params.image_size = Some(ImageSize::Landscape);
 		params.input = Some(vec![ImageInput {
 			path:      None,
 			data:      Some(Str::new(omp_core::base64::encode(b"\x89PNG\r\n\x1a\n").into_string())),
@@ -1219,8 +1608,7 @@ mod tests {
 		let request = image_request(root.path(), &params).expect("image request");
 		assert_eq!(
 			request.prompt,
-			"frog, jumping, a pond. wide shot. Apply these changes: make the frog blue. Preserve all \
-			 unspecified details."
+			"frog, jumping, a pond. wide shot.\n\nChanges:\n- make the frog blue"
 		);
 		assert_eq!(
 			request.size,
@@ -1228,14 +1616,78 @@ mod tests {
 		);
 		assert_eq!(request.input_images.len(), 1);
 		assert_eq!(request.input_images[0].mime, "image/png");
+
+		let data_url =
+			format!("data:image/png;base64,{}", omp_core::base64::encode(b"\x89PNG\r\n\x1a\n"));
+		let image = load_image_input(&root.path(), &ImageInput {
+			path:      None,
+			data:      Some(Str::new(data_url)),
+			mime_type: None,
+		})
+		.expect("data URL image");
+		assert_eq!(image.mime, "image/png");
+		assert_eq!(
+			load_image_input(&root.path(), &ImageInput {
+				path:      None,
+				data:      Some(
+					Str::new(omp_core::base64::encode(b"\x89PNG\r\n\x1a\n").into_string(),)
+				),
+				mime_type: None,
+			})
+			.expect_err("raw base64 requires MIME")
+			.code,
+			"input_image_mime_required"
+		);
 	}
 
 	#[test]
-	fn legacy_media_calls_lift_to_revision_three() {
+	fn image_provider_routing_follows_request_config_active_then_auto_order() {
+		let mut params = media_params();
+		params.subject = Some(sf!("frog"));
+		params.provider = Some(ImageProvider::Gemini);
+		let config = ImageConfig {
+			provider_order: vec![ImageProvider::Deepinfra, ImageProvider::Gemini],
+			active_model:   Some(sf!("xai/grok-4")),
+		};
+		let attempts = image_attempts(&config, &params);
+		assert_eq!(
+			attempts
+				.iter()
+				.map(|attempt| attempt.provider)
+				.collect::<Vec<_>>(),
+			vec![
+				ImageProvider::Gemini,
+				ImageProvider::Deepinfra,
+				ImageProvider::Xai,
+				ImageProvider::OpenaiCodex,
+				ImageProvider::Antigravity,
+				ImageProvider::Openrouter,
+			]
+		);
+
+		params.input = Some(vec![ImageInput {
+			path:      Some(sf!("source.png")),
+			data:      None,
+			mime_type: None,
+		}]);
+		params.aspect_ratio = Some(ImageAspectRatio::ThreeTwo);
+		assert_eq!(image_attempts(&config, &params), vec![ImageAttempt {
+			provider: ImageProvider::Xai,
+			model:    sf!("xai/grok-imagine-image"),
+		}]);
+	}
+
+	#[test]
+	fn legacy_media_calls_lift_to_current_revisions() {
 		let root = tempdir().expect("root");
 		let blobs = BlobHost::open(root.path().join("blobs")).expect("blobs");
 		let backend = Arc::new(SearchBridgeHost::new(None));
-		let image = image_gen(Arc::clone(&backend), blobs.clone(), root.path().to_path_buf());
+		let image = image_gen(
+			Arc::clone(&backend),
+			ImageConfig::default(),
+			blobs.clone(),
+			root.path().to_path_buf(),
+		);
 		let lifted = image
 			.lift(&Rev { family: Str::default(), n: 2 }, RecordedCall {
 				raw_args: br#"{"prompt":"frog","input_image":"frog.png","format":"png"}"#,
@@ -1271,15 +1723,27 @@ mod tests {
 		let root = tempdir().expect("root");
 		let blobs = BlobHost::open(root.path().join("blobs")).expect("blobs");
 		let backend = Arc::new(SearchBridgeHost::new(None));
-		let device = image_gen(backend, blobs.clone(), root.path().to_path_buf());
-		let payload = finish_image(&blobs, None, &thread_pb::Blob {
-			hash:   Bytes::new(),
-			mime:   "image/png".to_owned(),
-			size:   3,
-			inline: Bytes::from_static(b"png"),
-			detail: blob::Detail::Original as i32,
-		})
+		let device =
+			image_gen(backend, ImageConfig::default(), blobs.clone(), root.path().to_path_buf());
+		let payload = finish_image(
+			&blobs,
+			None,
+			&ImageAttempt {
+				provider: ImageProvider::Gemini,
+				model:    sf!("google/gemini-3-pro-image-preview"),
+			},
+			&thread_pb::Blob {
+				hash:   Bytes::new(),
+				mime:   "image/png".to_owned(),
+				size:   3,
+				inline: Bytes::from_static(b"png"),
+				detail: blob::Detail::Original as i32,
+			},
+		)
 		.expect("finish image");
+		assert_eq!(payload.backend.as_deref(), Some("gemini"));
+		assert_eq!(payload.model.as_deref(), Some("google/gemini-3-pro-image-preview"));
+		assert_eq!(payload.bytes, Some(3));
 		let parts = device.prompt(Ok(&payload), &PromptCaps {
 			maximum_parts:      16,
 			maximum_text_bytes: 1024,

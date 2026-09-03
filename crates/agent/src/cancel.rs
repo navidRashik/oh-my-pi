@@ -37,6 +37,13 @@ impl CancelTree {
 		self.session.is_cancelled()
 	}
 
+	/// Returns a child token for host-owned work that must end at the session
+	/// boundary but may outlast one ordinary turn.
+	#[must_use]
+	pub fn session_child(&self) -> CancellationToken {
+		self.session.child_token()
+	}
+
 	/// Starts one cancellation scope beneath the session root.
 	#[must_use]
 	pub fn begin_turn(&self) -> TurnCancellation {

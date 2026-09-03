@@ -3,14 +3,40 @@
 use std::{env, process::Command};
 
 use omp_core::Str;
-use omp_journal::{EntryDraft, Journal, Kind, gc::prune_abandoned, kind::KindName, live_chain};
+use omp_journal::{
+	EntryDraft, Journal, Kind,
+	blob::{BlobStore, GcPolicy},
+	gc::{collect_blobs, copy_journal_blobs, prune_abandoned},
+	kind::KindName,
+	live_chain,
+};
 
 fn draft(
 	kind: KindName,
 	by: Option<omp_journal::EntryId>,
 	prior: Option<omp_journal::EntryId>,
 ) -> EntryDraft {
-	EntryDraft { kind: Kind::known(kind), by, prior, label: None, data: Str::new_static("{}") }
+	draft_data(kind, by, prior, Str::new_static("{}"))
+}
+
+fn draft_data(
+	kind: KindName,
+	by: Option<omp_journal::EntryId>,
+	prior: Option<omp_journal::EntryId>,
+	data: Str,
+) -> EntryDraft {
+	EntryDraft { kind: Kind::known(kind), by, prior, label: None, data }
+}
+
+fn no_grace() -> GcPolicy {
+	GcPolicy {
+		unreferenced_grace: std::time::Duration::ZERO,
+		temporary_grace:    std::time::Duration::ZERO,
+	}
+}
+
+fn uri(reference: omp_journal::blob::BlobRef) -> String {
+	format!("artifact://sha256/{}", reference.to_hex())
 }
 
 #[test]
@@ -112,4 +138,202 @@ fn prune_refuses_a_journal_with_a_live_writer() {
 	let report = prune_abandoned(&path).expect("prune once the writer is gone");
 	assert_eq!(report.entries_before, 4);
 	assert_eq!(report.entries_after, 3);
+}
+
+#[test]
+fn blob_gc_preserves_rewindable_media_until_branch_pruning() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let store = BlobStore::open(directory.path()).expect("blob store");
+	let image = store.put(b"image").expect("image");
+	let audio = store.put(b"audio").expect("audio");
+	let video = store.put(b"video").expect("video");
+	let tool = store.put(b"tool").expect("tool artifact");
+	let abandoned = store.put(b"abandoned").expect("abandoned media");
+	let orphan = store.put(b"orphan").expect("orphan");
+
+	let path = directory.path().join("media.oms");
+	let mut journal = Journal::create(&path).expect("journal");
+	let genesis = journal
+		.append(draft(KindName::Journal, None, None))
+		.expect("genesis");
+	let turn = journal
+		.append(draft(KindName::TurnStart, Some(genesis.id), None))
+		.expect("turn");
+	let user = serde_json::json!({
+		"text": "mixed media",
+		"attachments": [
+			{"h": image.to_hex().as_str(), "n": image.size, "mime": "image/png"},
+			{"h": audio.to_hex().as_str(), "n": audio.size, "mime": "audio/wav"},
+			{"h": video.to_hex().as_str(), "n": video.size, "mime": "video/mp4"}
+		]
+	});
+	let user = journal
+		.append(draft_data(
+			KindName::MsgUser,
+			Some(turn.id),
+			None,
+			Str::new(serde_json::to_string(&user).expect("user json")),
+		))
+		.expect("user");
+	let tool_result = serde_json::json!({
+		"outcome": {
+			"blob": {
+				"hash": tool.to_hex().as_str(),
+				"media_type": "application/octet-stream",
+				"byte_len": tool.size
+			}
+		}
+	});
+	let tool_entry = journal
+		.append(draft_data(
+			KindName::ToolResult,
+			Some(user.id),
+			None,
+			Str::new(serde_json::to_string(&tool_result).expect("tool json")),
+		))
+		.expect("tool result");
+	let abandoned_patch = serde_json::json!({
+		"ops": [["ins", 3, null, {
+			"tag": "artifact",
+			"props": {"blob": uri(abandoned), "mime": "image/png"}
+		}]]
+	});
+	journal
+		.append(draft_data(
+			KindName::Patch,
+			Some(tool_entry.id),
+			None,
+			Str::new(serde_json::to_string(&abandoned_patch).expect("patch json")),
+		))
+		.expect("abandoned patch");
+	let live_patch = serde_json::json!({
+		"ops": [["set", 3, "media", uri(image)]]
+	});
+	journal
+		.append(draft_data(
+			KindName::Patch,
+			Some(tool_entry.id),
+			Some(tool_entry.id),
+			Str::new(serde_json::to_string(&live_patch).expect("live patch json")),
+		))
+		.expect("rewound live patch");
+	drop(journal);
+
+	let before_prune = collect_blobs(&store, std::slice::from_ref(&path), no_grace())
+		.expect("collect complete history");
+	assert_eq!(before_prune.journals_scanned, 1);
+	assert_eq!(before_prune.roots_retained, 5);
+	assert!(
+		store.has(&abandoned),
+		"rewindable history remains rooted until the journal branch is pruned"
+	);
+	assert!(!store.has(&orphan), "content absent from every history is collected");
+
+	prune_abandoned(&path).expect("prune abandoned branch");
+	let after_prune = collect_blobs(&store, std::slice::from_ref(&path), no_grace())
+		.expect("collect pruned history");
+	assert_eq!(after_prune.roots_retained, 4);
+	for retained in [image, audio, video, tool] {
+		assert!(store.has(&retained), "live media/tool root must survive");
+	}
+	assert!(!store.has(&abandoned), "pruning the branch releases its media root");
+}
+
+#[test]
+fn shared_session_root_survives_switch_and_one_session_deletion() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let store = BlobStore::open(directory.path()).expect("blob store");
+	let shared = store.put(b"shared").expect("shared");
+	let mut paths = Vec::new();
+	for name in ["first", "second"] {
+		let path = directory.path().join(format!("{name}.oms"));
+		let mut journal = Journal::create(&path).expect("journal");
+		let genesis = journal
+			.append(draft(KindName::Journal, None, None))
+			.expect("genesis");
+		journal
+			.append(draft_data(
+				KindName::Patch,
+				Some(genesis.id),
+				None,
+				Str::new(format!(r#"{{"ops":["{}"]}}"#, uri(shared))),
+			))
+			.expect("artifact root");
+		drop(journal);
+		paths.push(path);
+	}
+
+	std::fs::remove_file(&paths[0]).expect("delete inactive session");
+	let report = collect_blobs(&store, &paths[1..], no_grace()).expect("collect remaining session");
+	assert_eq!(report.roots_retained, 1);
+	assert!(store.has(&shared), "the other session still roots shared content");
+
+	std::fs::remove_file(&paths[1]).expect("delete last session");
+	collect_blobs(&store, &[], no_grace()).expect("collect without sessions");
+	assert!(!store.has(&shared), "last journal deletion releases the root");
+}
+
+#[test]
+fn journal_relocation_copies_all_rewindable_roots_but_no_other_session_data() {
+	let parent = tempfile::tempdir().expect("temporary directory");
+	let source = BlobStore::open(parent.path().join("source")).expect("source store");
+	let destination = BlobStore::open(parent.path().join("destination")).expect("destination store");
+	let rooted = source.put(b"rooted media").expect("rooted");
+	let abandoned = source.put(b"rewindable media").expect("rewindable");
+	let unrelated = source.put(b"other session").expect("unrelated");
+	let path = source.root().join("moving.oms");
+	let mut journal = Journal::create(&path).expect("journal");
+	let genesis = journal
+		.append(draft(KindName::Journal, None, None))
+		.expect("genesis");
+	let live = journal
+		.append(draft_data(
+			KindName::Patch,
+			Some(genesis.id),
+			None,
+			Str::new(format!(r#"{{"ops":["{}"]}}"#, uri(rooted))),
+		))
+		.expect("root");
+	journal
+		.append(draft_data(
+			KindName::Patch,
+			Some(live.id),
+			None,
+			Str::new(format!(r#"{{"ops":["{}"]}}"#, uri(abandoned))),
+		))
+		.expect("rewindable branch");
+	journal
+		.append(draft(KindName::Patch, Some(live.id), Some(live.id)))
+		.expect("select earlier branch");
+	drop(journal);
+
+	assert_eq!(
+		copy_journal_blobs(&source, &destination, std::slice::from_ref(&path))
+			.expect("copy rooted blobs"),
+		2
+	);
+	assert!(destination.has(&rooted), "moved session media exists in destination");
+	assert!(
+		destination.has(&abandoned),
+		"retained history remains valid if the moved session rewinds later"
+	);
+	assert!(!destination.has(&unrelated), "another session's blob does not cross projects");
+}
+
+#[test]
+fn blob_gc_cleans_abandoned_stages_without_crossing_project_namespaces() {
+	let parent = tempfile::tempdir().expect("temporary directory");
+	let first = BlobStore::open(parent.path().join("project-a")).expect("first store");
+	let second = BlobStore::open(parent.path().join("project-b")).expect("second store");
+	let first_blob = first.put(b"same bytes").expect("first blob");
+	let second_blob = second.put(b"same bytes").expect("second blob");
+	assert_eq!(first_blob, second_blob, "content identity is portable");
+
+	let temporary = first.root().join("tmp/crashed-upload.blob");
+	std::fs::write(&temporary, b"partial").expect("temporary");
+	let report = collect_blobs(&first, &[], no_grace()).expect("first collection");
+	assert_eq!(report.storage.temporaries_removed, 1);
+	assert!(!temporary.exists(), "abandoned staging content is removed");
+	assert!(!first.has(&first_blob), "first namespace is swept");
+	assert!(second.has(&second_blob), "another project's namespace is untouched");
 }
