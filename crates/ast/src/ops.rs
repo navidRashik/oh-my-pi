@@ -1,5 +1,6 @@
 use std::{
-	io,
+	collections::BTreeSet,
+	fs, io,
 	path::{Path, PathBuf},
 	str,
 };
@@ -286,8 +287,17 @@ pub fn compile_rewrite_rules(
 }
 
 /// Collects all matches for compiled patterns in source order per pattern.
-pub fn collect_matches(source: &str, language: SupportLang, patterns: &[Pattern]) -> Vec<AstMatch> {
+///
+/// The boolean reports whether the parsed syntax tree contains error nodes;
+/// callers surface that as a non-fatal parse advisory while retaining matches
+/// from the valid parts of the tree.
+pub fn collect_matches_with_parse_status(
+	source: &str,
+	language: SupportLang,
+	patterns: &[Pattern],
+) -> (Vec<AstMatch>, bool) {
 	let ast = language.ast_grep(source);
+	let has_parse_errors = ast.root().dfs().any(|node| node.is_error());
 	let mut matches = Vec::new();
 	for pattern in patterns {
 		for matched in ast.root().find_all(pattern.clone()) {
@@ -324,7 +334,12 @@ pub fn collect_matches(source: &str, language: SupportLang, patterns: &[Pattern]
 			});
 		}
 	}
-	matches
+	(matches, has_parse_errors)
+}
+
+/// Collects all matches for compiled patterns in source order per pattern.
+pub fn collect_matches(source: &str, language: SupportLang, patterns: &[Pattern]) -> Vec<AstMatch> {
+	collect_matches_with_parse_status(source, language, patterns).0
 }
 
 /// Applies compiled rewrite operations and returns source plus replacement
@@ -397,55 +412,171 @@ pub fn apply_edits(content: &str, edits: &[Edit<String>]) -> Result<String> {
 	Ok(output)
 }
 
+/// Walks files, directories, and glob targets, optionally intersecting every
+/// target with a walk-relative glob filter.
+pub fn collect_matched_files_filtered(
+	cwd: &Path,
+	patterns: &[String],
+	filter: Option<&str>,
+) -> Result<Vec<MatchedFile>, io::Error> {
+	collect_matched_files_filtered_bounded(cwd, patterns, filter, usize::MAX)
+}
+
+/// Walks files, directories, and glob targets, retaining at most `maximum + 1`
+/// files so callers can report a breached bound without traversing the rest of
+/// the tree.
+pub fn collect_matched_files_filtered_bounded(
+	cwd: &Path,
+	patterns: &[String],
+	filter: Option<&str>,
+	maximum: usize,
+) -> Result<Vec<MatchedFile>, io::Error> {
+	let root = fs::canonicalize(cwd)?;
+	let filter = filter
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+		.map(|value| {
+			CompiledGlobSet::new([value])
+				.map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+		})
+		.transpose()?;
+	let mut paths = BTreeSet::new();
+	let mut saw_existing_root = false;
+	let default = ".".to_owned();
+	let patterns = if patterns.is_empty() {
+		std::slice::from_ref(&default)
+	} else {
+		patterns
+	};
+
+	for pattern in patterns {
+		let pattern = pattern.trim();
+		if pattern.is_empty() {
+			continue;
+		}
+		if has_glob_syntax(pattern) {
+			let matcher = CompiledGlobSet::new([pattern])
+				.map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+			let limit_reached =
+				collect_walk_files(&root, &root, Some(&matcher), filter.as_ref(), &mut paths, maximum)?;
+			saw_existing_root = true;
+			if limit_reached {
+				break;
+			}
+			continue;
+		}
+
+		let candidate = Path::new(pattern);
+		let candidate = if candidate.is_absolute() {
+			candidate.to_path_buf()
+		} else {
+			root.join(candidate)
+		};
+		let candidate = match fs::canonicalize(&candidate) {
+			Ok(candidate) if candidate.starts_with(&root) => candidate,
+			Ok(_) => {
+				return Err(io::Error::new(
+					io::ErrorKind::PermissionDenied,
+					"AST target escapes the workspace root",
+				));
+			},
+			Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+			Err(error) => return Err(error),
+		};
+		let metadata = fs::metadata(&candidate)?;
+		saw_existing_root = true;
+		if metadata.is_file() {
+			let relative = candidate.strip_prefix(&root).unwrap_or(&candidate);
+			let file_name = candidate
+				.file_name()
+				.and_then(|name| name.to_str())
+				.unwrap_or_default();
+			if filter.as_ref().is_none_or(|matcher| {
+				matcher.matches(&relative.to_string_lossy()) || matcher.matches(file_name)
+			}) {
+				paths.insert(candidate);
+				if paths.len() > maximum {
+					break;
+				}
+			}
+		} else if metadata.is_dir()
+			&& collect_walk_files(&root, &candidate, None, filter.as_ref(), &mut paths, maximum)?
+		{
+			break;
+		}
+	}
+
+	if !saw_existing_root {
+		return Err(io::Error::new(io::ErrorKind::NotFound, "no AST search target exists"));
+	}
+
+	Ok(paths
+		.into_iter()
+		.map(|absolute_path| {
+			let relative_path = absolute_path
+				.strip_prefix(&root)
+				.unwrap_or(&absolute_path)
+				.to_string_lossy();
+			let relative_path = if relative_path.contains('\\') {
+				Str::from(relative_path.replace('\\', "/"))
+			} else {
+				Str::new(relative_path.as_ref())
+			};
+			MatchedFile { absolute_path, relative_path }
+		})
+		.collect())
+}
+
 /// Walks a directory and collects files matched by paths or glob patterns.
 pub fn collect_matched_files(
 	cwd: &Path,
 	patterns: &[String],
 ) -> Result<Vec<MatchedFile>, io::Error> {
-	let globset = build_globset(patterns)?;
-	let mut builder = WalkBuilder::new(cwd);
+	collect_matched_files_filtered(cwd, patterns, None)
+}
+
+fn collect_walk_files(
+	root: &Path,
+	walk_root: &Path,
+	target: Option<&CompiledGlobSet>,
+	filter: Option<&CompiledGlobSet>,
+	files: &mut BTreeSet<PathBuf>,
+	maximum: usize,
+) -> Result<bool, io::Error> {
+	let mut builder = WalkBuilder::new(walk_root);
 	builder
 		.hidden(false)
 		.git_ignore(true)
 		.git_global(true)
 		.git_exclude(true);
-	let mut files = Vec::new();
 	for entry in builder.build() {
-		let entry = match entry {
-			Ok(entry) => entry,
-			Err(error) => return Err(io::Error::other(error)),
-		};
-		if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+		let entry = entry.map_err(io::Error::other)?;
+		if !entry.file_type().is_some_and(|kind| kind.is_file()) {
 			continue;
 		}
-		let absolute_path = entry.into_path();
-		let relative_path = absolute_path
-			.strip_prefix(cwd)
-			.unwrap_or(&absolute_path)
-			.to_string_lossy();
-		let relative_path = if relative_path.contains('\\') {
-			Str::from(relative_path.replace('\\', "/"))
-		} else {
-			Str::new(relative_path.as_ref())
-		};
-		if globset.matches(relative_path.as_str())
-			|| patterns
-				.iter()
-				.any(|pattern| pattern == relative_path.as_str())
-		{
-			files.push(MatchedFile { absolute_path, relative_path });
+		let absolute = entry.into_path();
+		let root_relative = absolute.strip_prefix(root).unwrap_or(&absolute);
+		let walk_relative = absolute.strip_prefix(walk_root).unwrap_or(&absolute);
+		let root_relative = root_relative.to_string_lossy();
+		let walk_relative = walk_relative.to_string_lossy();
+		if target.is_some_and(|matcher| !matcher.matches(&root_relative)) {
+			continue;
+		}
+		if filter.is_some_and(|matcher| {
+			!matcher.matches(&walk_relative)
+				&& !absolute
+					.file_name()
+					.and_then(|name| name.to_str())
+					.is_some_and(|name| matcher.matches(name))
+		}) {
+			continue;
+		}
+		files.insert(absolute);
+		if files.len() > maximum {
+			return Ok(true);
 		}
 	}
-	files.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
-	Ok(files)
-}
-
-fn build_globset(patterns: &[String]) -> Result<CompiledGlobSet, io::Error> {
-	let globby = patterns
-		.iter()
-		.filter(|pattern| has_glob_syntax(pattern))
-		.map(String::as_str);
-	CompiledGlobSet::new(globby).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+	Ok(false)
 }
 
 /// Reports whether a path pattern contains supported glob syntax.
