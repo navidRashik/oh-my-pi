@@ -80,13 +80,14 @@ fn scripted_kernel(
 
 fn session_home(temp: &tempfile::TempDir, kernel: &Kernel<ScriptedInference>) -> SessionHome {
 	SessionHome {
-		sessions_dir: temp.path().join("sessions"),
-		project_root: temp.path().to_path_buf(),
-		model:        Str::new_static("scripted/test"),
-		prompt:       Default::default(),
-		facts:        Default::default(),
-		live:         Arc::new(SessionRegistry::new()),
-		up:           kernel.mailbox(),
+		sessions_dir:  temp.path().join("sessions"),
+		project_root:  temp.path().to_path_buf(),
+		model:         Str::new_static("scripted/test"),
+		prompt:        Default::default(),
+		facts:         Default::default(),
+		live:          Arc::new(SessionRegistry::new()),
+		tools_enabled: true,
+		up:            kernel.mailbox(),
 	}
 }
 
@@ -138,7 +139,14 @@ async fn rpc_prompt_is_acknowledged_then_emits_one_terminal_agent_end() {
 	};
 	let (server, frames) = tokio::join!(server, client);
 	server.expect("server");
-	assert!(frames.iter().any(|frame| frame["event"] == "patch@1"));
+	assert!(
+		frames.iter().any(|frame| frame["type"] == "message_start"),
+		"RPC projects session mutations into pi message events rather than private DOM patches",
+	);
+	assert!(
+		!frames.iter().any(|frame| frame["event"] == "patch@1"),
+		"private journal patches are not part of the public RPC event stream",
+	);
 	let prompt = frames
 		.iter()
 		.find(|frame| frame["type"] == "response" && frame["id"] == "1")
@@ -405,7 +413,7 @@ async fn rpc_v2_reassembles_large_requests_and_chunks_large_responses() {
 				.expect("negotiate");
 			let request = json!({
 				"id": "large",
-				"type": "get_state",
+				"type": "get_messages",
 				"padding": "y".repeat(MAX_FRAME_BYTES + 16 * 1024),
 			});
 			for frame in encode_json_v2(&request, "request").expect("chunk request") {
@@ -440,7 +448,7 @@ async fn rpc_v2_reassembles_large_requests_and_chunks_large_responses() {
 	let response = frames
 		.iter()
 		.find(|frame| frame["type"] == "response" && frame["id"] == "large")
-		.expect("reassembled get_state response");
+		.expect("reassembled get_messages response");
 	assert_eq!(response["success"], true);
 	assert!(
 		serde_json::to_vec(&response["data"])
@@ -499,10 +507,14 @@ async fn rpc_session_commands_publish_reset_snapshots() {
 	assert_eq!(
 		frames
 			.iter()
-			.filter(|frame| frame["type"] == "snapshot")
+			.filter(|frame| frame["type"] == "session_start")
 			.count(),
-		4,
-		"initial plus one reset snapshot per transition",
+		3,
+		"one public lifecycle event per transition",
+	);
+	assert!(
+		!frames.iter().any(|frame| frame["type"] == "snapshot"),
+		"the controller's private DOM snapshot is not an RPC event",
 	);
 }
 

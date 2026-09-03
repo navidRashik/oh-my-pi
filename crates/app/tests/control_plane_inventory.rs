@@ -2815,24 +2815,22 @@ const ROWS: &[Row] = &[
 		              `Eval`. Adding a second extension language requires superseding this record.",
 	},
 	Row {
-		key:         "eval.rb",
-		coverage:    Coverage::Deviation,
-		convar:      "",
-		declaration: "",
-		consumer:    "",
-		adr:         "docs/adr/0036-python-for-extensions.md",
-		quote:       "There is NO JavaScript/TypeScript plugin runtime and NO multi-language \
-		              `Eval`. Adding a second extension language requires superseding this record.",
+		key:         "eval.tools.enabled",
+		coverage:    Coverage::Declared,
+		convar:      "sv_eval_tools_enabled",
+		declaration: "crates/tools/src/pi_settings.rs",
+		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		adr:         "",
+		quote:       "",
 	},
 	Row {
-		key:         "eval.jl",
-		coverage:    Coverage::Deviation,
-		convar:      "",
-		declaration: "",
-		consumer:    "",
-		adr:         "docs/adr/0036-python-for-extensions.md",
-		quote:       "There is NO JavaScript/TypeScript plugin runtime and NO multi-language \
-		              `Eval`. Adding a second extension language requires superseding this record.",
+		key:         "eval.workpool.freshAgents",
+		coverage:    Coverage::Declared,
+		convar:      "sv_eval_workpool_fresh_agents",
+		declaration: "crates/tools/src/pi_settings.rs",
+		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		adr:         "",
+		quote:       "",
 	},
 	Row {
 		key:         "eval.autoBackground.enabled",
@@ -2868,28 +2866,7 @@ const ROWS: &[Row] = &[
 		declaration: "",
 		consumer:    "",
 		adr:         "docs/adr/0036-python-for-extensions.md",
-		quote:       "There is NO JavaScript/TypeScript plugin runtime and NO multi-language \
-		              `Eval`. Adding a second extension language requires superseding this record.",
-	},
-	Row {
-		key:         "ruby.interpreter",
-		coverage:    Coverage::Deviation,
-		convar:      "",
-		declaration: "",
-		consumer:    "",
-		adr:         "docs/adr/0036-python-for-extensions.md",
-		quote:       "There is NO JavaScript/TypeScript plugin runtime and NO multi-language \
-		              `Eval`. Adding a second extension language requires superseding this record.",
-	},
-	Row {
-		key:         "julia.interpreter",
-		coverage:    Coverage::Deviation,
-		convar:      "",
-		declaration: "",
-		consumer:    "",
-		adr:         "docs/adr/0036-python-for-extensions.md",
-		quote:       "There is NO JavaScript/TypeScript plugin runtime and NO multi-language \
-		              `Eval`. Adding a second extension language requires superseding this record.",
+		quote:       "The harness NEVER depends on a host-installed interpreter.",
 	},
 	Row {
 		key:         "tools.approval",
@@ -2965,11 +2942,10 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "grep.contextBefore",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_tools_grep_context_before",
 		declaration: "crates/envd/src/tool_settings.rs",
-		consumer:    "UNCONSUMED: Collapsed into single symmetric convar \
-		              sv_tools_grep_context_lines (default 2) in crates/envd/src/tool_settings.rs:91",
+		consumer:    "crates/tools/src/grep.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -3895,10 +3871,10 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "providers.imageOrder",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "ai_providers_image_order",
 		declaration: "crates/inference/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		consumer:    "crates/envd/src/tools.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -4486,7 +4462,7 @@ fn normalized(text: &str) -> String {
 }
 
 #[test]
-fn all_488_pi_settings_have_literal_control_plane_dispositions() {
+fn all_486_pi_settings_have_literal_control_plane_dispositions() {
 	let force_ctx = omp_con::Ctx::new();
 	let _force_link = [
 		omp_app::settings::LEGACY_CONVAR_MAPPINGS.len(),
@@ -4497,7 +4473,7 @@ fn all_488_pi_settings_have_literal_control_plane_dispositions() {
 		omp_catalog::pi_settings::LEGACY_CONVAR_MAPPINGS.len(),
 		omp_inference::pi_settings::LEGACY_CONVAR_MAPPINGS.len(),
 	];
-	assert_eq!(ROWS.len(), 488, "pi inventory must stay literal and complete");
+	assert_eq!(ROWS.len(), 486, "pi inventory must stay literal and complete");
 	let mut keys = BTreeSet::new();
 	let ctx = force_ctx;
 	for row in ROWS {
@@ -4573,21 +4549,21 @@ fn inventory_has_no_missing_or_wrong_status_variant() {
 			.iter()
 			.filter(|row| matches!(row.coverage, Coverage::Mapped))
 			.count(),
-		157
+		158
 	);
 	assert_eq!(
 		ROWS
 			.iter()
 			.filter(|row| matches!(row.coverage, Coverage::Declared))
 			.count(),
-		298
+		299
 	);
 	assert_eq!(
 		ROWS
 			.iter()
 			.filter(|row| matches!(row.coverage, Coverage::Deviation))
 			.count(),
-		33
+		29
 	);
 }
 
@@ -4793,6 +4769,123 @@ fn complete_files_tab_mechanically_matches_current_pi() {
 }
 
 #[test]
+fn complete_shell_tab_mechanically_matches_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| !matches!(row.coverage, Coverage::Deviation))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	let expected = pi
+		.entries
+		.into_iter()
+		.filter(|entry| entry.tab == "shell" && mappings.contains_key(entry.path.as_str()))
+		.map(|mut entry| {
+			entry.convar = mappings[entry.path.as_str()].to_owned();
+			entry
+		})
+		.collect::<Vec<_>>();
+	let entries = omp_con::builtin_ui_entries()
+		.filter(|entry| entry.tab == omp_con::SettingTab::Shell)
+		.collect::<Vec<_>>();
+	let deviations = [
+		"shellMinimizer.enabled",
+		"shellMinimizer.sourceOutlineLevel",
+		"eval.js",
+		"python.interpreter",
+	];
+	assert_eq!(entries.len() + deviations.len(), 15);
+	assert!(deviations.iter().all(|key| {
+		ROWS
+			.iter()
+			.any(|row| row.key == *key && matches!(row.coverage, Coverage::Deviation))
+	}));
+	let actual = entries
+		.iter()
+		.filter(|entry| !matches!(entry.widget, omp_con::UiWidget::ConfigOnly))
+		.map(|entry| projected_ui_entry(entry))
+		.collect::<Vec<_>>();
+	assert_eq!(entries.len(), 11);
+	assert_eq!(
+		entries
+			.iter()
+			.filter(|entry| matches!(entry.widget, omp_con::UiWidget::ConfigOnly))
+			.count(),
+		2
+	);
+	assert_eq!(actual.len(), 9);
+	assert_eq!(actual, expected);
+}
+
+#[test]
+fn tools_available_and_todos_groups_mechanically_match_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| !matches!(row.coverage, Coverage::Deviation))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	let expected = pi
+		.entries
+		.into_iter()
+		.filter(|entry| {
+			entry.tab == "tools" && matches!(entry.group.as_str(), "Available Tools" | "Todos")
+		})
+		.map(|mut entry| {
+			entry.convar = mappings[entry.path.as_str()].to_owned();
+			entry
+		})
+		.collect::<Vec<_>>();
+	let actual = omp_con::builtin_ui_entries()
+		.filter(|entry| {
+			entry.tab == omp_con::SettingTab::Tools
+				&& matches!(entry.group, "Available Tools" | "Todos")
+		})
+		.map(projected_ui_entry)
+		.collect::<Vec<_>>();
+	assert_eq!(actual.len(), 23);
+	assert_eq!(actual, expected);
+}
+
+#[test]
+fn tools_grep_and_browser_group_mechanically_matches_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| !matches!(row.coverage, Coverage::Deviation))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	let expected = pi
+		.entries
+		.into_iter()
+		.filter(|entry| entry.tab == "tools" && entry.group == "Grep & Browser")
+		.map(|mut entry| {
+			entry.convar = mappings[entry.path.as_str()].to_owned();
+			entry.description = entry
+				.description
+				.replace("PI_BROWSER_RELAY", "OMP_BROWSER_RELAY")
+				.replace("PI_BROWSER_CMUX", "OMP_BROWSER_CMUX");
+			entry
+		})
+		.collect::<Vec<_>>();
+	let actual = omp_con::builtin_ui_entries()
+		.filter(|entry| entry.tab == omp_con::SettingTab::Tools && entry.group == "Grep & Browser")
+		.map(projected_ui_entry)
+		.collect::<Vec<_>>();
+	assert_eq!(actual.len(), 8);
+	assert_eq!(actual, expected);
+}
+
+#[test]
 fn curated_settings_metadata_mechanically_matches_current_pi_for_every_mapped_setting() {
 	let Some(mut pi) = current_pi_ui() else {
 		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
@@ -4817,7 +4910,7 @@ fn curated_settings_metadata_mechanically_matches_current_pi_for_every_mapped_se
 		.map(projected_ui_entry)
 		.collect::<Vec<_>>();
 	assert_eq!(actual, pi.entries);
-	assert_eq!(actual.len(), 120);
+	assert_eq!(actual.len(), 122);
 
 	let ctx = omp_con::Ctx::new();
 	for entry in omp_con::builtin_ui_entries() {

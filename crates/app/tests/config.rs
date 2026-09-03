@@ -54,6 +54,42 @@ fn config_migrate_is_idempotent_and_maps_every_schema_key() {
 }
 
 #[test]
+fn keybinding_migration_replaces_action_defaults_without_erasing_unrelated_binds() {
+	let data = tempfile::tempdir().expect("data directory");
+	let config = tempfile::tempdir().expect("config directory");
+	// SAFETY: nextest runs each test in its own process.
+	unsafe { std::env::set_var("OMP_CONFIG_DIR", config.path()) };
+	let project = tempfile::tempdir().expect("project directory");
+	fs::write(
+		data.path().join("keybindings.toml"),
+		r#"
+active = "custom"
+
+[profiles.custom.bindings]
+"app.retry" = ["alt+shift+r"]
+"app.message.dequeue" = ["alt+up"]
+"#,
+	)
+	.expect("legacy keybindings");
+
+	let path = migrate_settings(data.path(), project.path()).expect("migration");
+	let script = fs::read_to_string(path).expect("config.cfg");
+	assert!(!script.contains("unbindall"), "a remap must not erase unrelated defaults");
+	assert!(script.contains("unbind f5"));
+	assert!(script.contains("unbind alt+r"));
+	assert!(script.contains("unbind shift+up"));
+	assert!(script.contains("bind alt+shift+r cl_retry"));
+
+	let ctx = omp_app::process_ctx(project.path()).expect("reload");
+	assert_eq!(ctx.bound("alt+r"), None);
+	assert_eq!(ctx.bound("f5"), None);
+	assert_eq!(ctx.bound("alt+shift+r").as_deref(), Some("cl_retry"));
+	assert_eq!(ctx.bound("shift+up"), None);
+	assert_eq!(ctx.bound("alt+up").as_deref(), Some("cl_dequeue"));
+	assert_eq!(ctx.bound("enter").as_deref(), Some("ed_enter"));
+}
+
+#[test]
 fn config_migrate_keeps_project_values_out_of_the_user_cfg() {
 	let data = tempfile::tempdir().expect("data directory");
 	let config = tempfile::tempdir().expect("config directory");
@@ -71,6 +107,10 @@ fn config_migrate_keeps_project_values_out_of_the_user_cfg() {
 	assert!(!user_script.contains("cl_stt_model"), "project value leaked into the user scope");
 	let project_script =
 		fs::read_to_string(project.path().join(".omp/config.cfg")).expect("project config.cfg");
+	assert!(
+		!project_script.contains("unbindall"),
+		"a settings migration must preserve default binds"
+	);
 	assert!(project_script.contains("cl_stt_model turbo"));
 	assert!(!project_script.contains("cl_voice_stt_enabled"));
 	let ctx = omp_app::process_ctx(project.path()).expect("reload context");

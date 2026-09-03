@@ -243,7 +243,9 @@ async fn content_block_prompts_journal_text_and_image_attachments() {
 	assert!(
 		frames.iter().all(|frame| {
 			!matches!(
-				frame.pointer("/params/update/sessionUpdate").and_then(Value::as_str),
+				frame
+					.pointer("/params/update/sessionUpdate")
+					.and_then(Value::as_str),
 				Some("patch" | "snapshot")
 			)
 		}),
@@ -316,8 +318,20 @@ async fn new_load_and_resume_switch_the_authoritative_durable_session() {
 			.join(format!("{new_id}.oms"))
 			.exists()
 	);
-	assert_eq!(response(&frames, "load")["result"]["sessionId"], "target");
-	assert_eq!(response(&frames, "resume")["result"]["sessionId"], "resumed");
+	assert!(
+		response(&frames, "load")["result"]
+			.get("sessionId")
+			.is_none(),
+		"ACP load response identifies the already-requested session implicitly",
+	);
+	assert!(
+		response(&frames, "resume")["result"]
+			.get("sessionId")
+			.is_none(),
+		"ACP resume response identifies the already-requested session implicitly",
+	);
+	assert_eq!(response(&frames, "load")["result"]["modes"]["currentModeId"], "default",);
+	assert_eq!(response(&frames, "resume")["result"]["modes"]["currentModeId"], "default",);
 
 	let target =
 		Session::open(&target_path, ComponentRegistry::standard()).expect("load target reopens");

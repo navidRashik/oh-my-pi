@@ -140,6 +140,21 @@ fn literal_full_pi_keymap_is_expressed_by_default_cfg() {
 }
 
 #[test]
+fn custom_editor_actions_precede_colliding_base_editor_defaults() {
+	let bindings = default_bindings();
+	assert_eq!(
+		bindings.command_for("ctrl+c"),
+		Some("cl_clear; cl_interrupt; ed_copy"),
+		"the custom editor clear action precedes base-editor copy"
+	);
+	assert_eq!(
+		bindings.command_for("ctrl+d"),
+		Some("panel_delete; cl_exit; ed_delete"),
+		"panel deletion gets first refusal, then custom editor exit precedes base deletion"
+	);
+}
+
+#[test]
 fn every_default_bind_names_registered_console_commands() {
 	let ctx = omp_con::Ctx::new();
 	for (_, script) in default_bindings().bindings {

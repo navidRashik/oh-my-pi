@@ -1,5 +1,7 @@
 //! Claude Code and Codex transcript import into native `.oms` journals.
 
+mod convert;
+
 use std::{
 	fs,
 	io::{self, BufRead, BufReader, IsTerminal as _, Write},
@@ -9,8 +11,6 @@ use std::{
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_core::Str;
-use omp_dom::{Op, PropId, PropKey, Txn, Value as DomValue};
-use omp_session::{ComponentRegistry, Session};
 use serde_json::Value;
 
 use crate::cli::ChatArgs;
@@ -59,10 +59,17 @@ impl From<omp_chat::overlays::services::ForeignSessionSource> for ForeignFormat 
 /// native session.
 pub fn candidates(format: ForeignFormat) -> miette::Result<Vec<ForeignCandidate>> {
 	let root = foreign_root(format)?;
-	jsonl_candidates(&root)?
+	let mut candidates = jsonl_candidates(format, &root)?
 		.into_iter()
 		.map(|path| inspect_candidate(format, path, &root))
-		.collect()
+		.collect::<miette::Result<Vec<_>>>()?;
+	candidates.sort_by(|left, right| {
+		right
+			.modified_ms
+			.cmp(&left.modified_ms)
+			.then_with(|| left.path.cmp(&right.path))
+	});
+	Ok(candidates)
 }
 
 /// Lets the operator select a requested foreign session, imports it, and
@@ -74,7 +81,10 @@ pub(crate) fn prepare(args: &mut ChatArgs) -> miette::Result<()> {
 		ForeignFormat::Codex
 	};
 	let root = foreign_root(format)?;
-	let candidates = jsonl_candidates(&root)?;
+	let candidates = candidates(format)?
+		.into_iter()
+		.map(|candidate| candidate.path)
+		.collect::<Vec<_>>();
 	let source = match candidates.as_slice() {
 		[] => {
 			return Err(miette!(
@@ -171,130 +181,17 @@ pub fn import_selected(
 	Ok(destination.to_path_buf())
 }
 
-/// Imports one foreign JSONL fixture into a replayable `.oms` journal.
+/// Imports one foreign JSONL transcript into a replayable `.oms` journal.
+///
+/// Conversion retains the exact source bytes in the journal's content-addressed
+/// store and materializes every representable message, content block, tool
+/// exchange, attachment, timestamp, usage record, and branch.
 pub fn import_file(
 	format: ForeignFormat,
 	source: &Path,
 	destination: &Path,
 ) -> miette::Result<usize> {
-	if destination.extension().and_then(|value| value.to_str()) != Some("oms") {
-		return Err(miette!("native session destination must use the .oms extension"));
-	}
-	if let Some(parent) = destination.parent() {
-		fs::create_dir_all(parent).into_diagnostic()?;
-	}
-	let input = BufReader::new(fs::File::open(source).into_diagnostic()?);
-	let mut messages = Vec::new();
-	for (line_number, line) in input.lines().enumerate() {
-		let line = line.into_diagnostic()?;
-		if line.trim().is_empty() {
-			continue;
-		}
-		let value: Value = serde_json::from_str(&line)
-			.map_err(|source| miette!("invalid JSON on line {}: {source}", line_number + 1))?;
-		if let Some(message) = foreign_message(format, &value) {
-			messages.push(message);
-		}
-	}
-	let mut session =
-		Session::create(destination, ComponentRegistry::standard()).into_diagnostic()?;
-	let cause = session
-		.head()
-		.ok_or_else(|| miette!("imported session has no genesis entry"))?;
-	session
-		.patch(Txn {
-			cause,
-			label: Some(Str::new_static("session.import")),
-			ops: vec![
-				Op::Set {
-					h:     session.dom().meta(),
-					prop:  PropKey::Custom(Str::new_static("import-source")),
-					value: DomValue::Str(Str::new(source.to_string_lossy())),
-				},
-				Op::Set {
-					h:     session.dom().meta(),
-					prop:  PropKey::Custom(Str::new_static("import-format")),
-					value: DomValue::Str(Str::new_static(match format {
-						ForeignFormat::Claude => "claude",
-						ForeignFormat::Codex => "codex",
-					})),
-				},
-			],
-		})
-		.into_diagnostic()?;
-	let mut turn_open = false;
-	for (role, text) in &messages {
-		match *role {
-			"user" => {
-				session.begin_turn().into_diagnostic()?;
-				session.user(text.as_str(), Vec::new()).into_diagnostic()?;
-				turn_open = true;
-			},
-			"assistant" => {
-				if !turn_open {
-					session.begin_turn().into_diagnostic()?;
-					session.user("", Vec::new()).into_diagnostic()?;
-				}
-				session
-					.assistant_start("imported", "foreign", "foreign/imported")
-					.into_diagnostic()?;
-				let turn = *session
-					.dom()
-					.children(session.dom().body())
-					.last()
-					.ok_or_else(|| miette!("imported turn is absent"))?;
-				let assistant = session
-					.dom()
-					.children(turn)
-					.iter()
-					.copied()
-					.find(|handle| {
-						session.dom().get(*handle).is_some_and(|node| {
-							node.tag == omp_dom::Tag::Known(omp_dom::KnownTag::Assistant)
-						})
-					})
-					.ok_or_else(|| miette!("imported assistant node is absent"))?;
-				session
-					.patch(Txn {
-						cause: session
-							.head()
-							.ok_or_else(|| miette!("import head is absent"))?,
-						label: Some(Str::new_static("assistant.content")),
-						ops:   vec![Op::Ins {
-							parent: assistant,
-							after:  None,
-							node:   omp_dom::NodeSpec::new(omp_dom::Tag::Custom(Str::new_static(
-								omp_session::ASSISTANT_CONTENT_TAG,
-							)))
-							.with_prop(PropId::Kind, DomValue::Str(Str::new_static("text")))
-							.with_prop(
-								PropKey::Custom(Str::new_static(omp_session::PROVIDER_BLOCK_INDEX_PROP)),
-								DomValue::Int(0),
-							)
-							.with_prop(PropId::Text, DomValue::Str(Str::new_static(""))),
-						}],
-					})
-					.into_diagnostic()?;
-				let content = *session
-					.dom()
-					.children(assistant)
-					.last()
-					.ok_or_else(|| miette!("imported assistant content node is absent"))?;
-				let sid = session
-					.stream_open(content, PropId::Text.into())
-					.into_diagnostic()?;
-				session
-					.stream_append(sid, text.as_str())
-					.into_diagnostic()?;
-				session.stream_close(sid).into_diagnostic()?;
-				session.assistant_end("imported").into_diagnostic()?;
-				turn_open = false;
-			},
-			_ => {},
-		}
-	}
-	session.process_exit().into_diagnostic()?;
-	Ok(messages.len())
+	convert::import_file(format, source, destination)
 }
 
 fn foreign_root(format: ForeignFormat) -> miette::Result<PathBuf> {
@@ -302,9 +199,20 @@ fn foreign_root(format: ForeignFormat) -> miette::Result<PathBuf> {
 		.map(PathBuf::from)
 		.ok_or_else(|| miette!("HOME is unset"))?;
 	Ok(match format {
-		ForeignFormat::Claude => home.join(".claude/projects"),
-		ForeignFormat::Codex => home.join(".codex/sessions"),
+		ForeignFormat::Claude => std::env::var_os("CLAUDE_CONFIG_DIR")
+			.map(PathBuf::from)
+			.unwrap_or_else(|| home.join(".claude")),
+		ForeignFormat::Codex => home.join(".codex"),
 	})
+}
+
+fn transcript_roots(format: ForeignFormat, root: &Path) -> Vec<PathBuf> {
+	match format {
+		ForeignFormat::Claude => vec![root.join("projects"), root.join(".projects")],
+		ForeignFormat::Codex => {
+			vec![root.join("sessions"), root.join(".sessions"), root.join("archived_sessions")]
+		},
+	}
 }
 
 fn validate_selection(format: ForeignFormat, source: &Path) -> miette::Result<PathBuf> {
@@ -315,16 +223,12 @@ fn validate_selection(format: ForeignFormat, source: &Path) -> miette::Result<Pa
 		},
 		Err(error) => return Err(error).into_diagnostic(),
 	};
-	let root = match fs::canonicalize(foreign_root(format)?) {
-		Ok(path) => path,
-		Err(error) if error.kind() == io::ErrorKind::NotFound => {
-			return Err(miette!("Selected {format} session is no longer available"));
-		},
-		Err(error) => return Err(error).into_diagnostic(),
-	};
-	if source.extension().and_then(|value| value.to_str()) != Some("jsonl")
-		|| !source.starts_with(&root)
-	{
+	let root = foreign_root(format)?;
+	let allowed = transcript_roots(format, &root)
+		.into_iter()
+		.filter_map(|path| fs::canonicalize(path).ok())
+		.any(|path| source.starts_with(path));
+	if source.extension().and_then(|value| value.to_str()) != Some("jsonl") || !allowed {
 		return Err(miette!(
 			"Selected {format} session is outside the {format} transcript directory"
 		));
@@ -358,18 +262,34 @@ fn inspect_candidate(
 		first_message: None,
 	};
 	let exact_count = metadata.len() <= MAX_EAGER_INDEX_BYTES;
-	let input = BufReader::new(fs::File::open(&candidate.path).into_diagnostic()?);
+	let mut input = BufReader::new(fs::File::open(&candidate.path).into_diagnostic()?);
 	let mut indexed_bytes = 0_u64;
-	for line in input.lines() {
-		let line = line.into_diagnostic()?;
-		indexed_bytes = indexed_bytes.saturating_add(line.len() as u64 + 1);
+	let mut source_created_ms = None::<u64>;
+	let mut source_modified_ms = None::<u64>;
+	let mut line = Vec::new();
+	loop {
+		line.clear();
+		let read = input.read_until(b'\n', &mut line).into_diagnostic()?;
+		if read == 0 {
+			break;
+		}
+		indexed_bytes = indexed_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
 		if !exact_count && indexed_bytes > MAX_EAGER_INDEX_BYTES {
 			break;
 		}
-		let Ok(value) = serde_json::from_str::<Value>(&line) else {
+		let Ok(value) = serde_json::from_slice::<Value>(&line) else {
 			continue;
 		};
 		let payload = value.get("payload").unwrap_or(&value);
+		if let Some(timestamp) = foreign_timestamp_ms(
+			value
+				.get("timestamp")
+				.or_else(|| value.get("ts"))
+				.or_else(|| payload.get("timestamp")),
+		) {
+			source_created_ms = Some(source_created_ms.map_or(timestamp, |old| old.min(timestamp)));
+			source_modified_ms = Some(source_modified_ms.map_or(timestamp, |old| old.max(timestamp)));
+		}
 		if let Some(id) = value.get("sessionId").and_then(Value::as_str).or_else(|| {
 			(value.get("type").and_then(Value::as_str) == Some("session_meta"))
 				.then(|| payload.get("id").and_then(Value::as_str))
@@ -384,14 +304,20 @@ fn inspect_candidate(
 		{
 			candidate.cwd = PathBuf::from(cwd);
 		}
-		if candidate.title.is_none() {
-			candidate.title = value
+		let record_title = match value.get("type").and_then(Value::as_str) {
+			Some("custom-title") => value.get("customTitle").and_then(Value::as_str),
+			Some("ai-title") => value.get("aiTitle").and_then(Value::as_str),
+			_ if payload.get("type").and_then(Value::as_str) == Some("thread_name_updated") => {
+				payload.get("thread_name").and_then(Value::as_str)
+			},
+			_ => value
 				.get("summary")
 				.and_then(Value::as_str)
 				.or_else(|| value.get("title").and_then(Value::as_str))
-				.or_else(|| payload.get("title").and_then(Value::as_str))
-				.filter(|title| !title.trim().is_empty())
-				.map(Str::new);
+				.or_else(|| payload.get("title").and_then(Value::as_str)),
+		};
+		if let Some(title) = record_title.filter(|title| !title.trim().is_empty()) {
+			candidate.title = Some(Str::new(title));
 		}
 		if let Some((role, text)) = foreign_message(format, &value) {
 			candidate.messages = candidate.messages.saturating_add(1);
@@ -407,6 +333,12 @@ fn inspect_candidate(
 	if !exact_count {
 		candidate.messages = 0;
 	}
+	if let Some(created) = source_created_ms {
+		candidate.created_ms = created;
+	}
+	if exact_count && let Some(modified) = source_modified_ms {
+		candidate.modified_ms = modified;
+	}
 	Ok(candidate)
 }
 
@@ -417,6 +349,19 @@ fn system_time_millis(time: SystemTime) -> u64 {
 		.as_millis()
 		.try_into()
 		.unwrap_or(u64::MAX)
+}
+
+fn foreign_timestamp_ms(value: Option<&Value>) -> Option<u64> {
+	let value = value?;
+	if let Some(number) = value.as_u64() {
+		return Some(if number < 10_000_000_000 {
+			number.saturating_mul(1000)
+		} else {
+			number
+		});
+	}
+	let timestamp = value.as_str()?.parse::<jiff::Timestamp>().ok()?;
+	u64::try_from(timestamp.as_millisecond()).ok()
 }
 
 fn foreign_message(format: ForeignFormat, value: &Value) -> Option<(&'static str, Str)> {
@@ -480,8 +425,10 @@ fn text_content(value: &Value) -> Option<Str> {
 	(!text.is_empty()).then(|| Str::new(text))
 }
 
-fn jsonl_candidates(root: &Path) -> miette::Result<Vec<PathBuf>> {
-	let mut stack = vec![root.to_path_buf()];
+fn jsonl_candidates(format: ForeignFormat, root: &Path) -> miette::Result<Vec<PathBuf>> {
+	let mut stack = transcript_roots(format, root);
+	stack.sort();
+	stack.dedup();
 	let mut candidates = Vec::new();
 	while let Some(directory) = stack.pop() {
 		let entries = match fs::read_dir(&directory) {
@@ -500,12 +447,16 @@ fn jsonl_candidates(root: &Path) -> miette::Result<Vec<PathBuf>> {
 			}
 		}
 	}
+	sort_candidate_paths(&mut candidates);
+	Ok(candidates.into_iter().map(|(_, path)| path).collect())
+}
+
+fn sort_candidate_paths(candidates: &mut [(SystemTime, PathBuf)]) {
 	candidates.sort_by(|(left_time, left_path), (right_time, right_path)| {
 		right_time
 			.cmp(left_time)
 			.then_with(|| left_path.cmp(right_path))
 	});
-	Ok(candidates.into_iter().map(|(_, path)| path).collect())
 }
 
 fn select_candidate(
@@ -533,6 +484,9 @@ fn select_candidate(
 
 #[cfg(test)]
 mod tests {
+	use omp_dom::{PropKey, Value as DomValue};
+	use omp_session::{ComponentRegistry, Session};
+
 	use super::*;
 
 	#[test]
@@ -545,6 +499,23 @@ mod tests {
 		let rendered = String::from_utf8(output).unwrap();
 		assert!(rendered.contains("1. newest.jsonl"));
 		assert!(rendered.contains("2. older.jsonl"));
+	}
+
+	#[test]
+	fn candidate_order_is_newest_first_then_path_ascending() {
+		let earlier = UNIX_EPOCH + std::time::Duration::from_secs(1);
+		let later = UNIX_EPOCH + std::time::Duration::from_secs(2);
+		let mut rows = vec![
+			(later, PathBuf::from("z.jsonl")),
+			(earlier, PathBuf::from("old.jsonl")),
+			(later, PathBuf::from("a.jsonl")),
+		];
+		sort_candidate_paths(&mut rows);
+		assert_eq!(rows.into_iter().map(|(_, path)| path).collect::<Vec<_>>(), vec![
+			PathBuf::from("a.jsonl"),
+			PathBuf::from("z.jsonl"),
+			PathBuf::from("old.jsonl"),
+		]);
 	}
 
 	#[test]

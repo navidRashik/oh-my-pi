@@ -2,8 +2,8 @@
 
 //! Production application CLI, TUI, and command dispatch.
 
-pub mod acp_mode;
 mod acp_events;
+pub mod acp_mode;
 pub mod audio_coordinator;
 pub mod auth_broker_cmd;
 pub mod auth_cli;
@@ -44,6 +44,7 @@ mod gui;
 pub mod help_extra;
 pub mod images_cmd;
 pub mod keybindings;
+mod live_reachability;
 pub mod models_cmd;
 pub(crate) mod pickers;
 pub mod print_mode;
