@@ -14,7 +14,7 @@ readme = "README.md"
 
 [features]
 default = ["native-audio"]
-native-audio = ["dep:libc", "dep:windows-sys"]
+native-audio = ["dep:libc", "dep:windows-sys", "dep:block2", "dep:objc2"]
 realtime-media = ["dep:audiopus_sys", "dep:bytes",  "dep:opus", "dep:webrtc"]
 realtime-transport = ["realtime-media", "device-attestation", "dep:futures", "dep:http", "dep:serde", "dep:serde_json", "dep:tokio-tungstenite", "dep:url"]
 device-attestation = ["dep:block2", "dep:objc2", "dep:objc2-foundation"]

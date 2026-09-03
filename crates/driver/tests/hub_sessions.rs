@@ -64,6 +64,13 @@ async fn send_lands_in_child_steering_and_inbox_reads_it() {
 		StaticPrompt(Str::new_static("test")),
 	);
 	let sessions = SessionRegistry::new();
+	let (main_up, _main_inbox) = flume::unbounded();
+	sessions.register(Str::new_static("Main"), KernelHandle {
+		id:       SessionId::new("main"),
+		name:     Str::new_static("Main"),
+		up:       main_up,
+		snapshot: Arc::new(RwLock::new(child.dom().snapshot())),
+	});
 	sessions.register(Str::new_static("Child"), KernelHandle {
 		id:       SessionId::new("child"),
 		name:     Str::new_static("Child"),
@@ -71,7 +78,14 @@ async fn send_lands_in_child_steering_and_inbox_reads_it() {
 		snapshot: Arc::new(RwLock::new(child.dom().snapshot())),
 	});
 
-	SessionHub::send(&sessions, "child", Str::new_static("please adjust")).expect("hub send");
+	SessionHub::send(
+		&sessions,
+		"Main",
+		"child",
+		Str::new_static("please adjust"),
+		None,
+	)
+	.expect("hub send");
 	kernel
 		.run_turn(
 			&mut child,

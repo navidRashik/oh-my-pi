@@ -16,7 +16,8 @@ use thiserror::Error;
 pub mod attestation;
 pub mod audio;
 pub mod coordinator;
-mod device;
+/// Native device discovery, permission, hot-plug observation, and selection.
+pub mod device;
 #[cfg(feature = "realtime-media")]
 pub mod live;
 /// Fence-aware enhanced-speech rewriting.
@@ -61,6 +62,12 @@ pub enum VoiceError {
 	/// A producer attempted to write after playback input was finished.
 	#[error("native audio playback is closed")]
 	PlaybackClosed,
+	/// A non-blocking producer exceeded the bounded speaker queue.
+	#[error("native audio playback queue reached its {capacity}-chunk limit")]
+	PlaybackBackpressure {
+		/// Configured queue capacity.
+		capacity: usize,
+	},
 	/// Playback gain was NaN or infinite.
 	#[error("audio playback gain must be finite")]
 	NonFiniteGain,

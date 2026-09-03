@@ -10,19 +10,23 @@ use std::{
 };
 
 use omp_agent::{
-	CallControl, JobBoard, JobSettlement, Received, SessionAuthority, SessionTool, SessionToolCx,
-	SessionToolFuture, Up,
+	CallControl, EnvEvent, JobBoard, JobSettlement, Received, SessionAuthority, SessionEndpoint,
+	SessionTool, SessionToolCx, SessionToolFuture, Up,
 };
 use omp_core::{EnvPath, Str, sf};
 use omp_dom::{Handle, KnownTag, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_env::{EnvClient, ProcessAttachmentEvent};
+use omp_journal::data::{
+	IrcDirection, IrcTraffic, LaunchDaemonCompletion, LaunchDaemonFault, LaunchDaemonFaultKind,
+	LaunchDaemonStatus,
+};
 use omp_proto::{
 	SCHEMA_REV,
 	env::v1::{
-		AttachOutput, EnvironmentDelta, ListProcesses, ProcessInfo, ProcessSpec, ProcessState,
-		PtySpec, ReadyLog, ReadyProbe, ReadyTcp, RestartPolicy as WireRestartPolicy, RestartProcess,
-		RestartSpec, Script, SendInput, SignalProcess, StartProcess, StopProcess, ready_probe,
-		send_input,
+		AttachOutput, EnvironmentDelta, ExecOutcome, ListProcesses, ProcessInfo, ProcessSpec,
+		ProcessState, PtySpec, ReadyLog, ReadyProbe, ReadyTcp, RestartPolicy as WireRestartPolicy,
+		RestartProcess, RestartSpec, Script, SendInput, SignalProcess, StartProcess, StopProcess,
+		ready_probe, send_input,
 	},
 };
 use omp_session::components::jobs::{self, JobSpec};
@@ -52,10 +56,12 @@ impl SessionHub {
 	/// Sends one steering item through the target kernel mailbox.
 	pub fn send(
 		authority: &dyn SessionAuthority,
+		from: &str,
 		to: &str,
 		message: Str,
+		reply_to: Option<Str>,
 	) -> Result<Response, omp_agent::SessionToolError> {
-		send_to(authority, to, message)
+		send_to(authority, from, to, message, reply_to)
 	}
 
 	/// Reads or drains the caller's journal-backed steering inbox.
@@ -112,13 +118,17 @@ impl SessionTool for HubSessionTool {
 				HubOp::Send if params.name.is_some() => {
 					process_send(&self.env, &params).await.map_err(fault_text)
 				},
-				HubOp::Send if params.await_reply => match send(cx.authority, &params) {
-					Ok(_) => wait_peer(cx.session, cx.control, params.timeout_ms)
-						.await
-						.map_err(fault_text),
-					Err(error) => Err(fault_text(error)),
+				HubOp::Send if params.await_reply => {
+					match send(cx.authority, self.caller_id.as_str(), &params) {
+						Ok(_) => wait_peer(cx.session, cx.control, params.timeout_ms)
+							.await
+							.map_err(fault_text),
+						Err(error) => Err(fault_text(error)),
+					}
 				},
-				HubOp::Send => send(cx.authority, &params).map_err(fault_text),
+				HubOp::Send => {
+					send(cx.authority, self.caller_id.as_str(), &params).map_err(fault_text)
+				},
 				HubOp::Inbox => inbox(cx.session, params.peek).map_err(fault_text),
 				HubOp::Wait => wait(cx.session, cx.jobs, cx.control, &self.env, &params)
 					.await
@@ -174,6 +184,7 @@ fn fault_text(error: impl std::fmt::Display) -> Fault {
 
 fn send(
 	authority: Option<&dyn SessionAuthority>,
+	caller_id: &str,
 	params: &Params,
 ) -> Result<Response, omp_agent::SessionToolError> {
 	let authority = authority.ok_or_else(|| omp_agent::SessionToolError::Rejected {
@@ -191,26 +202,39 @@ fn send(
 		.ok_or_else(|| omp_agent::SessionToolError::Rejected {
 			message: Str::new_static("hub send requires `message`"),
 		})?;
-	send_to(authority, target, message)
+	send_to(authority, caller_id, target, message, params.reply_to.clone())
 }
 
 fn send_to(
 	authority: &dyn SessionAuthority,
+	caller_id: &str,
 	target: &str,
 	message: Str,
+	reply_to: Option<Str>,
 ) -> Result<Response, omp_agent::SessionToolError> {
+	let from = authority.lookup(caller_id).ok_or_else(|| {
+		omp_agent::SessionToolError::Rejected {
+			message: Str::new_static("calling session is not live"),
+		}
+	})?;
 	let delivered = if target == "all" {
 		authority
 			.list()
 			.into_iter()
-			.filter(|endpoint| endpoint.up.send(Up::Peer(message.clone())).is_ok())
+			.filter(|endpoint| {
+				deliver_peer(
+					endpoint,
+					&from,
+					message.clone(),
+					reply_to.clone(),
+					unix_timestamp_ms(),
+				)
+			})
 			.count()
 	} else {
-		usize::from(
-			authority
-				.lookup(target)
-				.is_some_and(|endpoint| endpoint.up.send(Up::Peer(message)).is_ok()),
-		)
+		usize::from(authority.lookup(target).is_some_and(|endpoint| {
+			deliver_peer(&endpoint, &from, message, reply_to, unix_timestamp_ms())
+		}))
 	};
 	if delivered == 0 {
 		return Err(omp_agent::SessionToolError::Rejected {
@@ -221,6 +245,39 @@ fn send_to(
 		text:    Str::new(serde_json::json!({ "delivered": delivered }).to_string()),
 		useless: false,
 	})
+}
+
+fn deliver_peer(
+	target: &SessionEndpoint,
+	from: &SessionEndpoint,
+	body: Str,
+	reply_to: Option<Str>,
+	timestamp_ms: u64,
+) -> bool {
+	let payload = IrcTraffic {
+		direction: IrcDirection::Incoming,
+		from: Some(from.name.clone()),
+		to: Some(target.name.clone()),
+		body: body.clone(),
+		reply_to,
+		pool: None,
+		mode: None,
+		timestamp_ms,
+	};
+	// The mailbox is FIFO per sender. The display-only observation therefore
+	// reaches the controller before the ordinary peer body, while `Up::Peer`
+	// remains the sole model-delivery path.
+	target
+		.up
+		.send(Up::Env(EnvEvent::IrcTraffic { payload: Arc::new(payload) }))
+		.is_ok()
+		&& target.up.send(Up::Peer(body)).is_ok()
+}
+
+fn unix_timestamp_ms() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn list(
@@ -703,11 +760,25 @@ fn spawn_process_task(
 ) -> tokio::task::JoinHandle<JobSettlement> {
 	tokio::spawn(async move {
 		match monitor_process(&env, &name, initial, cancel).await {
-			Ok(status) => JobSettlement { status, output: None, error: None },
-			Err(error) => JobSettlement {
-				status: Str::new_static("failed"),
-				output: None,
-				error:  Some(Str::new(error.to_string())),
+			Ok(process) => process_settlement(process),
+			Err(error) => {
+				let message = Str::new(error.to_string());
+				JobSettlement {
+					status:     Str::new_static("failed"),
+					output:     None,
+					error:      Some(message.clone()),
+					completion: Some(LaunchDaemonCompletion {
+						name:        Str::new(name),
+						status:      LaunchDaemonStatus::Failed,
+						exit_code:   None,
+						duration_ms: 0,
+						fault:       Some(LaunchDaemonFault {
+							kind:    LaunchDaemonFaultKind::Supervisor,
+							message: Some(message),
+							signal:  None,
+						}),
+					}),
+				}
 			},
 		}
 	})
@@ -718,7 +789,7 @@ async fn monitor_process(
 	name: &str,
 	initial: bool,
 	cancel: CancellationToken,
-) -> Result<Str, omp_agent::SessionToolError> {
+) -> Result<ProcessInfo, omp_agent::SessionToolError> {
 	let mut process = find_process(env, name).await?;
 	if !initial && terminal_process(&process) {
 		let started = env
@@ -730,10 +801,15 @@ async fn monitor_process(
 			})
 			.await
 			.map_err(env_error)?;
-		process.generation = started.generation;
+		process = find_process(env, name).await?;
+		if process.generation != started.generation {
+			return Err(omp_agent::SessionToolError::Rejected {
+				message: Str::new_static("restarted process generation was not observable"),
+			});
+		}
 	}
 	if terminal_process(&process) {
-		return Ok(process_status(&process));
+		return Ok(process);
 	}
 	let mut attachment = env
 		.attach_output(AttachOutput {
@@ -748,9 +824,11 @@ async fn monitor_process(
 		})
 		.await
 		.map_err(env_error)?;
+	let mut stopping = false;
 	loop {
 		tokio::select! {
-			() = cancel.cancelled() => {
+			() = cancel.cancelled(), if !stopping => {
+				stopping = true;
 				env.stop_process(StopProcess {
 					name: name.to_owned(),
 					grace_ms: 5_000,
@@ -759,34 +837,73 @@ async fn monitor_process(
 				})
 				.await
 				.map_err(env_error)?;
-				return Ok(Str::new_static("cancelled"));
 			},
 			event = attachment.next_event() => match event.map_err(env_error)? {
 				Some(ProcessAttachmentEvent::State(state)) => {
 					let Some(next) = state.process else { continue };
 					if terminal_process(&next) {
-						return Ok(process_status(&next));
+						return Ok(next);
 					}
 				},
 				Some(ProcessAttachmentEvent::Attached(_) | ProcessAttachmentEvent::Output(_)) => {},
 				None => {
 					let current = find_process(env, name).await?;
-					return Ok(process_status(&current));
+					return Ok(current);
 				},
 			}
 		}
 	}
 }
 
-fn process_status(process: &ProcessInfo) -> Str {
-	match process.state() {
-		ProcessState::Exited => Str::new_static("completed"),
-		ProcessState::Stopped => Str::new_static("cancelled"),
-		ProcessState::Failed => Str::new_static("failed"),
-		ProcessState::Starting
-		| ProcessState::Ready
-		| ProcessState::Running
-		| ProcessState::Unspecified => Str::new_static("running"),
+fn process_settlement(process: ProcessInfo) -> JobSettlement {
+	let execution = process.status.as_ref();
+	let exit_code = execution.and_then(|status| status.exit_code);
+	let outcome = execution
+		.and_then(|status| ExecOutcome::try_from(status.outcome).ok())
+		.unwrap_or(ExecOutcome::Unspecified);
+	let completed = process.state() == ProcessState::Exited
+		&& exit_code.is_none_or(|code| code == 0)
+		&& matches!(outcome, ExecOutcome::Unspecified | ExecOutcome::Exited);
+	let fault_kind = if completed {
+		None
+	} else {
+		Some(match outcome {
+			ExecOutcome::Timeout => LaunchDaemonFaultKind::Timeout,
+			ExecOutcome::Cancelled => LaunchDaemonFaultKind::Cancelled,
+			ExecOutcome::Denied => LaunchDaemonFaultKind::Denied,
+			ExecOutcome::Failed | ExecOutcome::Exited => LaunchDaemonFaultKind::Failed,
+			ExecOutcome::Unspecified if process.state() == ProcessState::Stopped => {
+				LaunchDaemonFaultKind::Cancelled
+			},
+			ExecOutcome::Unspecified
+				if process.state() == ProcessState::Failed
+					|| exit_code.is_some_and(|code| code != 0) =>
+			{
+				LaunchDaemonFaultKind::Failed
+			},
+			ExecOutcome::Unspecified => LaunchDaemonFaultKind::Supervisor,
+		})
+	};
+	let signal = execution
+		.map(|status| status.signal.as_str())
+		.filter(|signal| !signal.is_empty())
+		.map(Str::new);
+	let completion = LaunchDaemonCompletion {
+		name: Str::new(process.name),
+		status: if completed {
+			LaunchDaemonStatus::Completed
+		} else {
+			LaunchDaemonStatus::Failed
+		},
+		exit_code,
+		duration_ms: execution.map_or(0, |status| status.wall_clock_ms),
+		fault: fault_kind.map(|kind| LaunchDaemonFault { kind, message: None, signal }),
+	};
+	JobSettlement {
+		status:     Str::new_static(if completed { "completed" } else { "failed" }),
+		output:     None,
+		error:      None,
+		completion: Some(completion),
 	}
 }
 
@@ -1342,6 +1459,56 @@ mod tests {
 			assert!(process_matches_wait(&process(state), "exit"));
 		}
 		assert!(!process_matches_wait(&process(ProcessState::Running), "exit"));
+	}
+
+	#[test]
+	fn process_settlement_preserves_terminal_status_exit_duration_and_fault() {
+		let process = |state, outcome, exit_code, signal: &str| ProcessInfo {
+			name: Str::new_static("web").to_string(),
+			state: state as i32,
+			status: Some(omp_proto::env::v1::ExecStatusMsg {
+				outcome: outcome as i32,
+				exit_code,
+				signal: signal.to_owned(),
+				wall_clock_ms: 1_234,
+				..Default::default()
+			}),
+			..ProcessInfo::default()
+		};
+
+		let success =
+			process_settlement(process(ProcessState::Exited, ExecOutcome::Exited, Some(0), ""))
+				.completion
+				.expect("completion");
+		assert_eq!(success.status, LaunchDaemonStatus::Completed);
+		assert_eq!(success.exit_code, Some(0));
+		assert_eq!(success.duration_ms, 1_234);
+		assert!(success.fault.is_none());
+
+		let nonzero =
+			process_settlement(process(ProcessState::Exited, ExecOutcome::Exited, Some(17), ""))
+				.completion
+				.expect("completion");
+		assert_eq!(nonzero.status, LaunchDaemonStatus::Failed);
+		assert_eq!(nonzero.fault.expect("nonzero fault").kind, LaunchDaemonFaultKind::Failed);
+
+		let timeout =
+			process_settlement(process(ProcessState::Failed, ExecOutcome::Timeout, None, "SIGKILL"))
+				.completion
+				.expect("completion");
+		let fault = timeout.fault.expect("timeout fault");
+		assert_eq!(fault.kind, LaunchDaemonFaultKind::Timeout);
+		assert_eq!(fault.signal.as_deref(), Some("SIGKILL"));
+
+		let stopped = process_settlement(process(
+			ProcessState::Stopped,
+			ExecOutcome::Unspecified,
+			None,
+			"SIGTERM",
+		))
+		.completion
+		.expect("completion");
+		assert_eq!(stopped.fault.expect("stopped fault").kind, LaunchDaemonFaultKind::Cancelled);
 	}
 
 	#[test]

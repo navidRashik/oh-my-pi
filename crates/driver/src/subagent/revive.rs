@@ -220,12 +220,18 @@ async fn live_loop(child: Revived, first: Option<Str>, cancel: CancellationToken
 				workspace,
 				error: error.clone(),
 			};
-			JobSettlement { status, output: serde_json::value::to_raw_value(&result).ok(), error }
+			JobSettlement {
+				status,
+				output: serde_json::value::to_raw_value(&result).ok(),
+				error,
+				completion: None,
+			}
 		},
 		Err(source) => JobSettlement {
-			status: Str::new_static("failed"),
-			output: None,
-			error:  Some(Str::new(source.to_string())),
+			status:     Str::new_static("failed"),
+			output:     None,
+			error:      Some(Str::new(source.to_string())),
+			completion: None,
 		},
 	}
 }
@@ -362,11 +368,39 @@ async fn idle(
 	loop {
 		tokio::select! {
 			() = cancel.cancelled() => return Idle::Cancelled,
-			() = &mut park => return Idle::Park,
+			() = &mut park, if !omp_agent::pause_state(session.dom()).active => return Idle::Park,
 			message = inbox.recv_async() => match message {
-				Ok(Up::Steer { text, attachments }) => return Idle::Prompt(text, attachments),
-				Ok(Up::Peer(text)) => return Idle::Prompt(text, Vec::new()),
-				Ok(Up::Queue { text, attachments }) => return Idle::Prompt(text, attachments),
+				Ok(Up::Steer { text, attachments } | Up::Queue { text, attachments }) => {
+					if omp_agent::pause_state(session.dom()).active {
+						if let Err(error) = omp_agent::queue_prompt(session, text, &attachments) {
+							tracing::warn!(%error, "paused subagent prompt could not be journaled");
+						}
+					} else {
+						return Idle::Prompt(text, attachments);
+					}
+				},
+				Ok(Up::Peer(text)) => {
+					if omp_agent::pause_state(session.dom()).active {
+						if let Err(error) = omp_agent::queue_prompt(session, text, &[]) {
+							tracing::warn!(%error, "paused subagent peer message could not be journaled");
+						}
+					} else {
+						return Idle::Prompt(text, Vec::new());
+					}
+				},
+				Ok(Up::Pause { active }) => {
+					if let Err(error) = omp_agent::set_paused(session, active) {
+						tracing::warn!(%error, "subagent pause transition could not be journaled");
+					}
+					if !active {
+						if let Some(ttl) = ttl {
+							park.as_mut().reset(tokio::time::Instant::now() + ttl);
+						}
+						if let Ok(Some((text, attachments))) = omp_agent::pop_queued_prompt(session) {
+							return Idle::Prompt(text, attachments);
+						}
+					}
+				},
 				Ok(Up::Subscribe(reply)) => {
 					let _ = reply.send(session.subscribe());
 				},

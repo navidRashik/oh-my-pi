@@ -1,20 +1,13 @@
 //! Authenticated Codex SDP signaling and realtime sideband coordination.
 
-use std::{
-	collections::{HashSet, VecDeque},
-	error,
-	future::Future,
-	io,
-	sync::Arc,
-	time::Duration,
-};
+use std::{collections::VecDeque, error, future::Future, io, sync::Arc, time::Duration};
 
 use futures::{SinkExt as _, StreamExt as _};
 use http::{
 	Request,
 	header::{HeaderName, HeaderValue},
 };
-use omp_core::{Str, sf};
+use omp_core::{FastHashSet, FastState, Str};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -36,16 +29,23 @@ use crate::{
 pub const SIGNALING_URL: &str =
 	"https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas";
 const SIDEBAND_ATTEMPTS: usize = 5;
+const SIDEBAND_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTEXT_CHUNK_BYTES: usize = 500;
 const DEDUP_WINDOW: usize = 4_096;
+const AGENT_FINAL_MESSAGE_HEADER: &str = "\"Agent Final Message\":\n\n";
+const AGENT_CANCELLED_MESSAGE: &str =
+	"\"Agent Delegation Cancelled\":\n\nThe delegated request was cancelled before completion.";
+const AGENT_FAILED_MESSAGE_HEADER: &str = "\"Agent Delegation Failed\":\n\n";
+const AGENT_FAILED_MESSAGE: &str =
+	"\"Agent Delegation Failed\":\n\nThe delegated request failed before completion.";
 
-/// OAuth access leased by the application credential authority.
+/// Opaque OAuth headers leased by the application credential authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveOAuthAccess {
-	/// Bearer access token; never serialized into receipts.
-	pub access_token: Str,
+	/// Sensitive `Bearer …` header. The raw token never crosses this boundary.
+	pub authorization: HeaderValue,
 	/// Optional ChatGPT account identity.
-	pub account_id:   Option<Str>,
+	pub account_id:    Option<Str>,
 }
 
 /// Inputs required to establish one live transport.
@@ -63,21 +63,13 @@ pub struct LiveTransportOptions {
 	pub client_version:   Str,
 	/// Optional proxy selected by the network authority.
 	pub proxy:            Option<Url>,
-	/// OAuth lease.
-	pub access:           LiveOAuthAccess,
 	/// Data-channel open timeout.
 	pub open_timeout:     Duration,
 }
 
 impl LiveTransportOptions {
 	/// Creates options with the data-channel timeout.
-	pub fn new(
-		session_id: Str,
-		instructions: Str,
-		voice: Str,
-		client_version: Str,
-		access: LiveOAuthAccess,
-	) -> Self {
+	pub fn new(session_id: Str, instructions: Str, voice: Str, client_version: Str) -> Self {
 		Self {
 			session_id,
 			realtime_session: Str::from(omp_core::Ulid::generate().to_string()),
@@ -85,7 +77,6 @@ impl LiveTransportOptions {
 			voice,
 			client_version,
 			proxy: None,
-			access,
 			open_timeout: Duration::from_millis(u64::from(DEFAULT_OPEN_TIMEOUT_MS)),
 		}
 	}
@@ -97,7 +88,7 @@ pub struct LiveSignalingRequest {
 	/// Fixed Codex endpoint.
 	pub url:     &'static str,
 	/// Secret-bearing headers for the credential-aware HTTP boundary.
-	pub headers: Vec<(Str, Str)>,
+	pub headers: Vec<(Str, HeaderValue)>,
 	/// JSON request body containing SDP and the session payload.
 	pub body:    Vec<u8>,
 	/// Proxy selected for this provider, if any.
@@ -111,6 +102,8 @@ pub struct LiveSignalingResponse {
 	pub answer:   Str,
 	/// HTTP Location header.
 	pub location: Str,
+	/// Exact OAuth generation used for signaling and therefore sideband.
+	pub access:   LiveOAuthAccess,
 }
 
 /// Unboxed signaling boundary implemented by the application's authenticated
@@ -217,6 +210,9 @@ where
 	/// Sideband request headers were invalid.
 	#[error("Codex live sideband request contains an invalid header")]
 	Header,
+	/// A sideband attempt did not settle within the connection deadline.
+	#[error("Codex live sideband connection timed out")]
+	SidebandTimeout,
 	/// Every exponential-backoff sideband attempt failed.
 	#[error("Codex live sideband connection failed after five attempts")]
 	Sideband {
@@ -270,6 +266,24 @@ where
 	C: SidebandConnector,
 {
 	let (media, offer) = LiveMediaSession::start(coordinator, callbacks).await?;
+	complete_live_transport(media, offer, options, signaling, connector).await
+}
+
+/// Completes authenticated signaling for an already-owned media session.
+///
+/// This split lets the application race network establishment against its
+/// lifecycle mailbox and explicitly await media cleanup when cancellation wins.
+pub async fn complete_live_transport<S, C>(
+	media: Arc<LiveMediaSession>,
+	offer: String,
+	options: &LiveTransportOptions,
+	signaling: &mut S,
+	connector: &mut C,
+) -> Result<EstablishedLiveTransport<C::Socket>, LiveTransportError<S::Error, C::Error>>
+where
+	S: LiveSignalingClient,
+	C: SidebandConnector,
+{
 	let result = establish_after_media(&media, offer, options, signaling, connector).await;
 	match result {
 		Ok(sideband) => Ok(EstablishedLiveTransport { media, sideband }),
@@ -292,8 +306,7 @@ where
 	C: SidebandConnector,
 {
 	let attestation = generate_codex_attestation().await;
-	let request = signaling_request(options, &offer, attestation.as_deref())
-		.map_err(|source| LiveTransportError::Payload { source })?;
+	let request = signaling_request::<S::Error, C::Error>(options, &offer, attestation.as_deref())?;
 	let response = signaling
 		.signal(request)
 		.await
@@ -308,40 +321,59 @@ where
 	media.peer().wait_for_open(timeout_ms).await?;
 	let mut delay = Duration::from_millis(200);
 	let mut last = None;
+	let mut timed_out = false;
 	for attempt in 0..SIDEBAND_ATTEMPTS {
-		let request = sideband_request(options, call_id, attestation.as_deref())?;
-		match connector.connect(request, options.proxy.as_ref()).await {
-			Ok(socket) => return Ok(socket),
-			Err(error) => last = Some(error),
+		let request = sideband_request(options, &response.access, call_id, attestation.as_deref())?;
+		match time::timeout(
+			SIDEBAND_CONNECT_TIMEOUT,
+			connector.connect(request, options.proxy.as_ref()),
+		)
+		.await
+		{
+			Ok(Ok(socket)) => return Ok(socket),
+			Ok(Err(error)) => {
+				last = Some(error);
+				timed_out = false;
+			},
+			Err(_) => timed_out = true,
 		}
 		if attempt + 1 < SIDEBAND_ATTEMPTS {
 			time::sleep(delay).await;
 			delay = delay.saturating_mul(2);
 		}
 	}
-	Err(LiveTransportError::Sideband { source: last.expect("sideband attempt count is non-zero") })
+	if timed_out {
+		Err(LiveTransportError::SidebandTimeout)
+	} else {
+		Err(LiveTransportError::Sideband {
+			source: last.expect("a non-timeout sideband attempt recorded its error"),
+		})
+	}
 }
 
-fn signaling_request(
+fn signaling_request<S, W>(
 	options: &LiveTransportOptions,
 	offer: &str,
 	attestation: Option<&str>,
-) -> Result<LiveSignalingRequest, serde_json::Error> {
+) -> Result<LiveSignalingRequest, LiveTransportError<S, W>>
+where
+	S: error::Error + Send + Sync + 'static,
+	W: error::Error + Send + Sync + 'static,
+{
 	let body = serde_json::to_vec(&json!({
 		"sdp": offer,
 		"session": {
-			"type": "realtime",
-			"model": "gpt-realtime",
+			"model": "gpt-live-1-codex",
 			"instructions": options.instructions,
-			"audio": {
-				"input": { "format": { "type": "audio/pcm", "rate": 24000 }, "turn_detection": { "type": "semantic_vad" } },
-				"output": { "format": { "type": "audio/pcm", "rate": 24000 }, "voice": options.voice },
-			},
+			"audio": { "output": { "voice": options.voice } },
+			"delegation": { "type": "client" },
 		},
-	}))?;
+	}))
+	.map_err(|source| LiveTransportError::Payload { source })?;
 	Ok(LiveSignalingRequest {
 		url: SIGNALING_URL,
-		headers: session_headers(options, attestation),
+		headers: session_headers(options, None, attestation)
+			.map_err(|()| LiveTransportError::Header)?,
 		body,
 		proxy: options.proxy.clone(),
 	})
@@ -349,6 +381,7 @@ fn signaling_request(
 
 fn sideband_request<S, W>(
 	options: &LiveTransportOptions,
+	access: &LiveOAuthAccess,
 	call_id: &str,
 	attestation: Option<&str>,
 ) -> Result<Request<()>, LiveTransportError<S, W>>
@@ -360,32 +393,45 @@ where
 	let mut request = url
 		.into_client_request()
 		.map_err(|_| LiveTransportError::Header)?;
-	for (name, value) in session_headers(options, attestation) {
+	for (name, value) in session_headers(options, Some(access), attestation)
+		.map_err(|()| LiveTransportError::Header)?
+	{
 		let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| LiveTransportError::Header)?;
-		let value = HeaderValue::from_str(value.as_str()).map_err(|_| LiveTransportError::Header)?;
 		request.headers_mut().insert(name, value);
 	}
 	Ok(request)
 }
 
-fn session_headers(options: &LiveTransportOptions, attestation: Option<&str>) -> Vec<(Str, Str)> {
+fn session_headers(
+	options: &LiveTransportOptions,
+	access: Option<&LiveOAuthAccess>,
+	attestation: Option<&str>,
+) -> Result<Vec<(Str, HeaderValue)>, ()> {
+	let header = |value: &str| HeaderValue::from_str(value).map_err(|_| ());
 	let mut headers = vec![
-		(Str::new_static("authorization"), sf!("Bearer {}", options.access.access_token)),
-		(Str::new_static("OpenAI-Alpha"), Str::new_static("quicksilver=v2")),
-		(Str::new_static("user-agent"), sf!("Codex Desktop/{}", options.client_version)),
-		(Str::new_static("x-session-id"), options.realtime_session.clone()),
-		(Str::new_static("originator"), Str::new_static("Codex Desktop")),
-		(Str::new_static("x-codex-version"), options.client_version.clone()),
-		(Str::new_static("x-codex-session-id"), options.session_id.clone()),
-		(Str::new_static("x-codex-thread-id"), options.session_id.clone()),
+		(Str::new_static("accept"), HeaderValue::from_static("*/*")),
+		(Str::new_static("content-type"), HeaderValue::from_static("application/json")),
+		(Str::new_static("OpenAI-Alpha"), HeaderValue::from_static("quicksilver=v2")),
+		(
+			Str::new_static("user-agent"),
+			header(&format!("Codex Desktop/{}", options.client_version))?,
+		),
+		(Str::new_static("x-session-id"), header(options.realtime_session.as_str())?),
+		(Str::new_static("originator"), HeaderValue::from_static("Codex Desktop")),
+		(Str::new_static("x-codex-version"), header(options.client_version.as_str())?),
+		(Str::new_static("x-codex-session-id"), header(options.session_id.as_str())?),
+		(Str::new_static("x-codex-thread-id"), header(options.session_id.as_str())?),
 	];
-	if let Some(account) = options.access.account_id.as_ref() {
-		headers.push((Str::new_static("ChatGPT-Account-Id"), account.clone()));
+	if let Some(access) = access {
+		headers.push((Str::new_static("authorization"), access.authorization.clone()));
+		if let Some(account) = access.account_id.as_ref() {
+			headers.push((Str::new_static("ChatGPT-Account-Id"), header(account.as_str())?));
+		}
 	}
 	if let Some(attestation) = attestation {
-		headers.push((Str::new_static("x-oai-attestation"), Str::from(attestation)));
+		headers.push((Str::new_static("x-oai-attestation"), header(attestation)?));
 	}
-	headers
+	Ok(headers)
 }
 
 /// Extracts a validated server-assigned `rtc_*` call ID from Location.
@@ -401,6 +447,402 @@ pub fn parse_live_call_id(location: &str) -> Option<&str> {
 					.bytes()
 					.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 		})
+}
+
+/// Semantic stream selected for appended Codex live context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveContextChannel {
+	/// Text the realtime assistant may speak.
+	Speakable,
+	/// Silent implementation commentary.
+	Commentary,
+}
+
+/// One text item in a Codex live context append.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LiveInputText {
+	#[serde(rename = "type")]
+	kind: &'static str,
+	text: Str,
+}
+
+impl LiveInputText {
+	fn new(text: Str) -> Self {
+		Self { kind: "input_text", text }
+	}
+}
+
+/// Typed client-to-Codex sideband message.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub enum LiveClientMessage {
+	/// Associate coding-agent context with a provider-created delegation.
+	#[serde(rename = "delegation.context.append")]
+	DelegationContextAppend {
+		/// Provider delegation identity.
+		delegation_item_id: Str,
+		/// Semantic context stream.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		channel:            Option<LiveContextChannel>,
+		/// Ordered context content.
+		content:            [LiveInputText; 1],
+	},
+	/// Append context outside an active delegation.
+	#[serde(rename = "session.context.append")]
+	SessionContextAppend {
+		/// Semantic context stream.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		channel: Option<LiveContextChannel>,
+		/// Ordered context content.
+		content: [LiveInputText; 1],
+	},
+	/// Gracefully close the live session.
+	#[serde(rename = "session.close")]
+	SessionClose,
+}
+
+impl LiveClientMessage {
+	/// Builds one delegation-bound context append.
+	pub fn delegation_context(
+		delegation_item_id: Str,
+		text: Str,
+		channel: Option<LiveContextChannel>,
+	) -> Self {
+		Self::DelegationContextAppend {
+			delegation_item_id,
+			channel,
+			content: [LiveInputText::new(text)],
+		}
+	}
+
+	/// Builds one session-level context append.
+	pub fn session_context(text: Str, channel: Option<LiveContextChannel>) -> Self {
+		Self::SessionContextAppend { channel, content: [LiveInputText::new(text)] }
+	}
+}
+
+/// Speaker on a completed Codex live turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveTurnRole {
+	/// Caller audio.
+	User,
+	/// Realtime assistant output.
+	Assistant,
+}
+
+/// Parsed Codex live server event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LiveServerEvent {
+	/// The authenticated live session started.
+	SessionStarted {
+		/// Provider session identity.
+		id:           Str,
+		/// Effective provider instructions when returned.
+		instructions: Option<Str>,
+	},
+	/// The authenticated live session changed.
+	SessionUpdated {
+		/// Provider session identity.
+		id:           Str,
+		/// Effective provider instructions when returned.
+		instructions: Option<Str>,
+	},
+	/// Encoded output-audio delta mirrored on the event channel.
+	OutputAudioDelta(Str),
+	/// Incremental caller transcript.
+	InputTranscriptAdded(Str),
+	/// Incremental assistant transcript.
+	OutputTranscriptAdded(Str),
+	/// Final transcript for one conversational turn.
+	TurnDone {
+		/// Turn speaker.
+		role:       LiveTurnRole,
+		/// Complete turn transcript.
+		transcript: Str,
+	},
+	/// Coding work delegated to the client agent.
+	DelegationCreated {
+		/// Provider delegation identity.
+		id:      Str,
+		/// Concatenated provider-authored request text.
+		request: Str,
+	},
+	/// Classified provider error text.
+	Error(Str),
+	/// Well-formed event not yet consumed by OMP.
+	Unknown(Str),
+}
+
+/// Parses one Frameless Bidi JSON event. Malformed or shape-invalid frames are
+/// rejected rather than projected as successful activity.
+pub fn parse_live_server_event(payload: &str) -> Option<LiveServerEvent> {
+	let value: Value = serde_json::from_str(payload).ok()?;
+	let object = value.as_object()?;
+	let kind = object.get("type")?.as_str()?;
+	match kind {
+		"session.started" | "session.updated" => {
+			let session = object.get("session")?.as_object()?;
+			let id = Str::from(session.get("id")?.as_str()?);
+			let instructions = session
+				.get("instructions")
+				.and_then(Value::as_str)
+				.map(Str::from);
+			if kind == "session.started" {
+				Some(LiveServerEvent::SessionStarted { id, instructions })
+			} else {
+				Some(LiveServerEvent::SessionUpdated { id, instructions })
+			}
+		},
+		"output_audio.delta" => object
+			.get("audio")
+			.and_then(Value::as_str)
+			.map(Str::from)
+			.map(LiveServerEvent::OutputAudioDelta),
+		"input_transcript.added" | "output_transcript.added" => {
+			let text = object
+				.get("item")
+				.and_then(Value::as_object)?
+				.get("text")
+				.and_then(Value::as_str)
+				.map(Str::from)?;
+			if kind == "input_transcript.added" {
+				Some(LiveServerEvent::InputTranscriptAdded(text))
+			} else {
+				Some(LiveServerEvent::OutputTranscriptAdded(text))
+			}
+		},
+		"turn.done" => {
+			let turn = object.get("turn")?.as_object()?;
+			let role = match turn.get("role")?.as_str()? {
+				"user" => LiveTurnRole::User,
+				"assistant" => LiveTurnRole::Assistant,
+				_ => return None,
+			};
+			let transcript = Str::from(turn.get("transcript")?.as_str()?);
+			Some(LiveServerEvent::TurnDone { role, transcript })
+		},
+		"delegation.created" => {
+			let item = object.get("item")?.as_object()?;
+			if item.get("type")?.as_str()? != "delegation" || item.get("target")?.as_str()? != "client"
+			{
+				return None;
+			}
+			let id = Str::from(item.get("id")?.as_str()?);
+			let mut request = String::new();
+			for content in item.get("content")?.as_array()? {
+				let Some(content) = content.as_object() else {
+					continue;
+				};
+				if content.get("type").and_then(Value::as_str) == Some("input_text")
+					&& let Some(text) = content.get("text").and_then(Value::as_str)
+				{
+					if !request.is_empty() {
+						request.push('\n');
+					}
+					request.push_str(text);
+				}
+			}
+			Some(LiveServerEvent::DelegationCreated { id, request: Str::from(request) })
+		},
+		"error" => {
+			let message = object.get("message").and_then(Value::as_str).or_else(|| {
+				object
+					.get("error")
+					.and_then(Value::as_object)
+					.and_then(|error| error.get("message"))
+					.and_then(Value::as_str)
+			})?;
+			Some(LiveServerEvent::Error(Str::from(message)))
+		},
+		_ => Some(LiveServerEvent::Unknown(Str::from(kind))),
+	}
+}
+
+/// One admitted request from the realtime peer to the normal agent kernel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveDelegationRequest {
+	/// Stable provider-issued delegation identity.
+	pub id:      Str,
+	/// Trimmed request handed to the controller as an ordinary agent turn.
+	pub request: Str,
+}
+
+/// Controller action required after admitting a provider delegation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LiveDelegationAdmission {
+	/// The event was empty or repeated and must not create another journal turn.
+	Ignored,
+	/// No delegated turn is running, so this request may start immediately.
+	Start(LiveDelegationRequest),
+	/// Another delegated turn is running. Interrupt it; the bridge retains this
+	/// request until the controller reports the old turn settled.
+	Interrupt {
+		/// Delegation whose kernel turn must be cancelled.
+		active_id: Str,
+	},
+	/// The current turn is already stopping and this request is retained in
+	/// provider order behind it.
+	Queued,
+}
+
+/// Terminal result of the active delegated kernel turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveDelegationTerminal {
+	/// The kernel produced its final assistant answer.
+	Completed,
+	/// Turn interruption settled through the kernel cancellation tree.
+	Cancelled,
+	/// The kernel stopped on a journaled failure.
+	Failed,
+}
+
+/// Ordered transport output and optional next turn after settlement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveDelegationSettlement {
+	/// Context frames that must be sent in order before starting `next`.
+	pub outbound: Vec<LiveClientMessage>,
+	/// Next provider request retained during interruption, if any.
+	pub next:     Option<LiveDelegationRequest>,
+}
+
+/// Exactly-once turn-taking state between Frameless Bidi and the normal agent
+/// controller.
+///
+/// This state owns no session authority. It admits each provider delegation
+/// identity once, associates kernel events with only the active identity, and
+/// promotes queued speech turns only after the previous kernel turn settles.
+#[derive(Debug)]
+pub struct LiveDelegationBridge {
+	active:  Option<LiveDelegationRequest>,
+	pending: VecDeque<LiveDelegationRequest>,
+	seen:    FastHashSet<Str>,
+}
+
+impl Default for LiveDelegationBridge {
+	fn default() -> Self {
+		Self {
+			active:  None,
+			pending: VecDeque::new(),
+			seen:    FastHashSet::with_capacity_and_hasher(16, FastState::default()),
+		}
+	}
+}
+
+impl LiveDelegationBridge {
+	/// Admits one non-empty provider delegation exactly once.
+	///
+	/// A request arriving during delegated work is retained in provider order.
+	/// Only the first such request asks the controller to interrupt; later
+	/// requests wait behind it and cannot be merged into the active journal
+	/// turn.
+	#[must_use]
+	pub fn admit(&mut self, id: Str, request: Str) -> LiveDelegationAdmission {
+		let id = id.trim();
+		let request = request.trim();
+		if id.is_empty() || request.is_empty() || self.seen.contains(&id) {
+			return LiveDelegationAdmission::Ignored;
+		}
+		let request = LiveDelegationRequest { id, request };
+		self.seen.insert(request.id.clone());
+		let Some(active) = self.active.as_ref() else {
+			self.active = Some(request.clone());
+			return LiveDelegationAdmission::Start(request);
+		};
+		let active_id = active.id.clone();
+		let interrupt = self.pending.is_empty();
+		self.pending.push_back(request);
+		if interrupt {
+			LiveDelegationAdmission::Interrupt { active_id }
+		} else {
+			LiveDelegationAdmission::Queued
+		}
+	}
+
+	/// Builds ordered silent progress frames for the active delegation.
+	///
+	/// Late deltas from an interrupted or already-settled turn are ignored, so
+	/// they cannot be attributed to the next realtime speech turn.
+	#[must_use]
+	pub fn progress(&self, id: &str, text: &str) -> Vec<LiveClientMessage> {
+		let Some(active) = self.active.as_ref().filter(|active| active.id == id) else {
+			return Vec::new();
+		};
+		if text.is_empty() {
+			return Vec::new();
+		}
+		chunk_live_context(text)
+			.map(|chunk| {
+				LiveClientMessage::delegation_context(
+					active.id.clone(),
+					Str::from(chunk),
+					Some(LiveContextChannel::Commentary),
+				)
+			})
+			.collect()
+	}
+
+	/// Settles the active delegated turn exactly once and promotes the next
+	/// retained request.
+	///
+	/// A completed answer and terminal cancellation/failure status are returned
+	/// as speakable context before turn ownership is released. Failure text
+	/// must already be classified by the application boundary.
+	pub fn settle(
+		&mut self,
+		id: &str,
+		terminal: LiveDelegationTerminal,
+		final_text: &str,
+	) -> Option<LiveDelegationSettlement> {
+		let active = self.active.as_ref().filter(|active| active.id == id)?;
+		let text = final_text.trim();
+		let (wrapped, channel) = match terminal {
+			LiveDelegationTerminal::Completed if text.is_empty() => (None, None),
+			LiveDelegationTerminal::Completed => {
+				let mut wrapped = String::with_capacity(AGENT_FINAL_MESSAGE_HEADER.len() + text.len());
+				wrapped.push_str(AGENT_FINAL_MESSAGE_HEADER);
+				wrapped.push_str(text);
+				(Some(Str::new(wrapped)), None)
+			},
+			LiveDelegationTerminal::Cancelled => {
+				(Some(Str::new_static(AGENT_CANCELLED_MESSAGE)), Some(LiveContextChannel::Speakable))
+			},
+			LiveDelegationTerminal::Failed if text.is_empty() => {
+				(Some(Str::new_static(AGENT_FAILED_MESSAGE)), Some(LiveContextChannel::Speakable))
+			},
+			LiveDelegationTerminal::Failed => {
+				let mut wrapped = String::with_capacity(AGENT_FAILED_MESSAGE_HEADER.len() + text.len());
+				wrapped.push_str(AGENT_FAILED_MESSAGE_HEADER);
+				wrapped.push_str(text);
+				(Some(Str::new(wrapped)), Some(LiveContextChannel::Speakable))
+			},
+		};
+		let outbound = wrapped.map_or_else(Vec::new, |wrapped| {
+			chunk_live_context(wrapped.as_str())
+				.map(|chunk| {
+					LiveClientMessage::delegation_context(active.id.clone(), Str::from(chunk), channel)
+				})
+				.collect()
+		});
+		self.active = self.pending.pop_front();
+		Some(LiveDelegationSettlement { outbound, next: self.active.clone() })
+	}
+
+	/// Cancels and forgets every active or queued delegation during live
+	/// transport teardown.
+	///
+	/// The returned active identity is the only one that may own a running
+	/// kernel turn; pending requests have never entered the journal.
+	pub fn cancel_all(&mut self) -> Option<Str> {
+		self.pending.clear();
+		self.active.take().map(|active| active.id)
+	}
+
+	/// Returns the delegation currently associated with kernel events.
+	#[must_use]
+	pub fn active_id(&self) -> Option<&str> {
+		self.active.as_ref().map(|active| active.id.as_str())
+	}
 }
 
 /// Splits context into UTF-8-safe chunks no larger than 500 bytes.
@@ -433,13 +875,16 @@ impl<'a> Iterator for ContextChunks<'a> {
 /// deliveries. Events without IDs remain deliverable.
 #[derive(Debug)]
 pub struct EventDeduplicator {
-	seen:  HashSet<Str>,
+	seen:  FastHashSet<Str>,
 	order: VecDeque<Str>,
 }
 
 impl Default for EventDeduplicator {
 	fn default() -> Self {
-		Self { seen: HashSet::with_capacity(DEDUP_WINDOW), order: VecDeque::new() }
+		Self {
+			seen:  FastHashSet::with_capacity_and_hasher(DEDUP_WINDOW, FastState::default()),
+			order: VecDeque::new(),
+		}
 	}
 }
 
@@ -482,15 +927,22 @@ pub async fn send_sideband(
 	socket.send(Message::Text(payload.into())).await
 }
 
-/// Receives the next text sideband event, ignoring ping/pong/binary frames.
+/// Receives the next text sideband event and services WebSocket control frames.
 pub async fn receive_sideband(
 	socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
 ) -> Result<Option<Str>, tungstenite::Error> {
 	while let Some(message) = socket.next().await {
 		match message? {
 			Message::Text(text) => return Ok(Some(Str::from(text.as_str()))),
+			Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
+			Message::Pong(_) | Message::Frame(_) => {},
 			Message::Close(_) => return Ok(None),
-			_ => {},
+			Message::Binary(_) => {
+				return Err(tungstenite::Error::Io(io::Error::new(
+					io::ErrorKind::InvalidData,
+					"Codex live sideband returned an unexpected binary frame",
+				)));
+			},
 		}
 	}
 	Ok(None)

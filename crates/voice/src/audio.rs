@@ -9,7 +9,8 @@ use std::sync::{
 	atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
-use flume::{Receiver, TryRecvError};
+use flume::{Receiver, TryRecvError, TrySendError};
+use omp_core::Str;
 use parking_lot::Mutex;
 use tokio::sync::{Notify, watch};
 
@@ -27,6 +28,10 @@ const CAPTURE_PERIOD_MS: u32 = 50;
 #[cfg(not(target_os = "linux"))]
 const CAPTURE_PERIOD_MS: u32 = 20;
 const PLAYBACK_DRAIN_MARGIN_CALLBACKS: usize = 1;
+/// Maximum rendered chunks buffered ahead of the native speaker. At a 20 ms
+/// callback period this permits short scheduling bursts without unbounded
+/// multi-utterance growth.
+const PLAYBACK_QUEUE_CAPACITY: usize = 128;
 
 mod level {
 	use tokio::sync::watch::Receiver;
@@ -92,6 +97,7 @@ impl PlaybackState {
 	fn finish_input(&self) {
 		let _gate = self.input_gate.lock();
 		self.accepting.store(false, Ordering::Release);
+		self.notify.notify_waiters();
 	}
 
 	fn mark_drained(&self) {
@@ -169,14 +175,41 @@ impl PlaybackWriter {
 		{
 			return Err(VoiceError::PlaybackClosed);
 		}
-		self
-			.tx
-			.send(samples)
-			.map_err(|_| VoiceError::PlaybackClosed)
+		match self.tx.try_send(samples) {
+			Ok(()) => Ok(()),
+			Err(TrySendError::Disconnected(_)) => Err(VoiceError::PlaybackClosed),
+			Err(TrySendError::Full(_)) => {
+				Err(VoiceError::PlaybackBackpressure { capacity: PLAYBACK_QUEUE_CAPACITY })
+			},
+		}
+	}
+
+	/// Queue an owned mono sample buffer while asynchronously applying bounded
+	/// speaker backpressure. Cancellation or device teardown closes the queue.
+	pub async fn write_owned_async(&self, samples: Vec<f32>) -> VoiceResult<()> {
+		if samples.is_empty() {
+			return Ok(());
+		}
+		let closed = self.state.notify.notified();
+		tokio::pin!(closed);
+		closed.as_mut().enable();
+		{
+			let _gate = self.state.input_gate.lock();
+			if !self.state.accepting.load(Ordering::Acquire)
+				|| self.state.stopped.load(Ordering::Acquire)
+			{
+				return Err(VoiceError::PlaybackClosed);
+			}
+		}
+		tokio::select! {
+			biased;
+			() = &mut closed => Err(VoiceError::PlaybackClosed),
+			result = self.tx.send_async(samples) => result.map_err(|_| VoiceError::PlaybackClosed),
+		}
 	}
 }
 
-/// A running default-speaker stream with one gapless FIFO across every write.
+/// A running speaker stream with one gapless FIFO across every write.
 #[must_use]
 pub struct PlaybackStream {
 	device: Option<PlaybackDevice>,
@@ -187,13 +220,22 @@ pub struct PlaybackStream {
 
 impl PlaybackStream {
 	/// Open and start the default speaker at the requested logical sample rate.
+	pub fn start(sample_rate: u32) -> VoiceResult<Self> {
+		Self::start_on(sample_rate, None)
+	}
+
+	/// Open and start a stable speaker endpoint, or the system default when omitted.
 	#[tracing::instrument(
 		level = "debug",
 		name = "device_open",
 		skip_all,
-		fields(audio.direction = "playback", audio.sample_rate = sample_rate)
+		fields(
+			audio.direction = "playback",
+			audio.sample_rate = sample_rate,
+			audio.device_id = device_id.unwrap_or_default()
+		)
 	)]
-	pub fn start(sample_rate: u32) -> VoiceResult<Self> {
+	pub fn start_on(sample_rate: u32, device_id: Option<&str>) -> VoiceResult<Self> {
 		let sample_rate = audio_sample_rate(sample_rate).map_err(|error| {
 			tracing::warn!(
 				audio.direction = "playback",
@@ -204,15 +246,19 @@ impl PlaybackStream {
 			error
 		})?;
 		let state = Arc::new(PlaybackState::new());
-		let (tx, rx) = flume::unbounded::<Vec<f32>>();
+		let (tx, rx) = flume::bounded::<Vec<f32>>(PLAYBACK_QUEUE_CAPACITY);
 		let (level_tx, level_rx) = watch::channel(0.0);
 		let callback_state = Arc::clone(&state);
 		let mut current = Vec::new();
 		let mut cursor = 0;
 		let mut empty_callbacks = 0;
-		let config = DeviceConfig { sample_rate, period_ms: PLAYBACK_PERIOD_MS };
+		let config = DeviceConfig {
+			sample_rate,
+			period_ms: PLAYBACK_PERIOD_MS,
+			device_id: device_id.map(Str::from),
+		};
 		let drain_callbacks =
-			(playback_drain_periods(config) as usize) + PLAYBACK_DRAIN_MARGIN_CALLBACKS;
+			(playback_drain_periods(config.clone()) as usize) + PLAYBACK_DRAIN_MARGIN_CALLBACKS;
 		let guard = FillGuard { state: Arc::clone(&state), level: level_tx.clone() };
 		let device = PlaybackDevice::start(
 			config,
@@ -332,8 +378,8 @@ impl Drop for PlaybackStream {
 	}
 }
 
-/// A running default-microphone stream delivering non-empty mono `f32`
-/// chunks on the backend's realtime thread.
+/// A running microphone stream delivering non-empty mono `f32` chunks on the
+/// backend's realtime thread.
 #[must_use]
 pub struct CaptureStream {
 	device: Option<CaptureDevice>,
@@ -343,13 +389,31 @@ pub struct CaptureStream {
 impl CaptureStream {
 	/// Open the default microphone at `sample_rate`. `on_audio` runs on the
 	/// realtime audio thread and must not block.
+	pub fn start<C>(sample_rate: u32, on_audio: C) -> VoiceResult<Self>
+	where
+		C: FnMut(&[f32]) + Send + 'static,
+	{
+		Self::start_on(sample_rate, None, on_audio)
+	}
+
+	/// Open a stable microphone endpoint, or the system default when omitted.
+	///
+	/// `on_audio` runs on the realtime audio thread and must not block.
 	#[tracing::instrument(
 		level = "debug",
 		name = "device_open",
 		skip_all,
-		fields(audio.direction = "capture", audio.sample_rate = sample_rate)
+		fields(
+			audio.direction = "capture",
+			audio.sample_rate = sample_rate,
+			audio.device_id = device_id.unwrap_or_default()
+		)
 	)]
-	pub fn start<C>(sample_rate: u32, mut on_audio: C) -> VoiceResult<Self>
+	pub fn start_on<C>(
+		sample_rate: u32,
+		device_id: Option<&str>,
+		mut on_audio: C,
+	) -> VoiceResult<Self>
 	where
 		C: FnMut(&[f32]) + Send + 'static,
 	{
@@ -362,7 +426,11 @@ impl CaptureStream {
 			);
 			error
 		})?;
-		let config = DeviceConfig { sample_rate, period_ms: CAPTURE_PERIOD_MS };
+		let config = DeviceConfig {
+			sample_rate,
+			period_ms: CAPTURE_PERIOD_MS,
+			device_id: device_id.map(Str::from),
+		};
 		let (level_tx, level_rx) = watch::channel(0.0);
 		let device = CaptureDevice::start(
 			config,
@@ -560,6 +628,20 @@ mod tests {
 			render(&rx, &state, &mut current, &mut cursor, &mut empty, &mut output);
 		}
 		assert!(state.is_drained());
+	}
+
+	#[test]
+	fn nonblocking_writer_reports_typed_backpressure() {
+		let state = Arc::new(PlaybackState::new());
+		let (tx, _rx) = flume::bounded(PLAYBACK_QUEUE_CAPACITY);
+		let writer = PlaybackWriter { tx, state };
+		for _ in 0..PLAYBACK_QUEUE_CAPACITY {
+			writer.write_owned(vec![0.25]).expect("bounded chunk fits");
+		}
+		assert!(matches!(
+			writer.write_owned(vec![0.5]),
+			Err(VoiceError::PlaybackBackpressure { capacity: PLAYBACK_QUEUE_CAPACITY })
+		));
 	}
 
 	#[test]

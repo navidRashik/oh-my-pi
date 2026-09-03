@@ -8,20 +8,23 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use omp_agent::{
 	CanonicalPromptSource, DirectorRegistry, DispatchPolicy, ExtensionRegistrar,
 	ExternalDispatchEvent, ExternalDispatchRequest, ExternalDispatchStream, ExternalToolExecutor,
 	Kernel, RouteFacts, RuntimeFlags,
 };
-use omp_core::{SecretString, Str, Ulid, sf};
+use omp_core::{Hash32, SecretString, Str, StrMut, Ulid, sf};
 use omp_dom::{Op, PropKey, Txn, Value};
 use omp_inference::{
-	CallMeta, ChatRequest, ChatStream, Client, ExecutionBudget, ProviderService, RequestId, Target,
-	router::Router,
+	AnswerBody, Call, CallMeta, ChatEvent, ChatRequest, ChatStream, Client, ContentPart,
+	ExecutionBudget, Message, NegotiationPolicy, OperationCall, ProviderService, RequestId, Role,
+	Sampling, Setting, Target, router::Router,
 };
 use omp_session::{ComponentRegistry, Session};
 use omp_tool::{
-	Abort, BlobRef as ToolBlobRef, Claims, Part as ToolPart, Precedence, Presentation, Registry,
+	Abort, BlobRef as ToolBlobRef, CallOutcome, Claims, Part as ToolPart, Precedence, Presentation,
+	Registry,
 };
 use omp_tools::output_schema::SchemaMode;
 use parking_lot::RwLock;
@@ -264,12 +267,26 @@ impl ProductionInference {
 		// advertises the hidden `think` tool instead.
 		if omp_inference::pi_settings::AI_EXTERNAL_THINKING.get(&self.con) {
 			request.reasoning = omp_inference::Setting::Unset;
-			return;
-		}
-		if matches!(request.reasoning, omp_inference::Setting::Unset) {
+		} else if matches!(request.reasoning, omp_inference::Setting::Unset) {
 			let thinking = omp_con::AI_THINKING.get(&self.con);
 			request.reasoning = convar_reasoning(self.catalog.as_ref(), &self.model, &thinking);
 		}
+		let provider = match &self.meta.target {
+			Target::Provider { provider, .. } | Target::ProviderService(provider) => {
+				Some(provider.as_str())
+			},
+			Target::Route { route, .. } | Target::RouteService(route) => self
+				.catalog
+				.route(route)
+				.map(|route| route.provider.as_str()),
+			Target::Model(_) => None,
+		};
+		omp_inference::settings::InferenceSettings::from_con(&self.con).apply_chat_request(
+			request,
+			provider,
+			Some(model.as_str()),
+			None,
+		);
 	}
 }
 
@@ -330,8 +347,9 @@ fn convar_reasoning(
 /// admission query by prompting the session's approval authority.
 #[derive(Clone)]
 pub struct EnvToolExecutor {
-	client:    omp_env::EnvClient,
-	approvals: omp_agent::ApprovalRoute,
+	client:        omp_env::EnvClient,
+	approvals:     omp_agent::ApprovalRoute,
+	outcome_store: omp_journal::blob::BlobStore,
 }
 
 impl EnvToolExecutor {
@@ -339,8 +357,12 @@ impl EnvToolExecutor {
 	/// environment raises (an `--approval-mode` tier above the call's
 	/// policy) becomes one prompt on `approvals`.
 	#[must_use]
-	pub const fn new(client: omp_env::EnvClient, approvals: omp_agent::ApprovalRoute) -> Self {
-		Self { client, approvals }
+	pub const fn new(
+		client: omp_env::EnvClient,
+		approvals: omp_agent::ApprovalRoute,
+		outcome_store: omp_journal::blob::BlobStore,
+	) -> Self {
+		Self { client, approvals, outcome_store }
 	}
 }
 
@@ -477,12 +499,21 @@ impl ExternalToolExecutor for EnvToolExecutor {
 	fn invoke(&self, request: ExternalDispatchRequest) -> ExternalDispatchStream {
 		let client = self.client.clone();
 		let approvals = self.approvals.clone();
+		let outcome_store = self.outcome_store.clone();
 		Box::pin(async_stream::stream! {
 			let opened = client.invoke(omp_env::frame::InvokeTool {
 				invocation_id: request.call_id.to_string(),
 				name: request.identity.name.to_string(),
 				rev: request.identity.rev.to_string(),
 				deadline_ms: u64::try_from(request.blocking_limit.as_millis()).unwrap_or(u64::MAX),
+				output_request: match request.output_request {
+					omp_tool::OutputRequest::Bounded => {
+						omp_env::frame::OutputRequest::Bounded as i32
+					},
+					omp_tool::OutputRequest::Complete => {
+						omp_env::frame::OutputRequest::Complete as i32
+					},
+				},
 				..Default::default()
 			}).await;
 			let mut invocation = match opened {
@@ -590,24 +621,161 @@ impl ExternalToolExecutor for EnvToolExecutor {
 						}
 					},
 					Ok(Some(omp_env::InvocationEvent::Verdict(verdict))) => {
-						let outcome = match raw_json(verdict.json) {
-							Ok(outcome) => outcome,
-							Err(()) => {
-								yield ExternalDispatchEvent::Aborted(Abort::MissingOutcome);
+						if verdict.invocation_id != request.call_id.as_str() {
+							tracing::warn!(
+								call_id = %request.call_id,
+								verdict_invocation_id = %verdict.invocation_id,
+								"environment verdict provenance does not match the invocation"
+							);
+							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+							return;
+						}
+						if !verdict.json.is_empty() {
+							tracing::warn!(call_id = %request.call_id, "environment verdict used forbidden inline outcome");
+							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+							return;
+						}
+						let Some(projection) = verdict.projection else {
+							tracing::warn!(call_id = %request.call_id, "environment verdict omitted output projection facts");
+							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+							return;
+						};
+						let Some(details) = verdict.details_blob else {
+							tracing::warn!(call_id = %request.call_id, "environment verdict omitted outcome blob");
+							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+							return;
+						};
+						if !valid_output_projection(request.output_request, &projection, &details) {
+							tracing::warn!(call_id = %request.call_id, "environment verdict output projection facts are invalid");
+							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+							return;
+						}
+						if details.mime != "application/json" || !details.inline.is_empty() {
+							tracing::warn!(call_id = %request.call_id, mime = %details.mime, "environment verdict blob provenance is invalid");
+							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+							return;
+						}
+						let hash: [u8; 32] = match details.hash.as_ref().try_into() {
+							Ok(hash) => hash,
+							Err(_) => {
+								tracing::warn!(call_id = %request.call_id, hash_bytes = details.hash.len(), "environment verdict blob digest is invalid");
+								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
 								return;
 							},
 						};
+						let expected_hash = Hash32::new(hash);
+						let max_bytes = u64::try_from(omp_proto::bounds::FRAME_MAX_BYTES)
+							.expect("protocol frame limit fits u64");
+						if details.size > max_bytes {
+							tracing::warn!(
+								call_id = %request.call_id,
+								size = details.size,
+								limit = max_bytes,
+								"environment outcome blob exceeds the host retrieval bound"
+							);
+							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+							return;
+						}
+						let mut stage = match outcome_store.begin_put() {
+							Ok(stage) => stage,
+							Err(source) => {
+								tracing::warn!(%source, call_id = %request.call_id, "session outcome artifact staging failed");
+								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+								return;
+							},
+						};
+						let download = match client
+							.blob_get(omp_env::blob_frame::GetRequest {
+								hash: details.hash.clone(),
+								offset: 0,
+								length: 0,
+							})
+							.await
+						{
+							Ok(download) => download,
+							Err(source) => {
+								tracing::warn!(%source, call_id = %request.call_id, "environment outcome blob download failed");
+								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+								return;
+							},
+						};
+						let transfer = tokio::select! {
+							biased;
+							() = request.cancellation.cancelled() => {
+								yield ExternalDispatchEvent::Aborted(Abort::Interrupted {
+									reason: Str::new_static("environment outcome retrieval interrupted"),
+								});
+								return;
+							},
+							transfer = download.write_verified(
+								expected_hash,
+								details.size,
+								max_bytes,
+								&mut stage,
+							) => transfer,
+						};
+						if let Err(source) = transfer {
+							tracing::warn!(%source, call_id = %request.call_id, "environment outcome blob verification failed");
+							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+							return;
+						}
+						let source_artifact = match stage.finish() {
+							Ok(source_artifact)
+								if source_artifact.hash == expected_hash
+									&& source_artifact.size == details.size =>
+							{
+								source_artifact
+							},
+							Ok(_) => {
+								tracing::warn!(call_id = %request.call_id, "session outcome artifact identity changed during adoption");
+								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+								return;
+							},
+							Err(source) => {
+								tracing::warn!(%source, call_id = %request.call_id, "session outcome artifact adoption failed");
+								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+								return;
+							},
+						};
+						let bytes = match outcome_store.get(&source_artifact) {
+							Ok(bytes) => bytes,
+							Err(source) => {
+								tracing::warn!(%source, call_id = %request.call_id, "session outcome artifact read failed");
+								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+								return;
+							},
+						};
+						let outcome = match serde_json::from_slice::<
+							CallOutcome<serde_json::Value, serde_json::Value>,
+						>(&bytes) {
+							Ok(outcome) => outcome,
+							Err(source) => {
+								tracing::warn!(%source, call_id = %request.call_id, "environment outcome blob is not a CallOutcome");
+								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+								return;
+							},
+						};
+						let typed_is_error = !matches!(&outcome, CallOutcome::Ok(_));
+						if typed_is_error != verdict.is_error {
+							tracing::warn!(
+								call_id = %request.call_id,
+								wire_is_error = verdict.is_error,
+								typed_is_error,
+								"environment outcome classification mismatch"
+							);
+							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+							return;
+						}
 						let mut parts = verdict.parts.into_iter().filter_map(tool_part).collect::<Vec<_>>();
 						if parts.is_empty() {
-							parts = structured_parts(outcome.get());
+							parts = structured_parts(&outcome);
 						}
-						if verdict.is_error && parts.is_empty() {
-							parts.push(ToolPart::Text { text: Str::new(outcome.get()) });
-						}
-						yield ExternalDispatchEvent::Done {
+						yield ExternalDispatchEvent::DoneProjected {
 							outcome,
 							parts,
 							is_error: verdict.is_error,
+							source_artifact: Some(source_artifact),
+							projection: tool_output_projection(projection),
 						};
 						return;
 					},
@@ -633,13 +801,18 @@ fn raw_json(bytes: Bytes) -> Result<Box<serde_json::value::RawValue>, ()> {
 	serde_json::value::RawValue::from_string(text).map_err(|_| ())
 }
 
-fn structured_parts(outcome: &str) -> Vec<ToolPart> {
-	let Ok(value) = serde_json::from_str::<serde_json::Value>(outcome) else {
-		return Vec::new();
+fn structured_parts(outcome: &CallOutcome<serde_json::Value, serde_json::Value>) -> Vec<ToolPart> {
+	let value = match outcome {
+		CallOutcome::Ok(value) | CallOutcome::Faulted(value) => value,
+		CallOutcome::ArgsRejected(_) => {
+			return vec![ToolPart::Text { text: Str::new_static("Tool arguments were rejected") }];
+		},
+		CallOutcome::Aborted { abort, .. } => {
+			return vec![ToolPart::Text { text: abort.render() }];
+		},
 	};
 	value
-		.get("value")
-		.and_then(|value| value.get("parts"))
+		.get("parts")
 		.and_then(serde_json::Value::as_array)
 		.into_iter()
 		.flatten()
@@ -654,6 +827,58 @@ fn structured_parts(outcome: &str) -> Vec<ToolPart> {
 			_ => None,
 		})
 		.collect()
+}
+
+fn tool_output_projection(
+	projection: omp_env::frame::OutputProjection,
+) -> omp_tool::OutputProjection {
+	let request = match omp_env::frame::OutputRequest::try_from(projection.request) {
+		Ok(omp_env::frame::OutputRequest::Complete) => omp_tool::OutputRequest::Complete,
+		Ok(omp_env::frame::OutputRequest::Bounded | omp_env::frame::OutputRequest::Unspecified)
+		| Err(_) => omp_tool::OutputRequest::Bounded,
+	};
+	let artifact = projection.artifact.map(|artifact| ToolBlobRef {
+		hash:       Str::new(omp_core::hex::encode(&artifact.hash).to_string()),
+		media_type: Str::new(artifact.mime),
+		byte_len:   artifact.size,
+	});
+	omp_tool::OutputProjection {
+		request,
+		source_bytes: projection.source_bytes,
+		inline_bytes: projection.inline_bytes,
+		omitted: projection.omitted,
+		artifact,
+	}
+}
+
+fn valid_output_projection(
+	request: omp_tool::OutputRequest,
+	projection: &omp_env::frame::OutputProjection,
+	details: &omp_proto::thread::v1::Blob,
+) -> bool {
+	let expected_request = match request {
+		omp_tool::OutputRequest::Bounded => omp_env::frame::OutputRequest::Bounded as i32,
+		omp_tool::OutputRequest::Complete => omp_env::frame::OutputRequest::Complete as i32,
+	};
+	let inline_limit = match request {
+		omp_tool::OutputRequest::Bounded => omp_agent::DispatchPolicy::DEFAULT_MAX_OUTPUT_BYTES,
+		omp_tool::OutputRequest::Complete => omp_agent::DispatchPolicy::MAX_COMPLETE_OUTPUT_BYTES,
+	};
+	projection.request == expected_request
+		&& projection.inline_bytes <= u64::try_from(inline_limit).unwrap_or(u64::MAX)
+		&& projection.source_bytes >= projection.inline_bytes
+		&& projection.artifact.as_ref().is_some_and(|artifact| {
+			artifact.hash == details.hash
+				&& artifact.size == details.size
+				&& artifact.mime == details.mime
+				&& artifact.inline.is_empty()
+		})
+}
+
+const fn invalid_outcome_blob() -> Abort {
+	Abort::EffectsUnknown {
+		reason: Str::new_static("environment returned an invalid outcome artifact"),
+	}
 }
 
 fn tool_part(part: omp_proto::thread::v1::Part) -> Option<ToolPart> {
@@ -742,6 +967,154 @@ impl omp_agent::Inference for ProductionInference {
 	}
 }
 
+/// A cloneable auxiliary inference handle for enhanced speech rewriting.
+///
+/// It shares the production registry and credential authorities already
+/// composed for the session; it never creates a second provider stack.
+#[derive(Clone)]
+pub enum SpeechRewriteClient {
+	/// Direct provider call sharing the session's registry and credentials.
+	Production {
+		/// Shared immutable route registry.
+		registry: omp_inference::Registry,
+		/// Resolved tiny-role model.
+		model:    omp_catalog::ModelKey,
+	},
+	/// Auxiliary call through the already-connected inference gateway.
+	Gateway {
+		/// Cloneable gateway client.
+		inference: GatewayInference,
+	},
+}
+
+/// Typed failure from one enhanced-speech auxiliary completion.
+#[derive(Debug, thiserror::Error)]
+pub enum SpeechRewriteClientError {
+	/// The operation was cancelled before a final response.
+	#[error("speech rewrite was cancelled")]
+	Cancelled,
+	/// The rewrite exceeded its bounded completion deadline.
+	#[error("speech rewrite timed out")]
+	Timeout,
+	/// The production inference route failed.
+	#[error("speech rewrite inference failed")]
+	Inference {
+		/// Typed provider/runtime source.
+		#[source]
+		source: omp_inference::Error,
+	},
+	/// The route completed without emitting speakable text.
+	#[error("speech rewrite completed without text")]
+	EmptyOutput,
+}
+
+impl SpeechRewriteClient {
+	/// Rewrites one bounded block on the configured `@tiny` role.
+	pub async fn rewrite(
+		&self,
+		instruction: &'static str,
+		text: Str,
+		cancel: tokio_util::sync::CancellationToken,
+	) -> Result<Str, SpeechRewriteClientError> {
+		let message = |role, text| Message {
+			role,
+			content: Arc::from([ContentPart::Text { text, proof: None }]),
+			name: None,
+		};
+		let request = ChatRequest {
+			messages:          Arc::from([
+				message(Role::System, Str::new_static(instruction)),
+				message(Role::User, text),
+			]),
+			tools:             Arc::from([]),
+			hosted_tools:      Arc::from([]),
+			tool_choice:       Setting::Unset,
+			output:            Setting::Unset,
+			reasoning:         Setting::Unset,
+			verbosity:         Setting::Unset,
+			cache_retention:   Setting::Unset,
+			service_tier:      Setting::Unset,
+			sampling:          Sampling::default(),
+			max_output_tokens: Some(1_536),
+			top_logprobs:      None,
+			safety:            Arc::from([]),
+			negotiation:       NegotiationPolicy::default(),
+			forced_call:       None,
+		};
+		let mut stream = match self {
+			Self::Production { registry, model } => {
+				let meta = CallMeta {
+					id:             RequestId::from(format!("speech-{}", Ulid::generate())),
+					target:         Target::Model(model.clone()),
+					deadline:       None,
+					budget:         ExecutionBudget::default(),
+					session:        None,
+					debug_session:  None,
+					response_hooks: Default::default(),
+				};
+				let execute = omp_inference::router::execute_registry_call(
+					registry.clone(),
+					Call::new(meta, OperationCall::Chat(Arc::new(request))),
+					Duration::from_secs(6),
+				);
+				let answer = tokio::select! {
+					biased;
+					() = cancel.cancelled() => return Err(SpeechRewriteClientError::Cancelled),
+					answer = execute => answer.map_err(|source| SpeechRewriteClientError::Inference { source })?,
+				};
+				let AnswerBody::Chat(stream) = answer.body else {
+					return Err(SpeechRewriteClientError::EmptyOutput);
+				};
+				stream
+			},
+			Self::Gateway { inference } => {
+				let mut inference = inference.clone();
+				let execute = tokio::time::timeout(
+					Duration::from_secs(6),
+					omp_agent::Inference::chat_on(&mut inference, "@tiny", request),
+				);
+				tokio::select! {
+					biased;
+					() = cancel.cancelled() => return Err(SpeechRewriteClientError::Cancelled),
+					stream = execute => stream
+						.map_err(|_| SpeechRewriteClientError::Timeout)?
+						.map_err(|source| SpeechRewriteClientError::Inference { source })?,
+				}
+			},
+		};
+		let mut output = StrMut::new("");
+		loop {
+			let event = tokio::select! {
+				biased;
+				() = cancel.cancelled() => return Err(SpeechRewriteClientError::Cancelled),
+				event = stream.next() => event,
+			};
+			let Some(event) = event else { break };
+			match event.map_err(|source| SpeechRewriteClientError::Inference { source })? {
+				ChatEvent::TextDelta { text, .. } => output.push_str(text.as_str()),
+				ChatEvent::Started(_)
+				| ChatEvent::BlockStarted { .. }
+				| ChatEvent::ThinkingDelta { .. }
+				| ChatEvent::ToolCallStarted { .. }
+				| ChatEvent::ToolArgumentsDelta { .. }
+				| ChatEvent::ToolCallReady { .. }
+				| ChatEvent::Artifact { .. }
+				| ChatEvent::Usage(_)
+				| ChatEvent::WorkflowAction(_)
+				| ChatEvent::WorkflowResume(_)
+				| ChatEvent::WorkflowCancelled { .. }
+				| ChatEvent::Completed(_) => {},
+			}
+		}
+		let output = output.freeze();
+		if output.trim().is_empty() {
+			Err(SpeechRewriteClientError::EmptyOutput)
+		} else {
+			Ok(output)
+		}
+	}
+}
+
 /// Inference selected by one headless invocation.
 pub enum ComposedInference {
 	/// Direct production provider stack.
@@ -783,6 +1156,31 @@ impl ComposedInference {
 		match self {
 			Self::Production(inference) => &inference._environment,
 			Self::Gateway { _environment, .. } => _environment,
+		}
+	}
+
+	/// Returns an auxiliary speech rewriter sharing this session's production
+	/// registry or already-connected remote gateway. Direct production returns
+	/// `None` only when no tiny role resolves.
+	#[must_use]
+	pub fn speech_rewriter(&self) -> Option<SpeechRewriteClient> {
+		match self {
+			Self::Production(inference) => {
+				let settings = omp_catalog::settings::ModelSettings::from_con(&inference.con);
+				let selected = crate::discovery::roles::resolve_role_selector(
+					inference.catalog.as_ref(),
+					&settings,
+					"@tiny",
+				)
+				.ok()?;
+				Some(SpeechRewriteClient::Production {
+					registry: inference._stack.registry.clone(),
+					model:    selected.model.clone(),
+				})
+			},
+			Self::Gateway { inference, .. } => {
+				Some(SpeechRewriteClient::Gateway { inference: inference.clone() })
+			},
 		}
 	}
 
@@ -1143,7 +1541,14 @@ pub async fn compose_kernel(
 	};
 	let con_journal = Arc::new(con_journal::ConJournal::attach(Arc::clone(&ctx), session.dom()));
 	apply_model_override(&ctx, model.as_str(), options.model_override)?;
-	install_prompt_facts(&mut session, &project_root, model.as_str(), &options.prompt, &facts)?;
+	install_prompt_facts(
+		&mut session,
+		&project_root,
+		model.as_str(),
+		&options.prompt,
+		&facts,
+		tools_enabled,
+	)?;
 	if !options.ephemeral {
 		remember_terminal_session(&sessions_dir, terminal.as_deref(), &journal_path)?;
 	}
@@ -1215,8 +1620,9 @@ pub async fn compose_kernel(
 		Some(Arc::new(omp_agent::ApprovalBook::new())),
 		Some(approvals.clone()),
 	);
+	let outcome_store = session.blobs().clone();
 	let mut kernel = kernel
-		.with_external_executor(Arc::new(EnvToolExecutor::new(tool_client, approvals)))
+		.with_external_executor(Arc::new(EnvToolExecutor::new(tool_client, approvals, outcome_store)))
 		.with_tool_admission(Arc::new(SettingsAdmission::new(&ctx, options.approval_mode)));
 	kernel.register_live_component(con_journal.live_component());
 	for component in live_python_components {
@@ -1224,6 +1630,7 @@ pub async fn compose_kernel(
 	}
 	kernel = kernel
 		.with_session_authority(Arc::clone(&live_sessions) as Arc<dyn omp_agent::SessionAuthority>);
+	kernel.reconcile_jobs(&mut session)?;
 	let id = journal_path
 		.file_stem()
 		.and_then(|name| name.to_str())
@@ -1283,8 +1690,10 @@ pub struct SessionHome {
 	pub facts:        crate::discovery::PromptFacts,
 	/// Process-local live-session routing authority.
 	pub live:         Arc<crate::sessions::SessionRegistry>,
+	/// Whether the session's production composition exposes the tool surface.
+	pub tools_enabled: bool,
 	/// The kernel's upward mailbox, shared by every session it drives.
-	pub up:           flume::Sender<omp_agent::Up>,
+	pub up:            flume::Sender<omp_agent::Up>,
 }
 
 impl SessionHome {
@@ -1314,6 +1723,7 @@ impl SessionHome {
 			prompt: options.prompt.clone(),
 			facts: crate::discovery::PromptFacts::default(),
 			live,
+			tools_enabled: !options.no_tools,
 			up,
 		})
 	}
@@ -1354,6 +1764,7 @@ impl SessionHome {
 			self.model.as_str(),
 			&self.prompt,
 			&self.facts,
+			self.tools_enabled,
 		)?;
 		self.register(&session);
 		Ok(session)
@@ -1369,6 +1780,7 @@ impl SessionHome {
 			self.model.as_str(),
 			&self.prompt,
 			&self.facts,
+			self.tools_enabled,
 		)?;
 		self.register(&session);
 		Ok(session)
@@ -1753,6 +2165,7 @@ fn install_prompt_facts(
 	model: &str,
 	overrides: &PromptOverrides,
 	discovered: &crate::discovery::PromptFacts,
+	tools_enabled: bool,
 ) -> Result<(), omp_session::SessionError> {
 	let home = std::env::var_os("HOME").map_or_else(|| project_root.to_path_buf(), PathBuf::from);
 	let mut facts = serde_json::json!({
@@ -1773,6 +2186,16 @@ fn install_prompt_facts(
 		"null_prompt": overrides.null_prompt,
 	});
 	let object = facts.as_object_mut().expect("prompt facts are an object");
+	if tools_enabled {
+		object.insert(
+			"device_guidance".to_owned(),
+			serde_json::Value::String(omp_tools::device::PROMPT_GUIDANCE.to_owned()),
+		);
+		object.insert(
+			"auto_qa_guidance".to_owned(),
+			serde_json::Value::String(omp_tools::device::AUTO_QA_PROMPT_GUIDANCE.to_owned()),
+		);
+	}
 	// Only a resolved repository is journaled: `active-repo.md` renders
 	// whenever the key is present, so a JSON null would misfire.
 	if let Some(repository) = &discovered.active_repository {
@@ -2078,6 +2501,7 @@ mod tests {
 			"provider/model",
 			&overrides,
 			&crate::discovery::PromptFacts::default(),
+			true,
 		)
 		.expect("prompt facts");
 		let value = session
@@ -2123,6 +2547,7 @@ mod tests {
 			"provider/model",
 			&PromptOverrides::default(),
 			&discovered,
+			true,
 		)
 		.expect("prompt facts");
 		let props = omp_agent::prompt::template_props(session.dom());
@@ -2168,6 +2593,7 @@ mod tests {
 			"provider/model",
 			&PromptOverrides::default(),
 			&crate::discovery::PromptFacts::default(),
+			true,
 		)
 		.expect("prompt facts");
 		let props = omp_agent::prompt::template_props(session.dom());

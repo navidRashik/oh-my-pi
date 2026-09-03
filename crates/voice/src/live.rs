@@ -1,9 +1,8 @@
 //! Native WebRTC media transport for Codex live conversations.
 //!
-//! The TypeScript host owns authenticated signaling and the sideband protocol;
-//! this module owns the realtime WebRTC peer, Opus media, and speaker
-//! playback. The N-API class is a thin adapter over
-//! [`LivePeerCore`].
+//! [`LivePeerCore`] owns the realtime peer, Opus microphone input, remote audio
+//! playback, and the `oai-events` data channel. Authenticated signaling and the
+//! sideband socket are composed by [`crate::transport`].
 
 use std::{
 	sync::{
@@ -87,15 +86,16 @@ enum InputCommand {
 }
 
 /// Host callbacks for peer lifecycle and media events. Every callback is
-/// invoked from tokio worker threads and must not block (the N-API adapter
-/// forwards through non-blocking threadsafe functions).
+/// invoked from Tokio or native audio worker threads and must not block.
 pub struct LiveCallbacks {
 	/// One `oai-events` data-channel text payload.
-	pub event:   Box<dyn Fn(String) + Send + Sync>,
+	pub event:        Box<dyn Fn(String) + Send + Sync>,
+	/// RMS microphone level in `[0, 1]`.
+	pub input_level:  Box<dyn Fn(f64) + Send + Sync>,
 	/// RMS output level in `[0, 1]`, one report per level window.
-	pub level:   Box<dyn Fn(f64) + Send + Sync>,
+	pub output_level: Box<dyn Fn(f64) + Send + Sync>,
 	/// Terminal transport failure; reported at most once per peer.
-	pub failure: Box<dyn Fn(String) + Send + Sync>,
+	pub failure:      Box<dyn Fn(String) + Send + Sync>,
 }
 
 struct LiveResources {
@@ -119,21 +119,37 @@ pub struct LiveMediaSession {
 }
 
 impl LiveMediaSession {
-	/// Acquire audio ownership, start the peer, and return the session and SDP
-	/// offer.
+	/// Acquire audio ownership, start the peer, and use both system-default endpoints.
 	pub async fn start(
 		coordinator: &AudioCoordinator,
 		callbacks: LiveCallbacks,
 	) -> VoiceResult<(Arc<Self>, String)> {
+		Self::start_on(coordinator, callbacks, None, None).await
+	}
+
+	/// Acquire audio ownership and start the peer on stable platform endpoint IDs.
+	///
+	/// An omitted ID follows the corresponding system default.
+	pub async fn start_on(
+		coordinator: &AudioCoordinator,
+		callbacks: LiveCallbacks,
+		input_device_id: Option<&str>,
+		output_device_id: Option<&str>,
+	) -> VoiceResult<(Arc<Self>, String)> {
 		let lease = coordinator.acquire_live()?;
 		let peer = Arc::new(LivePeerCore::new(callbacks));
-		let offer = peer.create_offer().await?;
+		let offer = peer.create_offer_on(output_device_id).await?;
 		let weak_peer = Arc::downgrade(&peer);
-		let capture = match CaptureStream::start(INPUT_SAMPLE_RATE, move |samples| {
-			if let Some(peer) = weak_peer.upgrade() {
-				let _ = peer.push_audio(samples);
-			}
-		}) {
+		let capture = match CaptureStream::start_on(
+			INPUT_SAMPLE_RATE,
+			input_device_id,
+			move |samples| {
+				if let Some(peer) = weak_peer.upgrade() {
+					peer.report_input_level(rms(samples));
+					let _ = peer.push_audio(samples);
+				}
+			},
+		) {
 			Ok(capture) => capture,
 			Err(error) => {
 				peer.close().await;
@@ -171,9 +187,31 @@ impl LiveMediaSession {
 	}
 }
 
+impl Drop for LiveMediaSession {
+	fn drop(&mut self) {
+		if self.closed.swap(true, Ordering::AcqRel) {
+			return;
+		}
+		if let Some(mut capture) = self.capture.lock().take() {
+			let _ = capture.stop();
+		}
+		let lease = self.lease.lock().take();
+		if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+			let peer = Arc::clone(&self.peer);
+			let _ = runtime.spawn(async move {
+				peer.close().await;
+				if let Some(mut lease) = lease {
+					lease.release();
+				}
+			});
+		} else if let Some(mut lease) = lease {
+			lease.release();
+		}
+	}
+}
+
 /// WebRTC live-conversation peer: accepts 16 kHz mono PCM input and renders
-/// remote Opus audio to the default speaker. Owned as an `Arc` by the N-API
-/// `LiveWebRtcPeer` wrapper.
+/// remote Opus audio to the default speaker.
 pub struct LivePeerCore {
 	callbacks:        LiveCallbacks,
 	resources:        Mutex<Option<LiveResources>>,
@@ -201,11 +239,19 @@ impl LivePeerCore {
 		}
 	}
 
-	/// Start the native media peer and return its SDP offer.
+	/// Start the native media peer on the system-default speaker.
+	pub async fn create_offer(self: &Arc<Self>) -> VoiceResult<String> {
+		self.create_offer_on(None).await
+	}
+
+	/// Start the native media peer on a stable speaker endpoint ID.
 	///
 	/// Fails when called twice, after close, or when the speaker, codec,
 	/// peer, track, or data channel cannot be set up.
-	pub async fn create_offer(self: &Arc<Self>) -> VoiceResult<String> {
+	pub async fn create_offer_on(
+		self: &Arc<Self>,
+		output_device_id: Option<&str>,
+	) -> VoiceResult<String> {
 		if self.started.swap(true, Ordering::AcqRel) {
 			return Err(
 				"Native live WebRTC peer has already started"
@@ -217,7 +263,7 @@ impl LivePeerCore {
 			return Err("Native live WebRTC peer is closed".to_owned().into());
 		}
 
-		let playback = PlaybackStream::start(OUTPUT_SAMPLE_RATE)?;
+		let playback = PlaybackStream::start_on(OUTPUT_SAMPLE_RATE, output_device_id)?;
 		let playback_tx = playback.writer()?;
 		let mut media_engine = MediaEngine::default();
 		let capability = opus_capability();
@@ -409,8 +455,12 @@ impl LivePeerCore {
 		(self.callbacks.event)(payload);
 	}
 
+	fn report_input_level(&self, level: f64) {
+		(self.callbacks.input_level)(level.clamp(0.0, 1.0));
+	}
+
 	fn report_level(&self, level: f64) {
-		(self.callbacks.level)(level.clamp(0.0, 1.0));
+		(self.callbacks.output_level)(level.clamp(0.0, 1.0));
 	}
 
 	fn mark_open(&self) {
@@ -456,6 +506,20 @@ impl LivePeerCore {
 		self.queued_samples.store(0, Ordering::Release);
 		self.signal_tx.send_replace(PeerSignal::Closed);
 	}
+}
+
+fn rms(samples: &[f32]) -> f64 {
+	if samples.is_empty() {
+		return 0.0;
+	}
+	let sum = samples
+		.iter()
+		.map(|sample| {
+			let sample = f64::from(*sample);
+			sample * sample
+		})
+		.sum::<f64>();
+	(sum / samples.len() as f64).sqrt().clamp(0.0, 1.0)
 }
 
 fn opus_capability() -> RTCRtpCodecCapability {

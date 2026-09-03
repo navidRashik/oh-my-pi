@@ -177,6 +177,22 @@ mod macos {
 	}
 
 	pub(super) async fn generate() -> Result<DeviceCheckResult, DeviceCheckError> {
+		let Some((receiver, started)) = start_generate()? else {
+			return Ok(DeviceCheckResult::default());
+		};
+		let token = receiver
+			.recv_async()
+			.await
+			.map_err(|_| DeviceCheckError::CompletionClosed)?;
+		Ok(DeviceCheckResult {
+			supported:    true,
+			token_base64: token.map(Str::from),
+			latency:      Some(started.elapsed()),
+		})
+	}
+
+	fn start_generate()
+	-> Result<Option<(flume::Receiver<Option<String>>, Instant)>, DeviceCheckError> {
 		let class = AnyClass::get(c"DCDevice").ok_or(DeviceCheckError::Unavailable)?;
 		// SAFETY: DCDevice is looked up dynamically and these selectors are the
 		// stable DeviceCheck framework API available since macOS 11.
@@ -186,7 +202,7 @@ mod macos {
 		}
 		let supported: bool = unsafe { msg_send![device, isSupported] };
 		if !supported {
-			return Ok(DeviceCheckResult::default());
+			return Ok(None);
 		}
 		let started = Instant::now();
 		let (sender, receiver) = flume::bounded(1);
@@ -204,14 +220,6 @@ mod macos {
 		});
 		// SAFETY: completion is copied by DeviceCheck and owns the channel sender.
 		let (): () = unsafe { msg_send![device, generateTokenWithCompletionHandler: &*completion] };
-		let token = receiver
-			.recv_async()
-			.await
-			.map_err(|_| DeviceCheckError::CompletionClosed)?;
-		Ok(DeviceCheckResult {
-			supported:    true,
-			token_base64: token.map(Str::from),
-			latency:      Some(started.elapsed()),
-		})
+		Ok(Some((receiver, started)))
 	}
 }

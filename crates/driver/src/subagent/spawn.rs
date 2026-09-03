@@ -675,6 +675,8 @@ struct PreparedChild {
 	agent:        Str,
 	session_path: PathBuf,
 	handle:       omp_dom::Handle,
+	/// Parent-derived initial runtime gate; the child journals its own copy.
+	paused:       bool,
 }
 
 struct ChildExecution {
@@ -779,6 +781,7 @@ fn prepare_child(
 		.duration_since(UNIX_EPOCH)?
 		.as_millis()
 		.to_string();
+	let paused = omp_agent::pause_state(parent.dom()).active;
 	let cause = parent.head().ok_or(SpawnError::MissingParentHead)?;
 	let txn = jobs::insert(parent.dom(), cause, JobSpec {
 		id:      id.clone(),
@@ -810,6 +813,7 @@ fn prepare_child(
 		agent,
 		session_path,
 		handle,
+		paused,
 	})
 }
 
@@ -821,14 +825,16 @@ fn spawn_child_task(
 	tokio::spawn(async move {
 		match run_child(prepared).await {
 			Ok(execution) => JobSettlement {
-				status: execution.status,
-				error:  execution.result.error.clone(),
-				output: serde_json::value::to_raw_value(&execution.result).ok(),
+				status:     execution.status,
+				error:      execution.result.error.clone(),
+				output:     serde_json::value::to_raw_value(&execution.result).ok(),
+				completion: None,
 			},
 			Err(source) => JobSettlement {
-				status: Str::new_static("failed"),
-				output: None,
-				error:  Some(Str::new(source.to_string())),
+				status:     Str::new_static("failed"),
+				output:     None,
+				error:      Some(Str::new(source.to_string())),
+				completion: None,
 			},
 		}
 	})
@@ -866,6 +872,9 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 		)
 		.await?;
 		engage_yield_ladder(&prepared.child, &mut child_session)?;
+		if prepared.paused {
+			omp_agent::set_paused(&mut child_session, true)?;
+		}
 		let deadline = (prepared.settings.max_runtime_ms != 0).then(|| {
 			std::time::Instant::now() + Duration::from_millis(prepared.settings.max_runtime_ms)
 		});

@@ -146,8 +146,37 @@ impl RewriteBlockAccumulator {
 		if !self.line.is_empty() {
 			self.finish_line(&mut output);
 		}
-		self.emit_buffer(&mut output);
+		if self.fence.is_some() {
+			self.buffer.clear();
+		} else {
+			self.emit_buffer(&mut output);
+		}
 		output
+	}
+
+	/// Drains a stalled partial prose block while preserving an open code
+	/// fence. Half a fenced block is never sent to the rewrite backend.
+	pub fn flush_partial(&mut self) -> Option<Str> {
+		if self.fence.is_some() {
+			return None;
+		}
+		let mut output = Vec::new();
+		if !self.line.is_empty() {
+			self.finish_line(&mut output);
+		}
+		self.emit_buffer(&mut output);
+		if output.is_empty() {
+			None
+		} else {
+			let mut joined = String::new();
+			for block in output {
+				if !joined.is_empty() {
+					joined.push_str("\n\n");
+				}
+				joined.push_str(block.as_str());
+			}
+			Some(Str::new(joined))
+		}
 	}
 
 	fn finish_line(&mut self, output: &mut Vec<Str>) {
@@ -202,4 +231,30 @@ fn is_table_divider(line: &str) -> bool {
 		}
 	}
 	saw_dash
+}
+
+#[cfg(test)]
+mod tests {
+	use super::RewriteBlockAccumulator;
+
+	#[test]
+	fn stalled_partial_flushes_prose_and_keeps_fence_silent() {
+		let mut blocks = RewriteBlockAccumulator::new();
+		assert_eq!(blocks.flush_partial(), None);
+		assert_eq!(blocks.push("A useful partial thought").len(), 0,);
+		assert_eq!(blocks.flush_partial().as_deref(), Some("A useful partial thought"),);
+		assert!(blocks.push("```rust\nsecret();").is_empty());
+		assert_eq!(blocks.flush_partial(), None);
+		assert!(blocks.push("\n```\nAfter fence").is_empty());
+		assert_eq!(blocks.flush_partial().as_deref(), Some("After fence"));
+	}
+
+	#[test]
+	fn final_flush_drops_an_unterminated_fence() {
+		let mut blocks = RewriteBlockAccumulator::new();
+		let ready = blocks.push("Before fence\n\n```text\nnever speak");
+		assert_eq!(ready.len(), 1);
+		assert_eq!(ready[0].as_str(), "Before fence");
+		assert!(blocks.flush().is_empty());
+	}
 }

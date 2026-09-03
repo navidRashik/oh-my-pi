@@ -21,7 +21,7 @@ local-all = [
 local-applefm = ["local", "omp-inference/local-applefm"]
 local-embedding = ["local", "omp-inference/local-embedding", "omp-memory/local-embedding"]
 local-stt = ["local", "omp-inference/local-stt"]
-local-tts = ["local", "omp-inference/local-tts"]
+local-tts = ["local", "omp-envd/local-tts", "omp-inference/local-tts"]
 
 [dependencies]
 async-stream.workspace = true

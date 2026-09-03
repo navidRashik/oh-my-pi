@@ -144,7 +144,7 @@ async fn run(approve: bool) -> (Session, String, bool) {
 	let kernel = Kernel::new(
 		WriteThenText { path: target_text.clone(), turns: 0 },
 		registry,
-		DispatchPolicy::new(spill),
+		DispatchPolicy::new(spill.clone()),
 		StaticPrompt(Str::new_static("test")),
 	);
 	let approvals = kernel.approval_route();
@@ -156,6 +156,7 @@ async fn run(approve: bool) -> (Session, String, bool) {
 		.with_external_executor(Arc::new(EnvToolExecutor::new(
 			environment.client().clone(),
 			approvals,
+			spill.clone(),
 		)))
 		.with_tool_admission(Arc::new(SettingsAdmission::new(
 			&omp_con::Ctx::new(),
@@ -174,9 +175,12 @@ async fn run(approve: bool) -> (Session, String, bool) {
 			}
 		}
 	});
-	let mut session =
-		Session::create(scratch.path().join("approval.oms"), ComponentRegistry::standard())
-			.expect("session");
+	let mut session = Session::create_with_blob_store(
+		scratch.path().join("approval.oms"),
+		ComponentRegistry::standard(),
+		spill,
+	)
+	.expect("session");
 	tokio::time::timeout(
 		Duration::from_secs(60),
 		kernel.run_turn(

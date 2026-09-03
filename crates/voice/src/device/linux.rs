@@ -1,10 +1,11 @@
 //! Linux default-device audio through runtime-loaded `PulseAudio` or ALSA.
 
 use std::{
-	ffi::{CStr, c_char, c_int, c_long, c_uint, c_void},
+	collections::BTreeMap,
+	ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_void},
 	mem, ptr,
 	sync::{
-		Arc, Mutex, OnceLock,
+		Arc, LazyLock, Mutex, OnceLock,
 		atomic::{AtomicBool, Ordering},
 		mpsc::{self, Receiver},
 	},
@@ -12,7 +13,11 @@ use std::{
 	time::Duration,
 };
 
-use super::{CaptureSink, DeviceConfig, PlaybackFill};
+use omp_core::Str;
+
+use super::{
+	AudioDevice, CaptureSink, DeviceConfig, DeviceSnapshot, MicrophonePermission, PlaybackFill,
+};
 use crate::device::BackendResult as VoiceResult;
 
 const PA_STREAM_PLAYBACK: c_int = 1;
@@ -85,14 +90,14 @@ struct PulseApi {
 	strerror:     PaStrerror,
 }
 
-static PULSE_API: OnceLock<Result<&'static PulseApi, String>> = OnceLock::new();
+static PULSE_API: LazyLock<Result<PulseApi, String>> = LazyLock::new(PulseApi::load);
 
 impl PulseApi {
 	fn get() -> Result<&'static Self, String> {
-		PULSE_API.get_or_init(Self::load).clone()
+		PULSE_API.as_ref().map_err(Clone::clone)
 	}
 
-	fn load() -> Result<&'static Self, String> {
+	fn load() -> Result<Self, String> {
 		let simple = open_library(c"libpulse-simple.so.0", libc::RTLD_NOW | libc::RTLD_GLOBAL)?;
 		let pulse = open_library(c"libpulse.so.0", libc::RTLD_NOW | libc::RTLD_GLOBAL)?;
 
@@ -113,7 +118,7 @@ impl PulseApi {
 		let strerror =
 			unsafe { mem::transmute::<*mut c_void, PaStrerror>(symbol(pulse, c"pa_strerror")?) };
 
-		Ok(Box::leak(Box::new(Self { simple_new, simple_free, simple_write, simple_read, strerror })))
+		Ok(Self { simple_new, simple_free, simple_write, simple_read, strerror })
 	}
 
 	fn error(&self, code: c_int) -> String {
@@ -132,6 +137,10 @@ type SndPcmRecover = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int;
 type SndPcmWait = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type SndPcmControl = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SndStrerror = unsafe extern "C" fn(c_int) -> *const c_char;
+type SndDeviceNameHint =
+	unsafe extern "C" fn(c_int, *const c_char, *mut *mut *mut c_void) -> c_int;
+type SndDeviceNameGetHint = unsafe extern "C" fn(*const c_void, *const c_char) -> *mut c_char;
+type SndDeviceNameFreeHint = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
 
 struct AlsaApi {
 	pcm_open:       SndPcmOpen,
@@ -141,18 +150,21 @@ struct AlsaApi {
 	pcm_recover:    SndPcmRecover,
 	pcm_wait:       SndPcmWait,
 	pcm_start:      SndPcmControl,
-	pcm_close:      SndPcmControl,
-	strerror:       SndStrerror,
+	pcm_close:           SndPcmControl,
+	strerror:            SndStrerror,
+	device_name_hint:    SndDeviceNameHint,
+	device_name_get_hint: SndDeviceNameGetHint,
+	device_name_free_hint: SndDeviceNameFreeHint,
 }
 
-static ALSA_API: OnceLock<Result<&'static AlsaApi, String>> = OnceLock::new();
+static ALSA_API: LazyLock<Result<AlsaApi, String>> = LazyLock::new(AlsaApi::load);
 
 impl AlsaApi {
 	fn get() -> Result<&'static Self, String> {
-		ALSA_API.get_or_init(Self::load).clone()
+		ALSA_API.as_ref().map_err(Clone::clone)
 	}
 
-	fn load() -> Result<&'static Self, String> {
+	fn load() -> Result<Self, String> {
 		let library = open_library(c"libasound.so.2", libc::RTLD_NOW | libc::RTLD_GLOBAL)?;
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
 		let pcm_open =
@@ -185,8 +197,29 @@ impl AlsaApi {
 		// SAFETY: each symbol is resolved from the library defining this exact C API.
 		let strerror =
 			unsafe { mem::transmute::<*mut c_void, SndStrerror>(symbol(library, c"snd_strerror")?) };
+		// SAFETY: each symbol is resolved from the library defining this exact C API.
+		let device_name_hint = unsafe {
+			mem::transmute::<*mut c_void, SndDeviceNameHint>(symbol(
+				library,
+				c"snd_device_name_hint",
+			)?)
+		};
+		// SAFETY: each symbol is resolved from the library defining this exact C API.
+		let device_name_get_hint = unsafe {
+			mem::transmute::<*mut c_void, SndDeviceNameGetHint>(symbol(
+				library,
+				c"snd_device_name_get_hint",
+			)?)
+		};
+		// SAFETY: each symbol is resolved from the library defining this exact C API.
+		let device_name_free_hint = unsafe {
+			mem::transmute::<*mut c_void, SndDeviceNameFreeHint>(symbol(
+				library,
+				c"snd_device_name_free_hint",
+			)?)
+		};
 
-		Ok(Box::leak(Box::new(Self {
+		Ok(Self {
 			pcm_open,
 			pcm_set_params,
 			pcm_writei,
@@ -196,7 +229,10 @@ impl AlsaApi {
 			pcm_start,
 			pcm_close,
 			strerror,
-		})))
+			device_name_hint,
+			device_name_get_hint,
+			device_name_free_hint,
+		})
 	}
 
 	fn error(&self, code: c_int) -> String {
@@ -204,6 +240,79 @@ impl AlsaApi {
 		let message = unsafe { (self.strerror)(code) };
 		cstring_lossy(message, "unknown ALSA error")
 	}
+}
+
+fn hint_value(api: &AlsaApi, hint: *const c_void, key: &CStr) -> Option<String> {
+	// SAFETY: ALSA supplied `hint`; the key is a valid NUL-terminated string.
+	let value = unsafe { (api.device_name_get_hint)(hint, key.as_ptr()) };
+	if value.is_null() {
+		return None;
+	}
+	// SAFETY: ALSA returns a malloc-owned NUL-terminated string.
+	let result = unsafe { CStr::from_ptr(value) }
+		.to_string_lossy()
+		.into_owned();
+	// SAFETY: ALSA documents this returned value as caller-freed with free(3).
+	unsafe { libc::free(value.cast()) };
+	Some(result)
+}
+
+fn alsa_endpoints(direction: &str) -> VoiceResult<Vec<AudioDevice>> {
+	let api = AlsaApi::get()?;
+	let mut hints = ptr::null_mut();
+	// SAFETY: `hints` is writable and "pcm" is a stable ALSA interface name.
+	let status = unsafe { (api.device_name_hint)(-1, c"pcm".as_ptr(), &raw mut hints) };
+	if status < 0 {
+		return Err(format!("ALSA device enumeration failed: {}", api.error(status)));
+	}
+	let mut devices = BTreeMap::<String, Str>::new();
+	if !hints.is_null() {
+		let mut cursor = hints;
+		loop {
+			// SAFETY: ALSA returns a null-terminated array of hint pointers.
+			let hint = unsafe { *cursor };
+			if hint.is_null() {
+				break;
+			}
+			let io = hint_value(api, hint, c"IOID");
+			if io.as_deref().is_none_or(|io| io == direction) {
+				if let Some(name) = hint_value(api, hint, c"NAME").filter(|name| name != "null") {
+					let label = hint_value(api, hint, c"DESC")
+						.and_then(|description| description.lines().next().map(Str::from))
+						.unwrap_or_else(|| Str::from(name.as_str()));
+					devices.entry(name).or_insert(label);
+				}
+			}
+			// SAFETY: cursor remains within ALSA's null-terminated hint array.
+			cursor = unsafe { cursor.add(1) };
+		}
+		// SAFETY: the complete hint array is owned by the matching ALSA free function.
+		unsafe { (api.device_name_free_hint)(hints) };
+	}
+	Ok(devices
+		.into_iter()
+		.map(|(name, label)| AudioDevice {
+			id: Str::from(format!("alsa:{name}")),
+			label,
+			is_default: name == "default",
+		})
+		.collect())
+}
+
+pub(super) const fn microphone_permission() -> MicrophonePermission {
+	MicrophonePermission::Unknown
+}
+
+pub(super) async fn request_microphone_permission() -> VoiceResult<MicrophonePermission> {
+	Ok(MicrophonePermission::Unknown)
+}
+
+pub(super) fn snapshot() -> VoiceResult<DeviceSnapshot> {
+	Ok(DeviceSnapshot {
+		input: alsa_endpoints("Input")?,
+		output: alsa_endpoints("Output")?,
+		microphone_permission: microphone_permission(),
+	})
 }
 
 fn open_library(name: &CStr, flags: c_int) -> Result<*mut c_void, String> {
@@ -262,7 +371,7 @@ unsafe impl Send for PulseStream {}
 impl PulseStream {
 	fn open(
 		api: &PulseApi,
-		config: DeviceConfig,
+		config: &DeviceConfig,
 		direction: c_int,
 		attr: &PaBufferAttr,
 	) -> Result<Self, String> {
@@ -302,12 +411,21 @@ struct AlsaStream(*mut c_void);
 unsafe impl Send for AlsaStream {}
 
 impl AlsaStream {
-	fn open(api: &AlsaApi, config: DeviceConfig, direction: c_int) -> Result<Self, String> {
+	fn open(api: &AlsaApi, config: &DeviceConfig, direction: c_int) -> Result<Self, String> {
 		let latency = config
 			.period_ms
 			.checked_mul(3)
 			.and_then(|value| value.checked_mul(1000))
 			.ok_or_else(|| "audio period is too large".to_owned())?;
+		if let Some(device_id) = config.device_id.as_deref() {
+			let name = device_id
+				.strip_prefix("alsa:")
+				.ok_or_else(|| format!("unsupported Linux audio device ID `{device_id}`"))?;
+			let name = CString::new(name)
+				.map_err(|_| "ALSA device ID contains an interior NUL".to_owned())?;
+			return Self::open_named(api, config, direction, latency, &name)
+				.map_err(|error| error.message().to_owned());
+		}
 		match Self::open_named(api, config, direction, latency, c"default") {
 			Ok(stream) => Ok(stream),
 			Err(AlsaOpenError::Open(error)) => Err(error),
@@ -321,7 +439,7 @@ impl AlsaStream {
 
 	fn open_named(
 		api: &AlsaApi,
-		config: DeviceConfig,
+		config: &DeviceConfig,
 		direction: c_int,
 		latency: u32,
 		name: &CStr,
@@ -411,7 +529,7 @@ fn parse_latency_msec(raw: &str) -> Option<u32> {
 	raw.trim().parse::<u32>().ok().filter(|ms| *ms > 0)
 }
 
-fn pulse_bytes(config: DeviceConfig, latency_ms: u32) -> Result<u32, String> {
+fn pulse_bytes(config: &DeviceConfig, latency_ms: u32) -> Result<u32, String> {
 	(config.sample_rate as usize)
 		.checked_mul(latency_ms as usize)
 		.map(|samples| (samples / 1000).max(1))
@@ -425,8 +543,8 @@ fn pulse_attr(
 	direction: c_int,
 	latency_ms: u32,
 ) -> Result<PaBufferAttr, String> {
-	let period_bytes = pulse_bytes(config, config.period_ms)?;
-	let latency_bytes = pulse_bytes(config, latency_ms.max(config.period_ms))?;
+	let period_bytes = pulse_bytes(&config, config.period_ms)?;
+	let latency_bytes = pulse_bytes(&config, latency_ms.max(config.period_ms))?;
 	let backlog_bytes = latency_bytes
 		.checked_mul(PULSE_BACKLOG_PERIODS)
 		.ok_or_else(|| "audio buffer is too large".to_owned())?;
@@ -785,7 +903,7 @@ fn finish(
 		.map_or(Ok(()), Err)
 }
 
-/// Running `PulseAudio` or ALSA playback worker.
+/// Running `PulseAudio` or ALSA playback worker for a selected or default endpoint.
 pub struct PlaybackDevice {
 	device: Arc<RunningDevice>,
 	thread: Option<JoinHandle<()>>,
@@ -793,10 +911,10 @@ pub struct PlaybackDevice {
 }
 
 impl PlaybackDevice {
-	/// Opens the default playback device and starts its worker thread.
+	/// Opens the selected or default playback device and starts its worker thread.
 	pub fn start(config: DeviceConfig, mut fill: PlaybackFill) -> VoiceResult<Self> {
 		let samples = config.period_samples();
-		let attr = pulse_attr(config, PA_STREAM_PLAYBACK, pulse_latency_ms(config.period_ms))?;
+		let attr = pulse_attr(config.clone(), PA_STREAM_PLAYBACK, pulse_latency_ms(config.period_ms))?;
 		let timeout_ms = c_int::try_from(config.period_ms)
 			.unwrap_or(c_int::MAX)
 			.max(1);
@@ -815,8 +933,14 @@ impl PlaybackDevice {
 			.spawn(move || {
 				let _done = ThreadDone(done_tx);
 				let _ = worker_device.worker_id.set(thread::current().id());
-				let pulse_error = match PulseApi::get().and_then(|api| {
-					PulseStream::open(api, config, PA_STREAM_PLAYBACK, &attr).map(|stream| (api, stream))
+				let pulse_error = match (config.device_id.is_none())
+					.then(PulseApi::get)
+					.transpose()
+					.and_then(|api| {
+						api.ok_or_else(|| "explicit device selection bypasses PulseAudio".to_owned())
+					})
+					.and_then(|api| {
+					PulseStream::open(api, &config, PA_STREAM_PLAYBACK, &attr).map(|stream| (api, stream))
 				}) {
 					Ok((api, stream)) => {
 						let _ = opened_tx.send(Ok(()));
@@ -835,7 +959,7 @@ impl PlaybackDevice {
 					Err(error) => error,
 				};
 				match AlsaApi::get().and_then(|api| {
-					AlsaStream::open(api, config, SND_PCM_STREAM_PLAYBACK).map(|stream| (api, stream))
+					AlsaStream::open(api, &config, SND_PCM_STREAM_PLAYBACK).map(|stream| (api, stream))
 				}) {
 					Ok((api, stream)) => {
 						let _ = opened_tx.send(Ok(()));
@@ -885,7 +1009,7 @@ impl Drop for PlaybackDevice {
 	}
 }
 
-/// Running `PulseAudio` or ALSA capture worker.
+/// Running `PulseAudio` or ALSA capture worker for a selected or default endpoint.
 pub struct CaptureDevice {
 	device: Arc<RunningDevice>,
 	thread: Option<JoinHandle<()>>,
@@ -893,10 +1017,10 @@ pub struct CaptureDevice {
 }
 
 impl CaptureDevice {
-	/// Opens the default capture device and starts its worker thread.
+	/// Opens the selected or default capture device and starts its worker thread.
 	pub fn start(config: DeviceConfig, mut sink: CaptureSink) -> VoiceResult<Self> {
 		let samples = config.period_samples();
-		let attr = pulse_attr(config, PA_STREAM_RECORD, pulse_latency_ms(config.period_ms))?;
+		let attr = pulse_attr(config.clone(), PA_STREAM_RECORD, pulse_latency_ms(config.period_ms))?;
 		let timeout_ms = c_int::try_from(config.period_ms)
 			.unwrap_or(c_int::MAX)
 			.max(1);
@@ -915,8 +1039,14 @@ impl CaptureDevice {
 			.spawn(move || {
 				let _done = ThreadDone(done_tx);
 				let _ = worker_device.worker_id.set(thread::current().id());
-				let pulse_error = match PulseApi::get().and_then(|api| {
-					PulseStream::open(api, config, PA_STREAM_RECORD, &attr).map(|stream| (api, stream))
+				let pulse_error = match (config.device_id.is_none())
+					.then(PulseApi::get)
+					.transpose()
+					.and_then(|api| {
+						api.ok_or_else(|| "explicit device selection bypasses PulseAudio".to_owned())
+					})
+					.and_then(|api| {
+					PulseStream::open(api, &config, PA_STREAM_RECORD, &attr).map(|stream| (api, stream))
 				}) {
 					Ok((api, stream)) => {
 						let _ = opened_tx.send(Ok(()));
@@ -935,7 +1065,7 @@ impl CaptureDevice {
 					Err(error) => error,
 				};
 				match AlsaApi::get().and_then(|api| {
-					AlsaStream::open(api, config, SND_PCM_STREAM_CAPTURE).map(|stream| (api, stream))
+					AlsaStream::open(api, &config, SND_PCM_STREAM_CAPTURE).map(|stream| (api, stream))
 				}) {
 					Ok((api, stream)) => {
 						let _ = opened_tx.send(Ok(()));
@@ -989,8 +1119,8 @@ impl Drop for CaptureDevice {
 mod tests {
 	use super::*;
 
-	const fn config(sample_rate: u32, period_ms: u32) -> DeviceConfig {
-		DeviceConfig { sample_rate, period_ms }
+	fn config(sample_rate: u32, period_ms: u32) -> DeviceConfig {
+		DeviceConfig { sample_rate, period_ms, device_id: None }
 	}
 
 	#[test]
