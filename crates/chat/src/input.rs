@@ -7,9 +7,9 @@
 
 use std::collections::BTreeMap;
 
-use omp_core::{Str, StrMut};
+pub use omp_con::{ChordError, normalize_chord};
+use omp_core::Str;
 use omp_tui::Key;
-use thiserror::Error;
 
 /// Normalized physical chord to console command.
 #[derive(Clone, Debug, Default)]
@@ -49,89 +49,6 @@ impl Bindings {
 			.map(|(chord, _)| chord.as_str())
 			.min_by_key(|chord| chord.len())
 	}
-}
-
-/// Invalid `bind` key chord.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum ChordError {
-	/// The chord had no key component.
-	#[error("key chord is empty")]
-	Empty,
-	/// The chord contains whitespace, an empty segment, or a repeated
-	/// modifier.
-	#[error("invalid key chord `{chord}`")]
-	Invalid {
-		/// Rejected chord.
-		chord: Str,
-	},
-}
-
-/// Canonical modifier order for chord spellings.
-const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "super"];
-
-/// Folds a `bind` chord to its canonical spelling: lowercase, modifiers in
-/// `ctrl+alt+shift+super` order, pi key names (`escape`, `pageup`,
-/// `shift+tab`, `f5`).
-pub fn normalize_chord(chord: &str) -> Result<Str, ChordError> {
-	let chord = chord.trim();
-	if chord.is_empty() {
-		return Err(ChordError::Empty);
-	}
-	let invalid = || ChordError::Invalid { chord: Str::new(chord) };
-	if chord.chars().any(char::is_whitespace) {
-		return Err(invalid());
-	}
-	let lower = chord.to_ascii_lowercase();
-	let mut parts = lower.split('+').collect::<Vec<_>>();
-	// A trailing `+` key (`ctrl++`) splits into two empties: fold them back.
-	if parts.len() >= 2 && parts[parts.len() - 1].is_empty() && parts[parts.len() - 2].is_empty() {
-		parts.truncate(parts.len() - 2);
-		parts.push("+");
-	}
-	let Some((key, mods)) = parts.split_last() else {
-		return Err(invalid());
-	};
-	if key.is_empty() {
-		return Err(invalid());
-	}
-	let mut present = [false; MODIFIERS.len()];
-	for modifier in mods {
-		let name = match *modifier {
-			"control" | "ctl" => "ctrl",
-			"option" | "opt" | "meta" => "alt",
-			"cmd" | "command" | "win" => "super",
-			other => other,
-		};
-		let Some(index) = MODIFIERS.iter().position(|known| *known == name) else {
-			return Err(invalid());
-		};
-		if present[index] {
-			return Err(invalid());
-		}
-		present[index] = true;
-	}
-	let key = match *key {
-		"esc" => "escape",
-		"return" | "cr" => "enter",
-		"pgup" => "pageup",
-		"pgdn" | "pgdown" => "pagedown",
-		"del" => "delete",
-		"bs" => "backspace",
-		"backtab" => {
-			present[2] = true;
-			"tab"
-		},
-		other => other,
-	};
-	let mut out = StrMut::with_capacity(chord.len() + 8);
-	for (index, name) in MODIFIERS.iter().enumerate() {
-		if present[index] {
-			out.push_str(name);
-			out.push('+');
-		}
-	}
-	out.push_str(key);
-	Ok(out.freeze())
 }
 
 /// Canonical chord spelling for a decoded key, or `None` for keys that are
@@ -212,6 +129,8 @@ mod tests {
 			("meta+up", "alt+up"),
 			("cmd+v", "super+v"),
 			("ctrl++", "ctrl++"),
+			("shift+!", "!"),
+			("ctrl+shift+_", "ctrl+_"),
 			("f5", "f5"),
 		];
 		for (input, expected) in cases {

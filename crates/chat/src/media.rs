@@ -152,11 +152,9 @@ fn prepare_one(source: &ComposerMediaSource) -> Result<PreparedMedia, MediaInput
 			max_bytes: MAX_MEDIA_INPUT_BYTES,
 		});
 	}
-	let bytes = fs::read(path.as_str()).map(Bytes::from).map_err(|source| MediaInputError::Io {
-		operation: "read",
-		path: path.clone(),
-		source,
-	})?;
+	let bytes = fs::read(path.as_str())
+		.map(Bytes::from)
+		.map_err(|source| MediaInputError::Io { operation: "read", path: path.clone(), source })?;
 	let byte_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
 	if byte_len > MAX_MEDIA_INPUT_BYTES {
 		return Err(MediaInputError::InputTooLarge {
@@ -176,10 +174,9 @@ fn prepare_image(path: Str, bytes: Bytes) -> Result<PreparedMedia, MediaInputErr
 	let format = image::guess_format(&bytes)
 		.map_err(|_| MediaInputError::UnsupportedImage { path: path.clone() })?;
 	let reader = ImageReader::with_format(Cursor::new(bytes.as_ref()), format);
-	let mut decoder = reader.into_decoder().map_err(|source| MediaInputError::ImageCodec {
-		path: path.clone(),
-		source,
-	})?;
+	let mut decoder = reader
+		.into_decoder()
+		.map_err(|source| MediaInputError::ImageCodec { path: path.clone(), source })?;
 	let original = decoder.dimensions();
 	let pixels = u64::from(original.0).saturating_mul(u64::from(original.1));
 	if pixels > MAX_IMAGE_DECODED_PIXELS {
@@ -190,15 +187,13 @@ fn prepare_image(path: Str, bytes: Bytes) -> Result<PreparedMedia, MediaInputErr
 			max_pixels: MAX_IMAGE_DECODED_PIXELS,
 		});
 	}
-	let orientation = decoder.orientation().map_err(|source| MediaInputError::ImageCodec {
-		path: path.clone(),
-		source,
-	})?;
+	let orientation = decoder
+		.orientation()
+		.map_err(|source| MediaInputError::ImageCodec { path: path.clone(), source })?;
 	// A real decode is the validity oracle. Signatures and dimensions alone do
 	// not reject middle-elided PNG/JPEG streams that providers cannot consume.
-	let mut image = DynamicImage::from_decoder(decoder).map_err(|source| {
-		MediaInputError::ImageCodec { path: path.clone(), source }
-	})?;
+	let mut image = DynamicImage::from_decoder(decoder)
+		.map_err(|source| MediaInputError::ImageCodec { path: path.clone(), source })?;
 	image.apply_orientation(orientation);
 	let oriented = image.dimensions();
 	let direct_mime = supported_image_mime(format);
@@ -208,14 +203,18 @@ fn prepare_image(path: Str, bytes: Bytes) -> Result<PreparedMedia, MediaInputErr
 		&& oriented.1 >= MIN_IMAGE_EDGE
 		&& oriented.0 <= MAX_IMAGE_EDGE
 		&& oriented.1 <= MAX_IMAGE_EDGE;
-	if orientation == Orientation::NoTransforms && !must_convert_webp && comfortable && within_edges {
+	if orientation == Orientation::NoTransforms && !must_convert_webp && comfortable && within_edges
+	{
 		if let Some(mime) = direct_mime {
 			return Ok(PreparedMedia {
-				kind: ComposerMediaKind::Image,
-				source: path,
-				input: omp_session::AttachmentInput { mime: Str::new_static(mime), bytes },
+				kind:                ComposerMediaKind::Image,
+				source:              path,
+				input:               omp_session::AttachmentInput {
+					mime: Str::new_static(mime),
+					bytes,
+				},
 				original_dimensions: Some(original),
-				dimensions: Some(oriented),
+				dimensions:          Some(oriented),
 			});
 		}
 	}
@@ -234,14 +233,14 @@ fn prepare_image(path: Str, bytes: Bytes) -> Result<PreparedMedia, MediaInputErr
 		});
 	}
 	Ok(PreparedMedia {
-		kind: ComposerMediaKind::Image,
-		source: path,
-		input: omp_session::AttachmentInput {
+		kind:                ComposerMediaKind::Image,
+		source:              path,
+		input:               omp_session::AttachmentInput {
 			mime:  Str::new_static(encoded.mime),
 			bytes: Bytes::from(encoded.bytes),
 		},
 		original_dimensions: Some(original),
-		dimensions: Some(dimensions),
+		dimensions:          Some(dimensions),
 	})
 }
 
@@ -249,20 +248,17 @@ fn prepare_video(path: Str, bytes: Bytes) -> Result<PreparedMedia, MediaInputErr
 	let mime = sniff_video_mime(&bytes)
 		.ok_or_else(|| MediaInputError::UnsupportedVideo { path: path.clone() })?;
 	Ok(PreparedMedia {
-		kind: ComposerMediaKind::Video,
-		source: path,
-		input: omp_session::AttachmentInput { mime: Str::new_static(mime), bytes },
+		kind:                ComposerMediaKind::Video,
+		source:              path,
+		input:               omp_session::AttachmentInput { mime: Str::new_static(mime), bytes },
 		original_dimensions: None,
-		dimensions: None,
+		dimensions:          None,
 	})
 }
 
 fn supported_image_mime(format: ImageFormat) -> Option<&'static str> {
-	matches!(
-		format,
-		ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP
-	)
-	.then(|| format.to_mime_type())
+	matches!(format, ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP)
+		.then(|| format.to_mime_type())
 }
 
 fn webp_excluded() -> bool {
@@ -346,7 +342,11 @@ fn encode_smallest(
 ) -> Result<EncodedImage, MediaInputError> {
 	let png = encode_png(image, path)?;
 	let jpeg = encode_jpeg(image, quality, path)?;
-	Ok(if jpeg.bytes.len() < png.bytes.len() { jpeg } else { png })
+	Ok(if jpeg.bytes.len() < png.bytes.len() {
+		jpeg
+	} else {
+		png
+	})
 }
 
 fn encode_png(image: &DynamicImage, path: &Str) -> Result<EncodedImage, MediaInputError> {
@@ -380,18 +380,23 @@ fn sniff_video_mime(bytes: &[u8]) -> Option<&'static str> {
 	}
 	if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
 		let probe = &bytes[..bytes.len().min(256)];
-		return Some(if probe.windows(4).any(|window| window.eq_ignore_ascii_case(b"webm")) {
-			"video/webm"
-		} else {
-			"video/x-matroska"
-		});
+		return Some(
+			if probe
+				.windows(4)
+				.any(|window| window.eq_ignore_ascii_case(b"webm"))
+			{
+				"video/webm"
+			} else {
+				"video/x-matroska"
+			},
+		);
 	}
 	if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"AVI ") {
 		return Some("video/x-msvideo");
 	}
 	const ASF: [u8; 16] = [
-		0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62,
-		0xce, 0x6c,
+		0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62, 0xce,
+		0x6c,
 	];
 	if bytes.starts_with(&ASF) {
 		return Some("video/x-ms-wmv");
@@ -426,8 +431,8 @@ mod tests {
 		let path = directory.path().join("comfortable.png");
 		write_image(&path, DynamicImage::new_rgb8(200, 200), ImageFormat::Png);
 		let original = fs::read(&path).expect("fixture");
-		let prepared = prepare_media_sources(&[source(ComposerMediaKind::Image, &path)])
-			.expect("normalize");
+		let prepared =
+			prepare_media_sources(&[source(ComposerMediaKind::Image, &path)]).expect("normalize");
 		assert_eq!(prepared[0].input.mime, "image/png");
 		assert_eq!(prepared[0].input.bytes.as_ref(), original.as_slice());
 		assert_eq!(prepared[0].dimensions, Some((200, 200)));
@@ -438,8 +443,8 @@ mod tests {
 		let directory = tempfile::tempdir().expect("tempdir");
 		let path = directory.path().join("mislabeled.png");
 		write_image(&path, DynamicImage::new_rgb8(240, 200), ImageFormat::Bmp);
-		let prepared = prepare_media_sources(&[source(ComposerMediaKind::Image, &path)])
-			.expect("normalize");
+		let prepared =
+			prepare_media_sources(&[source(ComposerMediaKind::Image, &path)]).expect("normalize");
 		assert_eq!(prepared.len(), 1);
 		assert!(matches!(prepared[0].input.mime.as_str(), "image/png" | "image/jpeg"));
 		assert!(image::load_from_memory(&prepared[0].input.bytes).is_ok());
@@ -451,8 +456,8 @@ mod tests {
 		let directory = tempfile::tempdir().expect("tempdir");
 		let path = directory.path().join("wide.png");
 		write_image(&path, DynamicImage::new_rgb8(2_000, 1_500), ImageFormat::Png);
-		let prepared = prepare_media_sources(&[source(ComposerMediaKind::Image, &path)])
-			.expect("normalize");
+		let prepared =
+			prepare_media_sources(&[source(ComposerMediaKind::Image, &path)]).expect("normalize");
 		let (width, height) = prepared[0].dimensions.expect("dimensions");
 		assert!(width <= MAX_IMAGE_EDGE && height <= MAX_IMAGE_EDGE);
 		assert_eq!((width, height), (1_568, 1_176));
@@ -469,8 +474,8 @@ mod tests {
 			.expect("jpeg");
 		let jpeg = jpeg.into_inner();
 		let exif = [
-			b'E', b'x', b'i', b'f', 0, 0, b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12,
-			0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0,
+			b'E', b'x', b'i', b'f', 0, 0, b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0,
+			0, 1, 0, 6, 0, 0, 0, 0, 0, 0,
 		];
 		let segment_len = u16::try_from(exif.len() + 2).expect("segment length");
 		let mut oriented = Vec::with_capacity(jpeg.len() + exif.len() + 4);
@@ -481,8 +486,8 @@ mod tests {
 		oriented.extend_from_slice(&jpeg[2..]);
 		fs::write(&path, oriented).expect("fixture");
 
-		let prepared = prepare_media_sources(&[source(ComposerMediaKind::Image, &path)])
-			.expect("normalize");
+		let prepared =
+			prepare_media_sources(&[source(ComposerMediaKind::Image, &path)]).expect("normalize");
 		assert_eq!(prepared[0].original_dimensions, Some((300, 200)));
 		assert_eq!(prepared[0].dimensions, Some((200, 300)));
 		let decoded = image::load_from_memory(&prepared[0].input.bytes).expect("normalized image");
@@ -520,7 +525,9 @@ mod tests {
 		let directory = tempfile::tempdir().expect("tempdir");
 		let path = directory.path().join("oversized.png");
 		let file = fs::File::create(&path).expect("fixture");
-		file.set_len(MAX_MEDIA_INPUT_BYTES + 1).expect("sparse fixture");
+		file
+			.set_len(MAX_MEDIA_INPUT_BYTES + 1)
+			.expect("sparse fixture");
 		let error = prepare_media_sources(&[source(ComposerMediaKind::Image, &path)])
 			.expect_err("oversized input refused");
 		assert!(matches!(error, MediaInputError::InputTooLarge {
@@ -534,11 +541,7 @@ mod tests {
 	fn header_valid_but_undecodable_image_is_refused() {
 		let directory = tempfile::tempdir().expect("tempdir");
 		let path = directory.path().join("truncated.png");
-		fs::write(
-			&path,
-			b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\xc8\0\0\0\xc8",
-		)
-		.expect("fixture");
+		fs::write(&path, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\xc8\0\0\0\xc8").expect("fixture");
 		let error = prepare_media_sources(&[source(ComposerMediaKind::Image, &path)])
 			.expect_err("truncated stream refused");
 		assert!(matches!(error, MediaInputError::ImageCodec { .. }));

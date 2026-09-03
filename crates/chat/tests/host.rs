@@ -4,8 +4,13 @@ use std::sync::Arc;
 
 use omp_agent::{ApprovalBook, ApprovalScope, ApprovalSpec};
 use omp_chat::{
-	BlockKind, CtrlCAction, HostCommand, HostOptions, NativeEffect, NativeHost, block_views,
-	ctrl_c_action, overlays::Overlays,
+	BlockKind, CtrlCAction, HostAction, HostCommand, HostOptions, NativeEffect, NativeHost,
+	block_views, ctrl_c_action,
+	overlays::{
+		Outcome, Overlays,
+		services::{CollabOp, CollabOutcome, CollabParticipant, CollabRole, CollabState},
+	},
+	status_band::{CollabHostSnapshot, CollabStatus},
 };
 use omp_dom::{Dom, Event, KnownTag, PropId, Tag};
 use omp_session::{ComponentRegistry, Session};
@@ -110,26 +115,25 @@ fn reset_after_rewind_rebuilds_actor_blocks() {
 }
 
 #[test]
-fn ctrl_c_interrupts_active_turn_and_quits_when_idle_or_repeated() {
-	assert_eq!(ctrl_c_action(true, false), CtrlCAction::Interrupt);
-	assert_eq!(ctrl_c_action(false, false), CtrlCAction::Quit);
-	assert_eq!(ctrl_c_action(true, true), CtrlCAction::Quit);
+fn ctrl_c_clears_once_then_quits_on_repeat() {
+	assert_eq!(ctrl_c_action(false), CtrlCAction::Clear);
+	assert_eq!(ctrl_c_action(true), CtrlCAction::Quit);
 }
 
 #[test]
-fn ctrl_c_during_an_active_turn_emits_one_interrupt_and_stays_open() {
+fn ctrl_c_during_an_active_turn_clears_without_interrupting() {
 	let (mut host, commands) = bound_host(vec![row("test/model", &[])]);
 	host.key(Key::Char('g')).expect("type");
 	host.key(Key::Char('o')).expect("type");
 	assert_eq!(host.key(Key::Enter).expect("enter"), NativeEffect::Consumed);
 	assert!(matches!(commands.recv().expect("submit"), HostCommand::Submit(text) if text == "go"));
-	assert_ne!(host.key(Key::Ctrl('c')).expect("ctrl+c"), NativeEffect::Quit);
-	assert!(matches!(commands.recv().expect("interrupt"), HostCommand::Interrupt));
-	assert!(commands.try_recv().is_err(), "one ctrl+c posts exactly one interrupt");
-	assert_eq!(host.key(Key::Char('!')).expect("type"), NativeEffect::Consumed);
-	// Idle ctrl+c (no active turn) still quits, per `ctrl_c_action`.
+	assert_ne!(host.key(Key::Ctrl('c')).expect("first ctrl+c"), NativeEffect::Quit);
+	assert!(commands.try_recv().is_err(), "first ctrl+c never interrupts active work");
+	assert_eq!(host.key(Key::Ctrl('c')).expect("second ctrl+c"), NativeEffect::Quit);
+
 	let (mut idle, idle_commands) = bound_host(vec![row("test/model", &[])]);
-	assert_eq!(idle.key(Key::Ctrl('c')).expect("ctrl+c"), NativeEffect::Quit);
+	assert_ne!(idle.key(Key::Ctrl('c')).expect("first ctrl+c"), NativeEffect::Quit);
+	assert_eq!(idle.key(Key::Ctrl('c')).expect("second ctrl+c"), NativeEffect::Quit);
 	assert!(idle_commands.try_recv().is_err());
 }
 
@@ -254,7 +258,7 @@ fn bound_host_with_session(
 }
 
 #[test]
-fn ctrl_c_reads_turn_activity_from_the_tree_through_receipts_and_notices() {
+fn ctrl_c_behavior_is_independent_of_turn_activity_from_the_tree() {
 	use omp_dom::{NodeSpec, Op, Txn, Value};
 	let (mut host, commands, mut session) = bound_host_with_session(vec![row("test/model", &[])]);
 	// A second turn: the assistant stopped for tool calls, the bash call is
@@ -296,13 +300,12 @@ fn ctrl_c_reads_turn_activity_from_the_tree_through_receipts_and_notices() {
 	assert_ne!(
 		host.key(Key::Ctrl('c')).expect("ctrl+c"),
 		NativeEffect::Quit,
-		"an informational notice after an open tool is transparent to lifecycle"
+		"the first press clears even while the tree says work is active"
 	);
-	assert!(matches!(commands.recv().expect("interrupt"), HostCommand::Interrupt));
-	assert!(commands.try_recv().is_err());
+	assert!(commands.try_recv().is_err(), "clear never sends an interrupt");
 
 	// The kernel settles the call as aborted and ends the turn with a notice:
-	// the tree now says the turn is over, so ctrl+c quits.
+	// turn activity still does not change the first-clear, second-exit rule.
 	let fault = serde_json::value::to_raw_value(&serde_json::json!({
 		"kind":"aborted","value":{"abort":{"kind":"interrupted","reason":"cancelled"},"kind":"cancelled"}
 	}))
@@ -329,7 +332,8 @@ fn ctrl_c_reads_turn_activity_from_the_tree_through_receipts_and_notices() {
 		.expect("interrupt notice");
 	host.poll().expect("apply dom events");
 	std::thread::sleep(std::time::Duration::from_millis(1100));
-	assert_eq!(host.key(Key::Ctrl('c')).expect("ctrl+c"), NativeEffect::Quit);
+	assert_ne!(host.key(Key::Ctrl('c')).expect("first ctrl+c"), NativeEffect::Quit);
+	assert_eq!(host.key(Key::Ctrl('c')).expect("second ctrl+c"), NativeEffect::Quit);
 }
 
 fn empty_host(resuming: bool, quiet: bool) -> NativeHost {
@@ -855,6 +859,35 @@ fn retry_loader_appears_on_inference_retry_and_clears_on_the_next_inference_star
 	assert!(host.status_frame().is_none());
 }
 
+/// The native actor samples the local clock when a clock-bearing preset is
+/// committed, keeps paint on the cached label, and schedules the next visible
+/// second boundary. Hiding the segment clears it immediately.
+#[test]
+fn native_status_clock_reconfigures_and_wakes_at_its_visible_unit() {
+	let (mut host, _commands) = bound_host(vec![row("test/model", &[])]);
+	host.resize(Size::new(200, 30));
+	let clock = omp_tui::Charset::default().icon(omp_tui::Icon::Time);
+	let band = |host: &NativeHost| {
+		text_of(host.frame())
+			.lines()
+			.find(|line| line.contains("📁 ") && line.contains(" ▶"))
+			.map(str::to_owned)
+			.expect("status band row")
+	};
+	assert!(!band(&host).contains(clock), "default preset has no clock");
+
+	host
+		.console("cl_status_line_preset nerd")
+		.expect("enable nerd status clock");
+	assert!(band(&host).contains(clock), "nerd preset shows cached local time");
+	assert!(host.tick(std::time::Duration::from_secs(2)), "second boundary repaints");
+
+	host
+		.console("cl_status_line_preset default")
+		.expect("disable status clock");
+	assert!(!band(&host).contains(clock), "hidden clock clears without a stale label");
+}
+
 #[test]
 fn error_banner_pins_above_the_editor_and_clears_on_the_next_submit() {
 	let (mut host, commands, _kernel, mut session) = kernel_host();
@@ -1171,6 +1204,47 @@ fn type_line(host: &mut NativeHost, line: &str) {
 	}
 }
 
+fn begin_local_run(session: &mut Session, mode: omp_chat::composer::PrefixMode) {
+	use omp_dom::{Op, PropKey, Txn, Value};
+
+	let (name, args) = match mode {
+		omp_chat::composer::PrefixMode::Bash => ("bash", serde_json::json!({"command":"sleep 30"})),
+		omp_chat::composer::PrefixMode::Eval => {
+			("eval", serde_json::json!({"language":"py","code":"await sleep(30)"}))
+		},
+	};
+	session.begin_turn().expect("begin local turn");
+	let args = serde_json::value::to_raw_value(&args).expect("args");
+	session
+		.call(name, 1, "local-1", None, Some(args), None)
+		.expect("running local call");
+	let turn = *session
+		.dom()
+		.children(session.dom().body())
+		.last()
+		.expect("local turn");
+	let element = *session.dom().children(turn).last().expect("local element");
+	let cause = session.head().expect("local call head");
+	session
+		.patch(Txn {
+			cause,
+			label: Some("local.run".into()),
+			ops: vec![
+				Op::Set {
+					h:     element,
+					prop:  PropKey::Custom(omp_agent::LOCAL_PRESENTATION_PROP.into()),
+					value: Value::Str(omp_agent::LOCAL_PRESENTATION_VALUE.into()),
+				},
+				Op::Set {
+					h:     element,
+					prop:  PropKey::Custom(omp_agent::LOCAL_KIND_PROP.into()),
+					value: Value::Str(name.into()),
+				},
+			],
+		})
+		.expect("mark local run");
+}
+
 /// pi `#submitToFocusedSession`: `!` / `$` lines never run while a subagent
 /// is focused; the draft stays put and the status names the way back.
 #[test]
@@ -1223,6 +1297,75 @@ fn focused_subagent_is_named_in_the_status_band_brand_slot() {
 	assert!(band(&host).starts_with(" π  >"), "{}", band(&host));
 }
 
+fn collab_state(role: Option<CollabRole>, participants: u32, line: &'static str) -> CollabState {
+	CollabState {
+		role,
+		connection: "connected".into(),
+		editor_link: None,
+		viewer_link: None,
+		participants: (0..participants)
+			.map(|id| CollabParticipant {
+				id,
+				name: format!("peer-{id}").into(),
+				host: id == 0,
+				read_only: false,
+			})
+			.collect(),
+		line: line.into(),
+	}
+}
+
+#[test]
+fn collaboration_status_tracks_outcomes_presence_snapshots_and_disconnect() {
+	let (mut host, _commands) = bound_host(vec![row("test/model", &[])]);
+	host.resize(Size { width: 160, height: 24 });
+
+	host
+		.act(HostAction::Outcome(Outcome::Collab(CollabOutcome {
+			op:     CollabOp::Start { read_only: false, relay: None },
+			result: Ok(collab_state(Some(CollabRole::Host), 3, "started")),
+		})))
+		.expect("host outcome");
+	let frame = text_of(host.frame());
+	assert!(frame.contains("collab:3"), "{frame}");
+
+	host
+		.act(HostAction::CollabStatus(Some(CollabStatus::host(5))))
+		.expect("presence update");
+	let frame = text_of(host.frame());
+	assert!(frame.contains("collab:5"), "{frame}");
+
+	host
+		.act(HostAction::CollabStatus(Some(CollabStatus::guest(4, CollabHostSnapshot {
+			model:          Some("Host model".into()),
+			thinking:       Some("high".into()),
+			cwd:            "/host/project".into(),
+			session_name:   Some("shared".into()),
+			tokens:         Some(321),
+			context_window: Some(8_192),
+		}))))
+		.expect("guest snapshot");
+	let frame = text_of(host.frame());
+	assert!(frame.contains("collab guest:4"), "{frame}");
+	assert!(frame.contains("Host model"), "{frame}");
+
+	host
+		.act(HostAction::Outcome(Outcome::Collab(CollabOutcome {
+			op:     CollabOp::Join { link: "wss://relay.example/room".into(), name: None },
+			result: Ok(collab_state(Some(CollabRole::Guest), 2, "joined")),
+		})))
+		.expect("guest outcome");
+	let frame = text_of(host.frame());
+	assert!(frame.contains("collab guest:2"), "{frame}");
+
+	host
+		.act(HostAction::CollabStatus(None))
+		.expect("disconnect");
+	let frame = text_of(host.frame());
+	assert!(!frame.contains("collab:"), "{frame}");
+	assert!(!frame.contains("collab guest:"), "{frame}");
+}
+
 /// pi `handleSubmit` collab guest branch: local execution is host-only; the
 /// line is consumed with a status and nothing is sent.
 #[test]
@@ -1239,31 +1382,105 @@ fn local_prefixes_are_refused_for_a_collab_guest() {
 	assert_eq!(host.composer_text(), "", "pi clears the consumed line");
 }
 
-/// pi: "A bash command is already running. Press Esc to cancel it first."
-/// followed by `editor.setText(text)` — the second command is handed back.
+/// Reconnect progress and both recoverable and terminal diagnostics stay in
+/// the live panel. Only the controller's `Closed` receipt releases the host
+/// edge and emits `Stop`.
 #[test]
-fn a_second_local_command_while_one_runs_is_handed_back_to_the_composer() {
-	let (mut host, commands, mut session) = bound_host_with_session(vec![row("test/model", &[])]);
-	session.begin_turn().expect("begin turn");
-	let args =
-		serde_json::value::to_raw_value(&serde_json::json!({"command":"sleep 30"})).expect("args");
-	session
-		.call("bash", 1, "local-1", None, Some(args), None)
-		.expect("running local call");
-	host.poll().expect("sync replica");
-	type_line(&mut host, "!echo second");
-	host.key(Key::Enter).expect("submit");
-	assert!(commands.try_recv().is_err(), "no second run while one is active");
-	assert_eq!(host.composer_text(), "!echo second", "the draft comes back");
-	assert_eq!(
-		host.notice(),
-		Some("A bash command is already running. Press Esc to cancel it first.")
-	);
-	// Ctrl+Q / Alt+Enter goes through the same door and must not wipe the
-	// restored draft afterwards.
-	host.console("cl_followup").expect("follow up");
-	assert!(commands.try_recv().is_err());
-	assert_eq!(host.composer_text(), "!echo second");
+fn live_reconnect_and_errors_do_not_close_the_host_before_closed() {
+	let (mut host, commands) = bound_host(vec![row("test/model", &[])]);
+	host
+		.act(omp_chat::HostAction::LiveToggle)
+		.expect("open live panel");
+	commands.try_iter().for_each(drop);
+
+	host
+		.act(omp_chat::HostAction::LiveEvent(omp_chat::overlays::live::LiveUiEvent::Reconnect {
+			attempt: 2,
+			maximum: 4,
+		}))
+		.expect("reconnect event");
+	assert!(text_of(host.frame()).contains("Reconnecting · attempt 2 of 4"));
+	assert!(commands.try_recv().is_err(), "reconnect does not stop the live controller");
+
+	for recoverable in [true, false] {
+		host
+			.act(omp_chat::HostAction::LiveEvent(omp_chat::overlays::live::LiveUiEvent::Error {
+				message: "network changed".into(),
+				recoverable,
+			}))
+			.expect("error event");
+		assert!(text_of(host.frame()).contains("network changed"));
+		assert!(commands.try_recv().is_err(), "an error remains panel state until Closed");
+	}
+
+	host
+		.act(omp_chat::HostAction::LiveEvent(omp_chat::overlays::live::LiveUiEvent::Closed))
+		.expect("closed event");
+	assert!(matches!(
+		commands.recv().expect("stop"),
+		HostCommand::LiveVoice(omp_chat::overlays::live::LiveControl::Stop)
+	));
+	host
+		.act(omp_chat::HostAction::LiveEvent(omp_chat::overlays::live::LiveUiEvent::Closed))
+		.expect("duplicate closed event");
+	assert!(commands.try_recv().is_err(), "Closed emits Stop exactly once");
+}
+
+/// Pi owns shell and evaluator activity independently: the active runner
+/// rejects only its own prefix and restores that draft; the other runner is
+/// admitted.
+#[test]
+fn local_run_rejection_tracks_the_active_runner_identity() {
+	{
+		let (mut host, commands, mut session) = bound_host_with_session(vec![row("test/model", &[])]);
+		begin_local_run(&mut session, omp_chat::composer::PrefixMode::Bash);
+		host.poll().expect("sync bash run");
+
+		type_line(&mut host, "!echo second");
+		host.key(Key::Enter).expect("submit");
+		assert!(commands.try_recv().is_err(), "no second bash run while bash is active");
+		assert_eq!(host.composer_text(), "!echo second", "the bash draft comes back");
+		assert_eq!(
+			host.notice(),
+			Some("A bash command is already running. Press Esc to cancel it first.")
+		);
+		// Ctrl+Q / Alt+Enter goes through the same door and must not wipe the
+		// restored draft afterwards.
+		host.console("cl_followup").expect("follow up");
+		assert!(commands.try_recv().is_err());
+		assert_eq!(host.composer_text(), "!echo second");
+
+		host.console("cl_clear").expect("clear refused bash draft");
+		type_line(&mut host, "$ print(2)");
+		host.key(Key::Enter).expect("submit evaluator");
+		assert!(matches!(commands.recv().expect("eval run"), HostCommand::RunLocal {
+			input: omp_chat::composer::LocalInput { mode: omp_chat::composer::PrefixMode::Eval, .. },
+			..
+		}));
+	}
+
+	{
+		let (mut host, commands, mut session) = bound_host_with_session(vec![row("test/model", &[])]);
+		begin_local_run(&mut session, omp_chat::composer::PrefixMode::Eval);
+		host.poll().expect("sync eval run");
+
+		type_line(&mut host, "$ print(2)");
+		host.key(Key::Enter).expect("submit");
+		assert!(commands.try_recv().is_err(), "no second eval run while eval is active");
+		assert_eq!(host.composer_text(), "$ print(2)", "the eval draft comes back");
+		assert_eq!(
+			host.notice(),
+			Some("A Python execution is already running. Press Esc to cancel it first.")
+		);
+
+		host.console("cl_clear").expect("clear refused eval draft");
+		type_line(&mut host, "!echo admitted");
+		host.key(Key::Enter).expect("submit shell");
+		assert!(matches!(commands.recv().expect("bash run"), HostCommand::RunLocal {
+			input: omp_chat::composer::LocalInput { mode: omp_chat::composer::PrefixMode::Bash, .. },
+			..
+		}));
+	}
 }
 
 /// The controller refused the run (paused): the draft returns and the

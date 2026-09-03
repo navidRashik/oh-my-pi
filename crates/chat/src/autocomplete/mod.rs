@@ -106,14 +106,6 @@ pub fn composer_chain(
 	}
 }
 
-/// Byte offset where the token containing `cursor` ends: the next
-/// whitespace at or after the cursor, else the end of the text.
-pub(crate) fn token_end(text: &str, cursor: usize) -> usize {
-	text[cursor..]
-		.find(char::is_whitespace)
-		.map_or(text.len(), |offset| cursor + offset)
-}
-
 /// Whether `at` starts a token: text start, or preceded by whitespace or
 /// one of pi's opening boundary characters (`"'`(<=`).
 pub(crate) fn is_token_start(text: &str, at: usize) -> bool {
@@ -179,7 +171,5 @@ mod tests {
 		assert!(is_token_start("see @", 4));
 		assert!(is_token_start("(@", 1));
 		assert!(!is_token_start("a@", 1));
-		assert_eq!(token_end("@src/main rest", 3), 9);
-		assert_eq!(token_end("@src", 2), 4);
 	}
 }

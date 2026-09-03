@@ -27,12 +27,12 @@ pub mod gallery;
 pub mod gitwatch;
 /// Interactive terminal actor.
 pub mod host;
-/// Bounded, typed normalization for composer-staged media.
-pub mod media;
 /// Terminal input and command bindings.
 pub mod input;
 /// Renderer-faithful Markdown facts (the hyperlinks a message draws).
 pub mod markdown;
+/// Bounded, typed normalization for composer-staged media.
+pub mod media;
 /// Transcript notices, maintenance dividers, usage rows, and the vocalizer.
 pub mod notices;
 /// Desktop notifications on turn completion, error, and pending questions.

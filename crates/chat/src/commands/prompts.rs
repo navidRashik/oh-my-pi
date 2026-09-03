@@ -27,8 +27,20 @@ pub trait PromptExpander: Send + Sync + 'static {
 	fn expand(&self, name: &str, args: &[Str]) -> Option<Str>;
 }
 
-/// The installed expander, stored on the console as host data.
+/// Expands the discovered `/skill:<name>` command roster.
+pub trait SkillExpander: Send + Sync + 'static {
+	/// `(name, description)` rows without the `skill:` command prefix.
+	fn skills(&self) -> Vec<(Str, Str)>;
+
+	/// Builds the typed, exact model-facing invocation.
+	fn expand_skill(&self, name: &str, args: &[Str]) -> Option<omp_journal::data::SkillPrompt>;
+}
+
+/// The installed template expander, stored on the console as host data.
 struct Installed(Arc<dyn PromptExpander>);
+
+/// The installed skill expander.
+struct InstalledSkills(Arc<dyn SkillExpander>);
 
 /// Registers every template as a dynamic console command and installs
 /// `expander` as the table those commands expand from. Returns the names
@@ -52,23 +64,68 @@ pub fn register(ctx: &Ctx, expander: Arc<dyn PromptExpander>) -> Vec<Str> {
 	reserved
 }
 
+/// Registers admitted skills as `/skill:<name>` commands.
+pub fn register_skills(ctx: &Ctx, expander: Arc<dyn SkillExpander>) -> Vec<Str> {
+	let mut reserved = Vec::new();
+	for (name, desc) in expander.skills() {
+		let command = Str::new(format!("skill:{name}"));
+		match ctx.register_dynamic_cmd(DynamicCmdSpec {
+			name: command.clone(),
+			desc,
+			handler: run_skill,
+		}) {
+			Ok(()) => {},
+			Err(ConError::Duplicate { .. }) => reserved.push(command),
+			Err(error) => {
+				ctx.reply(
+					Severity::Warn,
+					&format!("skill command `{command}` was not registered: {error}"),
+				);
+			},
+		}
+	}
+	ctx.insert_user(InstalledSkills(expander));
+	reserved
+}
+
 /// Shared handler for every prompt-template command.
-fn run(ctx: &Ctx, name: &str, args: &[Arg]) -> ConResult<()> {
-	let Some(installed) = ctx.user::<Installed>() else {
-		ctx.reply(Severity::Warn, "prompt templates are not installed on this console");
-		return Ok(());
-	};
-	let words = args
+fn words(args: &[Arg]) -> Vec<Str> {
+	args
 		.iter()
 		.map(|arg| match arg {
 			Arg::Atom(word) => word.clone(),
 			other => other.to_script(),
 		})
-		.collect::<Vec<_>>();
+		.collect()
+}
+
+fn run(ctx: &Ctx, name: &str, args: &[Arg]) -> ConResult<()> {
+	let Some(installed) = ctx.user::<Installed>() else {
+		ctx.reply(Severity::Warn, "prompt templates are not installed on this console");
+		return Ok(());
+	};
+	let words = words(args);
 	match installed.0.expand(name, &words) {
 		Some(text) => super::post(ctx, CommandAction::Prompt { text }),
 		None => {
 			ctx.reply(Severity::Warn, &format!("unknown prompt template `{name}`"));
+			Ok(())
+		},
+	}
+}
+
+fn run_skill(ctx: &Ctx, command: &str, args: &[Arg]) -> ConResult<()> {
+	let Some(installed) = ctx.user::<InstalledSkills>() else {
+		ctx.reply(Severity::Warn, "skills are not installed on this console");
+		return Ok(());
+	};
+	let Some(name) = command.strip_prefix("skill:") else {
+		return Ok(());
+	};
+	match installed.0.expand_skill(name, &words(args)) {
+		Some(prompt) => super::post(ctx, CommandAction::SkillPrompt { prompt }),
+		None => {
+			ctx.reply(Severity::Warn, &format!("unknown skill `{name}`"));
 			Ok(())
 		},
 	}
@@ -102,6 +159,22 @@ mod tests {
 		}
 	}
 
+	impl SkillExpander for Table {
+		fn skills(&self) -> Vec<(Str, Str)> {
+			vec![(Str::new_static("review"), Str::new_static("Review with a skill"))]
+		}
+
+		fn expand_skill(&self, name: &str, args: &[Str]) -> Option<omp_journal::data::SkillPrompt> {
+			(name == "review").then(|| omp_journal::data::SkillPrompt {
+				name:        Str::new_static("review"),
+				args:        Some(Str::new(args.join(" "))),
+				path:        Str::new_static("/skills/review/SKILL.md"),
+				prompt_body: Str::new_static("exact expanded prompt"),
+				line_count:  3,
+			})
+		}
+	}
+
 	#[test]
 	fn template_command_expands_words_and_posts_a_prompt() {
 		let ctx = HostMailbox::new().attach(Ctx::builder()).build();
@@ -119,5 +192,25 @@ mod tests {
 			})
 			.expect("a posted prompt");
 		assert_eq!(posted, "Review src/lib.rs carefully: src/lib.rs the tests");
+	}
+
+	#[test]
+	fn skill_command_posts_typed_source_and_exact_prompt() {
+		let ctx = HostMailbox::new().attach(Ctx::builder()).build();
+		assert!(register_skills(&ctx, Arc::new(Table)).is_empty());
+
+		ctx.run("skill:review src/lib.rs").unwrap();
+		let mailbox = ctx.user::<HostMailbox>().expect("attached mailbox");
+		let prompt = mailbox
+			.drain()
+			.find_map(|action| match action {
+				HostAction::Command(CommandAction::SkillPrompt { prompt }) => Some(prompt),
+				_ => None,
+			})
+			.expect("a typed skill prompt");
+		assert_eq!(prompt.name, "review");
+		assert_eq!(prompt.path, "/skills/review/SKILL.md");
+		assert_eq!(prompt.args.as_deref(), Some("src/lib.rs"));
+		assert_eq!(prompt.prompt_body, "exact expanded prompt");
 	}
 }

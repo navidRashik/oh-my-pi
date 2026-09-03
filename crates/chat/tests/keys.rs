@@ -6,7 +6,7 @@ use std::{
 		Arc,
 		atomic::{AtomicUsize, Ordering},
 	},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use omp_agent::Up;
@@ -23,8 +23,10 @@ use omp_core::Str;
 use omp_dom::{KnownTag, NodeSpec, Op, PropId, Tag, Txn, Value};
 use omp_session::{ComponentRegistry, Session};
 use omp_tui::{
-	Chord, Frame, Key, KeyEvent, Mods, Mouse, MouseButton, MouseReport, Size, UiContext,
-	paste::{Clipboard, ClipboardRead, ClipboardReadOutcome}, slots::ResizePolicy,
+	Chord, Frame, InputDecoder, InputEvent, Key, KeyEvent, Mods, Mouse, MouseButton, MouseReport,
+	Size, UiContext,
+	paste::{Clipboard, ClipboardRead, ClipboardReadOutcome, ClipboardWriteOutcome},
+	slots::ResizePolicy,
 };
 use tempfile::tempdir;
 
@@ -32,6 +34,7 @@ const BINDS: &str = r#"
 bind escape cl_interrupt
 bind ctrl+c cl_clear
 bind alt+up cl_dequeue
+bind shift+up cl_dequeue
 bind alt+shift+l cl_copy_line
 bind alt+shift+c cl_copy_prompt
 bind ctrl+v cl_paste_image
@@ -40,13 +43,14 @@ bind ctrl+shift+d debug
 bind ctrl+p panel_toggle_path
 bind ctrl+s panel_toggle_sort
 bind ctrl+r panel_rename
-bind ctrl+d panel_delete
+bind ctrl+d "panel_delete; cl_exit; ed_delete"
 bind ctrl+w panel_delete_fast
 bind ctrl+left panel_fold_up
 bind ctrl+right panel_unfold_down
 bind ctrl+o panel_expand
 bind ctrl+q cl_followup
 bind ctrl+enter cl_followup
+bind alt+r cl_retry
 "#;
 
 struct Harness {
@@ -270,6 +274,29 @@ fn double_escape_within_500ms_on_an_empty_composer_runs_the_selector_line() {
 }
 
 #[test]
+fn buffered_double_escape_burst_reaches_the_host_as_two_press_edges() {
+	let mut h = harness(idle_session());
+	let start = Instant::now();
+	let mut decoder = InputDecoder::new();
+	decoder.keymap_mut().set_chord_events(true);
+	let mut events = Vec::new();
+	decoder.feed(b"\x1b\x1b", start, &mut events);
+	assert!(events.is_empty(), "the ambiguous burst waits for the framing deadline");
+	decoder.tick(start + Duration::from_millis(100), &mut events);
+	assert_eq!(events.len(), 2);
+	for event in events {
+		let InputEvent::Chord(event) = event else {
+			panic!("double Escape must preserve physical chord events");
+		};
+		h.host.chord(event).expect("route buffered Escape");
+	}
+	assert!(
+		h.host.overlay_id().is_some() || h.host.notice().is_some(),
+		"the second Escape runs the configured branch selector"
+	);
+}
+
+#[test]
 fn double_escape_never_fires_while_a_draft_exists() {
 	let mut h = harness(idle_session());
 	type_text(&mut h.host, "keep me");
@@ -453,11 +480,13 @@ fn escape_cancels_main_session_maintenance_but_not_from_a_subagent_view() {
 // ---------------------------------------------------------------- ctrl+c
 
 #[test]
-fn ctrl_c_clears_the_draft_then_stops_a_recording() {
+fn ctrl_c_clears_the_draft_and_a_fresh_first_press_stops_recording() {
 	let mut h = harness(idle_session());
 	type_text(&mut h.host, "draft");
 	h.host.key(Key::Ctrl('c')).expect("ctrl+c");
 	assert_eq!(h.host.composer_text(), "");
+
+	let mut h = harness(idle_session());
 	h.host.act(HostAction::SttToggle).expect("record");
 	assert!(h.host.recording());
 	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::PushToTalk { active: true })));
@@ -466,7 +495,60 @@ fn ctrl_c_clears_the_draft_then_stops_a_recording() {
 	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::PushToTalk { active: false })));
 }
 
+#[test]
+fn first_ctrl_c_with_an_empty_active_composer_is_non_destructive_then_repeat_quits() {
+	let mut session = idle_session();
+	open_turn(&mut session);
+	let mut h = harness(session);
+	assert_ne!(h.host.key(Key::Ctrl('c')).expect("first ctrl+c"), NativeEffect::Quit);
+	assert!(
+		!h.commands
+			.try_iter()
+			.any(|command| matches!(command, HostCommand::Interrupt)),
+		"pi's first Ctrl+C clears; it does not interrupt solely because a turn is active"
+	);
+	assert_eq!(h.host.key(Key::Ctrl('c')).expect("second ctrl+c"), NativeEffect::Quit);
+}
+
+#[test]
+fn ctrl_d_exits_without_editing_the_draft() {
+	let mut h = harness(idle_session());
+	type_text(&mut h.host, "save this draft");
+	assert_eq!(h.host.key(Key::Ctrl('d')).expect("ctrl+d"), NativeEffect::Quit);
+	assert_eq!(h.host.composer_text(), "save this draft");
+}
+
 // ---------------------------------------------------------------- dequeue
+
+#[test]
+fn shipped_shift_up_dequeues_unless_an_explicit_bind_claims_it() {
+	let mut session = idle_session();
+	queue_prompt(&mut session, "q1", "queued");
+	let mut h = harness(session);
+	let chord = Chord::parse("shift+up").expect("shift up");
+	h.host
+		.chord(KeyEvent { chord, key: Some(Key::RestoreQueue), pressed: true })
+		.expect("shipped dequeue");
+	assert_eq!(h.host.composer_text(), "queued");
+	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::Dequeue { .. })));
+
+	let mut session = idle_session();
+	queue_prompt(&mut session, "q1", "stay queued");
+	let mut h = harness(session);
+	h.con
+		.run("bind shift+up ed_up")
+		.expect("explicit editor bind");
+	h.host
+		.chord(KeyEvent { chord, key: Some(Key::RestoreQueue), pressed: true })
+		.expect("custom shift up");
+	assert!(
+		!h.commands
+			.try_iter()
+			.any(|command| matches!(command, HostCommand::Dequeue { .. })),
+		"the explicit binding steals Shift+Up from the shipped dequeue fallback"
+	);
+	assert_ne!(h.host.composer_text(), "stay queued");
+}
 
 #[test]
 fn alt_up_restores_queued_prompts_ahead_of_the_draft() {
@@ -675,8 +757,7 @@ fn compaction_follow_up_keeps_normalized_media_and_exact_marker() {
 	open_turn(&mut session);
 	engage_director(&mut session, "compaction");
 	let mut h = harness(session);
-	h.host
-		.paste(path.to_str().expect("utf-8 path"));
+	h.host.paste(path.to_str().expect("utf-8 path"));
 	type_text(&mut h.host, "after compaction");
 	h.host.key(Key::FollowUp).expect("follow up");
 	let (prompt, attachments) = match h.commands.try_recv() {
@@ -767,7 +848,69 @@ fn live_bind_changes_apply_to_the_next_physical_edge() {
 }
 
 #[test]
-fn physical_release_runs_the_minus_action_from_the_live_bind() {
+fn configured_tool_visibility_chord_routes_through_the_command_stream() {
+	let mut h = harness(idle_session());
+	assert!(omp_chat::actions::CL_SHOWTOOLS.get(&h.con));
+	h.con
+		.run("bind alt+h \"toggle cl_showtools\"")
+		.expect("visibility remap");
+	h.host.key(Key::Alt('h')).expect("visibility chord");
+	assert!(!omp_chat::actions::CL_SHOWTOOLS.get(&h.con));
+}
+
+#[test]
+fn user_remap_precedes_the_shipped_action_and_unbind_removes_it() {
+	let mut h = harness(idle_session());
+	type_text(&mut h.host, "draft");
+	h.con
+		.run("bind option+r cl_copy_prompt")
+		.expect("remap retry chord by canonical alias");
+	h.host.key(Key::Alt('r')).expect("remapped chord");
+	assert_eq!(h.host.take_clipboard().as_deref(), Some("draft"));
+	assert!(h.commands.try_recv().is_err(), "the replaced retry action never runs");
+
+	h.con.run("unbind alt+r").expect("remove remap");
+	h.host.key(Key::Alt('r')).expect("removed chord");
+	assert_eq!(h.host.take_clipboard(), None);
+	assert!(h.commands.try_recv().is_err(), "removed custom binding has no fallback");
+}
+
+#[test]
+fn shifted_symbol_wire_alias_reaches_the_same_custom_binding() {
+	let mut h = harness(idle_session());
+	type_text(&mut h.host, "draft");
+	h.con
+		.run(r#"bind "!" cl_copy_prompt"#)
+		.expect("symbol bind");
+	let chord = Chord::parse("shift+!").expect("shifted symbol chord");
+	h.host
+		.chord(KeyEvent { chord, key: None, pressed: true })
+		.expect("shifted symbol press");
+	assert_eq!(h.host.take_clipboard().as_deref(), Some("draft"));
+}
+
+#[test]
+fn submit_and_newline_are_live_remappable_commands() {
+	let mut h = harness(idle_session());
+	h.con.run("bind enter ed_newline").expect("remap enter");
+	type_text(&mut h.host, "hello");
+	h.host.key(Key::Enter).expect("newline");
+	assert_eq!(h.host.composer_text(), "hello\n");
+	assert!(h.commands.try_recv().is_err());
+
+	h.con.run("bind ctrl+enter ed_enter").expect("remap submit");
+	let chord = Chord::parse("ctrl+enter").expect("ctrl enter");
+	h.host
+		.chord(KeyEvent { chord, key: Some(Key::FollowUp), pressed: true })
+		.expect("submit chord");
+	assert!(matches!(
+		h.commands.try_recv(),
+		Ok(HostCommand::Submit(text)) if text == "hello\n"
+	));
+}
+
+#[test]
+fn physical_release_runs_the_minus_action_from_the_latched_bind() {
 	let mut h = harness(idle_session());
 	h.con
 		.run(r#"alias +peek "cl_showthinking 1"; alias -peek "cl_showthinking 0"; bind ctrl+h +peek"#)
@@ -777,10 +920,24 @@ fn physical_release_runs_the_minus_action_from_the_live_bind() {
 		.chord(KeyEvent { chord, key: Some(Key::Ctrl('h')), pressed: true })
 		.expect("press");
 	assert!(omp_con::CL_SHOWTHINKING.get(&h.con));
+	h.con.run("unbind ctrl+h").expect("remove while held");
 	h.host
 		.chord(KeyEvent { chord, key: Some(Key::Ctrl('h')), pressed: false })
 		.expect("release");
 	assert!(!omp_con::CL_SHOWTHINKING.get(&h.con));
+}
+
+#[test]
+fn semantic_key_calls_close_a_held_action_edge_immediately() {
+	let mut h = harness(idle_session());
+	h.con
+		.run(r#"alias +peek "cl_showthinking 1"; alias -peek "cl_showthinking 0"; bind ctrl+h +peek"#)
+		.expect("hold action");
+	h.host.key(Key::Ctrl('h')).expect("semantic key");
+	assert!(
+		!omp_con::CL_SHOWTHINKING.get(&h.con),
+		"press-only callers synthesize release rather than stranding +actions"
+	);
 }
 
 #[test]
@@ -791,10 +948,8 @@ fn paste_chords_request_the_matching_clipboard_read_and_deliver_it() {
 	h.host.key(Key::PasteRaw).expect("ctrl+shift+v");
 	assert_eq!(h.host.take_clipboard_read(), Some(ClipboardRead::Text));
 	// Raw text keeps its newlines verbatim.
-	h.host.deliver_clipboard(
-		ClipboardReadOutcome::Payload(Clipboard::Text("a\nb".into())),
-		true,
-	);
+	h.host
+		.deliver_clipboard(ClipboardReadOutcome::Payload(Clipboard::Text("a\nb".into())), true);
 	assert_eq!(h.host.composer_text(), "a\nb");
 	// An image persists to a temp file and lands as an attachment chip whose
 	// submitted form is pi's positional marker (the file travels as the
@@ -824,34 +979,31 @@ fn paste_chords_request_the_matching_clipboard_read_and_deliver_it() {
 }
 
 #[test]
+fn typed_clipboard_writes_report_the_final_backend_outcome() {
+	let cases = [
+		(ClipboardWriteOutcome::Success, "Copied to clipboard"),
+		(ClipboardWriteOutcome::PermissionDenied, "Clipboard write access was denied"),
+		(ClipboardWriteOutcome::Unavailable, "Clipboard is unavailable"),
+		(ClipboardWriteOutcome::WriteFailure, "Failed to write clipboard"),
+	];
+	for (outcome, notice) in cases {
+		let mut h = harness(idle_session());
+		type_text(&mut h.host, "draft");
+		h.host.deliver_clipboard_write(outcome);
+		assert_eq!(h.host.composer_text(), "draft");
+		assert_eq!(h.host.notice(), Some(notice));
+	}
+}
+
+#[test]
 fn typed_clipboard_misses_report_exactly_without_mutating_the_composer() {
 	let cases = [
 		(ClipboardReadOutcome::Empty, false, "Clipboard is empty"),
-		(
-			ClipboardReadOutcome::Empty,
-			true,
-			"No text in clipboard to paste raw",
-		),
-		(
-			ClipboardReadOutcome::PermissionDenied,
-			false,
-			"Clipboard access was denied",
-		),
-		(
-			ClipboardReadOutcome::UnsupportedFormat,
-			false,
-			"Clipboard format is not supported",
-		),
-		(
-			ClipboardReadOutcome::ReadFailure,
-			false,
-			"Failed to read clipboard",
-		),
-		(
-			ClipboardReadOutcome::ReadFailure,
-			true,
-			"Failed to paste raw text from clipboard",
-		),
+		(ClipboardReadOutcome::Empty, true, "No text in clipboard to paste raw"),
+		(ClipboardReadOutcome::PermissionDenied, false, "Clipboard access was denied"),
+		(ClipboardReadOutcome::UnsupportedFormat, false, "Clipboard format is not supported"),
+		(ClipboardReadOutcome::ReadFailure, false, "Failed to read clipboard"),
+		(ClipboardReadOutcome::ReadFailure, true, "Failed to paste raw text from clipboard"),
 	];
 	for (outcome, raw, notice) in cases {
 		let mut h = harness(idle_session());
@@ -1084,10 +1236,8 @@ fn paste_reaches_the_active_side_panel_before_the_composer() {
 fn clipboard_payload_keeps_focused_panel_routing_and_refuses_hidden_media_mutation() {
 	let mut h = harness(idle_session());
 	open_probe(&mut h.host, "btw", PanelAnchor::Side);
-	h.host.deliver_clipboard(
-		ClipboardReadOutcome::Payload(Clipboard::Text("hello".into())),
-		true,
-	);
+	h.host
+		.deliver_clipboard(ClipboardReadOutcome::Payload(Clipboard::Text("hello".into())), true);
 	assert_eq!(h.host.take_clipboard().as_deref(), Some("pasted:hello"));
 	assert_eq!(h.host.composer_text(), "", "raw text stays in the focused panel");
 
@@ -1095,10 +1245,7 @@ fn clipboard_payload_keeps_focused_panel_routing_and_refuses_hidden_media_mutati
 		ClipboardReadOutcome::Payload(Clipboard::Paths(vec![Str::new_static("/tmp/a.png")])),
 		false,
 	);
-	assert_eq!(
-		h.host.notice(),
-		Some("Close the current panel before pasting images or files")
-	);
+	assert_eq!(h.host.notice(), Some("Close the current panel before pasting images or files"));
 	assert_eq!(h.host.composer_text(), "", "media refusal cannot mutate the hidden composer");
 }
 
@@ -1301,7 +1448,6 @@ fn space_hold_recognizes_a_metronomic_repeat_and_tracks_back_typed_spaces() {
 fn a_held_space_bar_starts_recording_and_release_stops_it() {
 	let mut h = harness(idle_session());
 	type_text(&mut h.host, "hi");
-	let epoch = h.host.clock();
 	// Feed the gesture on the real clock: repeats 30ms apart.
 	for _ in 0..5 {
 		h.host.key(Key::Space).expect("space");
@@ -1310,9 +1456,10 @@ fn a_held_space_bar_starts_recording_and_release_stops_it() {
 	assert!(h.host.recording(), "metronomic repeat begins push-to-talk");
 	assert_eq!(h.host.composer_text(), "hi", "pre-burst spaces are tracked back");
 	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::PushToTalk { active: true })));
-	// Release: the idle gap elapses on the presentation clock.
+	// Release: native polling advances the same presentation-clock deadline
+	// as the terminal host even when no controller event wakes the actor.
 	std::thread::sleep(SPACE_HOLD_RELEASE + Duration::from_millis(20));
-	assert!(h.host.tick(epoch.elapsed()));
+	assert_eq!(h.host.poll().expect("poll release"), NativeEffect::Consumed);
 	assert!(!h.host.recording());
 	assert!(matches!(h.commands.try_recv(), Ok(HostCommand::PushToTalk { active: false })));
 	// The recognizer's text lands at the caret.
@@ -1320,6 +1467,47 @@ fn a_held_space_bar_starts_recording_and_release_stops_it() {
 		.act(HostAction::SttEvent(SttUiEvent::Segment(Str::new_static(" there"))))
 		.expect("insert");
 	assert_eq!(h.host.composer_text(), "hi there");
+}
+
+#[test]
+fn stt_preview_replaces_commits_and_cancels_without_moving_surrounding_text() {
+	let mut h = harness(idle_session());
+	type_text(&mut h.host, "note: tail");
+	for _ in 0..4 {
+		h.host.key(Key::Left).expect("left");
+	}
+
+	h.host
+		.act(HostAction::SttEvent(SttUiEvent::Partial(Str::new_static("hel"))))
+		.expect("partial");
+	assert_eq!(h.host.composer_text(), "note: heltail");
+	h.host
+		.act(HostAction::SttEvent(SttUiEvent::Partial(Str::new_static("hello"))))
+		.expect("replace partial");
+	assert_eq!(h.host.composer_text(), "note: hellotail");
+	h.host
+		.act(HostAction::SttEvent(SttUiEvent::Cancelled))
+		.expect("cancel");
+	assert_eq!(h.host.composer_text(), "note: tail");
+
+	h.host
+		.act(HostAction::SttEvent(SttUiEvent::Partial(Str::new_static("hello"))))
+		.expect("partial");
+	h.host
+		.act(HostAction::SttEvent(SttUiEvent::Segment(Str::new_static("hello"))))
+		.expect("segment");
+	h.host
+		.act(HostAction::SttEvent(SttUiEvent::Partial(Str::new_static(" wor"))))
+		.expect("next partial");
+	assert_eq!(h.host.composer_text(), "note: hello wortail");
+	h.host
+		.act(HostAction::SttEvent(SttUiEvent::Finished {
+			had_speech:    true,
+			trim_trailing: 0,
+			submit:        false,
+		}))
+		.expect("finish");
+	assert_eq!(h.host.composer_text(), "note: hellotail");
 }
 
 #[test]

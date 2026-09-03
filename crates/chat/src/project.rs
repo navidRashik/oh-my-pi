@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 
 use crate::{
 	cards::{CardRegistry, CardStatus, CardView, Component, result_image},
-	notices::{cache, custom, divider, error, irc, local, misc, usage},
+	notices::{cache, custom, divider, error, file_mentions, irc, local, misc, skill, usage},
 	reaction, thinking,
 	transcript::{Local, REVEAL_HORIZON, StreamHead},
 };
@@ -141,6 +141,33 @@ pub(crate) fn project(
 			};
 			match &node.tag {
 				Tag::Known(KnownTag::User) => {
+					if let Some(mentions) = file_mentions::payload(node) {
+						let text = file_mentions::text(&mentions);
+						let component = file_mentions::block(&mentions);
+						blocks.push(rendered(
+							*handle,
+							BlockKind::Notice,
+							text,
+							Mode::Mutable,
+							true,
+							component,
+						));
+						continue;
+					}
+					if let Some(prompt) = skill::prompt(node) {
+						reaction_target = None;
+						let text = skill::prompt_text(&prompt);
+						let component = skill::prompt_card(&prompt, options.expanded);
+						blocks.push(rendered(
+							*handle,
+							BlockKind::Notice,
+							text,
+							Mode::Mutable,
+							true,
+							component,
+						));
+						continue;
+					}
 					if let Some(completion) = misc::launch_completion(node) {
 						reaction_target = None;
 						if options.show_tools {
@@ -1298,6 +1325,295 @@ mod tests {
 	}
 
 	#[test]
+	fn skill_prompt_replays_expands_copies_and_stays_visible_without_tool_activity() {
+		use omp_journal::data::SkillPrompt;
+
+		let directory = tempfile::tempdir().expect("temp directory");
+		let path = directory.path().join("skill-prompt.oms");
+		let mut session =
+			Session::create(&path, ComponentRegistry::standard()).expect("session creates");
+		session.begin_turn().expect("turn starts");
+		let prompt_body = Str::new_static("Use **atomic** commits.\n\n- Verify each hunk");
+		session
+			.skill_prompt(SkillPrompt {
+				name:        Str::new_static("atomic-commit"),
+				args:        Some(Str::new_static("stage all\nthen split")),
+				path:        Str::new_static("/Users/example/.o2/skills/atomic-commit/SKILL.md"),
+				prompt_body: prompt_body.clone(),
+				line_count:  88,
+			})
+			.expect("skill prompt journals");
+
+		let local = Local::default();
+		let collapsed = projected(&session, &Options { show_tools: true, ..Options::new(&local) });
+		let block = collapsed
+			.into_iter()
+			.find(|block| block.view.text.starts_with("skill atomic-commit"))
+			.expect("skill card");
+		assert_eq!(block.view.kind, BlockKind::Notice);
+		let collapsed = render(block.component, 120);
+		assert!(collapsed.contains("skill atomic-commit stage all then split"), "{collapsed:?}");
+		assert!(collapsed.contains("88 lines"), "{collapsed:?}");
+		assert!(!collapsed.contains("Use atomic commits"), "{collapsed:?}");
+
+		let expanded =
+			projected(&session, &Options { expanded: true, show_tools: true, ..Options::new(&local) });
+		let block = expanded
+			.into_iter()
+			.find(|block| block.view.text.starts_with("skill atomic-commit"))
+			.expect("expanded skill card");
+		assert!(render(block.component, 120).contains("Use atomic commits"));
+
+		let tools_hidden =
+			projected(&session, &Options { show_tools: false, ..Options::new(&local) });
+		assert!(
+			tools_hidden
+				.iter()
+				.any(|block| block.view.text.starts_with("skill atomic-commit")),
+			"a user-invoked skill is user context, not hideable tool activity"
+		);
+
+		let copied = crate::overlays::copy::collect_targets(session.dom(), true, false, false);
+		let copied = copied.last().expect("skill copy target");
+		assert_eq!(copied.label, "message");
+		assert_eq!(copied.content, prompt_body);
+
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		let user = *session.dom().children(turn).last().expect("skill user");
+		assert_eq!(
+			session
+				.dom()
+				.get(user)
+				.and_then(|node| node.content.as_deref()),
+			Some("Use **atomic** commits.\n\n- Verify each hunk"),
+			"the typed card body remains the ordinary model-facing user content"
+		);
+
+		drop(session);
+		let restored = Session::open(&path, ComponentRegistry::standard()).expect("session replays");
+		let replayed = projected(&restored, &Options { show_tools: false, ..Options::new(&local) });
+		assert_eq!(
+			replayed
+				.iter()
+				.filter(|block| block.view.text.starts_with("skill atomic-commit"))
+				.count(),
+			1,
+			"one typed skill card survives replay"
+		);
+	}
+
+	/// Authenticated collaboration prompts are ordinary authored user rows:
+	/// Markdown and attachment order survive replay and copy projection, and
+	/// observer-local tool hiding never suppresses user input.
+	#[test]
+	fn collaboration_prompt_replays_copies_and_stays_visible_without_tool_activity() {
+		let directory = tempfile::tempdir().expect("temp directory");
+		let path = directory.path().join("collaboration-prompt.oms");
+		let mut session =
+			Session::create(&path, ComponentRegistry::standard()).expect("session creates");
+		let blob = |byte: u8, size: u64| Attachment {
+			blob: omp_journal::blob::BlobRef { hash: omp_core::Hash32::new([byte; 32]), size },
+			mime: Str::new_static("image/png"),
+		};
+
+		session.begin_turn().expect("first turn starts");
+		session.user("host before", Vec::new()).expect("first user");
+		session.begin_turn().expect("collaboration turn starts");
+		let guest_text = "## Deploy\n\nPlease inspect **both** images.";
+		session
+			.user_authored(guest_text, vec![blob(7, 128), blob(8, 2_048)], "Ada Lovelace")
+			.expect("collaboration user");
+		session.begin_turn().expect("last turn starts");
+		session.user("host after", Vec::new()).expect("last user");
+
+		let local = Local::default();
+		let hidden = projected(&session, &Options { show_tools: false, ..Options::new(&local) });
+		let users: Vec<&RenderedBlock> = hidden
+			.iter()
+			.filter(|block| block.view.kind == BlockKind::User)
+			.collect();
+		assert_eq!(
+			users
+				.iter()
+				.map(|block| block.view.text.as_str())
+				.collect::<Vec<_>>(),
+			["host before", guest_text, "host after"],
+			"authored input retains transcript order"
+		);
+		let guest_rendered = render(
+			projected(&session, &Options { show_tools: false, ..Options::new(&local) })
+				.into_iter()
+				.find(|block| block.view.text == guest_text)
+				.expect("collaboration row")
+				.component,
+			80,
+		);
+		assert!(guest_rendered.starts_with(" «Ada Lovelace» ›\n"), "{guest_rendered:?}");
+		assert!(guest_rendered.contains("\n Deploy\n"), "body is Markdown:\n{guest_rendered}");
+		assert!(
+			!guest_rendered.contains("## Deploy"),
+			"Markdown source does not leak:\n{guest_rendered}"
+		);
+		let first = guest_rendered.find("#1 · 128B").expect("first attachment");
+		let second = guest_rendered
+			.find("#2 · 2.0KB")
+			.expect("second attachment");
+		assert!(first < second, "attachment ordinal order is stable:\n{guest_rendered}");
+
+		let copied = crate::overlays::copy::collect_targets(session.dom(), true, false, false);
+		assert_eq!(
+			copied
+				.iter()
+				.map(|target| target.content.as_str())
+				.collect::<Vec<_>>(),
+			["host before", guest_text, "host after"],
+			"copy projection retains the authored row even with tool activity hidden"
+		);
+
+		drop(session);
+		let restored = Session::open(&path, ComponentRegistry::standard()).expect("session replays");
+		let replayed = projected(&restored, &Options { show_tools: false, ..Options::new(&local) });
+		assert_eq!(
+			replayed
+				.iter()
+				.filter(|block| block.view.text == guest_text)
+				.count(),
+			1,
+			"one collaboration prompt survives replay"
+		);
+		let replayed_rendered = render(
+			replayed
+				.into_iter()
+				.find(|block| block.view.text == guest_text)
+				.expect("replayed collaboration row")
+				.component,
+			80,
+		);
+		assert!(
+			replayed_rendered.contains("«Ada Lovelace» ›"),
+			"replay retains authenticated author identity"
+		);
+		let first = replayed_rendered
+			.find("#1 · 128B")
+			.expect("replayed first attachment");
+		let second = replayed_rendered
+			.find("#2 · 2.0KB")
+			.expect("replayed second attachment");
+		assert!(first < second, "replay retains attachment order:\n{replayed_rendered}");
+	}
+
+	#[test]
+	fn file_mentions_replay_stay_visible_and_copy_linked_rows_in_order() {
+		use omp_core::Hash32;
+		use omp_journal::{
+			blob::BlobRef,
+			data::{FileMentions, MentionedFile, MentionedFileState},
+		};
+
+		let directory = tempfile::tempdir().expect("temp directory");
+		let path = directory.path().join("file-mentions.oms");
+		let mut session =
+			Session::create(&path, ComponentRegistry::standard()).expect("session creates");
+		session.begin_turn().expect("turn starts");
+		session.user("inspect these", Vec::new()).expect("user");
+		session
+			.file_mentions(FileMentions {
+				files: vec![
+					MentionedFile {
+						path:    Str::new_static("src/main.rs"),
+						content: Str::new_static("fn main() {}"),
+						state:   MentionedFileState::Lines { line_count: Some(1) },
+					},
+					MentionedFile {
+						path:    Str::new_static("screen.png"),
+						content: Str::default(),
+						state:   MentionedFileState::Image {
+							attachment: Attachment {
+								blob: BlobRef { hash: Hash32::new([3; 32]), size: 640 },
+								mime: Str::new_static("image/png"),
+							},
+						},
+					},
+					MentionedFile {
+						path:    Str::new_static("vendor.bin"),
+						content: Str::default(),
+						state:   MentionedFileState::SkippedBinary { byte_size: Some(3_072) },
+					},
+					MentionedFile {
+						path:    Str::new_static("dump.log"),
+						content: Str::default(),
+						state:   MentionedFileState::TooLarge { byte_size: Some(2_621_440) },
+					},
+				],
+			})
+			.expect("mentions append");
+
+		let local = Local::default();
+		let visible = projected(&session, &Options { show_tools: false, ..Options::new(&local) });
+		let mention = visible
+			.iter()
+			.find(|block| block.view.text.starts_with("Read src/main.rs"))
+			.expect("mention block remains visible with tools hidden");
+		assert_eq!(
+			mention.view.text.as_str(),
+			concat!(
+				"Read src/main.rs (1 lines)\n",
+				"Read screen.png (image)\n",
+				"Read vendor.bin (skipped: binary, 3.0KB)\n",
+				"Read dump.log (skipped: 2.5MB)"
+			)
+		);
+		let rendered = render(
+			projected(&session, &Options { show_tools: false, ..Options::new(&local) })
+				.into_iter()
+				.find(|block| block.view.text.starts_with("Read src/main.rs"))
+				.expect("rendered mention")
+				.component,
+			100,
+		);
+		let positions = ["src/main.rs", "screen.png", "vendor.bin", "dump.log"]
+			.map(|name| rendered.find(name).expect("rendered path"));
+		assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+
+		let copied = crate::overlays::copy::collect_targets(session.dom(), true, false, false);
+		let target = copied
+			.iter()
+			.find(|target| target.label == "file mention")
+			.expect("copy target");
+		assert_eq!(target.content, mention.view.text);
+		assert_eq!(
+			target
+				.blocks
+				.iter()
+				.map(|block| block.content.as_str())
+				.collect::<Vec<_>>(),
+			["src/main.rs", "screen.png", "vendor.bin", "dump.log"]
+		);
+		assert!(target.blocks.iter().all(|block| {
+			block
+				.href
+				.as_ref()
+				.is_some_and(|href| href.starts_with("file://"))
+		}));
+
+		let live = visible
+			.iter()
+			.map(|block| block.view.clone())
+			.collect::<Vec<_>>();
+		drop(session);
+		let restored = Session::open(&path, ComponentRegistry::standard()).expect("session replays");
+		let replayed = projected(&restored, &Options { show_tools: false, ..Options::new(&local) })
+			.into_iter()
+			.map(|block| block.view)
+			.collect::<Vec<_>>();
+		assert_eq!(replayed, live, "replay reproduces exact visible order and text");
+	}
+
+	#[test]
 	fn irc_traffic_replays_copies_and_follows_tool_visibility() {
 		use omp_journal::data::{IrcDirection, IrcTraffic};
 
@@ -1311,20 +1627,16 @@ mod tests {
 			.children(session.dom().body())
 			.last()
 			.expect("turn");
-		omp_agent::append_irc_traffic(
-			&mut session,
-			turn,
-			&IrcTraffic {
-				direction:    IrcDirection::Workpool,
-				from:         Some(Str::new_static("scheduler")),
-				to:           Some(Str::new_static("Scout")),
-				body:         Str::new_static("inspect parser\nreport risks"),
-				reply_to:     Some(Str::new_static("01K4A")),
-				pool:         Some(Str::new_static("audit")),
-				mode:         Some(Str::new_static("parallel")),
-				timestamp_ms: u64::MAX,
-			},
-		)
+		omp_agent::append_irc_traffic(&mut session, turn, &IrcTraffic {
+			direction:    IrcDirection::Workpool,
+			from:         Some(Str::new_static("scheduler")),
+			to:           Some(Str::new_static("Scout")),
+			body:         Str::new_static("inspect parser\nreport risks"),
+			reply_to:     Some(Str::new_static("01K4A")),
+			pool:         Some(Str::new_static("audit")),
+			mode:         Some(Str::new_static("parallel")),
+			timestamp_ms: u64::MAX,
+		})
 		.expect("IRC traffic journals");
 
 		let local = Local::default();
@@ -1340,15 +1652,14 @@ mod tests {
 
 		let hidden = projected(&session, &Options { show_tools: false, ..Options::new(&local) });
 		assert!(
-			hidden.iter().all(|block| !block.view.text.contains("Pool audit")),
+			hidden
+				.iter()
+				.all(|block| !block.view.text.contains("Pool audit")),
 			"IRC traffic follows tool-activity visibility"
 		);
 
 		let copied = crate::overlays::copy::collect_targets(session.dom(), true, true, false);
-		assert_eq!(
-			copied.last().expect("IRC copy target").content,
-			"inspect parser\nreport risks"
-		);
+		assert_eq!(copied.last().expect("IRC copy target").content, "inspect parser\nreport risks");
 		let hidden_copy = crate::overlays::copy::collect_targets(session.dom(), true, false, false);
 		assert!(hidden_copy.is_empty(), "hidden IRC traffic is not copied");
 

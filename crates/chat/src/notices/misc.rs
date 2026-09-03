@@ -497,7 +497,7 @@ pub fn synthetic_row(text: &str, expanded: bool) -> Component {
 #[cfg(test)]
 mod tests {
 	use omp_dom::{KnownTag, PropKey, Tag, Value};
-	use omp_tui::{CellContent, Ui, UiContext, frame_text};
+	use omp_tui::{CellContent, Color, Ui, UiContext, frame_text};
 	use smallvec::smallvec;
 
 	use super::*;
@@ -675,12 +675,23 @@ mod tests {
 	}
 
 	#[test]
-	fn guest_bubble_prefixes_author() {
-		let text = render(guest_bubble("alice", Str::new_static("can we ship today?")), 40);
+	fn guest_bubble_prefixes_bold_author_and_user_tinted_markdown() {
+		let ui = Ui::from_root(
+			guest_bubble("alice", Str::new_static("can we ship **today**?")),
+			40,
+			UiContext::default(),
+		);
+		let text = frame_text(ui.frame());
 		let lines: Vec<&str> = text.lines().collect();
 		assert_eq!(lines[0], " «alice» ›");
 		assert_eq!(lines[1], "", "tinted padding row above the bubble body");
 		assert_eq!(lines[2], " can we ship today?");
+		assert!(ui.frame().cell(1, 0).style().spec().bold, "authenticated author tag is bold");
+		assert_ne!(
+			ui.frame().cell(1, 2).style().background_color(),
+			Color::Default,
+			"Markdown body receives the semantic user-message tint"
+		);
 		let anonymous = render(guest_bubble("  ", Str::new_static("hi")), 40);
 		assert!(anonymous.starts_with(" «guest» ›\n"));
 	}

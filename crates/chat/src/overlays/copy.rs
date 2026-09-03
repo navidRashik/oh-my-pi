@@ -25,7 +25,7 @@ use crate::{
 	markdown::extract_links,
 	notices::{
 		divider::{SummaryDivider, turn_compactions},
-		irc, local, misc,
+		file_mentions, irc, local, misc, skill,
 	},
 	project::{AssistantPart, assistant_parts},
 	reaction, thinking,
@@ -96,6 +96,10 @@ enum Segment {
 	LaunchCompletion(omp_journal::data::LaunchCompletion),
 	/// Replay-stable incoming, autoreply, relay, or work-pool IRC traffic.
 	IrcTraffic(omp_journal::data::IrcTraffic),
+	/// Ordered auto-read file rows and their materialization states.
+	FileMentions(omp_journal::data::FileMentions),
+	/// User-invoked skill prompt with its typed source metadata.
+	SkillPrompt(omp_journal::data::SkillPrompt),
 	Thinking(Str),
 	Assistant(Str),
 	Tool {
@@ -451,6 +455,8 @@ fn segment_view(segment: &Segment, expanded: bool, ui: &UiContext) -> Component 
 		Segment::AsyncResult(result) => misc::async_result_block(result),
 		Segment::LaunchCompletion(completion) => misc::launch_completion_block(completion),
 		Segment::IrcTraffic(traffic) => irc::traffic_card(traffic, expanded),
+		Segment::FileMentions(mentions) => file_mentions::block(mentions),
+		Segment::SkillPrompt(prompt) => skill::prompt_card(prompt, expanded),
 		Segment::Artifact { uri, mime, kind } => {
 			if kind.as_str() == "image" || mime.as_str().starts_with("image/") {
 				result_image(uri, mime.as_str(), None, ui)
@@ -724,6 +730,44 @@ pub fn collect_targets(
 			};
 			match &node.tag {
 				Tag::Known(KnownTag::User) => {
+					if let Some(mentions) = file_mentions::payload(node) {
+						targets.extend(open.take());
+						let content = file_mentions::text(&mentions);
+						let blocks = mentions
+							.files
+							.iter()
+							.map(|file| {
+								let path = file.path.clone();
+								CopyBlock {
+									label:    Str::new_static("file"),
+									content:  path.clone(),
+									language: None,
+									href:     Some(crate::cards::file_link(path.as_str())),
+								}
+							})
+							.collect();
+						targets.push(CopyTarget {
+							label: Str::new_static("file mention"),
+							content,
+							blocks,
+							segments: vec![Segment::FileMentions(mentions)],
+						});
+						continue;
+					}
+					if let Some(prompt) = skill::prompt(node) {
+						reaction_target = None;
+						targets.extend(open.take());
+						let content = prompt.prompt_body.clone();
+						let mut blocks = Vec::new();
+						push_markdown_blocks(&mut blocks, content.as_str());
+						targets.push(CopyTarget {
+							label: Str::new_static("message"),
+							content,
+							blocks,
+							segments: vec![Segment::SkillPrompt(prompt)],
+						});
+						continue;
+					}
 					if let Some(completion) = misc::launch_completion(node) {
 						reaction_target = None;
 						targets.extend(open.take());
@@ -1366,6 +1410,35 @@ mod tests {
 				}],
 			})
 			.expect("mixed part");
+	}
+
+	#[test]
+	fn authored_user_preview_and_copy_survive_hidden_tool_activity() {
+		let directory = tempfile::tempdir().expect("temp directory");
+		let mut session =
+			Session::create(directory.path().join("authored-copy.oms"), ComponentRegistry::standard())
+				.expect("session");
+		session.begin_turn().expect("turn");
+		let attachment = |byte: u8, size: u64| omp_journal::data::Attachment {
+			blob: omp_journal::blob::BlobRef { hash: omp_core::Hash32::new([byte; 32]), size },
+			mime: Str::new_static("image/png"),
+		};
+		session
+			.user_authored("show me main", vec![attachment(1, 64), attachment(2, 2_048)], "Ada")
+			.expect("authored user");
+
+		let mut panel = CopySelector::open(session.dom(), true, false, false, &UiContext::default());
+		let text = frame_text(panel.frame(Size { width: 80, height: 24 }));
+		assert!(text.contains("«Ada» ›"), "copy preview retains author identity:\n{text}");
+		assert!(text.contains("show me main"), "copy preview retains Markdown body:\n{text}");
+		let first = text.find("#1 · 64B").expect("first attachment");
+		let second = text.find("#2 · 2.0KB").expect("second attachment");
+		assert!(first < second, "copy preview retains attachment order:\n{text}");
+		assert_eq!(
+			panel.key(Key::Enter),
+			PanelEvent::Copy(Str::new_static("show me main")),
+			"clipboard content remains the user-authored body"
+		);
 	}
 
 	#[test]

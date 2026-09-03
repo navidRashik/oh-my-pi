@@ -2292,11 +2292,7 @@ mod tests {
 			("sloppy.1", "sloppy"),
 		] {
 			assert_eq!(
-				project_value(
-					setting.codec,
-					&setting.widget,
-					&Value::Str(Str::new_static(stored)),
-				),
+				project_value(setting.codec, &setting.widget, &Value::Str(Str::new_static(stored)),),
 				RowValue::Scalar(Str::new_static(displayed))
 			);
 		}
@@ -2308,11 +2304,8 @@ mod tests {
 			("sloppy", "sloppy.1"),
 		] {
 			assert_eq!(
-				SettingsPanel::command_value(
-					&setting,
-					&RowValue::Scalar(Str::new_static(displayed)),
-				)
-				.unwrap(),
+				SettingsPanel::command_value(&setting, &RowValue::Scalar(Str::new_static(displayed)),)
+					.unwrap(),
 				stored
 			);
 		}

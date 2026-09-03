@@ -12,12 +12,13 @@ use std::{
 	thread,
 };
 
+use omp_agent::{file_mention_prefix, file_mention_token_end};
 use omp_core::{Str, sf};
 use omp_tui::{EditorCompletion, Icon, Suggestion, Suggestions};
 use omp_walker::{FileType, WalkRequest};
 use smallvec::SmallVec;
 
-use super::{fuzzy_score, is_token_start, token_end};
+use super::fuzzy_score;
 
 /// Upper bound on indexed paths; pi's fuzzy scan is capped the same way.
 const MAX_ENTRIES: usize = 5_000;
@@ -149,13 +150,9 @@ impl ProjectFiles {
 	}
 }
 
-/// The `@…` token ending at `cursor`: its `@` must start a token.
+/// The `@…` token ending at `cursor`, shared with submitted-token parsing.
 fn at_prefix(text: &str, cursor: usize) -> Option<usize> {
-	let before = text.get(..cursor)?;
-	let start = before
-		.rfind(|character: char| character.is_whitespace())
-		.map_or(0, |at| at + 1);
-	(before.as_bytes().get(start) == Some(&b'@') && is_token_start(text, start)).then_some(start)
+	file_mention_prefix(text, cursor)
 }
 
 impl EditorCompletion for ProjectFiles {
@@ -181,7 +178,7 @@ impl EditorCompletion for ProjectFiles {
 				})
 			})
 			.collect();
-		Some(Suggestions { range: start..token_end(text, cursor), items })
+		Some(Suggestions { range: start..file_mention_token_end(text, cursor), items })
 	}
 }
 

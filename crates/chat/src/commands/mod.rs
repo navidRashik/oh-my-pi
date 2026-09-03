@@ -247,6 +247,12 @@ pub enum CommandAction {
 		/// The expanded template.
 		text: Str,
 	},
+	/// A discovered `/skill:<name> [args]` invocation with its exact
+	/// model-facing prompt and source identity.
+	SkillPrompt {
+		/// Typed skill invocation journaled by the controller.
+		prompt: omp_journal::data::SkillPrompt,
+	},
 	/// `/force <tool> [prompt]`: push a `ForceTool` Director for the next
 	/// inference and optionally submit a prompt.
 	Force {

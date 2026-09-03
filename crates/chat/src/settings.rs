@@ -3,6 +3,8 @@
 use omp_con::Kv;
 use omp_core::Str;
 
+use crate::status_band::{WallClockFormatSetting, WallClockSecondsSetting};
+
 omp_con::var! {
 	/// pi `theme.dark` (string, default: "titanium").
 	pub static CL_THEME_DARK = cl_theme_dark: Str {
@@ -67,6 +69,16 @@ omp_con::var! {
 	/// pi `statusLine.segmentOptions` (record, default: {).
 	pub static CL_STATUS_LINE_SEGMENT_OPTIONS = cl_status_line_segment_options: Kv {
 		default: Kv::new(),
+		flags: archive,
+	};
+	/// Curated override for pi `statusLine.segmentOptions.time.format`.
+	pub static CL_STATUS_LINE_TIME_FORMAT = cl_status_line_time_format: WallClockFormatSetting {
+		default: WallClockFormatSetting::Preset,
+		flags: archive,
+	};
+	/// Curated override for pi `statusLine.segmentOptions.time.showSeconds`.
+	pub static CL_STATUS_LINE_TIME_SHOW_SECONDS = cl_status_line_time_show_seconds: WallClockSecondsSetting {
+		default: WallClockSecondsSetting::Preset,
 		flags: archive,
 	};
 	/// pi `terminal.showImages` (boolean, default: true).

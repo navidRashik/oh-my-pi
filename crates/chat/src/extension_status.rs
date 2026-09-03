@@ -148,8 +148,9 @@ fn sanitize_status(value: &str) -> Str {
 
 #[cfg(test)]
 mod tests {
-	use super::{ExtensionStatusEvent, ExtensionStatuses, status_text_from_tml};
 	use omp_core::Str;
+
+	use super::{ExtensionStatusEvent, ExtensionStatuses, status_text_from_tml};
 
 	fn set(key: &str, text: &str) -> ExtensionStatusEvent {
 		ExtensionStatusEvent::Set { key: Str::new(key), text: Str::new(text) }
@@ -165,16 +166,13 @@ mod tests {
 
 	#[test]
 	fn tml_status_uses_extension_parser_and_flattens_semantic_content() {
-		let text = status_text_from_tml(
-			"<row><text fg=error>failed</text><text>\\n  safely</text></row>",
-		)
-		.expect("valid extension TML");
+		let text =
+			status_text_from_tml("<row><text fg=error>failed</text><text>\\n  safely</text></row>")
+				.expect("valid extension TML");
 		assert_eq!(text, "failed safely");
 		assert!(
-			status_text_from_tml(
-				"<md><button id=unsafe when=active>interactive</button></md>",
-			)
-			.is_err(),
+			status_text_from_tml("<md><button id=unsafe when=active>interactive</button></md>",)
+				.is_err(),
 		);
 	}
 
@@ -192,10 +190,7 @@ mod tests {
 	#[test]
 	fn values_are_sanitized_before_retention() {
 		let mut statuses = ExtensionStatuses::default();
-		assert!(statuses.apply(set(
-			"hook",
-			"  \u{1b}[31mred\u{1b}[0m\n\u{7f} ready   now  ",
-		)));
+		assert!(statuses.apply(set("hook", "  \u{1b}[31mred\u{1b}[0m\n\u{7f} ready   now  ",)));
 		assert_eq!(values(&statuses, true), ["red ready now"]);
 		assert!(statuses.apply(set("hook", "\u{1b}[2J")));
 		assert!(statuses.is_empty());

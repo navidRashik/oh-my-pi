@@ -831,11 +831,21 @@ mod tests {
 		let mut state = LiveViewState::new("sol");
 		state.apply(&LiveUiEvent::Permission(MicrophonePermission::Denied));
 		assert_eq!(state.phase, LivePhase::Error);
-		assert!(state.error.as_ref().is_some_and(|(_, recoverable)| *recoverable));
+		assert!(
+			state
+				.error
+				.as_ref()
+				.is_some_and(|(_, recoverable)| *recoverable)
+		);
 
 		state.apply(&LiveUiEvent::Permission(MicrophonePermission::Restricted));
 		assert_eq!(state.phase, LivePhase::Error);
-		assert!(state.error.as_ref().is_some_and(|(_, recoverable)| !*recoverable));
+		assert!(
+			state
+				.error
+				.as_ref()
+				.is_some_and(|(_, recoverable)| !*recoverable)
+		);
 
 		state.apply(&LiveUiEvent::Permission(MicrophonePermission::Granted));
 		assert_eq!(state.phase, LivePhase::Connecting);
@@ -847,19 +857,19 @@ mod tests {
 		let mut state = LiveViewState::new("sol");
 		state.apply(&LiveUiEvent::Devices {
 			input:  vec![LiveDevice {
-				id: Str::new_static("old-mic"),
-				label: Str::new_static("Old microphone"),
+				id:         Str::new_static("old-mic"),
+				label:      Str::new_static("Old microphone"),
 				is_default: true,
-				selected: true,
+				selected:   true,
 			}],
 			output: vec![],
 		});
 		state.apply(&LiveUiEvent::Devices {
 			input:  vec![LiveDevice {
-				id: Str::new_static("new-mic"),
-				label: Str::new_static("New microphone"),
+				id:         Str::new_static("new-mic"),
+				label:      Str::new_static("New microphone"),
 				is_default: true,
-				selected: true,
+				selected:   true,
 			}],
 			output: vec![],
 		});

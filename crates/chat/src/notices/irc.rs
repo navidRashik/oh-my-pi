@@ -153,7 +153,11 @@ fn meta_parts(traffic: &IrcTraffic) -> SmallVec<Str, 4> {
 	{
 		meta.push(header_text(mode));
 	}
-	if traffic.reply_to.as_ref().is_some_and(|reply| !reply.trim().is_empty()) {
+	if traffic
+		.reply_to
+		.as_ref()
+		.is_some_and(|reply| !reply.trim().is_empty())
+	{
 		meta.push(Str::new_static("reply"));
 	}
 	meta.push(age(traffic.timestamp_ms));
@@ -189,8 +193,15 @@ fn age(timestamp_ms: u64) -> Str {
 }
 
 fn body_rows(body: &str, expanded: bool) -> Vec<Component> {
-	let max = if expanded { EXPANDED_LINES } else { COLLAPSED_LINES };
-	let nonempty = body.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>();
+	let max = if expanded {
+		EXPANDED_LINES
+	} else {
+		COLLAPSED_LINES
+	};
+	let nonempty = body
+		.lines()
+		.filter(|line| !line.trim().is_empty())
+		.collect::<Vec<_>>();
 	let shown = nonempty.len().min(max);
 	let mut rows = Vec::with_capacity(shown + usize::from(nonempty.len() > shown));
 	for line in nonempty.iter().take(shown) {

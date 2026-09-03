@@ -16,12 +16,15 @@
 //!   extension's message type, body = Markdown). The kernel journals the last
 //!   two from `EnvEvent::Notice`; `<notice kind=irc data={IrcTraffic}>` is the
 //!   typed incoming/autoreply/relay/work-pool observation projected by every
-//!   actor.
+//!   actor. `<user file_mention=true data={FileMentions}>` preserves auto-read
+//!   path order, materialization state, model content, and image blob refs.
 //! - `<user async_result=true data={"jobs":[...]}>` keeps the model-facing
 //!   notice in its body but projects one compact typed completion row per job;
 //!   `<user launch_completion=true data={"daemons":[...]}>` does the same for
 //!   terminal supervised processes and follows tool-activity visibility; `<user
-//!   author=guest>` renders as the collaboration guest bubble; `<user
+//!   skill_prompt=true data={SkillPrompt}>` projects the framed skill
+//!   invocation while its body remains an ordinary model-facing user message;
+//!   `<user author=guest>` renders as the collaboration guest bubble; `<user
 //!   synthetic=true>` collapses to pi's `Synthetic input · size · lines ·
 //!   ctrl+o` row.
 //! - `<usage tokens-in tokens-out cost-nano-usd cache-read cache-write ttft-ms
@@ -35,10 +38,12 @@ pub mod cache;
 pub mod custom;
 pub mod divider;
 pub mod error;
+pub(crate) mod file_mentions;
 pub(crate) mod irc;
 pub(crate) mod local;
 pub mod misc;
 pub mod retry;
+pub(crate) mod skill;
 pub mod usage;
 pub mod voice;
 

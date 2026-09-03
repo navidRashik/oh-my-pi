@@ -14,9 +14,10 @@ use omp_tui::{
 use crate::overlays::ModelRow;
 pub use crate::{
 	status_band::{
-		AccountUsage, AdvisorBadge, AdvisorHealth, CollabBadge, ContextLine, GitStatus, GoalState,
-		LoopLimit, ModeChip, PathLabel, PullRequest, Speculation, StatusAppearance, StatusBand,
-		StatusFacts, StatusPreset, StatusSeparator, UsageWindow, WorktreeLabel, display_path,
+		AccountUsage, AdvisorBadge, AdvisorHealth, CollabHostSnapshot, CollabStatus,
+		CollabStatusRole, ContextLine, GitStatus, GoalState, LoopLimit, ModeChip, PathLabel,
+		PullRequest, Speculation, StatusAppearance, StatusBand, StatusFacts, StatusPreset,
+		StatusSeparator, UsageWindow, WorktreeLabel, display_path,
 	},
 	welcome::{Welcome, tip_for},
 };

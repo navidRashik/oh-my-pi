@@ -2,9 +2,11 @@
 //! composer (`status-line/component.ts` `#buildStatusLine`).
 
 use core::fmt::Write as _;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use omp_core::{Str, sf};
+use jiff::Zoned;
+use omp_con::Kv;
+use omp_core::{Str, StrMut, sf};
 use omp_tui::{
 	Appearance, Charset, Color, Component, Icon, PaintCtx, Prop, Props, Rect, Slot, Style, Theme,
 	UiContext,
@@ -16,6 +18,7 @@ use omp_tui::{
 	},
 	next_slot, session_accent_color,
 };
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::chrome::STATUS_ID;
@@ -78,23 +81,252 @@ pub enum ContextLine {
 	Embedded,
 }
 
-/// Retained status appearance, including settings-preview overrides.
+/// One configurable status-line segment.
+///
+/// String forms are pi's public `StatusLineSegmentId` vocabulary. Unknown
+/// strings are intentionally rejected by `FromStr`; the host drops them
+/// while retaining every known occurrence in declaration order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum StatusSegment {
+	/// Omp identity / activity timer.
+	Pi,
+	/// Extension and hook status values.
+	Status,
+	/// Active model and thinking level.
+	Model,
+	/// Active workflow Director.
+	Mode,
+	/// Project path.
+	Path,
+	/// Git branch and worktree counts.
+	Git,
+	/// Pull request number.
+	Pr,
+	/// Running subagent count.
+	Subagents,
+	/// Input token count.
+	TokenIn,
+	/// Output token count.
+	TokenOut,
+	/// Input, output, and cache-write token count.
+	TokenTotal,
+	/// Output token rate.
+	TokenRate,
+	/// Session spend.
+	Cost,
+	/// Context-window percentage.
+	ContextPct,
+	/// Context-window size.
+	ContextTotal,
+	/// Active processing time.
+	TimeSpent,
+	/// Local wall clock.
+	Time,
+	/// Short session id.
+	Session,
+	/// Local hostname.
+	Hostname,
+	/// Prompt-cache read count.
+	CacheRead,
+	/// Prompt-cache write count.
+	CacheWrite,
+	/// Prompt-cache hit percentage.
+	CacheHit,
+	/// Session title.
+	SessionName,
+	/// Account quota windows.
+	Usage,
+	/// Collaboration role and participant count.
+	Collab,
+}
+
+/// Model-segment overrides.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModelSegmentOptions {
+	/// Whether to include the thinking level.
+	pub show_thinking_level: Option<bool>,
+}
+
+/// Path-segment overrides.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PathSegmentOptions {
+	/// Whether to replace the home prefix with `~`.
+	pub abbreviate:        Option<bool>,
+	/// Maximum visible path cells.
+	pub max_length:        Option<u16>,
+	/// Whether to strip `/work`, `~/Projects`, and scratch roots.
+	pub strip_work_prefix: Option<bool>,
+}
+
+/// Git-segment overrides.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GitSegmentOptions {
+	/// Whether to include the branch.
+	pub show_branch:    Option<bool>,
+	/// Whether to include the staged count.
+	pub show_staged:    Option<bool>,
+	/// Whether to include the unstaged count.
+	pub show_unstaged:  Option<bool>,
+	/// Whether to include the untracked count.
+	pub show_untracked: Option<bool>,
+}
+
+/// Clock-segment overrides.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TimeSegmentOptions {
+	/// Twelve- or twenty-four-hour display.
+	pub format:       Option<WallClockFormat>,
+	/// Whether to include seconds.
+	pub show_seconds: Option<bool>,
+}
+
+/// Typed status-segment options.
+///
+/// Missing fields inherit the active preset. Unknown keys are ignored for
+/// forward compatibility; malformed recognized fields reject the whole
+/// update so the host can retain the last valid appearance.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StatusSegmentOptions {
+	/// Model options.
+	pub model: ModelSegmentOptions,
+	/// Path options.
+	pub path:  PathSegmentOptions,
+	/// Git options.
+	pub git:   GitSegmentOptions,
+	/// Clock options.
+	pub time:  TimeSegmentOptions,
+}
+
+impl StatusSegmentOptions {
+	/// Parses pi's nested `segmentOptions` record.
+	#[must_use]
+	pub fn from_kv(options: &Kv) -> Option<Self> {
+		let mut parsed = Self::default();
+		for (segment, value) in options.iter() {
+			match segment.as_str() {
+				"model" => {
+					let block = value.as_kv()?;
+					for (key, value) in block.iter() {
+						if key == "showThinkingLevel" {
+							parsed.model.show_thinking_level = Some(value.as_bool()?);
+						}
+					}
+					continue;
+				},
+				"path" => {
+					let block = value.as_kv()?;
+					for (key, value) in block.iter() {
+						match key.as_str() {
+							"abbreviate" => parsed.path.abbreviate = Some(value.as_bool()?),
+							"maxLength" => {
+								parsed.path.max_length =
+									Some(u16::try_from(value.as_int()?).ok().filter(|n| *n > 0)?);
+							},
+							"stripWorkPrefix" => {
+								parsed.path.strip_work_prefix = Some(value.as_bool()?);
+							},
+							_ => {},
+						}
+					}
+					continue;
+				},
+				"git" => {
+					let block = value.as_kv()?;
+					for (key, value) in block.iter() {
+						let target = match key.as_str() {
+							"showBranch" => &mut parsed.git.show_branch,
+							"showStaged" => &mut parsed.git.show_staged,
+							"showUnstaged" => &mut parsed.git.show_unstaged,
+							"showUntracked" => &mut parsed.git.show_untracked,
+							_ => continue,
+						};
+						*target = Some(value.as_bool()?);
+					}
+					continue;
+				},
+				"time" => {
+					let block = value.as_kv()?;
+					for (key, value) in block.iter() {
+						match key.as_str() {
+							"format" => {
+								parsed.time.format = Some(match value.as_str()? {
+									"12h" => WallClockFormat::TwelveHour,
+									"24h" => WallClockFormat::TwentyFourHour,
+									_ => return None,
+								});
+							},
+							"showSeconds" => parsed.time.show_seconds = Some(value.as_bool()?),
+							_ => {},
+						}
+					}
+					continue;
+				},
+				_ => {},
+			}
+		}
+		Some(parsed)
+	}
+
+	fn overlay(self, overrides: Self) -> Self {
+		Self {
+			model: ModelSegmentOptions {
+				show_thinking_level: overrides
+					.model
+					.show_thinking_level
+					.or(self.model.show_thinking_level),
+			},
+			path:  PathSegmentOptions {
+				abbreviate:        overrides.path.abbreviate.or(self.path.abbreviate),
+				max_length:        overrides.path.max_length.or(self.path.max_length),
+				strip_work_prefix: overrides
+					.path
+					.strip_work_prefix
+					.or(self.path.strip_work_prefix),
+			},
+			git:   GitSegmentOptions {
+				show_branch:    overrides.git.show_branch.or(self.git.show_branch),
+				show_staged:    overrides.git.show_staged.or(self.git.show_staged),
+				show_unstaged:  overrides.git.show_unstaged.or(self.git.show_unstaged),
+				show_untracked: overrides.git.show_untracked.or(self.git.show_untracked),
+			},
+			time:  TimeSegmentOptions {
+				format:       overrides.time.format.or(self.time.format),
+				show_seconds: overrides.time.show_seconds.or(self.time.show_seconds),
+			},
+		}
+	}
+}
+
+/// Retained status appearance, including settings-preview overrides.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusAppearance {
 	/// Segment preset.
-	pub preset:       StatusPreset,
+	pub preset:          StatusPreset,
 	/// Segment separator.
-	pub separator:    StatusSeparator,
+	pub separator:       StatusSeparator,
 	/// Flexible context-line mode.
-	pub context_line: ContextLine,
+	pub context_line:    ContextLine,
 	/// Drop fill and powerline caps.
-	pub transparent:  bool,
+	pub transparent:     bool,
+	/// Custom left-group order. Only the `custom` preset reads this field.
+	pub left_segments:   Arc<[StatusSegment]>,
+	/// Custom right-group order. Only the `custom` preset reads this field.
+	pub right_segments:  Arc<[StatusSegment]>,
+	/// User overrides layered over the active preset's segment defaults.
+	pub segment_options: StatusSegmentOptions,
+}
+
+impl Default for StatusAppearance {
+	fn default() -> Self {
+		Self::for_preset(StatusPreset::Default)
+	}
 }
 
 impl StatusAppearance {
 	/// Pi's default separator for a preset.
 	#[must_use]
-	pub const fn for_preset(preset: StatusPreset) -> Self {
+	pub fn for_preset(preset: StatusPreset) -> Self {
 		let separator = match preset {
 			StatusPreset::Full | StatusPreset::Nerd => StatusSeparator::Powerline,
 			StatusPreset::Ascii => StatusSeparator::Ascii,
@@ -103,8 +335,221 @@ impl StatusAppearance {
 				StatusSeparator::PowerlineThin
 			},
 		};
-		Self { preset, separator, context_line: ContextLine::Embedded, transparent: false }
+		Self {
+			preset,
+			separator,
+			context_line: ContextLine::Embedded,
+			transparent: false,
+			left_segments: Arc::default(),
+			right_segments: Arc::default(),
+			segment_options: StatusSegmentOptions::default(),
+		}
 	}
+
+	fn effective_segment_options(&self) -> StatusSegmentOptions {
+		let preset = match self.preset {
+			StatusPreset::Minimal => StatusSegmentOptions {
+				path: PathSegmentOptions { max_length: Some(30), ..PathSegmentOptions::default() },
+				git: GitSegmentOptions {
+					show_branch:    Some(true),
+					show_staged:    Some(false),
+					show_unstaged:  Some(false),
+					show_untracked: Some(false),
+				},
+				..StatusSegmentOptions::default()
+			},
+			StatusPreset::Compact => StatusSegmentOptions {
+				model: ModelSegmentOptions { show_thinking_level: Some(false) },
+				git: GitSegmentOptions { show_untracked: Some(false), ..GitSegmentOptions::default() },
+				..StatusSegmentOptions::default()
+			},
+			StatusPreset::Full => StatusSegmentOptions {
+				path: PathSegmentOptions { max_length: Some(50), ..PathSegmentOptions::default() },
+				time: TimeSegmentOptions {
+					format:       Some(WallClockFormat::TwentyFourHour),
+					show_seconds: Some(false),
+				},
+				..StatusSegmentOptions::default()
+			},
+			StatusPreset::Nerd => StatusSegmentOptions {
+				path: PathSegmentOptions { max_length: Some(60), ..PathSegmentOptions::default() },
+				time: TimeSegmentOptions {
+					format:       Some(WallClockFormat::TwentyFourHour),
+					show_seconds: Some(true),
+				},
+				..StatusSegmentOptions::default()
+			},
+			StatusPreset::Default | StatusPreset::Ascii | StatusPreset::Custom => {
+				StatusSegmentOptions::default()
+			},
+		};
+		preset.overlay(self.segment_options)
+	}
+
+	/// Resolves pi's preset defaults, nested `segmentOptions.time` values,
+	/// and the two curated clock overrides. Presets without a configured
+	/// `time` segment return `None`, so an invisible clock owns no timer.
+	#[must_use]
+	pub fn wall_clock_options(
+		&self,
+		format: WallClockFormatSetting,
+		seconds: WallClockSecondsSetting,
+	) -> Option<WallClockOptions> {
+		let has_time = match self.preset {
+			StatusPreset::Full | StatusPreset::Nerd => true,
+			StatusPreset::Custom => self
+				.left_segments
+				.iter()
+				.chain(self.right_segments.iter())
+				.any(|segment| *segment == StatusSegment::Time),
+			StatusPreset::Default
+			| StatusPreset::Minimal
+			| StatusPreset::Compact
+			| StatusPreset::Ascii => false,
+		};
+		if !has_time {
+			return None;
+		}
+		let resolved = self.effective_segment_options().time;
+		let mut options = WallClockOptions {
+			format:       resolved.format.unwrap_or(WallClockFormat::TwentyFourHour),
+			show_seconds: resolved.show_seconds.unwrap_or(false),
+		};
+		options.format = match format {
+			WallClockFormatSetting::Preset => options.format,
+			WallClockFormatSetting::TwelveHour => WallClockFormat::TwelveHour,
+			WallClockFormatSetting::TwentyFourHour => WallClockFormat::TwentyFourHour,
+		};
+		options.show_seconds = match seconds {
+			WallClockSecondsSetting::Preset => options.show_seconds,
+			WallClockSecondsSetting::Hide => false,
+			WallClockSecondsSetting::Show => true,
+		};
+		Some(options)
+	}
+}
+
+/// User override for the clock's hour format. `Preset` preserves pi's
+/// per-preset option.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	Deserialize,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+	strum::VariantNames,
+)]
+#[strum(ascii_case_insensitive)]
+pub enum WallClockFormatSetting {
+	/// Use the active preset's format.
+	#[default]
+	#[strum(serialize = "preset")]
+	Preset,
+	/// Twelve-hour time with a lowercase `am`/`pm` suffix.
+	#[strum(serialize = "12h")]
+	TwelveHour,
+	/// Twenty-four-hour time.
+	#[strum(serialize = "24h")]
+	TwentyFourHour,
+}
+omp_con::con_enum!(WallClockFormatSetting);
+
+/// User override for whether the clock includes seconds. `Preset` preserves
+/// pi's full/nerd distinction.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	Deserialize,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+	strum::VariantNames,
+)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum WallClockSecondsSetting {
+	/// Use the active preset's choice.
+	#[default]
+	Preset,
+	/// Update once a minute and hide seconds.
+	Hide,
+	/// Update once a second and show seconds.
+	Show,
+}
+omp_con::con_enum!(WallClockSecondsSetting);
+
+/// Resolved local clock format for a visible preset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WallClockFormat {
+	/// Twelve-hour time with a lowercase `am`/`pm` suffix.
+	TwelveHour,
+	/// Twenty-four-hour time.
+	TwentyFourHour,
+}
+
+/// Resolved options for a visible local clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WallClockOptions {
+	/// Hour format.
+	pub format:       WallClockFormat,
+	/// Whether seconds are visible.
+	pub show_seconds: bool,
+}
+
+/// Formats one already-sampled local time. Callers cache the returned value;
+/// painting reads the cache and never reads the clock or timezone.
+#[must_use]
+pub(crate) fn format_wall_clock(now: &Zoned, options: WallClockOptions) -> Str {
+	let hour = now.hour();
+	let mut out = StrMut::new_inline("");
+	match options.format {
+		WallClockFormat::TwelveHour => {
+			let display = hour % 12;
+			let _ = write!(out, "{}:{:02}", if display == 0 { 12 } else { display }, now.minute());
+		},
+		WallClockFormat::TwentyFourHour => {
+			let _ = write!(out, "{hour}:{:02}", now.minute());
+		},
+	}
+	if options.show_seconds {
+		let _ = write!(out, ":{:02}", now.second());
+	}
+	if options.format == WallClockFormat::TwelveHour {
+		out.push_str(if hour >= 12 { "pm" } else { "am" });
+	}
+	out.freeze()
+}
+
+/// Next host-clock instant at which [`format_wall_clock`] can change.
+///
+/// The deadline follows the visible unit rather than a repaint cadence:
+/// seconds when shown, otherwise minutes.
+#[must_use]
+pub(crate) fn wall_clock_next_wake(
+	host_now: Duration,
+	local_now: &Zoned,
+	options: WallClockOptions,
+) -> Duration {
+	const NANOS_PER_SECOND: u64 = 1_000_000_000;
+	let unit_seconds = if options.show_seconds { 1 } else { 60 };
+	let elapsed_seconds = u64::try_from(local_now.second()).unwrap_or_default() % unit_seconds;
+	let subsec = u64::try_from(local_now.subsec_nanosecond()).unwrap_or_default();
+	let remaining = unit_seconds
+		.saturating_sub(elapsed_seconds)
+		.saturating_mul(NANOS_PER_SECOND)
+		.saturating_sub(subsec)
+		.max(1);
+	host_now.saturating_add(Duration::from_nanos(remaining))
 }
 
 /// Background compaction speculation state shown on the gauge tick (pi
@@ -206,13 +651,71 @@ pub struct AccountUsage {
 	pub monthly:   Option<UsageWindow>,
 }
 
-/// Collaboration role shown by pi's `collab` segment.
+/// Local collaboration role shown by pi's `collab` segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CollabBadge {
-	/// Whether this observer is a guest rather than the host.
-	pub guest:        bool,
+pub enum CollabStatusRole {
+	/// This controller owns the authoritative session.
+	Host,
+	/// This actor renders the host's replicated session.
+	Guest,
+}
+
+/// Status-line values published by the authoritative host.
+///
+/// The guest uses these instead of observer-local approximations. Participant
+/// presence is carried by [`CollabStatus`] because it changes independently
+/// from this debounced session snapshot.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CollabHostSnapshot {
+	/// Host model label, when the host published model metadata.
+	pub model:          Option<Str>,
+	/// Host reasoning level; `None` authoritatively means reasoning is off.
+	pub thinking:       Option<Str>,
+	/// Host working directory. The actor applies status-path normalization.
+	pub cwd:            Str,
+	/// Host session title; `None` authoritatively means unnamed.
+	pub session_name:   Option<Str>,
+	/// Host's provider-anchored context token count.
+	pub tokens:         Option<u64>,
+	/// Host model context window.
+	pub context_window: Option<u64>,
+}
+
+/// Collaboration facts projected into the status band.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollabStatus {
+	/// Whether this observer owns or replicates the authoritative session.
+	pub role:         CollabStatusRole,
 	/// Connected participants, including the local observer.
 	pub participants: u32,
+	/// Latest authoritative footer snapshot. Present only for guests.
+	pub host:         Option<Arc<CollabHostSnapshot>>,
+}
+
+const _: () = assert!(
+	core::mem::size_of::<CollabStatus>() <= 16,
+	"CollabStatus must remain cheap to clone into status facts"
+);
+
+impl CollabStatus {
+	/// Constructs host status from the current authenticated presence count.
+	#[must_use]
+	pub const fn host(participants: u32) -> Self {
+		Self { role: CollabStatusRole::Host, participants, host: None }
+	}
+
+	/// Constructs guest presence before the first authoritative footer
+	/// snapshot arrives.
+	#[must_use]
+	pub const fn guest_pending(participants: u32) -> Self {
+		Self { role: CollabStatusRole::Guest, participants, host: None }
+	}
+
+	/// Constructs guest status from host-published presence and footer values.
+	#[must_use]
+	pub fn guest(participants: u32, host: CollabHostSnapshot) -> Self {
+		Self { role: CollabStatusRole::Guest, participants, host: Some(Arc::new(host)) }
+	}
 }
 
 /// Lifecycle of an engaged goal Director (pi `goalMode.status`).
@@ -297,6 +800,10 @@ pub struct StatusFacts {
 	/// Project directory label: home-shortened and root-stripped, not yet
 	/// clamped (the band clamps to the width it has).
 	pub cwd: Str,
+	/// Exact project directory before path-segment presentation options.
+	pub raw_cwd: Option<Str>,
+	/// Exact home directory used by path abbreviation.
+	pub home: Option<Str>,
 	/// Whether the project lives under a scratch root (pi `scratchFolder`
 	/// icon instead of the folder icon).
 	pub scratch: bool,
@@ -311,8 +818,8 @@ pub struct StatusFacts {
 	pub pull_request: Option<PullRequest>,
 	/// Linked-worktree identity used to collapse redundant path components.
 	pub worktree: Option<WorktreeLabel>,
-	/// Collaboration presence badge.
-	pub collab: Option<CollabBadge>,
+	/// Collaboration role, presence, and guest-only host status snapshot.
+	pub collab: Option<CollabStatus>,
 	/// Sanitized extension/hook status strings, already key-sorted by the host.
 	pub hook_status: Vec<Str>,
 	/// Number of running subagents.
@@ -388,6 +895,8 @@ impl Default for StatusFacts {
 			fast: false,
 			advisor: None,
 			cwd: Str::default(),
+			raw_cwd: None,
+			home: None,
 			scratch: false,
 			path_url: None,
 			branch: None,
@@ -423,6 +932,42 @@ impl Default for StatusFacts {
 			working: None,
 			focused_agent: None,
 		}
+	}
+}
+
+impl StatusFacts {
+	/// Applies collaboration state to freshly projected local facts.
+	///
+	/// Host facts keep their local values. Guest facts replace values whose
+	/// local computation can diverge from the authoritative controller. A
+	/// disconnected actor passes `None`; because callers rebuild base facts
+	/// before each application, no host override survives a leave or session
+	/// reset.
+	pub fn apply_collab(&mut self, collab: Option<CollabStatus>) {
+		if let Some(status) = collab.as_ref()
+			&& status.role == CollabStatusRole::Guest
+			&& let Some(host) = status.host.as_ref()
+		{
+			if let Some(model) = host.model.as_ref().filter(|model| !model.is_empty()) {
+				self.model = model.clone();
+			}
+			self.thinking = host.thinking.clone();
+			if !host.cwd.is_empty() {
+				let path = display_path(&host.cwd, None, None);
+				self.raw_cwd = Some(host.cwd.clone());
+				self.cwd = path.text;
+				self.scratch = path.scratch;
+				self.path_url = None;
+			}
+			self.session_name = host.session_name.clone();
+			if let Some(tokens) = host.tokens {
+				self.tokens = tokens;
+			}
+			if let Some(context_window) = host.context_window {
+				self.context_window = Some(context_window);
+			}
+		}
+		self.collab = collab;
 	}
 }
 
@@ -492,6 +1037,14 @@ fn shorten_home(path: &str, home: Option<&str>) -> Str {
 			_ => Str::new(path),
 		},
 		None => Str::new(path),
+	}
+}
+
+fn expand_home(path: &str, home: Option<&str>) -> Str {
+	match (path, home) {
+		("~", Some(home)) => Str::new(home),
+		(path, Some(home)) if path.starts_with("~/") => Str::new(format!("{home}{}", &path[1..])),
+		_ => Str::new(path),
 	}
 }
 
@@ -605,14 +1158,14 @@ fn context_color(theme: &Theme, tokens: u64, window: Option<u64>) -> Color {
 	}
 }
 
-fn append_git_counts(out: &mut String, status: GitStatus) {
-	if status.unstaged > 0 {
+fn append_git_counts(out: &mut String, status: GitStatus, options: GitSegmentOptions) {
+	if options.show_unstaged.unwrap_or(true) && status.unstaged > 0 {
 		let _ = write!(out, " *{}", status.unstaged);
 	}
-	if status.staged > 0 {
+	if options.show_staged.unwrap_or(true) && status.staged > 0 {
 		let _ = write!(out, " +{}", status.staged);
 	}
-	if status.untracked > 0 {
+	if options.show_untracked.unwrap_or(true) && status.untracked > 0 {
 		let _ = write!(out, " ?{}", status.untracked);
 	}
 }
@@ -957,18 +1510,51 @@ enum Chip {
 	Clock,
 }
 
+impl StatusSegment {
+	const fn chip(self) -> Chip {
+		match self {
+			Self::Pi => Chip::Brand,
+			Self::Status => Chip::Hook,
+			Self::Model => Chip::Model,
+			Self::Mode => Chip::Mode,
+			Self::Path => Chip::Path,
+			Self::Git => Chip::Git,
+			Self::Pr => Chip::Pr,
+			Self::Subagents => Chip::Subagents,
+			Self::TokenIn => Chip::TokenIn,
+			Self::TokenOut => Chip::TokenOut,
+			Self::TokenTotal => Chip::TokenTotal,
+			Self::TokenRate => Chip::TokenRate,
+			Self::Cost => Chip::Cost,
+			Self::ContextPct => Chip::ContextPct,
+			Self::ContextTotal => Chip::ContextTotal,
+			Self::TimeSpent => Chip::ActiveTime,
+			Self::Time => Chip::Clock,
+			Self::Session => Chip::SessionId,
+			Self::Hostname => Chip::Hostname,
+			Self::CacheRead => Chip::CacheRead,
+			Self::CacheWrite => Chip::CacheWrite,
+			Self::CacheHit => Chip::CacheHit,
+			Self::SessionName => Chip::Session,
+			Self::Usage => Chip::Usage,
+			Self::Collab => Chip::Collab,
+		}
+	}
+}
+
 /// One rendered chip: identity, text, and foreground.
 type Label = (Chip, Str, Color);
 
 /// Both fitted groups of the band.
 struct Layout {
-	left:        SmallVec<Label, 5>,
-	right:       SmallVec<Label, 6>,
-	gauge:       Color,
-	pr_url:      Option<Str>,
-	path_url:    Option<Str>,
-	git_parts:   SmallVec<(u16, Str, Color), 3>,
-	usage_parts: SmallVec<StyledPart, 9>,
+	left:             SmallVec<Label, 5>,
+	right:            SmallVec<Label, 6>,
+	gauge:            Color,
+	embedded_context: bool,
+	pr_url:           Option<Str>,
+	path_url:         Option<Str>,
+	git_parts:        SmallVec<(u16, Str, Color), 3>,
+	usage_parts:      SmallVec<StyledPart, 9>,
 }
 
 /// What a fitted layout depends on besides the facts: the row width, the
@@ -1043,8 +1629,8 @@ impl StatusBand {
 
 	/// Current appearance.
 	#[must_use]
-	pub const fn appearance(&self) -> StatusAppearance {
-		self.facts.appearance
+	pub const fn appearance(&self) -> &StatusAppearance {
+		&self.facts.appearance
 	}
 
 	/// Whether the fitted layout is retained for `key` (test hook).
@@ -1163,8 +1749,17 @@ impl StatusBand {
 
 	/// Model icon: the thinking glyph in compact mode, else the model icon.
 	fn model_icon(&self, charset: Charset) -> &'static str {
+		let show_thinking = self
+			.facts
+			.appearance
+			.effective_segment_options()
+			.model
+			.show_thinking_level
+			.unwrap_or(true);
 		match self.facts.thinking.as_deref() {
-			Some(level) if self.facts.compact_thinking => thinking_glyph(charset, level),
+			Some(level) if show_thinking && self.facts.compact_thinking => {
+				thinking_glyph(charset, level)
+			},
 			_ => charset.icon(Icon::Model),
 		}
 	}
@@ -1193,14 +1788,27 @@ impl StatusBand {
 	/// Model chip text (pi `modelSegment`): icon, name, fast icon, advisor
 	/// badge, and the ` · <level>` tail when the level is not compact.
 	fn model_label(&self, charset: Charset) -> Str {
-		let mut text = format!("{} {}", self.model_icon(charset), self.facts.model);
+		let model = if self.facts.model.is_empty() {
+			"no-model"
+		} else {
+			self.facts.model.as_str()
+		};
+		let mut text = format!("{} {model}", self.model_icon(charset));
 		if self.facts.fast {
 			let _ = write!(text, " {}", charset.icon(Icon::Fast));
 		}
 		if let Some((_, icon)) = self.advisor_span(charset) {
 			let _ = write!(text, " {icon}");
 		}
+		let show_thinking = self
+			.facts
+			.appearance
+			.effective_segment_options()
+			.model
+			.show_thinking_level
+			.unwrap_or(true);
 		if let Some(level) = self.facts.thinking.as_deref()
+			&& show_thinking
 			&& !self.facts.compact_thinking
 		{
 			let _ =
@@ -1216,12 +1824,14 @@ impl StatusBand {
 		let charset = pc.ctx.charset;
 		let theme = pc.ctx.theme;
 		let status = self.facts.git_status.unwrap_or_default();
+		let options = self.facts.appearance.effective_segment_options().git;
+		let show_branch = options.show_branch.unwrap_or(true);
 		let mut parts = SmallVec::new();
 		let mut offset = self
 			.facts
 			.branch
 			.as_deref()
-			.filter(|branch| !branch.is_empty())
+			.filter(|branch| show_branch && !branch.is_empty())
 			.map_or_else(
 				|| cell_width(charset.icon(Icon::Git)),
 				|branch| {
@@ -1230,12 +1840,12 @@ impl StatusBand {
 						.saturating_add(cell_width(&sanitize_status(branch)))
 				},
 			);
-		for (prefix, count, color) in [
-			('*', status.unstaged, theme.status_dirty),
-			('+', status.staged, theme.status_staged),
-			('?', status.untracked, theme.status_untracked),
+		for (shown, prefix, count, color) in [
+			(options.show_unstaged.unwrap_or(true), '*', status.unstaged, theme.status_dirty),
+			(options.show_staged.unwrap_or(true), '+', status.staged, theme.status_staged),
+			(options.show_untracked.unwrap_or(true), '?', status.untracked, theme.status_untracked),
 		] {
-			if count == 0 {
+			if !shown || count == 0 {
 				continue;
 			}
 			offset = offset.saturating_add(1);
@@ -1245,6 +1855,51 @@ impl StatusBand {
 			offset = offset.saturating_add(width);
 		}
 		parts
+	}
+
+	fn path_label(&self, pc: &PaintCtx<'_>, path_max: u16) -> Option<Label> {
+		let options = self.facts.appearance.effective_segment_options().path;
+		let strip = options.strip_work_prefix.unwrap_or(true);
+		let abbreviate = options.abbreviate.unwrap_or(true);
+		let charset = pc.ctx.charset;
+		let theme = pc.ctx.theme;
+		if strip && let Some(worktree) = &self.facts.worktree {
+			let label = if self.facts.branch.as_deref() == Some(worktree.worktree.as_str()) {
+				worktree.project.clone()
+			} else {
+				sf!("{}/{}", worktree.project, worktree.worktree)
+			};
+			return Some((
+				Chip::Path,
+				sf!("{} {}", charset.icon(Icon::Worktree), clamp_path(&label, path_max)),
+				theme.status_path,
+			));
+		}
+		let source = if strip {
+			self.facts.cwd.as_str()
+		} else {
+			self.facts.raw_cwd.as_deref().unwrap_or(&self.facts.cwd)
+		};
+		if source.is_empty() {
+			return None;
+		}
+		let path = if abbreviate {
+			shorten_home(source, self.facts.home.as_deref())
+		} else if strip {
+			expand_home(source, self.facts.home.as_deref())
+		} else {
+			Str::new(source)
+		};
+		let icon = if strip && self.facts.scratch {
+			Icon::ScratchFolder
+		} else {
+			Icon::Folder
+		};
+		Some((
+			Chip::Path,
+			sf!("{} {}", charset.icon(icon), clamp_path(&path, path_max)),
+			theme.status_path,
+		))
 	}
 
 	fn left_labels(&self, pc: &PaintCtx<'_>, path_max: u16) -> SmallVec<Label, 5> {
@@ -1261,59 +1916,58 @@ impl StatusBand {
 		if let Some((label, color)) = self.mode_label(charset, &theme, accent) {
 			labels.push((Chip::Mode, label, color));
 		}
-		if let Some(collab) = self.facts.collab {
-			let role = if collab.guest {
+		if let Some(collab) = self.facts.collab.as_ref() {
+			let role = if collab.role == CollabStatusRole::Guest {
 				"collab guest:"
 			} else {
 				"collab:"
 			};
-			labels.push((Chip::Collab, sf!("⇄ {role}{}", collab.participants), accent));
+			labels.push((
+				Chip::Collab,
+				sf!("{} {role}{}", charset.icon(Icon::Swap), collab.participants),
+				accent,
+			));
 		}
+		let mut hook = StrMut::new_inline("");
 		for status in &self.facts.hook_status {
 			let clean = sanitize_status(status);
-			if !clean.is_empty() {
-				labels.push((Chip::Hook, clean, accent));
+			if clean.is_empty() {
+				continue;
 			}
+			if !hook.is_empty() {
+				hook.push_str(charset.icon(Icon::Dot));
+			}
+			hook.push_str(&clean);
 		}
-		if !self.facts.cwd.is_empty() {
-			let (icon, path) = if let Some(worktree) = &self.facts.worktree {
-				let label = if self.facts.branch.as_deref() == Some(worktree.worktree.as_str()) {
-					worktree.project.clone()
-				} else {
-					sf!("{}/{}", worktree.project, worktree.worktree)
-				};
-				(Icon::Worktree, clamp_path(&label, path_max))
-			} else {
-				(
-					if self.facts.scratch {
-						Icon::ScratchFolder
-					} else {
-						Icon::Folder
-					},
-					clamp_path(&self.facts.cwd, path_max),
-				)
-			};
-			labels.push((Chip::Path, sf!("{} {path}", charset.icon(icon)), theme.status_path));
+		if !hook.is_empty() {
+			labels.push((Chip::Hook, hook.freeze(), accent));
+		}
+		if let Some(path) = self.path_label(pc, path_max) {
+			labels.push(path);
 		}
 		let status = self.facts.git_status.unwrap_or_default();
-		if let Some(branch) = self
+		let git_options = self.facts.appearance.effective_segment_options().git;
+		let branch = self
 			.facts
 			.branch
 			.as_deref()
-			.filter(|branch| !branch.is_empty())
-		{
+			.filter(|branch| git_options.show_branch.unwrap_or(true) && !branch.is_empty());
+		let counts_visible = (git_options.show_unstaged.unwrap_or(true) && status.unstaged > 0)
+			|| (git_options.show_staged.unwrap_or(true) && status.staged > 0)
+			|| (git_options.show_untracked.unwrap_or(true) && status.untracked > 0);
+		if let Some(branch) = branch {
 			let branch = sanitize_status(branch);
 			let mut label = format!("{} {branch}", charset.icon(Icon::Branch));
-			append_git_counts(&mut label, status);
+			append_git_counts(&mut label, status, git_options);
 			let color = if status.dirty() {
 				theme.status_git_dirty
 			} else {
 				theme.status_git_clean
 			};
 			labels.push((Chip::Git, Str::new(label), color));
-		} else if status.dirty() {
+		} else if counts_visible {
 			let mut label = String::from(charset.icon(Icon::Git));
-			append_git_counts(&mut label, status);
+			append_git_counts(&mut label, status, git_options);
 			labels.push((Chip::Git, Str::new(label), theme.status_git_dirty));
 		}
 		if let Some(pull) = &self.facts.pull_request {
@@ -1359,31 +2013,31 @@ impl StatusBand {
 		{
 			labels.push((Chip::Session, clamp_end(&sanitize_status(name), name_max), accent));
 		}
-		if let Some(session) = facts
+		let session = facts
 			.session_id
 			.as_deref()
 			.filter(|session| !session.is_empty())
-		{
-			let end = session
-				.char_indices()
-				.nth(8)
-				.map_or(session.len(), |(index, _)| index);
-			labels.push((
-				Chip::SessionId,
-				sf!("{} {}", charset.icon(Icon::Session), &session[..end]),
-				theme.muted,
-			));
-		}
+			.unwrap_or("new");
+		let end = session
+			.char_indices()
+			.nth(8)
+			.map_or(session.len(), |(index, _)| index);
+		labels.push((
+			Chip::SessionId,
+			sf!("{} {}", charset.icon(Icon::Session), &session[..end]),
+			theme.muted,
+		));
 		if let Some(host) = facts.hostname.as_deref().filter(|host| !host.is_empty()) {
 			let host = sanitize_status(host);
 			labels.push((Chip::Hostname, sf!("{} {host}", charset.icon(Icon::Host)), accent));
 		}
 		if let Some(clock) = facts.wall_time.as_deref().filter(|clock| !clock.is_empty()) {
-			labels.push((
-				Chip::Clock,
-				sf!("{} {}", charset.icon(Icon::Time), sanitize_status(clock)),
-				theme.muted,
-			));
+			let mut label = StrMut::new_inline(charset.icon(Icon::Time));
+			if !label.is_empty() {
+				label.push(' ');
+			}
+			label.push_str(clock);
+			labels.push((Chip::Clock, label.freeze(), theme.muted));
 		}
 		if facts.tokens_in > 0 {
 			labels.push((
@@ -1494,7 +2148,7 @@ impl StatusBand {
 		&self,
 		left: SmallVec<Label, 5>,
 		right: SmallVec<Label, 6>,
-	) -> (SmallVec<Label, 5>, SmallVec<Label, 6>) {
+	) -> (SmallVec<Label, 5>, SmallVec<Label, 6>, bool) {
 		const DEFAULT_LEFT: &[Chip] = &[
 			Chip::Brand,
 			Chip::Model,
@@ -1574,36 +2228,70 @@ impl StatusBand {
 			Chip::Cost,
 			Chip::ContextPct,
 		];
-		let (left_order, right_order) = match self.facts.appearance.preset {
-			StatusPreset::Default => (DEFAULT_LEFT, DEFAULT_RIGHT),
-			StatusPreset::Minimal => (MINIMAL_LEFT, MINIMAL_RIGHT),
-			StatusPreset::Compact => (COMPACT_LEFT, COMPACT_RIGHT),
-			StatusPreset::Full => (FULL_LEFT, FULL_RIGHT),
-			StatusPreset::Nerd => (NERD_LEFT, NERD_RIGHT),
-			StatusPreset::Ascii | StatusPreset::Custom => (ASCII_LEFT, ASCII_RIGHT),
-		};
 		let mut pool = Vec::with_capacity(left.len() + right.len());
 		pool.extend(left);
 		pool.extend(right);
 		let mut selected_left = SmallVec::<Label, 5>::new();
-		for wanted in left_order {
-			if let Some(label) = pool.iter().find(|(chip, ..)| chip == wanted) {
-				selected_left.push(label.clone());
-			}
-		}
 		let mut selected_right = SmallVec::<Label, 6>::new();
-		for wanted in right_order {
-			if let Some(label) = pool.iter().find(|(chip, ..)| chip == wanted) {
-				selected_right.push(label.clone());
+		if self.facts.appearance.preset == StatusPreset::Custom {
+			for segment in self.facts.appearance.left_segments.iter().copied() {
+				if segment == StatusSegment::Subagents {
+					continue;
+				}
+				let wanted = segment.chip();
+				selected_left.extend(pool.iter().filter(|(chip, ..)| *chip == wanted).cloned());
+			}
+			for segment in self.facts.appearance.right_segments.iter().copied() {
+				if segment == StatusSegment::Subagents {
+					continue;
+				}
+				let wanted = segment.chip();
+				selected_right.extend(pool.iter().filter(|(chip, ..)| *chip == wanted).cloned());
+			}
+			// Pi treats live lifecycle badges as semantic right-group prefixes:
+			// configuration cannot hide, duplicate, or relocate them.
+			for wanted in [Chip::Jobs, Chip::Subagents] {
+				if let Some(label) = pool.iter().find(|(chip, ..)| *chip == wanted) {
+					selected_right.insert(0, label.clone());
+				}
+			}
+		} else {
+			let (left_order, right_order) = match self.facts.appearance.preset {
+				StatusPreset::Default => (DEFAULT_LEFT, DEFAULT_RIGHT),
+				StatusPreset::Minimal => (MINIMAL_LEFT, MINIMAL_RIGHT),
+				StatusPreset::Compact => (COMPACT_LEFT, COMPACT_RIGHT),
+				StatusPreset::Full => (FULL_LEFT, FULL_RIGHT),
+				StatusPreset::Nerd => (NERD_LEFT, NERD_RIGHT),
+				StatusPreset::Ascii => (ASCII_LEFT, ASCII_RIGHT),
+				StatusPreset::Custom => unreachable!(),
+			};
+			for wanted in left_order {
+				if let Some(label) = pool.iter().find(|(chip, ..)| chip == wanted) {
+					selected_left.push(label.clone());
+				}
+			}
+			for wanted in right_order {
+				if let Some(label) = pool.iter().find(|(chip, ..)| chip == wanted) {
+					selected_right.push(label.clone());
+				}
 			}
 		}
-		if self.facts.appearance.context_line == ContextLine::Embedded
-			&& self.facts.context_window.is_some_and(|window| window > 0)
-		{
+		let embeds_context = self.facts.appearance.context_line == ContextLine::Embedded
+			&& self.facts.context_window.is_some_and(|window| window > 0);
+		let has_context = selected_left
+			.iter()
+			.chain(&selected_right)
+			.any(|(chip, ..)| matches!(chip, Chip::ContextPct | Chip::ContextTotal));
+		let has_non_context = selected_left
+			.iter()
+			.chain(&selected_right)
+			.any(|(chip, ..)| !matches!(chip, Chip::ContextPct | Chip::ContextTotal));
+		let embedded = embeds_context && has_context && has_non_context;
+		if embedded {
 			selected_left.retain(|(chip, ..)| !matches!(chip, Chip::ContextPct | Chip::ContextTotal));
 			selected_right.retain(|(chip, ..)| !matches!(chip, Chip::ContextPct | Chip::ContextTotal));
 		}
-		(selected_left, selected_right)
+		(selected_left, selected_right, embedded)
 	}
 
 	fn band_chrome(
@@ -1710,8 +2398,8 @@ impl StatusBand {
 
 	/// Fits both groups into `width` around the gauge (pi `#buildStatusLine`):
 	/// clamp the session title, pop right chips, shrink the path, then shed
-	/// secondary left chips. Active workflow mode is the last chip removed:
-	/// unlike git/model decoration it changes how the next turn behaves.
+	/// left chips. Custom layout drops from the declared right edge while
+	/// preserving path; built-in presets use their semantic priority.
 	fn fitted(&self, pc: &PaintCtx<'_>, width: u16) -> Layout {
 		let charset = pc.ctx.charset;
 		let transparent =
@@ -1720,9 +2408,18 @@ impl StatusBand {
 			Self::band_chrome(charset, false, self.facts.appearance.separator, transparent);
 		let right_chrome =
 			Self::band_chrome(charset, true, self.facts.appearance.separator, transparent);
-		let gauge_min = self.gauge_min_width();
-		let mut path_max = PATH_MAX;
+		let options = self.facts.appearance.effective_segment_options();
+		let mut path_max = options.path.max_length.unwrap_or(PATH_MAX).max(4);
+		let custom_usage = self.facts.appearance.preset == StatusPreset::Custom
+			&& self
+				.facts
+				.appearance
+				.left_segments
+				.iter()
+				.chain(self.facts.appearance.right_segments.iter())
+				.any(|segment| *segment == StatusSegment::Usage);
 		let usage = if matches!(self.facts.appearance.preset, StatusPreset::Full | StatusPreset::Nerd)
+			|| custom_usage
 		{
 			self.facts.account_usage.as_ref().and_then(|usage| {
 				account_usage_label(
@@ -1735,10 +2432,16 @@ impl StatusBand {
 		} else {
 			None
 		};
-		let (mut left, mut right) = self.apply_preset(
+		let (mut left, mut right, embedded_context) = self.apply_preset(
 			self.left_labels(pc, path_max),
 			self.right_labels(pc, u16::MAX, usage.as_ref().map(|(label, _)| label)),
 		);
+		let gauge_min = if embedded_context {
+			self.gauge_min_width()
+		} else {
+			1
+		};
+		let custom = self.facts.appearance.preset == StatusPreset::Custom;
 		// pi `minimumGapWidth`: a lone surviving chip that cannot share the
 		// row with both gauge labels keeps the one-cell gauge instead of
 		// losing the whole band.
@@ -1759,10 +2462,14 @@ impl StatusBand {
 			let current = cell_width(&right[index].1);
 			let shrink = current.saturating_sub(SESSION_NAME_MIN).min(excess);
 			if shrink > 0 {
-				(_, right) = self.apply_preset(
-					self.left_labels(pc, path_max),
-					self.right_labels(pc, current - shrink, usage.as_ref().map(|(label, _)| label)),
-				);
+				if custom {
+					right[index].1 = clamp_end(&right[index].1, current - shrink);
+				} else {
+					(_, right, _) = self.apply_preset(
+						self.left_labels(pc, path_max),
+						self.right_labels(pc, current - shrink, usage.as_ref().map(|(label, _)| label)),
+					);
+				}
 			}
 		}
 		while overflow(&left, &right) > 0 && !right.is_empty() {
@@ -1771,7 +2478,11 @@ impl StatusBand {
 		loop {
 			let excess = overflow(&left, &right);
 			if excess == 0 || left.is_empty() {
-				let usage_parts = if right.iter().any(|(chip, ..)| *chip == Chip::Usage) {
+				let usage_parts = if left
+					.iter()
+					.chain(&right)
+					.any(|(chip, ..)| *chip == Chip::Usage)
+				{
 					usage
 						.as_ref()
 						.map_or_else(SmallVec::new, |(_, parts)| parts.clone())
@@ -1782,6 +2493,7 @@ impl StatusBand {
 					left,
 					right,
 					gauge: self.session_accent(pc, pc.ctx.theme.status_rule),
+					embedded_context,
 					pr_url: self
 						.facts
 						.pull_request
@@ -1801,33 +2513,72 @@ impl StatusBand {
 				&& current > PATH_MIN
 			{
 				path_max = path_max.min(current).saturating_sub(excess).max(PATH_MIN);
-				(left, _) = self.apply_preset(
-					self.left_labels(pc, path_max),
-					self.right_labels(pc, u16::MAX, usage.as_ref().map(|(label, _)| label)),
-				);
+				if custom {
+					if let Some(index) = left.iter().position(|(chip, ..)| *chip == Chip::Path)
+						&& let Some(label) = self.path_label(pc, path_max)
+					{
+						left[index] = label;
+					}
+				} else {
+					(left, _, _) = self.apply_preset(
+						self.left_labels(pc, path_max),
+						self.right_labels(pc, u16::MAX, usage.as_ref().map(|(label, _)| label)),
+					);
+				}
 				continue;
 			}
-			let drop = [
-				Chip::Pr,
-				Chip::Git,
-				Chip::Hook,
-				Chip::Collab,
-				Chip::Mode,
-				Chip::Model,
-				Chip::Brand,
-				Chip::Path,
-			]
-			.into_iter()
-			.find_map(|candidate| left.iter().position(|(chip, ..)| *chip == candidate))
-			.unwrap_or(left.len() - 1);
+			let drop = if custom {
+				left
+					.iter()
+					.rposition(|(chip, ..)| *chip != Chip::Path)
+					.unwrap_or(left.len() - 1)
+			} else {
+				[
+					Chip::Pr,
+					Chip::Git,
+					Chip::Hook,
+					Chip::Collab,
+					Chip::Mode,
+					Chip::Model,
+					Chip::Brand,
+					Chip::Path,
+				]
+				.into_iter()
+				.find_map(|candidate| left.iter().position(|(chip, ..)| *chip == candidate))
+				.unwrap_or(left.len() - 1)
+			};
 			left.remove(drop);
+		}
+	}
+
+	fn visit_group_labels(
+		labels: &[Label],
+		rect: Rect,
+		chrome: (&str, &str, &str),
+		mut visit: impl FnMut(&Label, u16),
+	) {
+		if labels.is_empty() {
+			return;
+		}
+		let (left_cap, separator, _) = chrome;
+		let mut column = rect
+			.x
+			.saturating_add(cell_width(left_cap))
+			.saturating_add(1);
+		for (index, label) in labels.iter().enumerate() {
+			if index > 0 {
+				column = column
+					.saturating_add(cell_width(separator))
+					.saturating_add(2);
+			}
+			visit(label, column);
+			column = column.saturating_add(cell_width(&label.1));
 		}
 	}
 
 	/// Paints one powerline group at `rect` — the same cells the `<status>`
 	/// component paints, written straight into the frame from the fitted
-	/// labels so an animation frame builds no component — and reports each
-	/// label's first column so callers can overpaint spans inside a chip.
+	/// labels so an animation frame builds no component.
 	fn paint_group(
 		pc: &mut PaintCtx<'_>,
 		labels: &[Label],
@@ -1836,7 +2587,6 @@ impl StatusBand {
 		dimmed: bool,
 		separator: StatusSeparator,
 		transparent: bool,
-		mut on_label: impl FnMut(Chip, u16),
 	) {
 		let theme = pc.ctx.theme;
 		let (left_cap, separator, cap) =
@@ -1857,13 +2607,12 @@ impl StatusBand {
 		let y = rect.y;
 		let mut column = pc.frame.put(rect.x, y, left_cap, edge);
 		column = pc.frame.put(column, y, " ", band);
-		for (index, (chip, label, color)) in labels.iter().enumerate() {
+		for (index, (_, label, color)) in labels.iter().enumerate() {
 			if index > 0 {
 				column = pc.frame.put(column, y, " ", separator_style);
 				column = pc.frame.put(column, y, separator, separator_style);
 				column = pc.frame.put(column, y, " ", separator_style);
 			}
-			on_label(*chip, column);
 			column = pc.frame.put(column, y, label, band.fg(*color));
 		}
 		column = pc.frame.put(column, y, " ", band);
@@ -1962,121 +2711,88 @@ impl Component for StatusBand {
 			self.facts.speculation_percent,
 		);
 		let dimmed = self.facts.focused_agent.is_some();
-		let appearance = self.facts.appearance;
-		let transparent = appearance.transparent || theme.status_bg == Color::Default;
+		let separator = self.facts.appearance.separator;
+		let context_line = self.facts.appearance.context_line;
+		let transparent = self.facts.appearance.transparent || theme.status_bg == Color::Default;
 		let band_bg = if transparent {
 			Color::Default
 		} else {
 			theme.status_bg
 		};
 		let speculation_accent = self.session_accent(pc, theme.accent);
-		let Layout { left, right, gauge, pr_url, path_url, git_parts, usage_parts } =
+		let Layout { left, right, gauge, embedded_context, pr_url, path_url, git_parts, usage_parts } =
 			self.layout(pc, rect.width, brand_color);
 		let gauge_color = *gauge;
-		let left_width = Self::group_width(
-			left,
-			Self::band_chrome(charset, false, appearance.separator, transparent),
-		)
-		.min(rect.width);
-		let right_width = Self::group_width(
-			right,
-			Self::band_chrome(charset, true, appearance.separator, transparent),
-		)
-		.min(rect.width.saturating_sub(left_width));
-		let mut advisor_column = None;
-		let mut pr_column = None;
-		let mut git_column = None;
-		let mut path_column = None;
+		if left.is_empty() && right.is_empty() {
+			return;
+		}
+		let left_width =
+			Self::group_width(left, Self::band_chrome(charset, false, separator, transparent))
+				.min(rect.width);
+		let right_width =
+			Self::group_width(right, Self::band_chrome(charset, true, separator, transparent))
+				.min(rect.width.saturating_sub(left_width));
+		let left_rect = Rect::new(rect.x, rect.y, left_width, 1);
+		let right_rect =
+			Rect::new(rect.x.saturating_add(rect.width - right_width), rect.y, right_width, 1);
 		if left_width > 0 {
-			Self::paint_group(
-				pc,
-				left,
-				Rect::new(rect.x, rect.y, left_width, 1),
-				false,
-				dimmed,
-				appearance.separator,
-				transparent,
-				|chip, x| {
-					if chip == Chip::Model {
-						advisor_column = advisor.map(|(offset, icon)| (x.saturating_add(offset), icon));
-					} else if chip == Chip::Pr {
-						pr_column = Some(x);
-					} else if chip == Chip::Git {
-						git_column = Some(x);
-					} else if chip == Chip::Path {
-						path_column = Some(x);
-					}
-				},
-			);
-		}
-		if let Some(column) = path_column
-			&& let Some(url) = path_url
-			&& let Some((_, label, color)) = left.iter().find(|(chip, ..)| *chip == Chip::Path)
-			&& let Some((icon, path)) = label.split_once(' ')
-		{
-			let offset = cell_width(icon).saturating_add(1);
-			let mut style = Style::new().fg(*color).bg(band_bg).link(url);
-			if dimmed {
-				style = style.dim();
-			}
-			pc.frame
-				.put(column.saturating_add(offset), rect.y, path, style);
-		}
-		if let Some(column) = git_column {
-			for (offset, part, color) in git_parts {
-				let mut style = Style::new().fg(*color).bg(band_bg);
-				if dimmed {
-					style = style.dim();
-				}
-				pc.frame
-					.put(column.saturating_add(*offset), rect.y, part, style);
-			}
-		}
-		if let Some(column) = pr_column
-			&& let Some(url) = pr_url
-			&& let Some((_, label, color)) = left.iter().find(|(chip, ..)| *chip == Chip::Pr)
-		{
-			let mut style = Style::new().fg(*color).bg(band_bg).link(url);
-			if dimmed {
-				style = style.dim();
-			}
-			pc.frame.put(column, rect.y, label, style);
-		}
-		if let Some(((column, icon), badge)) = advisor_column.zip(advisor_badge)
-			&& column.saturating_add(cell_width(icon)) <= rect.x.saturating_add(left_width)
-		{
-			// pi paints the badge as its own span inside the model chip, so
-			// the roster health reads apart from the model color.
-			let color = match badge.health {
-				AdvisorHealth::Error => theme.err,
-				AdvisorHealth::QuotaExhausted => theme.warn,
-				AdvisorHealth::Running => theme.ok,
-				AdvisorHealth::Paused => theme.muted,
-			};
-			let mut style = Style::new().fg(color).bg(band_bg);
-			if dimmed {
-				style = style.dim();
-			}
-			pc.frame.put(column, rect.y, icon, style);
+			Self::paint_group(pc, left, left_rect, false, dimmed, separator, transparent);
 		}
 		if right_width > 0 {
-			let x = rect.x.saturating_add(rect.width - right_width);
-			let mut usage_column = None;
-			Self::paint_group(
-				pc,
-				right,
-				Rect::new(x, rect.y, right_width, 1),
-				true,
-				dimmed,
-				appearance.separator,
-				transparent,
-				|chip, column| {
-					if chip == Chip::Usage {
-						usage_column = Some(column);
+			Self::paint_group(pc, right, right_rect, true, dimmed, separator, transparent);
+		}
+		let mut overlay = |label: &Label, column: u16| match label.0 {
+			Chip::Path => {
+				if let Some(url) = path_url
+					&& let Some((icon, path)) = label.1.split_once(' ')
+				{
+					let offset = cell_width(icon).saturating_add(1);
+					let mut style = Style::new().fg(label.2).bg(band_bg).link(url);
+					if dimmed {
+						style = style.dim();
 					}
-				},
-			);
-			if let Some(column) = usage_column {
+					pc.frame
+						.put(column.saturating_add(offset), rect.y, path, style);
+				}
+			},
+			Chip::Git => {
+				for (offset, part, color) in git_parts {
+					let mut style = Style::new().fg(*color).bg(band_bg);
+					if dimmed {
+						style = style.dim();
+					}
+					pc.frame
+						.put(column.saturating_add(*offset), rect.y, part, style);
+				}
+			},
+			Chip::Pr => {
+				if let Some(url) = pr_url {
+					let mut style = Style::new().fg(label.2).bg(band_bg).link(url);
+					if dimmed {
+						style = style.dim();
+					}
+					pc.frame.put(column, rect.y, &label.1, style);
+				}
+			},
+			Chip::Model => {
+				if let Some(((offset, icon), badge)) = advisor.zip(advisor_badge) {
+					let column = column.saturating_add(offset);
+					if column.saturating_add(cell_width(icon)) <= rect.x.saturating_add(rect.width) {
+						let color = match badge.health {
+							AdvisorHealth::Error => theme.err,
+							AdvisorHealth::QuotaExhausted => theme.warn,
+							AdvisorHealth::Running => theme.ok,
+							AdvisorHealth::Paused => theme.muted,
+						};
+						let mut style = Style::new().fg(color).bg(band_bg);
+						if dimmed {
+							style = style.dim();
+						}
+						pc.frame.put(column, rect.y, icon, style);
+					}
+				}
+			},
+			Chip::Usage => {
 				for (offset, part, color) in usage_parts {
 					let mut style = Style::new().fg(*color).bg(band_bg);
 					if dimmed {
@@ -2085,8 +2801,21 @@ impl Component for StatusBand {
 					pc.frame
 						.put(column.saturating_add(*offset), rect.y, part, style);
 				}
-			}
-		}
+			},
+			_ => {},
+		};
+		Self::visit_group_labels(
+			left,
+			left_rect,
+			Self::band_chrome(charset, false, separator, transparent),
+			&mut overlay,
+		);
+		Self::visit_group_labels(
+			right,
+			right_rect,
+			Self::band_chrome(charset, true, separator, transparent),
+			overlay,
+		);
 
 		let gap = rect
 			.width
@@ -2101,7 +2830,7 @@ impl Component for StatusBand {
 			threshold_percent: f64::from(compact_percent),
 			speculation_percent,
 		});
-		let gauge = match self.facts.appearance.context_line {
+		let gauge = match context_line {
 			ContextLine::Off => ContextGauge::plan(gap, tokens, None, None),
 			ContextLine::Percentage => {
 				ContextGauge::plan_with_labels(gap, tokens, context_window, None, false)
@@ -2109,7 +2838,12 @@ impl Component for StatusBand {
 			ContextLine::Annotated => {
 				ContextGauge::plan_with_labels(gap, tokens, context_window, boundaries, false)
 			},
-			ContextLine::Embedded => ContextGauge::plan(gap, tokens, context_window, boundaries),
+			ContextLine::Embedded if *embedded_context => {
+				ContextGauge::plan(gap, tokens, context_window, boundaries)
+			},
+			ContextLine::Embedded => {
+				ContextGauge::plan_with_labels(gap, tokens, context_window, boundaries, false)
+			},
 		};
 		let dim = |style: Style| if dimmed { style.dim() } else { style };
 		let used = dim(Style::new().fg(gauge_color));
@@ -2225,6 +2959,104 @@ pub(crate) mod tests {
 		}
 	}
 
+	#[test]
+	fn collaboration_renders_role_real_count_and_charset_icon() {
+		let host_facts = StatusFacts { collab: Some(CollabStatus::host(3)), ..facts() };
+		let host_ui = Ui::from_root(StatusBand::new(host_facts), 160, UiContext::default());
+		let host = frame_text(host_ui.frame());
+		assert!(host.contains("⇄ collab:3"), "{host}");
+		let collab_column = cell_width(&host[..host.find('⇄').expect("collaboration icon")]);
+		assert_eq!(
+			host_ui
+				.frame()
+				.cell(collab_column, 0)
+				.style()
+				.foreground_color(),
+			UiContext::default().theme.accent,
+			"pi's collaboration segment uses the semantic accent"
+		);
+
+		let guest_facts = StatusFacts {
+			collab: Some(CollabStatus::guest(7, CollabHostSnapshot::default())),
+			..facts()
+		};
+		let guest = row(guest_facts.clone(), 160);
+		assert!(guest.contains("⇄ collab guest:7"), "{guest}");
+
+		let ctx = UiContext { charset: Charset::Ascii, ..UiContext::default() };
+		let ui = Ui::from_root(StatusBand::new(guest_facts), 160, ctx);
+		let ascii = frame_text(ui.frame());
+		assert!(ascii.contains("<-> collab guest:7"), "{ascii}");
+		assert!(!ascii.contains('⇄'), "{ascii}");
+	}
+
+	#[test]
+	fn collaboration_guest_uses_host_snapshot_values() {
+		let mut guest = StatusFacts {
+			model: Str::new_static("Local model"),
+			thinking: Some(Str::new_static("local")),
+			cwd: Str::new_static("~/local"),
+			scratch: true,
+			path_url: Some(Str::new_static("file:///local")),
+			session_name: Some(Str::new_static("Local title")),
+			tokens: 11,
+			context_window: Some(22),
+			..StatusFacts::default()
+		};
+		let snapshot = CollabHostSnapshot {
+			model:          Some(Str::new_static("Host model")),
+			thinking:       None,
+			cwd:            Str::new_static("/host/project"),
+			session_name:   Some(Str::new_static("Host title")),
+			tokens:         Some(33),
+			context_window: Some(44),
+		};
+		guest.apply_collab(Some(CollabStatus::guest(4, snapshot)));
+		assert_eq!(guest.model, "Host model");
+		assert_eq!(guest.thinking, None);
+		assert_eq!(guest.cwd, "/host/project");
+		assert!(!guest.scratch);
+		assert_eq!(guest.path_url, None, "a remote host path must not become a local file link");
+		assert_eq!(guest.session_name.as_deref(), Some("Host title"));
+		assert_eq!(guest.tokens, 33);
+		assert_eq!(guest.context_window, Some(44));
+		assert_eq!(guest.collab.as_ref().map(|status| status.participants), Some(4));
+
+		let mut pending = facts();
+		let pending_local = pending.clone();
+		pending.apply_collab(Some(CollabStatus::guest_pending(2)));
+		assert_eq!(pending.model, pending_local.model);
+		assert_eq!(pending.cwd, pending_local.cwd);
+		assert_eq!(pending.session_name, pending_local.session_name);
+
+		let mut host = facts();
+		let local = host.clone();
+		host.apply_collab(Some(CollabStatus {
+			role:         CollabStatusRole::Host,
+			participants: 2,
+			host:         Some(Arc::new(CollabHostSnapshot {
+				model: Some(Str::new_static("must not override")),
+				..CollabHostSnapshot::default()
+			})),
+		}));
+		assert_eq!(host.model, local.model, "host status always uses local authoritative facts");
+	}
+
+	#[test]
+	fn collaboration_overflow_drops_badge_before_the_project_path() {
+		let collab = || StatusFacts { collab: Some(CollabStatus::host(12)), ..facts() };
+		let cutoff = (1..=160)
+			.find(|width| row(collab(), *width).contains("collab:12"))
+			.expect("collaboration chip eventually fits");
+		assert!(cutoff > 1);
+		let overflowed = row(collab(), cutoff - 1);
+		assert!(!overflowed.contains("collab:12"), "{overflowed}");
+		assert!(
+			overflowed.contains("proj"),
+			"collaboration yields before the project path: {overflowed}"
+		);
+	}
+
 	/// Facts with every right-group chip populated.
 	fn spending() -> StatusFacts {
 		StatusFacts {
@@ -2285,6 +3117,303 @@ pub(crate) mod tests {
 		);
 		assert!(nerd.contains("◫ 10.0%/200K"), "{nerd}");
 		assert!(nerd.contains("◫ 200K"), "{nerd}");
+	}
+
+	fn custom_appearance(left: &[StatusSegment], right: &[StatusSegment]) -> StatusAppearance {
+		let mut appearance = StatusAppearance::for_preset(StatusPreset::Custom);
+		appearance.context_line = ContextLine::Off;
+		appearance.left_segments = left.to_vec().into();
+		appearance.right_segments = right.to_vec().into();
+		appearance
+	}
+
+	#[test]
+	fn custom_layout_preserves_group_order_duplicates_and_empty_arrays() {
+		let mut appearance =
+			custom_appearance(&[StatusSegment::Path, StatusSegment::Model, StatusSegment::Path], &[
+				StatusSegment::SessionName,
+			]);
+		let custom = row(
+			StatusFacts {
+				session_name: Some(Str::new_static("named")),
+				appearance: appearance.clone(),
+				..facts()
+			},
+			200,
+		);
+		let paths = custom
+			.match_indices("~/proj")
+			.map(|(index, _)| index)
+			.collect::<Vec<_>>();
+		assert_eq!(paths.len(), 2, "{custom}");
+		let model = custom.find("Sonnet 4.5").expect("custom model");
+		assert!(paths[0] < model && model < paths[1], "{custom}");
+		assert!(custom.find("named").is_some_and(|name| name > paths[1]), "{custom}");
+
+		appearance.left_segments = Arc::default();
+		appearance.right_segments = Arc::default();
+		let empty = row(StatusFacts { appearance, ..facts() }, 80);
+		assert!(empty.trim().is_empty(), "empty custom arrays are exact: {empty:?}");
+
+		let mut preset = StatusAppearance::for_preset(StatusPreset::Default);
+		preset.left_segments = vec![StatusSegment::Time].into();
+		let fixed = row(
+			StatusFacts { wall_time: Some(Str::new_static("23:59")), appearance: preset, ..facts() },
+			120,
+		);
+		assert!(fixed.contains("Sonnet 4.5") && !fixed.contains("23:59"), "{fixed}");
+	}
+
+	#[test]
+	fn custom_layout_ignores_unknown_ids_and_preserves_known_duplicates() {
+		assert!("future_segment".parse::<StatusSegment>().is_err());
+		let parsed = ["model", "future_segment", "model"]
+			.into_iter()
+			.filter_map(|value| value.parse::<StatusSegment>().ok())
+			.collect::<Vec<_>>();
+		let row = row(StatusFacts { appearance: custom_appearance(&parsed, &[]), ..facts() }, 120);
+		assert_eq!(row.matches("Sonnet 4.5").count(), 2, "{row}");
+	}
+
+	#[test]
+	fn custom_segment_options_control_model_path_git_and_clock() {
+		let nested = Kv(vec![
+			(
+				Str::new_static("model"),
+				omp_con::Value::Kv(Kv(vec![(
+					Str::new_static("showThinkingLevel"),
+					omp_con::Value::Bool(false),
+				)])),
+			),
+			(
+				Str::new_static("path"),
+				omp_con::Value::Kv(Kv(vec![
+					(Str::new_static("abbreviate"), omp_con::Value::Bool(false)),
+					(Str::new_static("maxLength"), omp_con::Value::Int(100)),
+					(Str::new_static("stripWorkPrefix"), omp_con::Value::Bool(false)),
+				])),
+			),
+			(
+				Str::new_static("git"),
+				omp_con::Value::Kv(Kv(vec![
+					(Str::new_static("showBranch"), omp_con::Value::Bool(false)),
+					(Str::new_static("showStaged"), omp_con::Value::Bool(true)),
+					(Str::new_static("showUnstaged"), omp_con::Value::Bool(false)),
+					(Str::new_static("showUntracked"), omp_con::Value::Bool(false)),
+				])),
+			),
+			(
+				Str::new_static("time"),
+				omp_con::Value::Kv(Kv(vec![
+					(Str::new_static("format"), omp_con::Value::Str(Str::new_static("12h"))),
+					(Str::new_static("showSeconds"), omp_con::Value::Bool(true)),
+				])),
+			),
+		]);
+		let mut appearance = custom_appearance(
+			&[StatusSegment::Model, StatusSegment::Path, StatusSegment::Git, StatusSegment::Time],
+			&[],
+		);
+		appearance.segment_options =
+			StatusSegmentOptions::from_kv(&nested).expect("valid typed options");
+		assert_eq!(
+			appearance
+				.wall_clock_options(WallClockFormatSetting::Preset, WallClockSecondsSetting::Preset,),
+			Some(WallClockOptions { format: WallClockFormat::TwelveHour, show_seconds: true })
+		);
+		let rendered = row(
+			StatusFacts {
+				thinking: Some(Str::new_static("high")),
+				compact_thinking: false,
+				raw_cwd: Some(Str::new_static("/home/me/Projects/app")),
+				home: Some(Str::new_static("/home/me")),
+				git_status: Some(GitStatus { staged: 1, unstaged: 2, untracked: 3 }),
+				wall_time: Some(Str::new_static("1:04:05pm")),
+				appearance,
+				..facts()
+			},
+			240,
+		);
+		assert!(!rendered.contains("high") && !rendered.contains("main"), "{rendered}");
+		assert!(rendered.contains("/home/me/Projects/app"), "{rendered}");
+		assert!(rendered.contains("+1"), "{rendered}");
+		assert!(!rendered.contains("*2") && !rendered.contains("?3"), "{rendered}");
+		assert!(rendered.contains("1:04:05pm"), "{rendered}");
+
+		let malformed = Kv(vec![(
+			Str::new_static("path"),
+			omp_con::Value::Kv(Kv(vec![(Str::new_static("maxLength"), omp_con::Value::Int(0))])),
+		)]);
+		assert_eq!(StatusSegmentOptions::from_kv(&malformed), None);
+	}
+
+	#[test]
+	fn custom_overflow_uses_declared_semantic_roles() {
+		let appearance =
+			custom_appearance(&[StatusSegment::Path, StatusSegment::Model, StatusSegment::Git], &[
+				StatusSegment::SessionName,
+				StatusSegment::TokenIn,
+				StatusSegment::Cost,
+			]);
+		let configured = StatusFacts { appearance, ..spending() };
+		assert!(
+			(20..=180).any(|width| {
+				let line = row(configured.clone(), width);
+				line.contains("12K") && !line.contains("$0.12")
+			}),
+			"right overflow pops the declared tail before earlier chips"
+		);
+		assert!(
+			(20..=100).any(|width| {
+				let line = row(configured.clone(), width);
+				line.contains("~/proj") && !line.contains("Sonnet 4.5") && !line.contains("main")
+			}),
+			"path survives non-path left chips"
+		);
+	}
+
+	#[test]
+	fn custom_context_only_stays_a_chip_and_lifecycle_badges_stay_right() {
+		let mut context_appearance = custom_appearance(&[StatusSegment::ContextPct], &[]);
+		context_appearance.context_line = ContextLine::Embedded;
+		let context = row(StatusFacts { appearance: context_appearance, ..facts() }, 80);
+		assert!(context.contains("10.0%/200K"), "{context}");
+
+		let lifecycle = row(
+			StatusFacts {
+				subagents: 2,
+				background_jobs: 1,
+				appearance: custom_appearance(
+					&[StatusSegment::Subagents, StatusSegment::Subagents],
+					&[],
+				),
+				..facts()
+			},
+			100,
+		);
+		assert_eq!(lifecycle.matches("2 agents").count(), 1, "{lifecycle}");
+	}
+
+	#[test]
+	fn retained_custom_layout_updates_without_rebuilding_the_composer() {
+		let mut ui = Ui::from_root(StatusBand::new(facts()), 120, UiContext::default());
+		assert!(frame_text(ui.frame()).contains("Sonnet 4.5"));
+		assert!(ui.update_component::<StatusBand>(STATUS_ID, |band| {
+			band.set_appearance(custom_appearance(&[StatusSegment::Path], &[]))
+		}));
+		let updated = frame_text(ui.frame());
+		assert!(updated.contains("~/proj") && !updated.contains("Sonnet 4.5"), "{updated}");
+	}
+
+	#[test]
+	fn wall_clock_resolves_presets_and_overrides() {
+		assert_eq!(
+			StatusAppearance::for_preset(StatusPreset::Default)
+				.wall_clock_options(WallClockFormatSetting::Preset, WallClockSecondsSetting::Preset,),
+			None
+		);
+		assert_eq!(
+			StatusAppearance::for_preset(StatusPreset::Full)
+				.wall_clock_options(WallClockFormatSetting::Preset, WallClockSecondsSetting::Preset,),
+			Some(WallClockOptions {
+				format:       WallClockFormat::TwentyFourHour,
+				show_seconds: false,
+			})
+		);
+		assert_eq!(
+			StatusAppearance::for_preset(StatusPreset::Nerd)
+				.wall_clock_options(WallClockFormatSetting::Preset, WallClockSecondsSetting::Preset,),
+			Some(WallClockOptions {
+				format:       WallClockFormat::TwentyFourHour,
+				show_seconds: true,
+			})
+		);
+
+		let nested = Kv(vec![(
+			Str::new_static("time"),
+			omp_con::Value::Kv(Kv(vec![
+				(Str::new_static("format"), omp_con::Value::Str(Str::new_static("12h"))),
+				(Str::new_static("showSeconds"), omp_con::Value::Bool(true)),
+			])),
+		)]);
+		let mut appearance = StatusAppearance::for_preset(StatusPreset::Full);
+		appearance.segment_options =
+			StatusSegmentOptions::from_kv(&nested).expect("valid nested options");
+		assert_eq!(
+			appearance.wall_clock_options(
+				WallClockFormatSetting::TwentyFourHour,
+				WallClockSecondsSetting::Hide,
+			),
+			Some(WallClockOptions {
+				format:       WallClockFormat::TwentyFourHour,
+				show_seconds: false,
+			}),
+			"curated settings override migrated nested options"
+		);
+	}
+
+	#[test]
+	fn wall_clock_formats_local_time_and_wakes_only_at_visible_units() {
+		let stamp = "2026-09-03T13:04:05.250Z"
+			.parse::<jiff::Timestamp>()
+			.expect("timestamp");
+		let utc = stamp.to_zoned(jiff::tz::TimeZone::UTC);
+		let minute =
+			WallClockOptions { format: WallClockFormat::TwentyFourHour, show_seconds: false };
+		assert_eq!(format_wall_clock(&utc, minute).as_str(), "13:04");
+		assert_eq!(
+			wall_clock_next_wake(Duration::from_secs(10), &utc, minute),
+			Duration::from_millis(64_750)
+		);
+
+		let seconds =
+			WallClockOptions { format: WallClockFormat::TwelveHour, show_seconds: true };
+		assert_eq!(format_wall_clock(&utc, seconds).as_str(), "1:04:05pm");
+		assert_eq!(
+			wall_clock_next_wake(Duration::from_secs(10), &utc, seconds),
+			Duration::from_millis(10_750)
+		);
+
+		let midnight = "2026-09-03T00:04:05Z"
+			.parse::<jiff::Timestamp>()
+			.expect("timestamp")
+			.to_zoned(jiff::tz::TimeZone::UTC);
+		let noon = "2026-09-03T12:04:05Z"
+			.parse::<jiff::Timestamp>()
+			.expect("timestamp")
+			.to_zoned(jiff::tz::TimeZone::UTC);
+		assert_eq!(format_wall_clock(&midnight, seconds).as_str(), "12:04:05am");
+		assert_eq!(format_wall_clock(&noon, seconds).as_str(), "12:04:05pm");
+
+		let new_york = stamp.to_zoned(jiff::tz::TimeZone::get("America/New_York").expect("tz"));
+		assert_eq!(
+			format_wall_clock(&new_york, seconds).as_str(),
+			"9:04:05am",
+			"each refresh uses the newly supplied system timezone"
+		);
+	}
+
+	#[test]
+	fn full_and_nerd_include_clock_and_overflow_drops_it_first() {
+		let with_clock = |preset| StatusFacts {
+			wall_time: Some(Str::new_static("23:59:58")),
+			appearance: StatusAppearance::for_preset(preset),
+			..facts()
+		};
+		assert!(!row(with_clock(StatusPreset::Default), 160).contains("23:59:58"));
+		assert!(row(with_clock(StatusPreset::Full), 160).contains("23:59:58"));
+		assert!(row(with_clock(StatusPreset::Nerd), 160).contains("23:59:58"));
+
+		let cutoff = (1..=160)
+			.find(|width| row(with_clock(StatusPreset::Full), *width).contains("23:59:58"))
+			.expect("clock eventually fits");
+		assert!(cutoff > 1);
+		let overflowed = row(with_clock(StatusPreset::Full), cutoff - 1);
+		assert!(!overflowed.contains("23:59:58"), "{overflowed}");
+		assert!(
+			overflowed.contains("~/proj"),
+			"the rightmost clock yields before the path: {overflowed}"
+		);
 	}
 
 	#[test]

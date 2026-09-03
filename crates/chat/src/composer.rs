@@ -121,10 +121,7 @@ fn compact_media_markers(text: &str, markers: &[usize]) -> String {
 	})
 }
 
-fn rewrite_media_markers(
-	text: &str,
-	mut mapped: impl FnMut(usize) -> Option<usize>,
-) -> String {
+fn rewrite_media_markers(text: &str, mut mapped: impl FnMut(usize) -> Option<usize>) -> String {
 	const PREFIXES: [&str; 2] = ["[Image #", "[Video #"];
 	const LEGACY: &str = " attachment://";
 	let mut out = String::with_capacity(text.len());
@@ -1180,9 +1177,8 @@ impl Composer {
 		} else {
 			// pi: a leading `/` line is a command, never a prompt.
 			match text.trim_start().strip_prefix("/") {
-				Some(command) if !command.starts_with('/') => ComposerAction::Command {
-					statement: Str::new(command.trim()),
-					media,
+				Some(command) if !command.starts_with('/') => {
+					ComposerAction::Command { statement: Str::new(command.trim()), media }
 				},
 				_ if !media.is_empty() => ComposerAction::SubmitWithMedia { text: text.clone(), media },
 				_ => ComposerAction::Submit(text.clone()),
@@ -1375,6 +1371,35 @@ mod tests {
 		composer.clear_volatile_text();
 		assert_eq!(composer.text(), "note: hellotail");
 		assert_eq!(composer.frame().cursor(), Some((14, 2)));
+	}
+
+	#[test]
+	fn volatile_stt_preserves_the_caret_and_adjacent_attachment_atom() {
+		const PAYLOAD: &str = "line one\nline two";
+		let mut composer = composer();
+		composer.paste_chip(PAYLOAD, None);
+		type_text(&mut composer, " tail");
+		let displayed = composer.text_displayed();
+		let expanded = composer.text();
+
+		composer.key(Key::Home);
+		let caret = composer.frame().cursor();
+		composer.set_volatile_text("heard");
+		assert!(composer.text_displayed().contains("#1"), "the preview must not tear the chip");
+		composer.clear_volatile_text();
+		assert_eq!(composer.text_displayed(), displayed);
+		assert_eq!(composer.text(), expanded, "cancelling restores the atom-backed draft exactly");
+		assert_eq!(composer.frame().cursor(), caret, "cancelling restores the insertion caret");
+
+		composer.key(Key::End);
+		for _ in 0..5 {
+			composer.key(Key::Left);
+		}
+		composer.set_volatile_text("heard");
+		composer.commit_volatile_text("heard");
+		assert!(composer.text_displayed().contains("#1"), "committing must not flatten the chip");
+		assert_eq!(composer.text().matches(PAYLOAD).count(), 1);
+		assert!(composer.text().contains("heard tail"));
 	}
 
 	/// pi `addToHistory` + `navigateHistory`: every submission (prompt,

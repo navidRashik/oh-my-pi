@@ -13,6 +13,7 @@ use std::{
 };
 
 use flume::{Receiver, Sender};
+use jiff::Zoned;
 use omp_agent::{KernelEvent, Up};
 use omp_con::{
 	AI_COMPACT_THRESHOLD, AI_FASTMODE, AI_MODEL, AI_THINKING, CL_IME_SAFE_CURSOR, CL_SHOWTHINKING,
@@ -28,7 +29,9 @@ use omp_tui::{
 	anim::Intro,
 	components::{ComposerStyle, Countdown},
 	negotiate_async,
-	paste::{Clipboard, ClipboardRead, ClipboardReadOutcome, spawn_clipboard_read},
+	paste::{
+		Clipboard, ClipboardRead, ClipboardReadOutcome, ClipboardWriteOutcome, spawn_clipboard_read,
+	},
 	respond_debug_query,
 	slots::{Mode, ResizePolicy},
 };
@@ -70,12 +73,15 @@ use crate::{
 	settings::{
 		CL_AUTOCOMPLETE_MAX_VISIBLE, CL_EMOJI_AUTOCOMPLETE, CL_PASTE_LARGE_MENU_THRESHOLD,
 		CL_SPELLING_AUTOCOMPLETE, CL_SPELLING_AUTOCORRECT, CL_SPELLING_TYPO_DETECTION,
-		CL_STATUS_LINE_CONTEXT_LINE, CL_STATUS_LINE_PRESET, CL_STATUS_LINE_SEPARATOR,
-		CL_STATUS_LINE_SHOW_HOOK_STATUS, CL_STATUS_LINE_TRANSPARENT,
+		CL_STATUS_LINE_CONTEXT_LINE, CL_STATUS_LINE_LEFT_SEGMENTS, CL_STATUS_LINE_PRESET,
+		CL_STATUS_LINE_RIGHT_SEGMENTS, CL_STATUS_LINE_SEGMENT_OPTIONS, CL_STATUS_LINE_SEPARATOR,
+		CL_STATUS_LINE_SHOW_HOOK_STATUS, CL_STATUS_LINE_TIME_FORMAT,
+		CL_STATUS_LINE_TIME_SHOW_SECONDS, CL_STATUS_LINE_TRANSPARENT,
 	},
 	status_band::{
-		ActiveTime, CollabBadge, ContextLine, GitStatus, ModeChip, PullRequest, Speculation,
-		StatusAppearance, StatusPreset, StatusSeparator, WorktreeLabel,
+		ActiveTime, CollabStatus, CollabStatusRole, ContextLine, GitStatus, ModeChip, PullRequest,
+		Speculation, StatusAppearance, StatusPreset, StatusSegment, StatusSegmentOptions,
+		StatusSeparator, WallClockOptions, WorktreeLabel, format_wall_clock, wall_clock_next_wake,
 	},
 	status_line::{StatusLine, advisor_badge, director_mode},
 	transcript::Projection,
@@ -199,6 +205,8 @@ pub enum SpawnKind {
 pub enum HostCommand {
 	/// Begin a fresh explicit turn.
 	Submit(Str),
+	/// Begin or steer with a discovered skill's typed prompt.
+	SkillPrompt(omp_journal::data::SkillPrompt),
 	/// Begin a turn with user media (pi `pendingImages`): the controller
 	/// content-addresses each input in the session's blob store and journals
 	/// the prompt with the references, `[Image #N]` in `text` naming
@@ -419,19 +427,21 @@ pub type UpEvent = HostCommand;
 /// Result of applying `C-c` to the current chat activity state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CtrlCAction {
-	/// Cancel the active turn while keeping the host open.
-	Interrupt,
+	/// Clear the draft (or consume the first press when it is already empty).
+	Clear,
 	/// Leave chat and restore the terminal.
 	Quit,
 }
 
-/// Resolves pi-compatible `C-c` behavior.
+/// Resolves pi-compatible `C-c` behavior: only a repeat within the host's
+/// 500 ms window exits; active work does not turn the first press into an
+/// interrupt.
 #[must_use]
-pub const fn ctrl_c_action(turn_active: bool, repeated: bool) -> CtrlCAction {
-	if turn_active && !repeated {
-		CtrlCAction::Interrupt
-	} else {
+pub const fn ctrl_c_action(repeated: bool) -> CtrlCAction {
+	if repeated {
 		CtrlCAction::Quit
+	} else {
+		CtrlCAction::Clear
 	}
 }
 
@@ -532,122 +542,172 @@ impl LeftTaps {
 	}
 }
 
+/// Observer-local wall clock sampled only at its visible unit boundary or
+/// when its status configuration changes. Paint reads `label` and performs no
+/// time-zone lookup, formatting, or allocation.
+#[derive(Default)]
+struct WallClock {
+	options:   Option<WallClockOptions>,
+	label:     Option<Str>,
+	next_wake: Option<Duration>,
+}
+
+impl WallClock {
+	fn refresh(&mut self, now: Duration, appearance: &StatusAppearance, con: &Ctx) -> bool {
+		let options = appearance.wall_clock_options(
+			CL_STATUS_LINE_TIME_FORMAT.get(con),
+			CL_STATUS_LINE_TIME_SHOW_SECONDS.get(con),
+		);
+		let due = self.next_wake.is_some_and(|deadline| now >= deadline);
+		if options == self.options && !due {
+			return false;
+		}
+		self.options = options;
+		match options {
+			Some(options) => {
+				// `Zoned::now()` resolves the current system time zone afresh;
+				// a zone change is therefore observed at the next visible unit.
+				let local_now = Zoned::now();
+				self.label = Some(format_wall_clock(&local_now, options));
+				self.next_wake = Some(wall_clock_next_wake(now, &local_now, options));
+			},
+			None => {
+				self.label = None;
+				self.next_wake = None;
+			},
+		}
+		true
+	}
+
+	const fn label(&self) -> Option<&Str> {
+		self.label.as_ref()
+	}
+
+	const fn next_wake(&self) -> Option<Duration> {
+		self.next_wake
+	}
+}
+
 /// Presentation state shared by the terminal and native actors.
 pub(crate) struct Presenter {
-	pub(crate) replica:        Dom,
-	pub(crate) dom_events:     Receiver<Event>,
-	pub(crate) kernel_events:  Receiver<KernelEvent>,
-	pub(crate) commands:       Sender<HostCommand>,
-	pub(crate) up:             Sender<Up>,
-	pub(crate) con:            Arc<Ctx>,
-	pub(crate) cards:          CardRegistry,
-	pub(crate) ui:             UiContext,
-	pub(crate) model:          ModelBadge,
-	pub(crate) local:          LocalFacts,
+	pub(crate) replica: Dom,
+	pub(crate) dom_events: Receiver<Event>,
+	pub(crate) kernel_events: Receiver<KernelEvent>,
+	pub(crate) commands: Sender<HostCommand>,
+	pub(crate) up: Sender<Up>,
+	pub(crate) con: Arc<Ctx>,
+	pub(crate) cards: CardRegistry,
+	pub(crate) ui: UiContext,
+	pub(crate) model: ModelBadge,
+	pub(crate) local: LocalFacts,
 	/// Observer-local, sanitized extension status contributions.
 	pub(crate) extension_status: ExtensionStatuses,
-	pub(crate) composer:       Composer,
-	pub(crate) overlays:       Overlays,
-	pub(crate) turn_active:    bool,
+	pub(crate) composer: Composer,
+	pub(crate) overlays: Overlays,
+	pub(crate) turn_active: bool,
 	/// Union of processing windows for the current session/branch.
-	active_time:               ActiveTime,
+	active_time: ActiveTime,
 	/// Presentation-clock start of the in-flight turn (the band timer).
-	pub(crate) turn_started:   Option<Duration>,
-	pub(crate) last_interrupt: Option<Instant>,
+	pub(crate) turn_started: Option<Duration>,
+	/// Cached local clock label and its visible-unit boundary.
+	wall_clock: WallClock,
 	/// Last `cl_clear` press, for pi's double-press exit window.
-	pub(crate) last_clear:     Option<Instant>,
+	pub(crate) last_clear: Option<Instant>,
 	/// Double-Left gesture state (pi `#detectLeftDoubleTap`).
-	left_taps:                 LeftTaps,
-	pub(crate) clock:          Instant,
+	left_taps: LeftTaps,
+	pub(crate) clock: Instant,
 	/// Launch facts painted in the welcome box's right column.
-	pub(crate) welcome:        WelcomeFacts,
+	pub(crate) welcome: WelcomeFacts,
 	/// Presentation-clock start of pi's 3000ms brand intro; `None` once a
 	/// rebuilt welcome should rest.
-	intro:                     Option<Duration>,
+	intro: Option<Duration>,
 	/// The one console mailbox: bound commands post actions here.
-	pub(crate) mailbox:        Arc<HostMailbox>,
-	pub(crate) models:         Vec<ModelRow>,
-	pub(crate) cycle:          Vec<(Str, Str, Option<Str>)>,
+	pub(crate) mailbox: Arc<HostMailbox>,
+	pub(crate) models: Vec<ModelRow>,
+	pub(crate) cycle: Vec<(Str, Str, Option<Str>)>,
 	/// Last prompt sent as a turn, for `cl_retry`.
-	pub(crate) last_prompt:    Option<Str>,
+	pub(crate) last_prompt: Option<Str>,
 	/// Text the composer asked to copy; the terminal loop drains it into
 	/// the clipboard (OSC 52 / native).
-	pub(crate) clipboard:      Option<Str>,
+	pub(crate) clipboard: Option<Str>,
 	/// Live git facts for the band; `None` outside a checkout. The watch is
 	/// a drop guard: it runs for the presenter's lifetime.
 	#[expect(dead_code, reason = "drop guard keeping the git watcher task alive")]
-	pub(crate) git_watch:      Option<GitWatch>,
-	pub(crate) git_facts:      Option<Receiver<GitFacts>>,
+	pub(crate) git_watch: Option<GitWatch>,
+	pub(crate) git_facts: Option<Receiver<GitFacts>>,
 	/// Clipboard read the host asked for; the terminal loop starts it.
 	pub(crate) clipboard_read: Option<ClipboardRead>,
 	/// Application data feeds for panels.
-	pub(crate) services:       Arc<dyn Services>,
+	pub(crate) services: Arc<dyn Services>,
 	/// `agent://` completion roster shared with the composer's URL provider.
-	agents:                    AgentRoster,
+	agents: AgentRoster,
 	/// Registered Esc hooks (rungs 1 and 4 of the ladder).
-	pub(crate) escape_hooks:   Vec<EscapeHook>,
+	pub(crate) escape_hooks: Vec<EscapeHook>,
 	/// Subagent whose session the view shows (pi `focusedAgentId`).
-	pub(crate) focused_agent:  Option<Str>,
+	pub(crate) focused_agent: Option<Str>,
 	/// This actor is a collaboration guest (pi `collabGuest`).
-	pub(crate) collab_guest:   bool,
+	pub(crate) collab_guest: bool,
+	/// Runtime-published collaboration role, real presence, and guest view of
+	/// the authoritative host status.
+	pub(crate) collab_status: Option<CollabStatus>,
 	/// Space-hold push-to-talk detector.
-	pub(crate) space_hold:     SpaceHold,
+	pub(crate) space_hold: SpaceHold,
 	/// Whether push-to-talk is recording (space hold or `cl_stt_toggle`).
-	pub(crate) stt_recording:  bool,
+	pub(crate) stt_recording: bool,
 	/// Whether a live-voice session is on (pi `liveVoiceActive`).
-	pub(crate) live_active:    bool,
+	pub(crate) live_active: bool,
 	/// Observer-local palette before a settings submenu preview.
-	preview_ui:                Option<(Str, UiContext)>,
+	preview_ui: Option<(Str, UiContext)>,
 	/// Observer-local composer shape before a settings submenu preview.
-	preview_shape:             Option<(Str, ComposerStyle)>,
+	preview_shape: Option<(Str, ComposerStyle)>,
 	/// Baseline and candidate status appearance during a settings preview.
-	preview_status:            Option<(Str, StatusAppearance, StatusAppearance)>,
+	preview_status: Option<(Str, StatusAppearance, StatusAppearance)>,
 	/// Presentation-clock instant the visible approval prompt appeared, for
 	/// its countdown.
-	approval_shown:            Option<Duration>,
+	approval_shown: Option<Duration>,
 	/// Last presented terminal height, for panel viewports.
-	viewport_height:           u16,
+	viewport_height: u16,
 	/// Terminal title run-state machine (pi `title-generator.ts`); the
 	/// terminal actor writes its output, the native actor never reads it.
-	title:                     TerminalTitle,
+	title: TerminalTitle,
 	/// Whether native OSC 9;4 progress is currently shown (pi
 	/// `#terminalProgressActive`).
-	progress_shown:            bool,
+	progress_shown: bool,
 	/// pi `startup.quiet`: the welcome block is never projected.
-	quiet:                     bool,
+	quiet: bool,
 	/// Launch project directory: the title label's fallback until the
 	/// kernel projects a cwd.
-	project:                   PathBuf,
+	project: PathBuf,
 	/// Observer-local transcript facts: tool start instants, the thinking
 	/// speed gauge, and the reset banner.
-	pub(crate) transcript:     crate::transcript::Local,
+	pub(crate) transcript: crate::transcript::Local,
 	/// Decides which desktop toasts a settled turn earns (pi
 	/// `sendCompletionNotification` / `sendErrorNotification`).
-	pub(crate) notifier:       crate::notify::Notifier,
+	pub(crate) notifier: crate::notify::Notifier,
 	/// Toasts decided since the last terminal delivery.
-	pub(crate) notifications:  Vec<omp_tui::Notification>,
+	pub(crate) notifications: Vec<omp_tui::Notification>,
 	/// Periodic Codex quota refresh behind the reset fireworks.
-	quota:                     crate::celebrate::QuotaWatch,
+	quota: crate::celebrate::QuotaWatch,
 	/// Exact-account quota snapshot for the live provider/model route.
-	account_usage:             AccountUsageCache,
+	account_usage: AccountUsageCache,
 	/// Same-route provider retry the transport scheduled (pi
 	/// `#retryPending`): pre-commit, so observer-local, cleared by the next
 	/// inference start or turn end.
-	pub(crate) retrying:       Option<RetryState>,
+	pub(crate) retrying: Option<RetryState>,
 	/// Elements of a failed attempt that a retry superseded (pi
 	/// `#syntheticFailureCards`): their blocks leave the live projection so
 	/// the re-streamed attempt never shows the same call twice.
-	superseded:                Vec<Handle>,
+	superseded: Vec<Handle>,
 	/// Pinned error the user dismissed by sending the next message (pi
 	/// `clearPinnedError`), so the banner drops before the DOM catches up.
-	dismissed_error:           Option<Handle>,
+	dismissed_error: Option<Handle>,
 	/// Streaming assistant speech, when the app supplied a synthesizer.
-	speech:                    Option<Arc<Mutex<Vocalizer>>>,
+	speech: Option<Arc<Mutex<Vocalizer>>>,
 	/// `ask` call the notifier already toasted for.
-	ask_notified:              Option<Handle>,
+	ask_notified: Option<Handle>,
 	/// `ask` call the open dialog was projected from; cleared once it is
 	/// answered so the dialog never reopens for the same call.
-	ask_open:                  Option<Handle>,
+	ask_open: Option<Handle>,
 }
 
 /// Observer-local band facts that never enter the DOM.
@@ -751,7 +811,7 @@ impl LocalFacts {
 			.clamp(0.0, 100.0) as u8;
 		self.fast = AI_FASTMODE.get(con);
 		self.compact_thinking = CL_STATUS_COMPACT_THINKING.get(con);
-		self.status_appearance = status_appearance(con);
+		self.status_appearance = status_appearance(con, &self.status_appearance);
 	}
 
 	/// Re-reads whether the primary route is served by a stored OAuth
@@ -897,14 +957,17 @@ impl Presenter {
 		let mut active_time = ActiveTime::default();
 		active_time.set_running(Duration::ZERO, turn_active);
 		let extension_status = ExtensionStatuses::default();
+		let mut wall_clock = WallClock::default();
+		let _ = wall_clock.refresh(Duration::ZERO, &local.status_appearance, &options.con);
 		let facts = status_facts(
 			&replica,
 			&options.model,
 			&local,
+			wall_clock.label(),
 			active_time.display_elapsed(Duration::ZERO),
 			None,
 			None,
-			false,
+			None,
 			None,
 			&options.con,
 			&extension_status,
@@ -971,7 +1034,7 @@ impl Presenter {
 			turn_active,
 			active_time,
 			turn_started: None,
-			last_interrupt: None,
+			wall_clock,
 			last_clear: None,
 			left_taps: LeftTaps::default(),
 			clock: Instant::now(),
@@ -990,6 +1053,7 @@ impl Presenter {
 			escape_hooks,
 			focused_agent: None,
 			collab_guest: false,
+			collab_status: None,
 			space_hold: SpaceHold::default(),
 			stt_recording: false,
 			live_active: false,
@@ -1577,21 +1641,35 @@ impl Presenter {
 		)
 	}
 
-	fn sync_status(&mut self) -> bool {
+	fn sync_status_inputs(&mut self) {
 		self.adopt_live_model();
 		self.local.sync_con(&self.con, &self.model);
-		if let Some((_, _, preview)) = self.preview_status {
-			self.local.status_appearance = preview;
+		if let Some((_, _, preview)) = &self.preview_status {
+			self.local.status_appearance = preview.clone();
 		}
+	}
+
+	/// Samples and formats the local wall clock only when its visible unit or
+	/// effective settings changed. Callers run this before deciding to paint.
+	fn refresh_wall_clock(&mut self, now: Duration) -> bool {
+		self.sync_status_inputs();
+		self
+			.wall_clock
+			.refresh(now, &self.local.status_appearance, &self.con)
+	}
+
+	fn sync_status(&mut self) -> bool {
+		self.sync_status_inputs();
 		let now = self.clock.elapsed();
 		let facts = status_facts(
 			&self.replica,
 			&self.model,
 			&self.local,
+			self.wall_clock.label(),
 			self.active_time.display_elapsed(now),
 			self.turn_started.filter(|_| !self.live_active),
 			self.focused_agent.as_deref(),
-			self.collab_guest,
+			self.collab_status.clone(),
 			self.account_usage.usage(),
 			&self.con,
 			&self.extension_status,
@@ -1641,7 +1719,9 @@ impl Presenter {
 		if let Some(chord) = crate::input::chord(key)
 			&& self.con.bound(chord.as_str()).is_some()
 		{
-			return self.run_bound_key(chord.as_str(), true);
+			let pressed = self.run_bound_key(chord.as_str(), true)?;
+			let released = self.run_bound_key(chord.as_str(), false)?;
+			return Ok(pressed.max(released));
 		}
 		if key == Key::Ctrl('c') {
 			return self.act(HostAction::Clear);
@@ -1667,16 +1747,17 @@ impl Presenter {
 			return self.route_unbound_key(Key::Esc);
 		}
 		let chord = event.chord.label();
+		if !event.pressed {
+			// `Ctx` latches the press program. Always forward the matching
+			// release, even if that program unbound or remapped its own chord.
+			return self.run_bound_key(chord.as_str(), false);
+		}
 		if self.con.bound(chord.as_str()).is_some() {
-			return self.run_bound_key(chord.as_str(), event.pressed);
+			return self.run_bound_key(chord.as_str(), true);
 		}
-		if event.pressed {
-			event
-				.key
-				.map_or(Ok(Routed::Ignored), |key| self.route_unbound_key(key))
-		} else {
-			Ok(Routed::Ignored)
-		}
+		event
+			.key
+			.map_or(Ok(Routed::Ignored), |key| self.route_unbound_key(key))
 	}
 
 	/// Swallows every key while policy is blocked on approval. Escape is an
@@ -2011,25 +2092,29 @@ impl Presenter {
 					return Ok(Routed::Ignored);
 				}
 				if let Some(local) = crate::composer::parse_local_input(&text) {
-					let refusal = if self.focused_agent.is_some() {
-						Some("Commands run in the main session — press ←← to return first")
-					} else if self.collab_guest {
-						Some("Local execution is host-only during a collab session")
-					} else if omp_agent::pause_state(&self.replica).active {
-						Some("Paused: resume before running local commands")
-					} else if local_run_active(&self.replica) {
-						Some(match local.mode {
+					if self.focused_agent.is_some() {
+						return Ok(
+							self.notice("Commands run in the main session — press ←← to return first")
+						);
+					}
+					if self.collab_guest {
+						// Pi consumes host-only local input from a guest rather
+						// than leaving an executable command in its editor.
+						let _ = self.composer.commit_submission();
+						return Ok(self.notice("Local execution is host-only during a collab session"));
+					}
+					if omp_agent::pause_state(&self.replica).active {
+						return Ok(self.notice("Paused: resume before running local commands"));
+					}
+					if local_run_active(&self.replica, local.mode) {
+						let reason = match local.mode {
 							PrefixMode::Bash => {
 								"A bash command is already running. Press Esc to cancel it first."
 							},
 							PrefixMode::Eval => {
 								"A Python execution is already running. Press Esc to cancel it first."
 							},
-						})
-					} else {
-						None
-					};
-					if let Some(reason) = refusal {
+						};
 						return Ok(self.notice(reason));
 					}
 				}
@@ -2164,7 +2249,7 @@ impl Presenter {
 		// 8. A running local command uses the typed interrupt path. An idle
 		// prefix draft is cleared only when it matches pi's real prefix
 		// grammar (`$HOME` and `${x}` are prose).
-		if local_run_active(&self.replica) {
+		if active_local_run(&self.replica).is_some() {
 			let _ = self.commands.send(HostCommand::Interrupt);
 			return Ok(Routed::Ignored);
 		}
@@ -2207,7 +2292,6 @@ impl Presenter {
 	}
 
 	fn interrupt_turn(&mut self) -> Routed {
-		self.last_interrupt = Some(Instant::now());
 		self.silence_speech();
 		let _ = self.commands.send(HostCommand::Interrupt);
 		Routed::Ignored
@@ -2296,6 +2380,9 @@ impl Presenter {
 			self.overlays.notify(error.to_string());
 			routed = routed.max(Routed::Repaint);
 		}
+		if self.refresh_wall_clock(self.clock.elapsed()) {
+			routed = routed.max(Routed::Repaint);
+		}
 		Ok(routed)
 	}
 
@@ -2326,7 +2413,22 @@ impl Presenter {
 			self.overlays.notify(error.to_string());
 			routed = routed.max(Routed::Repaint);
 		}
+		if self.refresh_wall_clock(self.clock.elapsed()) {
+			routed = routed.max(Routed::Repaint);
+		}
 		Ok(routed)
+	}
+
+	/// Applies a finished clipboard write without guessing from an absent
+	/// result. The final backend outcome replaces the optimistic key-action
+	/// notice.
+	fn deliver_clipboard_write(&mut self, outcome: ClipboardWriteOutcome) -> Routed {
+		self.notice(match outcome {
+			ClipboardWriteOutcome::Success => "Copied to clipboard",
+			ClipboardWriteOutcome::PermissionDenied => "Clipboard write access was denied",
+			ClipboardWriteOutcome::Unavailable => "Clipboard is unavailable",
+			ClipboardWriteOutcome::WriteFailure => "Failed to write clipboard",
+		})
 	}
 
 	/// Applies a finished clipboard read: non-payload outcomes only surface a
@@ -2339,13 +2441,9 @@ impl Presenter {
 		raw: bool,
 	) -> Result<Routed, HostError> {
 		Ok(match outcome {
-			ClipboardReadOutcome::Empty if raw => {
-				self.notice("No text in clipboard to paste raw")
-			},
+			ClipboardReadOutcome::Empty if raw => self.notice("No text in clipboard to paste raw"),
 			ClipboardReadOutcome::Empty => self.notice("Clipboard is empty"),
-			ClipboardReadOutcome::PermissionDenied => {
-				self.notice("Clipboard access was denied")
-			},
+			ClipboardReadOutcome::PermissionDenied => self.notice("Clipboard access was denied"),
 			ClipboardReadOutcome::UnsupportedFormat => {
 				self.notice("Clipboard format is not supported")
 			},
@@ -2421,6 +2519,20 @@ impl Presenter {
 		Routed::Repaint
 	}
 
+	fn set_collab_status(&mut self, status: Option<CollabStatus>) -> Routed {
+		let guest = status
+			.as_ref()
+			.is_some_and(|status| status.role == CollabStatusRole::Guest);
+		let changed = self.collab_status != status;
+		self.collab_guest = guest;
+		self.collab_status = status;
+		if changed && self.sync_status() {
+			Routed::Repaint
+		} else {
+			Routed::Ignored
+		}
+	}
+
 	/// A `!` / `$` line that cannot run right now goes back into the
 	/// composer verbatim (pi `editor.setText(text)`) with the reason shown.
 	fn refuse_local(&mut self, draft: &str, reason: impl Into<Str>) -> Routed {
@@ -2439,8 +2551,9 @@ impl Presenter {
 		// and never reach the model. Local execution belongs to the main
 		// session: while a subagent is focused the draft stays (pi
 		// `#submitToFocusedSession`), a collaboration guest is refused
-		// outright, and a run already in flight hands the draft back (pi
-		// "A bash command is already running. Press Esc to cancel it first.").
+		// outright, and the same runner identity already in flight hands the
+		// draft back (pi keeps independent `isBashRunning` / `isEvalRunning`
+		// gates).
 		if let Some(local) = crate::composer::parse_local_input(&text) {
 			if self.focused_agent.is_some() {
 				return self
@@ -2449,7 +2562,7 @@ impl Presenter {
 			if self.collab_guest {
 				return self.notice("Local execution is host-only during a collab session");
 			}
-			if local_run_active(&self.replica) {
+			if local_run_active(&self.replica, local.mode) {
 				return self.refuse_local(&text, match local.mode {
 					PrefixMode::Bash => {
 						"A bash command is already running. Press Esc to cancel it first."
@@ -2474,6 +2587,17 @@ impl Presenter {
 		self.dismissed_error = pinned_error(&self.replica).map(|(handle, _)| handle);
 		self.silence_speech();
 		let _ = self.commands.send(HostCommand::Submit(text));
+		Routed::Repaint
+	}
+
+	pub(crate) fn submit_skill_prompt(&mut self, prompt: omp_journal::data::SkillPrompt) -> Routed {
+		if !self.turn_active {
+			self.set_turn_active(true);
+			self.last_prompt = Some(prompt.prompt_body.clone());
+		}
+		self.dismissed_error = pinned_error(&self.replica).map(|(handle, _)| handle);
+		self.silence_speech();
+		let _ = self.commands.send(HostCommand::SkillPrompt(prompt));
 		Routed::Repaint
 	}
 
@@ -2531,25 +2655,24 @@ impl Presenter {
 				return self.escape();
 			},
 			HostAction::Clear => {
+				if self.overlays.modal() {
+					return Ok(Routed::Ignored);
+				}
 				let now = Instant::now();
 				let repeated = self
 					.last_clear
 					.is_some_and(|prior| now.duration_since(prior) <= Duration::from_millis(500));
 				self.last_clear = Some(now);
-				if self.stt_recording {
-					self.set_recording(false);
-					return Ok(Routed::Repaint);
-				}
-				if !self.composer.text().is_empty() {
-					self.composer.clear();
-					return Ok(Routed::Repaint);
-				}
-				let interrupted = self
-					.last_interrupt
-					.is_some_and(|prior| now.duration_since(prior) <= Duration::from_secs(1));
-				match ctrl_c_action(self.turn_active, repeated || interrupted) {
-					CtrlCAction::Interrupt => self.interrupt_turn(),
+				match ctrl_c_action(repeated) {
 					CtrlCAction::Quit => Routed::Quit,
+					CtrlCAction::Clear if self.stt_recording => {
+						self.set_recording(false);
+						Routed::Repaint
+					},
+					CtrlCAction::Clear => {
+						self.composer.clear();
+						Routed::Repaint
+					},
 				}
 			},
 			HostAction::Exit => Routed::Quit,
@@ -2744,6 +2867,7 @@ impl Presenter {
 				self.collab_guest = guest;
 				Routed::Ignored
 			},
+			HostAction::CollabStatus(status) => self.set_collab_status(status),
 			HostAction::SttToggle => {
 				let active = !self.stt_recording;
 				self.set_recording(active)
@@ -2848,9 +2972,28 @@ impl Presenter {
 						},
 						crate::overlays::Outcome::Collab(outcome) => match outcome.result {
 							Ok(state) => {
-								self.collab_guest =
-									matches!(state.role, Some(crate::overlays::services::CollabRole::Guest));
-								self.notice(state.line)
+								let status = match state.role {
+									Some(crate::overlays::services::CollabRole::Host) => {
+										Some(CollabStatus::host(
+											state.participants.len().try_into().unwrap_or(u32::MAX),
+										))
+									},
+									Some(crate::overlays::services::CollabRole::Guest) => {
+										let participants =
+											state.participants.len().try_into().unwrap_or(u32::MAX);
+										let host = self
+											.collab_status
+											.as_ref()
+											.and_then(|status| status.host.as_deref())
+											.cloned();
+										Some(host.map_or_else(
+											|| CollabStatus::guest_pending(participants),
+											|host| CollabStatus::guest(participants, host),
+										))
+									},
+									None => None,
+								};
+								self.set_collab_status(status).max(self.notice(state.line))
 							},
 							Err(error) => self.notice(error.to_string()),
 						},
@@ -2930,16 +3073,22 @@ impl Presenter {
 					.preview_status
 					.as_ref()
 					.filter(|(name, ..)| name == &convar)
-					.map_or(self.local.status_appearance, |(_, baseline, _)| *baseline);
+					.map_or_else(
+						|| self.local.status_appearance.clone(),
+						|(_, baseline, _)| baseline.clone(),
+					);
 				let mut preview = self
 					.preview_status
 					.as_ref()
 					.filter(|(name, ..)| name == &convar)
-					.map_or(baseline, |(_, _, preview)| *preview);
+					.map_or_else(|| baseline.clone(), |(_, _, preview)| preview.clone());
 				apply_status_preview(&mut preview, convar.as_str(), value.as_str());
-				self.preview_status = Some((convar, baseline, preview));
-				self.local.status_appearance = preview;
+				self.preview_status = Some((convar, baseline, preview.clone()));
+				self.local.status_appearance = preview.clone();
 				self.composer.set_status_appearance(preview);
+				if self.refresh_wall_clock(self.clock.elapsed()) {
+					self.sync_status();
+				}
 				Routed::Repaint
 			},
 			_ => Routed::Repaint,
@@ -2970,8 +3119,11 @@ impl Presenter {
 			.is_some_and(|(name, ..)| name == convar)
 			&& let Some((_, baseline, _)) = self.preview_status.take()
 		{
-			self.local.status_appearance = baseline;
+			self.local.status_appearance = baseline.clone();
 			self.composer.set_status_appearance(baseline);
+			if self.refresh_wall_clock(self.clock.elapsed()) {
+				self.sync_status();
+			}
 		}
 		Routed::RebuildProjection
 	}
@@ -3488,9 +3640,10 @@ impl Presenter {
 /// Projection actor retaining only presentation state and a detached DOM
 /// replica.
 pub struct Host {
-	presenter:     Presenter,
-	resize_policy: ResizePolicy,
-	projection:    Option<Projection>,
+	presenter:       Presenter,
+	resize_policy:   ResizePolicy,
+	projection:      Option<Projection>,
+	clipboard_write: Option<oneshot::Receiver<ClipboardWriteOutcome>>,
 }
 
 impl Host {
@@ -3498,7 +3651,12 @@ impl Host {
 	#[must_use]
 	pub fn new(options: HostOptions) -> Self {
 		let resize_policy = options.resize_policy;
-		Self { presenter: Presenter::new(options, 80), resize_policy, projection: None }
+		Self {
+			presenter: Presenter::new(options, 80),
+			resize_policy,
+			projection: None,
+			clipboard_write: None,
+		}
 	}
 
 	/// Runs the real-terminal actor until `C-c`, debug quit, or terminal
@@ -3584,6 +3742,7 @@ impl Host {
 					Some((spawn_clipboard_read(scope), scope == ClipboardRead::Text, Instant::now()));
 			}
 			let clipboard_pending = clipboard.is_some();
+			let clipboard_write_pending = self.clipboard_write.is_some();
 			tokio::select! {
 				biased;
 				terminal_event = terminal.next() => {
@@ -3639,7 +3798,7 @@ impl Host {
 					if let Some(action) = action {
 						let routed = self.presenter.act(action)?.max(self.presenter.drain_mailbox()?);
 						if let Some(text) = self.presenter.clipboard.take() {
-							terminal.copy_to_clipboard(&text)?;
+							self.clipboard_write = Some(terminal.copy_to_clipboard(&text)?);
 						}
 						if let Some(pause) = self.apply_routed(routed, renderer, size)? {
 							return Ok(pause);
@@ -3660,6 +3819,18 @@ impl Host {
 				}, if clipboard_pending => {
 					let raw = clipboard.take().is_some_and(|(_, raw, _)| raw);
 					let routed = self.presenter.deliver_clipboard(read, raw)?;
+					if let Some(pause) = self.apply_routed(routed, renderer, size)? {
+						return Ok(pause);
+					}
+				},
+				written = async {
+					match self.clipboard_write.as_mut() {
+						Some(receiver) => receiver.await.unwrap_or(ClipboardWriteOutcome::WriteFailure),
+						None => future::pending().await,
+					}
+				}, if clipboard_write_pending => {
+					self.clipboard_write = None;
+					let routed = self.presenter.deliver_clipboard_write(written);
 					if let Some(pause) = self.apply_routed(routed, renderer, size)? {
 						return Ok(pause);
 					}
@@ -3748,7 +3919,7 @@ impl Host {
 		}
 		let routed = self.input(event, submit_after_paste)?;
 		if let Some(text) = self.presenter.clipboard.take() {
-			terminal.copy_to_clipboard(&text)?;
+			self.clipboard_write = Some(terminal.copy_to_clipboard(&text)?);
 		}
 		self.apply_routed(routed, renderer, size)
 	}
@@ -3803,10 +3974,18 @@ impl Host {
 			.title
 			.next_wake(self.presenter.ui.charset, now);
 		let active_time = self.presenter.active_time.next_wake(now);
-		[composer, blocks, self.presenter.next_wake(), intro, title, active_time]
-			.into_iter()
-			.flatten()
-			.min()
+		[
+			composer,
+			blocks,
+			self.presenter.next_wake(),
+			intro,
+			title,
+			active_time,
+			self.presenter.wall_clock.next_wake(),
+		]
+		.into_iter()
+		.flatten()
+		.min()
 	}
 
 	/// Synchronizes title and OSC progress from the same retained run state
@@ -3851,6 +4030,7 @@ impl Host {
 	fn tick(&mut self) -> bool {
 		let now = self.presenter.clock.elapsed();
 		let account_usage = self.presenter.poll_account_usage(now);
+		let wall_clock = self.presenter.refresh_wall_clock(now);
 		// ActiveTime schedules only visible label boundaries. Synchronizing
 		// the retained status here makes that deadline paint exactly once,
 		// even when no working spinner is mounted.
@@ -3870,7 +4050,15 @@ impl Host {
 			self.presenter.notice(error.to_string());
 			true
 		});
-		account_usage || status || composer || blocks || overlay || countdown || hold || quota
+		account_usage
+			|| wall_clock
+			|| status
+			|| composer
+			|| blocks
+			|| overlay
+			|| countdown
+			|| hold
+			|| quota
 	}
 
 	fn debug_response(&self, op: DebugOp, size: Size) -> serde_json::Value {
@@ -4128,14 +4316,19 @@ pub enum NativeEffect {
 /// Window creation and GPU delivery stay in `omp-gui`; this type owns only the
 /// projection, composer, overlays, and command mailbox.
 pub struct NativeHost {
-	presenter:       Presenter,
-	frame:           Frame,
-	approval_frame:  Option<Frame>,
-	size:            Size,
+	presenter:           Presenter,
+	frame:               Frame,
+	approval_frame:      Option<Frame>,
+	size:                Size,
 	/// Presentation-clock instant the composited status row (retry
 	/// countdown loader) next changes, so [`NativeHost::poll`] repaints it
 	/// without a controller event.
-	status_deadline: Option<Duration>,
+	status_deadline:     Option<Duration>,
+	/// Presentation-clock instant a held-space cadence becomes a release.
+	///
+	/// Native actors do not run the terminal host's deadline loop, so
+	/// [`NativeHost::poll`] must advance this observer-local timer itself.
+	space_hold_deadline: Option<Duration>,
 }
 
 impl NativeHost {
@@ -4148,6 +4341,7 @@ impl NativeHost {
 			approval_frame: None,
 			size,
 			status_deadline: None,
+			space_hold_deadline: None,
 		};
 		host.refresh();
 		host
@@ -4174,8 +4368,16 @@ impl NativeHost {
 		}
 		let now = self.presenter.clock.elapsed();
 		changed |= self.presenter.composer.tick(now);
-		// The retry loader's spinner and countdown advance on the clock alone.
-		changed |= self.status_deadline.is_some_and(|due| now >= due);
+		// Retry animation and the retained wall-clock label advance only at
+		// their shared earliest deadline.
+		let status_due = self.status_deadline.is_some_and(|due| now >= due);
+		if status_due {
+			let _ = self.presenter.refresh_wall_clock(now);
+			changed = true;
+		}
+		if self.space_hold_deadline.is_some_and(|due| now >= due) {
+			changed |= self.presenter.tick_space_hold(now);
+		}
 		if changed {
 			self.refresh();
 			Ok(NativeEffect::Consumed)
@@ -4390,15 +4592,17 @@ impl NativeHost {
 	}
 
 	/// Delivers a finished clipboard read exactly as the terminal loop would.
-	pub fn deliver_clipboard(
-		&mut self,
-		outcome: ClipboardReadOutcome,
-		raw: bool,
-	) -> NativeEffect {
+	pub fn deliver_clipboard(&mut self, outcome: ClipboardReadOutcome, raw: bool) -> NativeEffect {
 		let routed = match self.presenter.deliver_clipboard(outcome, raw) {
 			Ok(routed) => routed,
 			Err(error) => self.presenter.notice(error.to_string()),
 		};
+		self.native_effect(routed)
+	}
+
+	/// Delivers a finished clipboard write exactly as the terminal loop would.
+	pub fn deliver_clipboard_write(&mut self, outcome: ClipboardWriteOutcome) -> NativeEffect {
+		let routed = self.presenter.deliver_clipboard_write(outcome);
 		self.native_effect(routed)
 	}
 
@@ -4412,6 +4616,7 @@ impl NativeHost {
 	/// timers); returns whether anything repainted.
 	pub fn tick(&mut self, now: Duration) -> bool {
 		let changed = self.presenter.poll_account_usage(now)
+			| self.presenter.refresh_wall_clock(now)
 			| self.presenter.sync_status()
 			| self.presenter.composer.tick(now)
 			| self.presenter.tick_overlay(now).unwrap_or(true)
@@ -4496,7 +4701,11 @@ impl NativeHost {
 		frame.blit(&chrome, 0, chrome.size().height, 0, rows.saturating_add(status_rows));
 		self.frame = frame;
 		self.approval_frame = self.presenter.approval_frame(self.size.width);
-		self.status_deadline = self.presenter.retry_wake();
+		self.status_deadline = [self.presenter.retry_wake(), self.presenter.wall_clock.next_wake()]
+			.into_iter()
+			.flatten()
+			.min();
+		self.space_hold_deadline = self.presenter.space_hold.next_wake();
 	}
 }
 
@@ -4585,10 +4794,11 @@ fn status_facts(
 	dom: &Dom,
 	badge: &ModelBadge,
 	local: &LocalFacts,
+	wall_time: Option<&Str>,
 	active_time: Duration,
 	working: Option<Duration>,
 	focused: Option<&str>,
-	collab_guest: bool,
+	collab: Option<CollabStatus>,
 	account_usage: Option<&crate::status_band::AccountUsage>,
 	con: &Ctx,
 	statuses: &ExtensionStatuses,
@@ -4628,7 +4838,7 @@ fn status_facts(
 		.map(Str::new);
 	// Both chips project the `<meta><directors>` subtree, so a headless
 	// render and the first frame show the same band as the live loop.
-	StatusFacts {
+	let mut facts = StatusFacts {
 		model,
 		mode: director_mode(dom),
 		thinking: local.thinking.clone(),
@@ -4636,6 +4846,8 @@ fn status_facts(
 		fast: local.fast,
 		advisor: advisor_badge(dom),
 		cwd: path.text,
+		raw_cwd: (!status.session.is_empty()).then(|| status.session.clone()),
+		home: (!status.home.is_empty()).then(|| status.home.clone()),
 		scratch: path.scratch,
 		path_url: (!status.session.is_empty())
 			.then(|| crate::cards::file_link(status.session.as_str())),
@@ -4643,7 +4855,7 @@ fn status_facts(
 		git_status: local.git_status,
 		pull_request: local.pull_request.clone(),
 		worktree: local.worktree.clone(),
-		collab: collab_guest.then_some(CollabBadge { guest: true, participants: 1 }),
+		collab: None,
 		hook_status: statuses
 			.visible(CL_STATUS_LINE_SHOW_HOOK_STATUS.get(con))
 			.to_vec(),
@@ -4651,9 +4863,9 @@ fn status_facts(
 		background_jobs,
 		session_id,
 		hostname,
-		wall_time: None,
+		wall_time: wall_time.cloned(),
 		session_name: status.name,
-		appearance: local.status_appearance,
+		appearance: local.status_appearance.clone(),
 		tokens: status.context,
 		context_window: badge.context_window,
 		compact_percent: local.compact,
@@ -4676,21 +4888,31 @@ fn status_facts(
 		premium_requests_millionths: status.premium_requests_millionths,
 		working,
 		focused_agent: focused.map(Str::new),
-	}
+	};
+	facts.apply_collab(collab);
+	facts
 }
 
-fn status_appearance(con: &Ctx) -> StatusAppearance {
+fn status_appearance(con: &Ctx, previous: &StatusAppearance) -> StatusAppearance {
+	let preset = match CL_STATUS_LINE_PRESET.get(con).as_str() {
+		"minimal" => StatusPreset::Minimal,
+		"compact" => StatusPreset::Compact,
+		"full" => StatusPreset::Full,
+		"nerd" => StatusPreset::Nerd,
+		"ascii" => StatusPreset::Ascii,
+		"custom" => StatusPreset::Custom,
+		_ => StatusPreset::Default,
+	};
+	let left = CL_STATUS_LINE_LEFT_SEGMENTS.get(con);
+	let left_segments = status_segments(&left, &previous.left_segments);
+	let right = CL_STATUS_LINE_RIGHT_SEGMENTS.get(con);
+	let right_segments = status_segments(&right, &previous.right_segments);
+	let segment_options = StatusSegmentOptions::from_kv(&CL_STATUS_LINE_SEGMENT_OPTIONS.get(con))
+		.unwrap_or(previous.segment_options);
+
 	StatusAppearance {
-		preset:       match CL_STATUS_LINE_PRESET.get(con).as_str() {
-			"minimal" => StatusPreset::Minimal,
-			"compact" => StatusPreset::Compact,
-			"full" => StatusPreset::Full,
-			"nerd" => StatusPreset::Nerd,
-			"ascii" => StatusPreset::Ascii,
-			"custom" => StatusPreset::Custom,
-			_ => StatusPreset::Default,
-		},
-		separator:    match CL_STATUS_LINE_SEPARATOR.get(con).as_str() {
+		preset,
+		separator: match CL_STATUS_LINE_SEPARATOR.get(con).as_str() {
 			"powerline" => StatusSeparator::Powerline,
 			"slash" => StatusSeparator::Slash,
 			"pipe" => StatusSeparator::Pipe,
@@ -4705,8 +4927,28 @@ fn status_appearance(con: &Ctx) -> StatusAppearance {
 			"annotated" => ContextLine::Annotated,
 			_ => ContextLine::Embedded,
 		},
-		transparent:  CL_STATUS_LINE_TRANSPARENT.get(con),
+		transparent: CL_STATUS_LINE_TRANSPARENT.get(con),
+		left_segments,
+		right_segments,
+		segment_options,
 	}
+}
+
+/// Parses one custom group without replacing its shared allocation when a
+/// live convar refresh resolves to the same ordered segment sequence.
+fn status_segments(values: &[Str], previous: &Arc<[StatusSegment]>) -> Arc<[StatusSegment]> {
+	if values
+		.iter()
+		.filter_map(|segment| segment.parse::<StatusSegment>().ok())
+		.eq(previous.iter().copied())
+	{
+		return Arc::clone(previous);
+	}
+	values
+		.iter()
+		.filter_map(|segment| segment.parse::<StatusSegment>().ok())
+		.collect::<Vec<_>>()
+		.into()
 }
 
 fn apply_status_preview(appearance: &mut StatusAppearance, convar: &str, value: &str) {
@@ -4810,25 +5052,38 @@ fn tool_settled(node: &omp_dom::Node) -> bool {
 		.is_some_and(|status| matches!(status, "ok" | "error" | "cancelled" | "aborted"))
 }
 
-/// Whether the newest turn is a host-run `!`/`$` command still executing:
-/// its first element is a tool (no user message opened it) and that tool
-/// has not settled (pi `session.isBashRunning` / `isEvalRunning`).
-fn local_run_active(dom: &Dom) -> bool {
-	let Some(turn) = dom.children(dom.body()).last() else {
-		return false;
-	};
+/// Identity of the newest active host-run `!`/`$` command. Pi owns these as
+/// two independent runners (`session.isBashRunning` / `isEvalRunning`), so a
+/// busy shell rejects only another shell line and a busy evaluator rejects
+/// only another evaluator line.
+fn active_local_run(dom: &Dom) -> Option<PrefixMode> {
+	let turn = dom.children(dom.body()).last()?;
 	let mut children = dom
 		.children(*turn)
 		.iter()
 		.filter_map(|handle| dom.get(*handle));
-	children.next().is_some_and(|first| {
-		matches!(first.tag, Tag::Custom(_))
-			&& first
-				.prop(&PropKey::Custom(Str::new_static(omp_agent::LOCAL_PRESENTATION_PROP)))
-				.and_then(Value::as_str)
-				== Some(omp_agent::LOCAL_PRESENTATION_VALUE)
-			&& !tool_settled(first)
-	})
+	let first = children.next()?;
+	if !matches!(first.tag, Tag::Custom(_))
+		|| first
+			.prop(&PropKey::Custom(Str::new_static(omp_agent::LOCAL_PRESENTATION_PROP)))
+			.and_then(Value::as_str)
+			!= Some(omp_agent::LOCAL_PRESENTATION_VALUE)
+		|| tool_settled(first)
+	{
+		return None;
+	}
+	match first
+		.prop(&PropKey::Custom(Str::new_static(omp_agent::LOCAL_KIND_PROP)))
+		.and_then(Value::as_str)
+	{
+		Some("bash") => Some(PrefixMode::Bash),
+		Some("eval") => Some(PrefixMode::Eval),
+		_ => None,
+	}
+}
+
+fn local_run_active(dom: &Dom, mode: PrefixMode) -> bool {
+	active_local_run(dom) == Some(mode)
 }
 
 fn approval_frame(
@@ -4886,10 +5141,11 @@ pub fn render_surface(
 		&replica,
 		model,
 		local,
+		None,
 		Duration::ZERO,
 		working,
 		None,
-		false,
+		None,
 		None,
 		&con,
 		&statuses,

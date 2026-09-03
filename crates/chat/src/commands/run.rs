@@ -146,6 +146,7 @@ impl Presenter {
 				})
 			},
 			CommandAction::Prompt { text } => self.submit(text),
+			CommandAction::SkillPrompt { prompt } => self.submit_skill_prompt(prompt),
 			CommandAction::Force { tool, prompt } => {
 				let _ = self.commands.send(HostCommand::Director {
 					id:     Str::new_static(FORCE),

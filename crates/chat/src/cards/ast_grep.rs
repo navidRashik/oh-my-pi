@@ -1,4 +1,4 @@
-//! Typed card for `ast_grep@2`.
+//! Typed card for `ast_grep@3`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,11 +41,20 @@ impl Card for AstGrepCard {
 			.and_then(|value| value.get("total"))
 			.and_then(Value::as_u64)
 			.unwrap_or(matches.len() as u64);
-		let file_count = matches
-			.iter()
-			.filter_map(|entry| entry.get("path").and_then(Value::as_str))
-			.collect::<BTreeSet<_>>()
-			.len();
+		let file_count = result
+			.as_ref()
+			.and_then(|value| value.get("files_with_matches"))
+			.and_then(Value::as_u64)
+			.map_or_else(
+				|| {
+					matches
+						.iter()
+						.filter_map(|entry| entry.get("path").and_then(Value::as_str))
+						.collect::<BTreeSet<_>>()
+						.len() as u64
+				},
+				|count| count,
+			);
 		// `files_searched` is `0` for lifted `ast_grep@1` calls that never
 		// recorded it; pi only prints the meta when a count exists.
 		let searched = result
@@ -53,7 +62,21 @@ impl Card for AstGrepCard {
 			.and_then(|value| value.get("files_searched"))
 			.and_then(Value::as_u64)
 			.filter(|count| *count > 0);
-		let scope = path.clone();
+		let scope = if path.is_empty() {
+			".".to_owned()
+		} else {
+			path.clone()
+		};
+		let limit_reached = result
+			.as_ref()
+			.and_then(|value| value.get("limit_reached"))
+			.and_then(Value::as_bool)
+			.unwrap_or(false);
+		let next_skip = result
+			.as_ref()
+			.and_then(|value| value.get("next_skip"))
+			.and_then(Value::as_u64);
+		let notices = ast_notices(result.as_ref(), next_skip);
 		let fault = diag_text(view);
 		let groups = directory_groups(&matches);
 		let shown = if expanded {
@@ -78,7 +101,8 @@ impl Card for AstGrepCard {
 					},
 					CardStatus::Done => {
 						<row kind=title gap=0>
-							<i:search fg=accent/><text>{" "}</text>
+							if limit_reached { <i:warning fg=warn/> } else { <i:search fg=accent/> }
+							<text>{" "}</text>
 							<text fg=accent>{"AST Grep"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {pattern}")}</text>
 							<text fg=muted wrap=pre>{format!(" {match_count} matches · {file_count} files · in {scope}")}</text>
 							if let Some(searched) = searched {
@@ -103,7 +127,10 @@ impl Card for AstGrepCard {
 							</col>
 						}
 						if hidden > 0 {
-							<row gap=1 fg=muted><i:tree-last/><text fg=output>{format!("… {hidden} more {}", if hidden == 1 { "match" } else { "matches" })}</text></row>
+							<row gap=1 fg=muted><i:tree-last/><text fg=output>{format!("… {hidden} more {}", if hidden == 1 { "group" } else { "groups" })}</text></row>
+						}
+						for notice in &notices {
+							<row gap=1 fg=warn><i:warning/><text wrap=word>{notice}</text></row>
 						}
 					},
 					CardStatus::Failed => {
@@ -195,6 +222,32 @@ fn binding_text(entry: &Value) -> Option<String> {
 		.map(str::to_owned)
 		.unwrap_or_else(|| value.to_string());
 	Some(format!("${key}={value}"))
+}
+
+fn ast_notices(result: Option<&Value>, next_skip: Option<u64>) -> Vec<String> {
+	let Some(result) = result else {
+		return Vec::new();
+	};
+	let mut notices = Vec::new();
+	if let Some(skip) = next_skip {
+		notices.push(format!("Result limit reached; continue with skip {skip}"));
+	}
+	if let Some(advisories) = result.get("advisories").and_then(Value::as_array) {
+		notices.extend(advisories.iter().filter_map(|advisory| {
+			let path = advisory.get("path")?.as_str()?;
+			let message = advisory.get("message")?.as_str()?;
+			Some(format!("{path}: {message}"))
+		}));
+	}
+	if let Some(errors) = result.get("parse_errors").and_then(Value::as_array) {
+		notices.extend(
+			errors
+				.iter()
+				.filter_map(Value::as_str)
+				.map(|error| format!("Parse issue: {error}")),
+		);
+	}
+	notices
 }
 
 fn diag_text(view: &CardView<'_>) -> Option<String> {

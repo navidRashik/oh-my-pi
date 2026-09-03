@@ -140,8 +140,8 @@ pub enum HostAction {
 	/// `cl_interrupt` (pi `app.interrupt`, Esc): dismiss the topmost local
 	/// surface, else interrupt the active turn, else preserve the draft.
 	Interrupt,
-	/// `cl_clear` (pi `app.clear`, Ctrl+C): clear the draft; on an empty
-	/// draft interrupt the active turn, and a repeat quits.
+	/// `cl_clear` (pi `app.clear`, Ctrl+C): the first press clears the draft
+	/// (including an already-empty draft); a repeat within 500 ms exits.
 	Clear,
 	/// `cl_exit` (pi `app.exit`, Ctrl+D): leave the chat.
 	Exit,
@@ -211,6 +211,9 @@ pub enum HostAction {
 	/// `cl_collab_guest on|off`: this actor is a collaboration guest, so
 	/// Esc asks the remote host to interrupt instead of aborting locally.
 	CollabGuest(bool),
+	/// Authoritative collaboration role, presence, and guest footer snapshot
+	/// published by the collaboration runtime.
+	CollabStatus(Option<crate::status_band::CollabStatus>),
 	/// `cl_stt_toggle` (pi `app.stt.toggle`): start or stop push-to-talk
 	/// recording without the space-hold gesture.
 	SttToggle,
@@ -367,7 +370,7 @@ omp_con::cmd! {
 	/// Dismisses the topmost overlay, else interrupts the active turn.
 	cl_interrupt() = |ctx, _args| post(ctx, HostAction::Interrupt);
 
-	/// Clears the draft; on an empty draft interrupts the turn, twice quits.
+	/// Clears the draft; a repeat within 500 ms exits.
 	cl_clear() = |ctx, _args| post(ctx, HostAction::Clear);
 
 	/// Leaves the chat.
@@ -558,6 +561,20 @@ mod tests {
 			HostAction::ModelSelect { session_only: true },
 			HostAction::ModelCycle { backward: true },
 			HostAction::Reply { severity: Severity::Info, text: Str::new_static("hi") },
+		]);
+	}
+
+	#[test]
+	fn editor_and_lifecycle_commands_post_typed_host_actions_in_order() {
+		let ctx = HostMailbox::new().attach(Ctx::builder()).build();
+		ctx.run("ed_newline; ed_enter; cl_clear; cl_exit")
+			.expect("commands run");
+		let mailbox = ctx.user::<HostMailbox>().expect("mailbox installed");
+		assert_eq!(mailbox.drain().collect::<Vec<_>>(), [
+			HostAction::Editor(omp_tui::Key::ShiftEnter),
+			HostAction::Editor(omp_tui::Key::Enter),
+			HostAction::Clear,
+			HostAction::Exit,
 		]);
 	}
 
