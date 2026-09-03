@@ -86,7 +86,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 ignore = "0.4"
 im = { version = "15.1", features = ["serde"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "png", "jpeg", "gif", "webp"] }
 indicatif = "0.18"
 insta = { version = "1.47", features = ["glob", "ron", "redactions"] }
 itertools = "0.14"

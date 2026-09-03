@@ -7846,7 +7846,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
+ "xutf",
 ]
 
 [[package]]
@@ -8656,6 +8658,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "strum",
  "tempfile",
  "thiserror 2.0.20",
 ]
