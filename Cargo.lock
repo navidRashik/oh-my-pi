@@ -7606,7 +7606,6 @@ dependencies = [
  "flate2",
  "flume",
  "futures",
- "image",
  "indicatif",
  "insta",
  "jiff",
@@ -7820,6 +7819,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "flume",
+ "image",
  "insta",
  "jiff",
  "nix 0.31.3",
@@ -8973,6 +8973,7 @@ dependencies = [
  "url",
  "webrtc",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
