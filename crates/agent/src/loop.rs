@@ -4,7 +4,7 @@ use std::{sync::Arc, time::Instant};
 
 use futures::StreamExt as _;
 use omp_core::{FastHashMap, Str};
-use omp_dom::{Handle, KnownTag, PropId, Tag, Txn};
+use omp_dom::{Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_inference::{
 	ArtifactBody, BlockKind, ChatEvent, ChatRequest, ChatStream, Client, Completion, FinishReason,
 	Message as InferenceMessage, NegotiationPolicy, Planner, SafetySetting, Sampling, Setting,
@@ -12,7 +12,8 @@ use omp_inference::{
 };
 use omp_journal::{
 	EntryId,
-	data::{Attachment, TurnReceipt},
+	blob::BlobStore,
+	data::{AsyncJobDelivery, AsyncJobStatus, AsyncResult, Attachment, TurnReceipt},
 };
 use omp_proto::{
 	thread::v1::{Item, Message, Part as ThreadPart, Role, item, part},
@@ -529,6 +530,21 @@ impl<C> Kernel<C> {
 		self.dispatcher.jobs()
 	}
 
+	/// Reconciles journaled detached jobs after a session open, fork, or
+	/// restart.
+	///
+	/// A terminal tool result whose process died before `jobs.settle` is
+	/// adopted into the durable job node. A still-running detached tool with
+	/// no execution unit is settled as an orphan. Repeated calls are
+	/// idempotent because terminal job nodes are never selected again.
+	pub fn reconcile_jobs(
+		&self,
+		session: &mut Session,
+	) -> Result<Vec<crate::JobRecord>, SessionError> {
+		self.dispatcher.jobs().rebuild(session);
+		self.dispatcher.jobs().poll(session)
+	}
+
 	/// Returns the one upward control mailbox.
 	#[must_use]
 	pub fn mailbox(&self) -> flume::Sender<Up> {
@@ -903,7 +919,31 @@ impl<C: Inference> Kernel<C> {
 				turn_cancel.cancel_turn();
 				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
 			}
-			let route = self.current_route();
+			if self
+				.hold_while_paused(session, turn_cancel, control)
+				.await?
+			{
+				self.notify_deadline_or_interrupt(session, turn, control, turn_started);
+				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
+			}
+			let mut route = self.current_route();
+			// A crash can land after the durable observation tick and before
+			// its one-shot handoff tick. Re-offer that journaled state before
+			// projecting another request so replay never runs an extra turn on
+			// the prewalk model.
+			let resumed_view = TurnView {
+				turn,
+				had_tool_calls: false,
+				assistant_text: Str::new_static(""),
+				stop_reason: Str::new_static(""),
+			};
+			let resumed_cx = DirectorCx::new(turn, &route);
+			if directors.after_settled_turn(session, &resumed_cx, &resumed_view)? {
+				self.flush_session_state(session)?;
+				self.resync_session_state(session);
+				self.apply_live_components(session)?;
+				route = self.current_route();
+			}
 			// A settled background job or subagent re-wakes the loop with its
 			// result before the next request (pi `async-result` follow-up).
 			if self.deliver_settlements(session, turn)? {
@@ -1062,7 +1102,10 @@ impl<C: Inference> Kernel<C> {
 								turn_cancel.cancel_turn();
 								return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
 							},
-							Received::None | Received::Steering | Received::Approved(_) => {},
+							Received::None
+							| Received::Steering
+							| Received::PauseChanged
+							| Received::Approved(_) => {},
 						}
 						continue;
 					},
@@ -1122,7 +1165,10 @@ impl<C: Inference> Kernel<C> {
 											tokens_out,
 										));
 									},
-									Received::None | Received::Steering | Received::Approved(_) => {},
+									Received::None
+									| Received::Steering
+									| Received::PauseChanged
+									| Received::Approved(_) => {},
 								}
 							},
 						}
@@ -1141,6 +1187,13 @@ impl<C: Inference> Kernel<C> {
 				driven
 			};
 			let mut driven = driven;
+			if self
+				.hold_while_paused(session, turn_cancel, control)
+				.await?
+			{
+				self.notify_deadline_or_interrupt(session, turn, control, turn_started);
+				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
+			}
 			let director_cx = DirectorCx::new(turn, &route);
 			let had_tool_calls = driven.had_tool_calls;
 			let mut settled_reports = Vec::new();
@@ -1236,6 +1289,13 @@ impl<C: Inference> Kernel<C> {
 						"items": [],
 					}),
 				)?;
+			}
+			if turn_view.had_tool_calls
+				&& directors.after_settled_turn(session, &director_cx, &turn_view)?
+			{
+				self.flush_session_state(session)?;
+				self.resync_session_state(session);
+				self.apply_live_components(session)?;
 			}
 			if turn_view.had_tool_calls || steering_received {
 				continue;
@@ -1341,8 +1401,18 @@ impl<C: Inference> Kernel<C> {
 						turn_cancel.cancel_turn();
 						return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
 					},
-					Received::None | Received::Steering | Received::Approved(_) => {},
+					Received::None
+					| Received::Steering
+					| Received::PauseChanged
+					| Received::Approved(_) => {},
 				},
+			}
+			if self
+				.hold_while_paused(session, turn_cancel, control)
+				.await?
+			{
+				self.notify_deadline_or_interrupt(session, turn, control, turn_started);
+				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
 			}
 			self.apply_live_components(session)?;
 			let decision = directors.on_yield(session, &director_cx, &turn_view)?;
@@ -1420,41 +1490,30 @@ impl<C: Inference> Kernel<C> {
 		}
 		let mut rendered = Vec::with_capacity(undelivered.len());
 		for record in &undelivered {
-			let text = settlement_text(record);
-			let text = if text.len() > ASYNC_INLINE_RESULT_MAX_BYTES {
-				let blob = self.dispatcher.policy().spill.put(text.as_bytes())?;
-				let preview = crate::dispatch::utf8_prefix(&text, ASYNC_PREVIEW_MAX_BYTES);
-				format!(
-					"{preview}\n\n[result truncated: {} bytes; full result at artifact://sha256/{}]",
-					text.len(),
-					blob.to_hex()
-				)
-			} else {
-				text
-			};
-			rendered.push((record.id.clone(), record.kind, text));
+			rendered.push((record.id.clone(), record.label.clone(), settlement_text(record)));
 		}
 		let body = async_result_notice(&rendered);
+		let delivery = AsyncResult { jobs: undelivered.iter().map(async_job_delivery).collect() };
+		let data = serde_json::value::to_raw_value(&delivery)?;
 		let cause = session.head().ok_or(SessionError::NoActiveTurn)?;
-		session.patch(Txn {
-			cause,
-			label: Some(Str::new_static("jobs.async-result")),
-			ops: vec![omp_dom::Op::Ins {
-				parent: turn,
-				after:  session.dom().children(turn).last().copied(),
-				node:   omp_dom::NodeSpec::new(KnownTag::User)
-					.with_prop(
-						omp_dom::PropKey::Custom(Str::new_static("async_result")),
-						omp_dom::Value::Bool(true),
-					)
-					.with_content(Str::new(body)),
-			}],
-		})?;
-		let handles = undelivered
-			.iter()
-			.map(|record| record.handle)
-			.collect::<Vec<_>>();
-		crate::jobs::mark_delivered(session, &handles)?;
+		let mut ops = Vec::with_capacity(undelivered.len() + 1);
+		ops.push(Op::Ins {
+			parent: turn,
+			after:  session.dom().children(turn).last().copied(),
+			node:   NodeSpec::new(KnownTag::User)
+				.with_prop(PropKey::Custom(Str::new_static("async_result")), Value::Bool(true))
+				.with_prop(PropId::Data, Value::Json(data))
+				.with_content(Str::new(body)),
+		});
+		ops.extend(undelivered.iter().map(|record| Op::Set {
+			h:     record.handle,
+			prop:  PropKey::Custom(Str::new_static(crate::jobs::DELIVERED)),
+			value: Value::Bool(true),
+		}));
+		// The notice and every delivery marker are one journal entry. Replay
+		// can therefore observe both or neither, never a notice that gets
+		// delivered a second time after a crash.
+		session.patch(Txn { cause, label: Some(Str::new_static("jobs.async-result")), ops })?;
 		self.events.publish(KernelEvent::JobsDelivered {
 			ids: undelivered.into_iter().map(|record| record.id).collect(),
 		});
@@ -1498,7 +1557,7 @@ impl<C: Inference> Kernel<C> {
 						return Ok(Awaited::Cancelled);
 					},
 					Received::Steering => return Ok(Awaited::Steering),
-					Received::None | Received::Approved(_) => {
+					Received::None | Received::PauseChanged | Received::Approved(_) => {
 						if !crate::jobs::pending_wake(session.dom()) {
 							return Ok(Awaited::Settled);
 						}
@@ -1785,7 +1844,10 @@ impl<C: Inference> Kernel<C> {
 								turn_cancel.cancel_turn();
 								return Ok(Fold::Cancelled);
 							},
-							Received::None | Received::Steering | Received::Approved(_) => {},
+							Received::None
+							| Received::Steering
+							| Received::PauseChanged
+							| Received::Approved(_) => {},
 						}
 						continue;
 					},
@@ -1821,23 +1883,18 @@ impl<C: Inference> Kernel<C> {
 					},
 					ChatEvent::BlockStarted { index, kind } => match kind {
 						BlockKind::Text => {
-							let handle = assistant.ok_or(KernelError::MissingResponseStart)?;
-							let sid = session.stream_open(handle, PropId::Text.into())?;
+							content_sid(session, assistant, &mut content_streams, index, "text")?;
 							self.apply_live_components(session)?;
-							content_streams.insert(index, sid);
 						},
 						BlockKind::Thinking => {
-							let handle = assistant.ok_or(KernelError::MissingResponseStart)?;
-							let sid = session.stream_open(handle, PropId::Thinking.into())?;
+							content_sid(session, assistant, &mut content_streams, index, "thinking")?;
 							self.apply_live_components(session)?;
-							content_streams.insert(index, sid);
 						},
 						BlockKind::ToolCall | BlockKind::Artifact => {},
 					},
 					ChatEvent::TextDelta { index, text: delta } => {
 						first_token.get_or_insert_with(Instant::now);
-						let sid =
-							content_sid(session, assistant, &mut content_streams, index, PropId::Text)?;
+						let sid = content_sid(session, assistant, &mut content_streams, index, "text")?;
 						session.stream_append(sid, delta.as_str())?;
 						self.apply_live_components(session)?;
 						self.events.publish(KernelEvent::TextDelta(delta.clone()));
@@ -1859,13 +1916,8 @@ impl<C: Inference> Kernel<C> {
 					},
 					ChatEvent::ThinkingDelta { index, text: delta } => {
 						first_token.get_or_insert_with(Instant::now);
-						let sid = content_sid(
-							session,
-							assistant,
-							&mut content_streams,
-							index,
-							PropId::Thinking,
-						)?;
+						let sid =
+							content_sid(session, assistant, &mut content_streams, index, "thinking")?;
 						session.stream_append(sid, delta.as_str())?;
 						self.apply_live_components(session)?;
 						if let (Some(hooks), Some(item)) = (&self.lifecycle_hooks, assistant) {
@@ -2072,18 +2124,9 @@ impl<C: Inference> Kernel<C> {
 							&& ready.is_empty()
 							&& let Some(identity) = self.dispatcher.registry().resolved_identity("edit")
 							&& identity.rev.family.as_str() == "sloppy"
-							&& let Some((remaining, input, _regions)) = extract_inline_sloppy_edits(&text)
+							&& let Some((remaining, input, _regions)) =
+								recover_inline_sloppy_edits(session, assistant)?
 						{
-							let assistant = assistant.ok_or(KernelError::MissingResponseStart)?;
-							session.patch(Txn {
-								cause: session.head().ok_or(SessionError::NoActiveTurn)?,
-								label: Some(Str::new_static("edit.inline-recovery")),
-								ops:   vec![omp_dom::Op::Set {
-									h:     assistant,
-									prop:  PropId::Text.into(),
-									value: omp_dom::Value::Str(Str::new(remaining.clone())),
-								}],
-							})?;
 							text = remaining;
 							let args =
 								serde_json::value::to_raw_value(&serde_json::json!({"input": input}))?;
@@ -2144,14 +2187,45 @@ impl<C: Inference> Kernel<C> {
 						completed = true;
 						break Ok(Fold::Ended);
 					},
-					ChatEvent::Artifact { artifact, .. } => {
-						let uri = self.artifact_uri(artifact).await?;
-						let sid =
-							content_sid(session, assistant, &mut content_streams, u32::MAX, PropId::Text)?;
-						session.stream_append(sid, uri.as_str())?;
+					ChatEvent::Artifact { index, artifact } => {
+						let media_type = artifact.media_type.clone();
+						let size = artifact.size;
+						let blobs = session.blobs().clone();
+						let uri = Self::artifact_uri(&blobs, artifact).await?;
+						let assistant = assistant.ok_or(KernelError::MissingResponseStart)?;
+						let kind = if media_type.starts_with("image/") {
+							"image"
+						} else if media_type.starts_with("video/") {
+							"video"
+						} else if media_type.starts_with("audio/") {
+							"audio"
+						} else {
+							"file"
+						};
+						let mut node = NodeSpec::new(Tag::Custom(Str::new_static("artifact")))
+							.with_prop(PropId::Blob, Value::Str(uri))
+							.with_prop(PropId::Mime, Value::Str(media_type))
+							.with_prop(PropId::Kind, Value::Str(Str::new_static(kind)))
+							.with_prop(
+								PropKey::Custom(Str::new_static(omp_session::PROVIDER_BLOCK_INDEX_PROP)),
+								Value::Int(i64::from(index)),
+							);
+						if let Some(size) = size {
+							node = node.with_prop(
+								PropKey::Custom(Str::new_static("size")),
+								Value::Int(i64::try_from(size).unwrap_or(i64::MAX)),
+							);
+						}
+						session.patch(Txn {
+							cause: session.head().ok_or(SessionError::NoActiveTurn)?,
+							label: Some(Str::new_static("assistant.artifact")),
+							ops:   vec![Op::Ins {
+								parent: assistant,
+								after: session.dom().children(assistant).last().copied(),
+								node,
+							}],
+						})?;
 						self.apply_live_components(session)?;
-						self.events.publish(KernelEvent::TextDelta(uri.clone()));
-						text.push_str(uri.as_str());
 					},
 					ChatEvent::WorkflowAction(action) => {
 						// A provider-side workflow asks the client to execute
@@ -2343,10 +2417,13 @@ impl<C: Inference> Kernel<C> {
 		}
 	}
 
-	async fn artifact_uri(&self, artifact: omp_inference::Artifact) -> Result<Str, KernelError> {
+	async fn artifact_uri(
+		blobs: &BlobStore,
+		artifact: omp_inference::Artifact,
+	) -> Result<Str, KernelError> {
 		match artifact.body {
 			ArtifactBody::Bytes(bytes) => {
-				let blob = self.dispatcher.policy().spill.put(&bytes)?;
+				let blob = blobs.put(&bytes)?;
 				Ok(Str::new(format!("artifact://sha256/{}", blob.to_hex())))
 			},
 			ArtifactBody::Stored(reference) => {
@@ -2357,7 +2434,7 @@ impl<C: Inference> Kernel<C> {
 				while let Some(chunk) = stream.next().await {
 					bytes.extend_from_slice(&chunk?);
 				}
-				let blob = self.dispatcher.policy().spill.put(&bytes)?;
+				let blob = blobs.put(&bytes)?;
 				Ok(Str::new(format!("artifact://sha256/{}", blob.to_hex())))
 			},
 		}
@@ -2484,6 +2561,54 @@ impl<C: Inference> Kernel<C> {
 		Ok(())
 	}
 
+	/// Holds all new inference, tool, subagent, and job admission while the
+	/// authoritative `<meta><pause>` element is active. Existing execution
+	/// units may settle; their terminal state is journaled but delivery and
+	/// continuation wait for resume. Interrupt and session cancellation stay
+	/// live while held.
+	async fn hold_while_paused(
+		&mut self,
+		session: &mut Session,
+		turn: &crate::TurnCancellation,
+		run: &RunControl,
+	) -> Result<bool, KernelError> {
+		let control = CallControl::new(
+			self.mailbox_rx.clone(),
+			turn.clone(),
+			self.cancel.clone(),
+			Some(run.clone()),
+			self.approvals.clone(),
+		);
+		while crate::pause_state(session.dom()).active {
+			if self.dispatcher.jobs().has_finished_units() {
+				self.dispatcher.jobs().poll(session)?;
+				self.apply_live_components(session)?;
+			}
+			let jobs = Arc::clone(self.dispatcher.jobs());
+			tokio::select! {
+				biased;
+				() = run.cancelled() => {
+					turn.cancel_turn();
+					return Ok(true);
+				},
+				message = control.recv() => match control.handle(session, message)? {
+					Received::Cancelled => return Ok(true),
+					Received::Rewound(work) => {
+						self.dispatcher.jobs().apply_lifecycle(session, &work).await;
+						turn.cancel_turn();
+						return Ok(true);
+					},
+					Received::None
+					| Received::Steering
+					| Received::PauseChanged
+					| Received::Approved(_) => {},
+				},
+				() = jobs.any_finished() => {},
+			}
+		}
+		Ok(false)
+	}
+
 	/// Drains every queued mailbox message at a safe point. A rewind that
 	/// lands here applies its lifecycle work (removed subagents and jobs are
 	/// terminated, ADR 0004) and cancels the turn like every other drain.
@@ -2510,7 +2635,7 @@ impl<C: Inference> Kernel<C> {
 					turn.cancel_turn();
 					drained.cancelled = true;
 				},
-				Received::None => {},
+				Received::None | Received::PauseChanged => {},
 			}
 		}
 		// A prompt whose policy stopped waiting (timeout, cancelled or
@@ -2697,13 +2822,6 @@ enum AwaitSignal {
 	Finished,
 }
 
-/// pi `ASYNC_INLINE_RESULT_MAX_CHARS`: larger results spill to the blob
-/// store with a bounded preview (ADR 0009).
-const ASYNC_INLINE_RESULT_MAX_BYTES: usize = 12_000;
-/// pi `ASYNC_PREVIEW_MAX_CHARS`.
-const ASYNC_PREVIEW_MAX_BYTES: usize = 4_000;
-
-/// The longest UTF-8 prefix of `text` within `limit` bytes.
 /// The model-facing text of one settled job (pi `AsyncJobManager` result
 /// text): a subagent's final text and structured verdict, a detached
 /// tool's artifact address, or its terminal error.
@@ -2762,16 +2880,47 @@ fn settlement_text(record: &crate::JobRecord) -> String {
 	text
 }
 
+fn async_job_delivery(record: &crate::JobRecord) -> AsyncJobDelivery {
+	let output = record
+		.output
+		.as_deref()
+		.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.get()).ok());
+	let artifact = output
+		.as_ref()
+		.and_then(|output| output.get("artifact"))
+		.and_then(serde_json::Value::as_str)
+		.map(Str::new);
+	let fault = record.error.clone().or_else(|| {
+		output
+			.as_ref()
+			.and_then(|output| output.get("error"))
+			.and_then(serde_json::Value::as_str)
+			.map(Str::new)
+	});
+	AsyncJobDelivery {
+		id: record.id.clone(),
+		job_type: record.job_type.clone(),
+		label: record.label.clone(),
+		duration_ms: record.duration_ms.unwrap_or(0),
+		status: record
+			.status
+			.parse::<AsyncJobStatus>()
+			.unwrap_or(AsyncJobStatus::Failed),
+		artifact,
+		fault,
+	}
+}
+
 /// pi `prompts/tools/async-result.md`.
-fn async_result_notice(jobs: &[(Str, crate::JobKind, String)]) -> String {
+fn async_result_notice(jobs: &[(Str, Str, String)]) -> String {
 	let mut body = String::from("<system-notice>\n");
 	if jobs.len() > 1 {
 		body.push_str(&format!(
 			"{} background jobs have completed. Resume your work using the results below.\n\n",
 			jobs.len()
 		));
-		for (index, (id, kind, result)) in jobs.iter().enumerate() {
-			body.push_str(&format!("── Job {id} ({kind}) ──\n{result}"));
+		for (index, (id, label, result)) in jobs.iter().enumerate() {
+			body.push_str(&format!("── Job {id} ({label}) ──\n{result}"));
 			if index + 1 < jobs.len() {
 				body.push('\n');
 			}
@@ -2985,15 +3134,108 @@ fn content_sid(
 	assistant: Option<Handle>,
 	streams: &mut FastHashMap<u32, u32>,
 	index: u32,
-	prop: PropId,
+	kind: &'static str,
 ) -> Result<u32, KernelError> {
 	if let Some(sid) = streams.get(&index) {
 		return Ok(*sid);
 	}
-	let sid =
-		session.stream_open(assistant.ok_or(KernelError::MissingResponseStart)?, prop.into())?;
+	let assistant = assistant.ok_or(KernelError::MissingResponseStart)?;
+	session.patch(Txn {
+		cause: session.head().ok_or(SessionError::NoActiveTurn)?,
+		label: Some(Str::new_static("assistant.content")),
+		ops:   vec![Op::Ins {
+			parent: assistant,
+			after:  session.dom().children(assistant).last().copied(),
+			node:   NodeSpec::new(Tag::Custom(Str::new_static(omp_session::ASSISTANT_CONTENT_TAG)))
+				.with_prop(PropId::Kind, Value::Str(Str::new_static(kind)))
+				.with_prop(
+					PropKey::Custom(Str::new_static(omp_session::PROVIDER_BLOCK_INDEX_PROP)),
+					Value::Int(i64::from(index)),
+				)
+				.with_prop(PropId::Text, Value::Str(Str::new_static(""))),
+		}],
+	})?;
+	let child = session
+		.dom()
+		.children(assistant)
+		.last()
+		.copied()
+		.ok_or(KernelError::MissingResponseStart)?;
+	let sid = session.stream_open(child, PropId::Text.into())?;
 	streams.insert(index, sid);
 	Ok(sid)
+}
+
+fn recover_inline_sloppy_edits(
+	session: &mut Session,
+	assistant: Option<Handle>,
+) -> Result<Option<(String, String, usize)>, KernelError> {
+	let Some(assistant) = assistant else {
+		return Ok(None);
+	};
+	let mut children = session
+		.dom()
+		.children(assistant)
+		.iter()
+		.enumerate()
+		.filter_map(|(position, handle)| {
+			let node = session.dom().get(*handle)?;
+			if !matches!(
+				&node.tag,
+				Tag::Custom(tag) if tag.as_str() == omp_session::ASSISTANT_CONTENT_TAG
+			) || !matches!(
+				node.prop(&PropId::Kind.into()),
+				Some(Value::Str(kind)) if kind.as_str() == "text"
+			) {
+				return None;
+			}
+			let index = node
+				.prop(&PropKey::Custom(Str::new_static(omp_session::PROVIDER_BLOCK_INDEX_PROP)))
+				.and_then(|value| match value {
+					Value::Int(index) => Some(*index),
+					_ => None,
+				})
+				.unwrap_or(i64::MAX);
+			let text = session
+				.dom()
+				.stream_text(*handle, &PropId::Text.into())
+				.or_else(|| node.prop(&PropId::Text.into()).and_then(Value::as_str))?;
+			Some((index, position, *handle, Str::new(text)))
+		})
+		.collect::<Vec<_>>();
+	children.sort_by_key(|(index, position, ..)| (*index, *position));
+
+	let mut ops = Vec::new();
+	let mut visible = String::new();
+	let mut payloads = Vec::new();
+	let mut regions = 0;
+	for (_, _, handle, text) in children {
+		if let Some((remaining, input, found)) = extract_inline_sloppy_edits(text.as_str()) {
+			regions += found;
+			payloads.push(input);
+			visible.push_str(&remaining);
+			if remaining.trim().is_empty() {
+				ops.push(Op::Rm(handle));
+			} else {
+				ops.push(Op::Set {
+					h:     handle,
+					prop:  PropId::Text.into(),
+					value: Value::Str(Str::new(remaining)),
+				});
+			}
+		} else {
+			visible.push_str(text.as_str());
+		}
+	}
+	if regions == 0 {
+		return Ok(None);
+	}
+	session.patch(Txn {
+		cause: session.head().ok_or(SessionError::NoActiveTurn)?,
+		label: Some(Str::new_static("edit.inline-recovery")),
+		ops,
+	})?;
+	Ok(Some((visible, payloads.join("\n"), regions)))
 }
 
 fn close_streams(
@@ -3157,6 +3399,7 @@ fn receipt_facts(
 		ttft_ms: first_token.map(|at| millis(at.duration_since(request_started))),
 		duration_ms: Some(millis(request_started.elapsed())),
 		premium_requests_millionths: usage.premium_requests_millionths,
+		identity: None,
 	}
 }
 

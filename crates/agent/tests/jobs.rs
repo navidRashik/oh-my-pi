@@ -45,7 +45,12 @@ async fn jobs_rewind_removing_a_subagent_terminates_it() {
 			starts.fetch_add(1, Ordering::SeqCst);
 			tokio::spawn(async move {
 				cancel.cancelled().await;
-				JobSettlement { status: Str::new_static("cancelled"), output: None, error: None }
+				JobSettlement {
+					status:     Str::new_static("cancelled"),
+					output:     None,
+					error:      None,
+					completion: None,
+				}
 			})
 		}
 	}));
@@ -98,6 +103,148 @@ async fn jobs_tool_job_without_an_execution_unit_settles_failed_at_poll() {
 	assert!(!board.has_finished_units(), "the orphan is journaled exactly once");
 }
 
+/// Progress after detachment is not a terminal outcome. Restart reconciliation
+/// keys off the durable result-entry marker rather than the call's general
+/// order marker, so streamed updates cannot be mistaken for completion.
+#[tokio::test]
+async fn jobs_restart_does_not_adopt_progress_as_a_terminal() {
+	let temp = tempdir().expect("temporary session directory");
+	let path = temp.path().join("progress.oms");
+	let mut session = Session::create(&path, ComponentRegistry::standard()).expect("create session");
+	session.begin_turn().expect("turn");
+	let call = session
+		.call(
+			"bash",
+			1,
+			"call-progress",
+			None,
+			Some(serde_json::value::to_raw_value(&serde_json::json!({})).expect("args")),
+			None,
+		)
+		.expect("call");
+	session
+		.settle(
+			call,
+			serde_json::value::to_raw_value(&serde_json::json!({
+				"kind": "detached",
+				"id": "job-progress"
+			}))
+			.expect("detached outcome"),
+		)
+		.expect("detach");
+	session
+		.call_update(
+			call,
+			serde_json::value::to_raw_value(&serde_json::json!({"progress":"still running"}))
+				.expect("update"),
+		)
+		.expect("progress");
+	drop(session);
+
+	let mut session =
+		Session::open(&path, ComponentRegistry::standard()).expect("restart session");
+	let board = JobBoard::new();
+	board.rebuild(&session);
+	let jobs = board.poll(&mut session).expect("orphan settlement");
+	assert_eq!(jobs.len(), 1);
+	assert_eq!(jobs[0].status.as_str(), "failed");
+	assert_eq!(jobs[0].error.as_deref(), Some(omp_agent::ORPHANED_TOOL_JOB));
+}
+
+/// A supervised-process settlement journals its typed completion and delivery
+/// marker in the same patch, so replay shows exactly one launch row and generic
+/// async delivery cannot duplicate it after a crash.
+#[tokio::test]
+async fn process_settlement_journals_one_atomic_replayable_completion() {
+	use omp_journal::data::{LaunchCompletion, LaunchDaemonCompletion, LaunchDaemonStatus, Patch};
+
+	let temp = tempdir().expect("temporary session directory");
+	let path = temp.path().join("process.oms");
+	let mut session = Session::create(&path, ComponentRegistry::standard()).expect("create session");
+	session.begin_turn().expect("turn");
+	let head = session.head().expect("turn head");
+	let txn = jobs::insert(session.dom(), head, JobSpec {
+		id:      Str::new_static("web"),
+		kind:    Str::new_static("process"),
+		owner:   Str::new_static("Main"),
+		started: Str::new_static("1"),
+		agent:   None,
+	})
+	.expect("jobs root");
+	session.patch(txn).expect("insert process job");
+	let handle = session
+		.dom()
+		.select("jobs job[id=web]")
+		.expect("valid selector")
+		.into_iter()
+		.next()
+		.expect("process job");
+
+	let board = JobBoard::new();
+	assert!(board.attach_task(
+		session.dom(),
+		handle,
+		tokio_util::sync::CancellationToken::new(),
+		tokio::spawn(async move {
+			JobSettlement {
+				status:     Str::new_static("completed"),
+				output:     None,
+				error:      None,
+				completion: Some(LaunchDaemonCompletion {
+					name:        Str::new_static("web"),
+					status:      LaunchDaemonStatus::Completed,
+					exit_code:   Some(0),
+					duration_ms: 2_500,
+					fault:       None,
+				}),
+			}
+		}),
+	));
+	board
+		.wait(&mut session, Some(&[Str::new_static("web")]))
+		.await
+		.expect("poll")
+		.expect("process settles");
+	assert_eq!(
+		session
+			.dom()
+			.get(handle)
+			.and_then(|node| node.prop(&omp_dom::PropKey::Custom(Str::new_static("delivered")))),
+		Some(&omp_dom::Value::Bool(true))
+	);
+	drop(session);
+
+	let restored = Session::open(&path, ComponentRegistry::standard()).expect("completion replays");
+	let rows = restored
+		.dom()
+		.select("body turn user[launch_completion=true]")
+		.expect("valid selector")
+		.collect::<Vec<_>>();
+	assert_eq!(rows.len(), 1, "exactly one launch row replays");
+	let data = restored
+		.dom()
+		.get(rows[0])
+		.and_then(|node| node.prop(&omp_dom::PropId::Data.into()))
+		.and_then(|value| match value {
+			omp_dom::Value::Json(raw) => Some(raw),
+			_ => None,
+		})
+		.expect("typed completion data");
+	let completion: LaunchCompletion = serde_json::from_str(data.get()).expect("completion decodes");
+	assert_eq!(completion.daemons[0].name, "web");
+	assert_eq!(completion.daemons[0].duration_ms, 2_500);
+
+	let (_, entries) = omp_journal::Journal::open(&path).expect("journal opens");
+	let settlement = entries
+		.iter()
+		.filter(|entry| entry.label.as_deref() == Some("jobs.settle"))
+		.collect::<Vec<_>>();
+	assert_eq!(settlement.len(), 1, "settlement is one journal entry");
+	let patch: Patch = serde_json::from_str(settlement[0].data.as_str()).expect("patch payload");
+	assert!(patch.ops.get().contains("\"launch_completion\""));
+	assert!(patch.ops.get().contains("\"delivered\""));
+}
+
 /// ADR 0009: a settlement larger than the central inline bound never lands
 /// on the `<subagent>` element verbatim; the full JSON goes to the session
 /// CAS and the element carries the artifact address plus a bounded head of
@@ -137,9 +284,10 @@ async fn jobs_oversized_settlement_is_spilled_to_the_cas_and_resolvable() {
 			let full = full.clone();
 			async move {
 				JobSettlement {
-					status: Str::new_static("completed"),
-					output: serde_json::value::to_raw_value(&full).ok(),
-					error:  None,
+					status:     Str::new_static("completed"),
+					output:     serde_json::value::to_raw_value(&full).ok(),
+					error:      None,
+					completion: None,
 				}
 			}
 		}),
@@ -161,4 +309,96 @@ async fn jobs_oversized_settlement_is_spilled_to_the_cas_and_resolvable() {
 		.expect("blob read")
 		.expect("addressable");
 	assert_eq!(serde_json::from_str::<serde_json::Value>(resolved.get()).expect("json"), full);
+}
+
+/// A restart between the terminal `tool.result@1` and `jobs.settle` adopts the
+/// call's complete-output artifact instead of failing the job as an orphan.
+/// The artifact is copied from the runtime spill namespace into the session
+/// namespace before the one durable settlement patch names it.
+#[tokio::test]
+async fn jobs_restart_adopts_terminal_artifact_and_settles_exactly_once() {
+	let temp = tempdir().expect("temporary session directory");
+	let path = temp.path().join("restart.oms");
+	let runtime =
+		omp_journal::blob::BlobStore::open(temp.path().join("runtime")).expect("runtime CAS");
+	let mut session = Session::create(&path, ComponentRegistry::standard()).expect("create session");
+	session.begin_turn().expect("turn");
+	let call = session
+		.call(
+			"bash",
+			1,
+			"call-1",
+			Some(Str::new_static("run a long command")),
+			Some(serde_json::value::to_raw_value(&serde_json::json!({})).expect("args")),
+			None,
+		)
+		.expect("call");
+	session
+		.settle(
+			call,
+			serde_json::value::to_raw_value(&serde_json::json!({
+				"kind": "detached",
+				"id": "job-1"
+			}))
+			.expect("detached outcome"),
+		)
+		.expect("detach");
+	let full =
+		serde_json::value::to_raw_value(&serde_json::json!({"kind":"ok","value":{"text":"done"}}))
+			.expect("full outcome");
+	let artifact = runtime.put(full.get().as_bytes()).expect("runtime artifact");
+	session
+		.settle_projected(
+			call,
+			serde_json::value::to_raw_value(&serde_json::json!({
+				"storage": "spilled",
+				"blob": {
+					"hash": artifact.to_hex().as_str(),
+					"media_type": "application/json",
+					"byte_len": artifact.size
+				},
+				"byte_len": artifact.size
+			}))
+			.expect("spilled details"),
+			serde_json::value::to_raw_value(&serde_json::json!([
+				{"kind":"text","text":"artifact-backed completion"}
+			]))
+			.expect("parts"),
+		)
+		.expect("terminal result");
+	drop(session);
+
+	let mut session =
+		Session::open(&path, ComponentRegistry::standard()).expect("restart session");
+	assert!(
+		!session.blobs().has(&artifact),
+		"runtime and session stores are distinct before adoption"
+	);
+	let board = JobBoard::new();
+	board.set_artifact_store(runtime);
+	board.rebuild(&session);
+	let jobs = board.poll(&mut session).expect("reconcile");
+	assert_eq!(jobs.len(), 1);
+	assert_eq!(jobs[0].status.as_str(), "completed");
+	assert!(session.blobs().has(&artifact), "settlement pins the artifact in the session CAS");
+	let output = jobs[0].output.as_deref().expect("artifact-backed output");
+	let spilled: omp_agent::SpilledOutput =
+		serde_json::from_str(output.get()).expect("spilled output");
+	let address = format!("artifact://sha256/{}", artifact.to_hex());
+	assert_eq!(spilled.artifact.as_str(), address.as_str());
+	let resolved = omp_agent::resolve_output(&session, output)
+		.expect("resolve")
+		.expect("full output");
+	assert_eq!(resolved.get(), full.get());
+
+	board.poll(&mut session).expect("idempotent reconcile");
+	let (_, entries) = omp_journal::Journal::open(&path).expect("journal");
+	assert_eq!(
+		entries
+			.iter()
+			.filter(|entry| entry.label.as_deref() == Some("jobs.settle"))
+			.count(),
+		1,
+		"the recovered terminal is journaled exactly once"
+	);
 }

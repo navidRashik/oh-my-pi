@@ -229,6 +229,26 @@ async fn content_block_prompts_journal_text_and_image_attachments() {
 		serde_json::json!(-32602),
 		"content-block prompts must be accepted as valid params: {prompt:#?}"
 	);
+	assert!(prompt["result"].get("text").is_none(), "ACP PromptResponse carries chunks, not text");
+	assert!(
+		frames.iter().any(|frame| {
+			frame["method"] == "session/update"
+				&& frame["params"]["sessionId"] == "startup"
+				&& frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+				&& frame["params"]["update"]["content"]["text"] == "seen"
+				&& frame["params"]["update"]["messageId"].is_string()
+		}),
+		"assistant text must use the ACP chunk event with a stable message id: {frames:#?}",
+	);
+	assert!(
+		frames.iter().all(|frame| {
+			!matches!(
+				frame.pointer("/params/update/sessionUpdate").and_then(Value::as_str),
+				Some("patch" | "snapshot")
+			)
+		}),
+		"private DOM patch vocabulary must never leak onto ACP: {frames:#?}",
+	);
 
 	let reopened = Session::open(&journal_path, ComponentRegistry::standard()).expect("reopen");
 	let dom = reopened.dom();

@@ -1,7 +1,9 @@
-//! `Kernel::run_local`: the `!`/`$` prefix modes journal a turn holding only
-//! the tool element and never call inference.
+//! `Kernel::run_local`: the `!`/`$` prefix modes journal an explicitly local
+//! turn and never call inference.
 
-use omp_agent::{DispatchPolicy, Kernel, KernelEvent, RunControl, StaticPrompt, TurnStop};
+use omp_agent::{
+	DispatchPolicy, Kernel, KernelEvent, LocalRunKind, RunControl, StaticPrompt, TurnStop,
+};
 use omp_core::Str;
 use omp_dom::{KnownTag, PropId, PropKey, Tag, Value};
 use omp_journal::{blob::BlobStore, kind};
@@ -20,7 +22,7 @@ async fn local_run_journals_one_tool_turn_without_inference() {
 	let (inference, requests) = ScriptedInference::new(Vec::<Vec<omp_inference::ChatEvent>>::new());
 	let mut kernel = Kernel::new(
 		inference,
-		registry([spec("echo", 1, "hi")]),
+		registry([spec("bash", 1, "hi")]),
 		DispatchPolicy::new(BlobStore::open(directory.path().join("blobs")).expect("blob store")),
 		StaticPrompt(Str::new_static("test system")),
 	);
@@ -31,10 +33,8 @@ async fn local_run_journals_one_tool_turn_without_inference() {
 		.run_local(
 			&mut session,
 			omp_agent::LocalRun {
-				name:    Str::new_static("echo"),
-				args:    serde_json::value::to_raw_value(&serde_json::json!({"command": "echo hi"}))
-					.expect("args"),
-				intent:  None,
+				kind:    LocalRunKind::Bash,
+				input:   Str::new_static("echo hi"),
 				exclude: false,
 			},
 			RunControl::default(),
@@ -45,7 +45,7 @@ async fn local_run_journals_one_tool_turn_without_inference() {
 	assert_eq!(outcome.stop, TurnStop::Completed);
 	assert!(requests.lock().is_empty(), "no inference request left the kernel");
 	let events = events.try_iter().collect::<Vec<_>>();
-	assert!(matches!(events[0], KernelEvent::ToolReady { ref name, .. } if name == "echo"));
+	assert!(matches!(events[0], KernelEvent::ToolReady { ref name, .. } if name == "bash"));
 	assert!(matches!(events.last(), Some(KernelEvent::TurnEnded { stop: TurnStop::Completed })));
 
 	let dom = session.dom();
@@ -55,7 +55,7 @@ async fn local_run_journals_one_tool_turn_without_inference() {
 		.iter()
 		.map(|handle| dom.get(*handle).expect("node").tag.clone())
 		.collect::<Vec<_>>();
-	assert_eq!(children, [Tag::Custom(Str::new_static("echo"))], "only the tool element");
+	assert_eq!(children, [Tag::Custom(Str::new_static("bash"))], "only the local element");
 	let element = dom.get(dom.children(turn)[0]).expect("tool element");
 	assert_eq!(
 		element
@@ -68,6 +68,18 @@ async fn local_run_journals_one_tool_turn_without_inference() {
 			.prop(&PropKey::from(PropId::Id))
 			.and_then(Value::as_str)
 			.is_some_and(|id| id.starts_with("local-"))
+	);
+	assert_eq!(
+		element
+			.prop(&PropKey::Custom(Str::new_static(omp_agent::LOCAL_PRESENTATION_PROP)))
+			.and_then(Value::as_str),
+		Some(omp_agent::LOCAL_PRESENTATION_VALUE)
+	);
+	assert_eq!(
+		element
+			.prop(&PropKey::Custom(Str::new_static(omp_agent::LOCAL_INPUT_PROP)))
+			.and_then(Value::as_str),
+		Some("echo hi")
 	);
 
 	let entries = journal_entries(&journal_path);
@@ -98,7 +110,7 @@ async fn local_run_journals_one_tool_turn_without_inference() {
 		})
 		.collect::<Vec<_>>();
 	assert_eq!(texts.len(), 1, "one user message for the run: {items:?}");
-	assert!(texts[0].starts_with("Ran `echo` with `{\"command\":\"echo hi\"}`\n"), "{}", texts[0]);
+	assert!(texts[0].starts_with("Ran `echo hi`\n"), "{}", texts[0]);
 	assert!(texts[0].contains("```\nhi"), "{}", texts[0]);
 	assert!(
 		dom.get(turn)
@@ -113,7 +125,7 @@ async fn excluded_local_run_is_hidden_from_the_thread() {
 	let (inference, _) = ScriptedInference::new(Vec::<Vec<omp_inference::ChatEvent>>::new());
 	let mut kernel = Kernel::new(
 		inference,
-		registry([spec("echo", 1, "hi")]),
+		registry([spec("bash", 1, "hi")]),
 		DispatchPolicy::new(BlobStore::open(directory.path().join("blobs")).expect("blob store")),
 		StaticPrompt(Str::new_static("test system")),
 	);
@@ -122,9 +134,8 @@ async fn excluded_local_run_is_hidden_from_the_thread() {
 		.run_local(
 			&mut session,
 			omp_agent::LocalRun {
-				name:    Str::new_static("echo"),
-				args:    serde_json::value::to_raw_value(&serde_json::json!({})).expect("args"),
-				intent:  None,
+				kind:    LocalRunKind::Bash,
+				input:   Str::new_static("echo hi"),
 				exclude: true,
 			},
 			RunControl::default(),

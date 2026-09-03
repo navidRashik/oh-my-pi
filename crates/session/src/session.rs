@@ -711,6 +711,7 @@ impl Session {
 		self.commit(KindName::ToolResult, Some(call), None, None, &ToolResult::Outcome {
 			outcome,
 			prompt_parts: None,
+			source_blob: None,
 		})
 	}
 
@@ -727,6 +728,28 @@ impl Session {
 		self.commit(KindName::ToolResult, Some(call), None, None, &ToolResult::Outcome {
 			outcome,
 			prompt_parts: Some(prompt_parts),
+			source_blob: None,
+		})
+	}
+
+	/// Records a successful terminal tool outcome and its durable model
+	/// projection while retaining the verified environment source artifact.
+	pub fn settle_projected_from_blob(
+		&mut self,
+		call: EntryId,
+		outcome: Box<RawValue>,
+		prompt_parts: Box<RawValue>,
+		source_blob: BlobRef,
+	) -> Result<EntryId, SessionError> {
+		self.ensure_call(call)?;
+		crate::fold::prompt_parts_text(&prompt_parts)?;
+		if !self.blobs.has(&source_blob) {
+			return Err(omp_journal::blob::Error::NotFound.into());
+		}
+		self.commit(KindName::ToolResult, Some(call), None, None, &ToolResult::Outcome {
+			outcome,
+			prompt_parts: Some(prompt_parts),
+			source_blob: Some(source_blob),
 		})
 	}
 
@@ -736,6 +759,7 @@ impl Session {
 		self.commit(KindName::ToolResult, Some(call), None, None, &ToolResult::Fault {
 			fault,
 			prompt_parts: None,
+			source_blob: None,
 		})
 	}
 
@@ -751,6 +775,28 @@ impl Session {
 		self.commit(KindName::ToolResult, Some(call), None, None, &ToolResult::Fault {
 			fault,
 			prompt_parts: Some(prompt_parts),
+			source_blob: None,
+		})
+	}
+
+	/// Records a failed terminal tool outcome and its durable model projection
+	/// while retaining the verified environment source artifact.
+	pub fn fail_projected_from_blob(
+		&mut self,
+		call: EntryId,
+		fault: Box<RawValue>,
+		prompt_parts: Box<RawValue>,
+		source_blob: BlobRef,
+	) -> Result<EntryId, SessionError> {
+		self.ensure_call(call)?;
+		crate::fold::prompt_parts_text(&prompt_parts)?;
+		if !self.blobs.has(&source_blob) {
+			return Err(omp_journal::blob::Error::NotFound.into());
+		}
+		self.commit(KindName::ToolResult, Some(call), None, None, &ToolResult::Fault {
+			fault,
+			prompt_parts: Some(prompt_parts),
+			source_blob: Some(source_blob),
 		})
 	}
 

@@ -28,7 +28,8 @@ mod session;
 
 pub use component::{Component, ComponentRegistry, Draft};
 pub use projection::{
-	ProjectionError, project_thread, project_thread_history, project_thread_through,
+	ASSISTANT_CONTENT_TAG, PROVIDER_BLOCK_INDEX_PROP, ProjectionError, project_thread,
+	project_thread_history, project_thread_through,
 };
 pub use rewind::{LifecycleWork, diff};
 pub use session::{AttachmentInput, Session, SessionError, UnsettledCall};

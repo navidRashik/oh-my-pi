@@ -399,7 +399,7 @@ fn write_api_assigns_the_declared_causes() {
 /// (the transcript's usage row and maintenance dividers project only these).
 #[test]
 fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
-	use omp_journal::data::{Compaction, TurnReceipt};
+	use omp_journal::data::{Compaction, ReceiptIdentity, ReceiptRole, TurnReceipt};
 	let directory = tempfile::tempdir().expect("temporary session directory");
 	let path = directory.path().join("facts.oms");
 	let store = omp_journal::blob::BlobStore::open(directory.path()).expect("blob store opens");
@@ -417,8 +417,20 @@ fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
 			ttft_ms:                     Some(420),
 			duration_ms:                 Some(3_100),
 			premium_requests_millionths: 330_000,
+			identity:                    None,
 		})
 		.expect("receipt");
+	session
+		.receipt(TurnReceipt {
+			cost_nano_usd: 80_000_000,
+			identity: Some(ReceiptIdentity {
+				role:     ReceiptRole::Advisor,
+				provider: Str::new_static("anthropic"),
+				model:    Str::new_static("claude-sonnet-4-5"),
+			}),
+			..TurnReceipt::default()
+		})
+		.expect("advisor receipt");
 	session
 		.compaction(Compaction {
 			summary,
@@ -435,11 +447,8 @@ fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
 	let reopened = Session::open(&path, ComponentRegistry::default()).expect("session reopens");
 	assert_eq!(reopened.dom().snapshot(), live);
 	let dom = reopened.dom();
-	let usage = dom
-		.select("body turn usage")
-		.expect("selector")
-		.next()
-		.expect("usage");
+	let mut usages = dom.select("body turn usage").expect("selector");
+	let usage = usages.next().expect("usage");
 	let usage = dom.get(usage).expect("usage node");
 	let int = |node: &omp_dom::Node, prop: PropId| match node.prop(&prop.into()) {
 		Some(Value::Int(value)) => *value,
@@ -449,6 +458,21 @@ fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
 	assert_eq!(int(usage, PropId::CacheWrite), 100);
 	assert_eq!(int(usage, PropId::TtftMs), 420);
 	assert_eq!(int(usage, PropId::DurationMs), 3_100);
+	let advisor = dom
+		.get(usages.next().expect("advisor usage"))
+		.expect("advisor usage node");
+	assert_eq!(advisor.prop(&PropId::Kind.into()).and_then(Value::as_str), Some("advisor"));
+	assert_eq!(
+		advisor
+			.prop(&PropId::Provider.into())
+			.and_then(Value::as_str),
+		Some("anthropic")
+	);
+	assert_eq!(
+		advisor.prop(&PropId::Model.into()).and_then(Value::as_str),
+		Some("claude-sonnet-4-5")
+	);
+	assert_eq!(int(advisor, PropId::CostNanoUsd), 80_000_000);
 	let compaction = dom
 		.select("meta compaction")
 		.expect("selector")

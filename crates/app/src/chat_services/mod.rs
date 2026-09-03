@@ -7,9 +7,10 @@
 use std::{path::PathBuf, sync::Arc};
 
 use omp_chat::overlays::services::{
-	AccountRow, AgentRow, AgentView, CleanseRequest, CleanseRun, ExtensionRow, LoginFlow, MemoryOp,
+	AccountRow, ActiveAccountUsage, ActiveUsageRequest, AgentRow, AgentView, CleanseRequest,
+	CleanseRun, ExtensionRow, ForeignSessionRow, ForeignSessionSource, LoginFlow, MemoryOp,
 	Mutation, Mutations, Pending, PluginsReport, ServiceError, ServiceResult, Services, SessionRow,
-	SessionScope, SshHostRow, SshHostSpec, ToolRow, UsageReport,
+	SessionScope, SettingsChoice, SettingsInventory, SshHostRow, SshHostSpec, ToolRow, UsageReport,
 };
 use omp_core::{Str, sf};
 use omp_driver::registry::ProductionInference as ProductionStack;
@@ -38,42 +39,46 @@ mod workspace;
 /// Everything the feeds need, captured once at chat launch.
 pub struct ServiceState {
 	/// User data directory (`credentials.db`, caches).
-	pub data_dir:     PathBuf,
+	pub data_dir:      PathBuf,
 	/// Canonical project root.
-	pub project:      PathBuf,
+	pub project:       PathBuf,
 	/// Project state directory (`sessions/`).
-	pub state_dir:    PathBuf,
+	pub state_dir:     PathBuf,
 	/// Durable session directory.
-	pub sessions_dir: PathBuf,
+	pub sessions_dir:  PathBuf,
 	/// Journal path at launch.
-	pub journal:      PathBuf,
+	pub journal:       PathBuf,
 	/// Current journal path: `/new`, `/resume`, and `/fork` swap sessions in
 	/// process, and the controller writes the new path here on every switch.
-	pub live_journal: Arc<parking_lot::RwLock<PathBuf>>,
+	pub live_journal:  Arc<parking_lot::RwLock<PathBuf>>,
 	/// Resolved launch model key (child kernels for `/btw`).
-	pub model:        Str,
+	pub model:         Str,
 	/// Catalog snapshot; `None` behind a remote gateway.
-	pub catalog:      Option<Arc<omp_catalog::snapshot::Catalog>>,
+	pub catalog:       Option<Arc<omp_catalog::snapshot::Catalog>>,
 	/// Kernel tool registry.
-	pub registry:     Arc<omp_tool::Registry>,
+	pub registry:      Arc<omp_tool::Registry>,
 	/// Process console.
-	pub con:          Arc<omp_con::Ctx>,
+	pub con:           Arc<omp_con::Ctx>,
 	/// Live-session routing index (`/hub` transcripts, agent steering).
-	pub sessions:     Arc<omp_driver::sessions::SessionRegistry>,
+	pub sessions:      Arc<omp_driver::sessions::SessionRegistry>,
+	/// Collaboration relay/session owner.
+	pub collab:        omp_driver::collab::session::CollabCommandHandle,
 	/// Environment client (isolated workspaces for revived agents).
-	pub env:          omp_env::EnvClient,
+	pub env:           omp_env::EnvClient,
 	/// MCP inspection authority.
-	pub mcp:          omp_envd::McpInspectorHandle,
+	pub mcp:           omp_envd::McpInspectorHandle,
 	/// Extension hot-reload authority.
-	pub reload:       omp_envd::ExtensionReloadHandle,
+	pub reload:        omp_envd::ExtensionReloadHandle,
 	/// The session's memory runtime (`/memory`).
-	pub memory:       Arc<omp_memory::MemoryRuntime>,
+	pub memory:        Arc<omp_memory::MemoryRuntime>,
 	/// Production auth + usage stack; `None` behind a remote gateway.
-	pub stack:        Option<StackHandles>,
+	pub stack:         Option<StackHandles>,
 	/// Kernel notifications recorded since launch (`/trace`).
-	pub trace:        Arc<trace::TraceLog>,
+	pub trace:         Arc<trace::TraceLog>,
+	/// Named palettes discovered at launch for settings choices and preview.
+	pub theme_catalog: Arc<omp_tui::ThemeCatalog>,
 	/// Runtime the asynchronous feeds spawn onto.
-	pub runtime:      tokio::runtime::Handle,
+	pub runtime:       tokio::runtime::Handle,
 }
 
 /// Cloneable handles into the production authentication and usage stack.
@@ -128,8 +133,79 @@ impl AppServices {
 }
 
 impl Services for AppServices {
+	fn settings_inventory(&self) -> ServiceResult<SettingsInventory> {
+		let themes = self
+			.state
+			.theme_catalog
+			.themes()
+			.iter()
+			.map(|loaded| SettingsChoice {
+				value:       loaded.name.clone(),
+				label:       loaded.name.clone(),
+				description: loaded.theme.name.clone(),
+			})
+			.collect();
+		let providers = self
+			.state
+			.catalog
+			.as_ref()
+			.map_or_else(Vec::new, |catalog| {
+				catalog
+					.providers()
+					.iter()
+					.map(|provider| Str::new(provider.id.as_str()))
+					.collect()
+			});
+		let mut thinking_levels = vec![SettingsChoice {
+			value:       Str::new_static("auto"),
+			label:       Str::new_static("auto"),
+			description: Str::new_static("Auto-detect per prompt"),
+		}];
+		if let Some(catalog) = self.state.catalog.as_ref() {
+			let active_model = self
+				.state
+				.con
+				.get("ai_model")
+				.and_then(|value| {
+					value
+						.as_str()
+						.filter(|value| !value.is_empty())
+						.map(Str::new)
+				})
+				.unwrap_or_else(|| self.state.model.clone());
+			let key = omp_catalog::ModelKey::from(active_model.as_str());
+			if let Some(policy) = catalog
+				.model(&key)
+				.or_else(|| catalog.resolve_alias(active_model.as_str()))
+				.and_then(|model| model.thinking.as_ref())
+				.and_then(|id| catalog.thinking_policy(id))
+			{
+				thinking_levels.extend(policy.efforts.iter().map(|effort| {
+					let metadata = effort.metadata();
+					SettingsChoice {
+						value:       Str::new_static(<&'static str>::from(*effort)),
+						label:       Str::new_static(metadata.label),
+						description: Str::new_static(metadata.description),
+					}
+				}));
+			}
+		}
+		Ok(SettingsInventory { themes, thinking_levels, providers, ..SettingsInventory::default() })
+	}
+
+	fn theme(&self, name: &str) -> ServiceResult<Option<Arc<omp_tui::JsonTheme>>> {
+		Ok(self.state.theme_catalog.get(name))
+	}
+
 	fn usage(&self) -> ServiceResult<Pending<UsageReport>> {
 		usage::fetch(&self.state)
+	}
+
+	fn active_account_usage(
+		&self,
+		request: ActiveUsageRequest,
+	) -> ServiceResult<Pending<Option<ActiveAccountUsage>>> {
+		usage::active_account(&self.state, request)
 	}
 
 	fn reset_accounts(
@@ -162,12 +238,23 @@ impl Services for AppServices {
 		accounts::live_session_id(&self.state)
 	}
 
+	fn collaboration(&self) -> ServiceResult<omp_chat::overlays::services::CollabState> {
+		Ok(collab_state(&self.state.collab))
+	}
+
 	fn export(&self, path: Option<&std::path::Path>) -> ServiceResult<PathBuf> {
 		misc::export(&self.state, path)
 	}
 
 	fn sessions(&self, scope: SessionScope) -> ServiceResult<Vec<SessionRow>> {
 		sessions::rows(&self.state, scope)
+	}
+
+	fn foreign_sessions(
+		&self,
+		source: ForeignSessionSource,
+	) -> ServiceResult<Vec<ForeignSessionRow>> {
+		sessions::foreign_rows(source)
 	}
 
 	fn agents(&self) -> ServiceResult<Vec<AgentRow>> {
@@ -354,6 +441,55 @@ impl AppServices {
 			let _ = tx.send(result);
 		});
 		Ok(rx)
+	}
+}
+
+fn collab_state(
+	handle: &omp_driver::collab::session::CollabCommandHandle,
+) -> omp_chat::overlays::services::CollabState {
+	use omp_chat::overlays::services::{CollabParticipant, CollabRole, CollabState};
+	let Some(presence) = handle.presence() else {
+		return CollabState {
+			role:         None,
+			connection:   Str::new_static("disconnected"),
+			editor_link:  None,
+			viewer_link:  None,
+			participants: Vec::new(),
+			line:         Str::new_static("Collaboration is not active."),
+		};
+	};
+	let role = match presence.role() {
+		omp_collab::presence::CollabRole::Host => CollabRole::Host,
+		omp_collab::presence::CollabRole::Guest => CollabRole::Guest,
+	};
+	let connection: &'static str = match presence.connection() {
+		omp_collab::presence::ConnectionState::Connecting => "connecting",
+		omp_collab::presence::ConnectionState::Connected => "connected",
+		omp_collab::presence::ConnectionState::Reconnecting => "reconnecting",
+		omp_collab::presence::ConnectionState::Disconnected => "disconnected",
+	};
+	let participants = (0..presence.participant_count())
+		.map(|index| CollabParticipant {
+			id:        u32::try_from(index).unwrap_or(u32::MAX),
+			name:      if index == 0 {
+				Str::new_static("Host")
+			} else {
+				Str::new(format!("Participant {index}"))
+			},
+			host:      index == 0,
+			read_only: index > 0 && presence.read_only(),
+		})
+		.collect();
+	CollabState {
+		role: Some(role),
+		connection: Str::new_static(connection),
+		editor_link: None,
+		viewer_link: None,
+		participants,
+		line: Str::new(format!(
+			"Collaboration {connection}: {} participant(s).",
+			presence.participant_count()
+		)),
 	}
 }
 

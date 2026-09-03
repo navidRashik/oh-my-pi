@@ -14,7 +14,7 @@ use std::{sync::Arc, task::Poll};
 
 use async_trait::async_trait;
 use omp_chat::{
-	HostAction, HostMailbox,
+	ExtensionStatusEvent, HostAction, HostMailbox, status_text_from_tml,
 	overlays::{
 		PanelCall, PanelEvent, PanelOpener,
 		ask::AskDialog,
@@ -389,6 +389,43 @@ impl UiControlOwner for ChatUiOwner {
 				self
 					.mailbox()?
 					.post(HostAction::Reply { severity, text: Str::new(text) });
+				Ok(())
+			},
+			"set_status" => {
+				let body = effect
+					.get("body")
+					.and_then(Value::as_object)
+					.ok_or_else(|| protocol("invalid_effect", "set_status requires an object body"))?;
+				let key = body
+					.get("key")
+					.and_then(Value::as_str)
+					.filter(|key| !key.is_empty())
+					.ok_or_else(|| protocol("invalid_effect", "set_status requires a non-empty body.key"))?;
+				let event = match body.get("content") {
+					Some(Value::Null) => ExtensionStatusEvent::Clear { key: Str::new(key) },
+					Some(Value::Object(content)) => {
+						let source = content
+							.get("source")
+							.and_then(Value::as_str)
+							.ok_or_else(|| {
+								protocol(
+									"invalid_effect",
+									"set_status body.content requires a string source",
+								)
+							})?;
+						let text = status_text_from_tml(source).map_err(|_| {
+							protocol("invalid_effect", "set_status body.content.source is invalid TML")
+						})?;
+						ExtensionStatusEvent::Set { key: Str::new(key), text }
+					},
+					_ => {
+						return Err(protocol(
+							"invalid_effect",
+							"set_status body.content must be an object or null",
+						));
+					},
+				};
+				self.mailbox()?.post(HostAction::ExtensionStatus(event));
 				Ok(())
 			},
 			other => Err(protocol(
@@ -914,6 +951,62 @@ mod tests {
 		assert_eq!(value["height"], json!(30));
 		assert_eq!(value["has_ui"], Value::Bool(true));
 		assert_eq!(value["charset"], Value::String("unicode".into()));
+	}
+
+	#[tokio::test]
+	async fn set_status_effect_posts_sanitized_set_and_clear() {
+		let (owner, ctx, _ask) = owner();
+		owner
+			.effect(
+				context(),
+				json!({
+					"kind": "set_status",
+					"body": {
+						"key": "build",
+						"content": {
+							"source": "<row><text fg=error>failed</text><text>\\n  safely</text></row>",
+						},
+					},
+				}),
+			)
+			.await
+			.expect("styled status");
+		owner
+			.effect(
+				context(),
+				json!({"kind": "set_status", "body": {"key": "build", "content": null}}),
+			)
+			.await
+			.expect("clear status");
+		let actions = ctx.user::<HostMailbox>().expect("mailbox").drain().collect::<Vec<_>>();
+		assert!(matches!(
+			actions.first(),
+			Some(HostAction::ExtensionStatus(ExtensionStatusEvent::Set { key, text }))
+				if key == "build" && text == "failed safely"
+		));
+		assert!(matches!(
+			actions.get(1),
+			Some(HostAction::ExtensionStatus(ExtensionStatusEvent::Clear { key }))
+				if key == "build"
+		));
+		assert!(
+			owner
+				.effect(
+					context(),
+					json!({
+						"kind": "set_status",
+						"body": {
+							"key": "build",
+							"content": {
+								"source": "<md><button id=unsafe when=active>interactive</button></md>",
+							},
+						},
+					}),
+				)
+				.await
+				.is_err(),
+			"interactive or malformed TML is rejected at the app bridge",
+		);
 	}
 
 	#[tokio::test]

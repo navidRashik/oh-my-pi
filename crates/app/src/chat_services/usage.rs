@@ -11,12 +11,22 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use omp_catalog::{ProviderId, snapshot::Catalog};
-use omp_chat::overlays::services::{
-	Pending, ResetAccountRow, ServiceError, ServiceResult, UsageAccount, UsageReport, UsageStatus,
-	UsageWindow,
+use omp_catalog::{ModelKey, ProviderId, RouteId, snapshot::Catalog};
+use omp_chat::{
+	overlays::services::{
+		AccountIdentity, ActiveAccountUsage, ActiveUsageRequest, Pending, ResetAccountRow,
+		ServiceError, ServiceResult, UsageAccount, UsageReport, UsageStatus, UsageWindow,
+	},
+	status_band::UsageWindow as StatusUsageWindow,
 };
 use omp_core::Str;
+use omp_inference::{
+	account::AccountRecord,
+	answer::{
+		UsageQuantity, UsageReport as ProviderUsageReport, UsageUnit,
+		UsageWindow as ProviderUsageWindow,
+	},
+};
 use serde_json::Value;
 
 use super::ServiceState;
@@ -41,6 +51,485 @@ pub fn fetch(state: &ServiceState) -> ServiceResult<Pending<UsageReport>> {
 		let _ = tx.send(result);
 	});
 	Ok(rx)
+}
+
+/// Starts one exact active-account status usage fetch on the application
+/// runtime. Route and account selection are memory-only; credential and
+/// provider work begins only after the pending receiver has been returned.
+pub fn active_account(
+	state: &ServiceState,
+	request: ActiveUsageRequest,
+) -> ServiceResult<Pending<Option<ActiveAccountUsage>>> {
+	let stack = state
+		.stack
+		.as_ref()
+		.ok_or(ServiceError::Unavailable("active account usage (remote gateway)"))?;
+	let catalog = state
+		.catalog
+		.as_deref()
+		.ok_or(ServiceError::Unavailable("provider catalog (remote gateway)"))?;
+	let provider = ProviderId::from(request.provider.as_str());
+	let Some(route) = active_route(catalog, &provider, request.model.as_str()) else {
+		return Ok(ready_active(Ok(None)));
+	};
+	let Some(account) = stack
+		.auth_control
+		.accounts(Some(&provider))
+		.into_iter()
+		.find(|record| record.enabled && record.routes.contains(&route))
+	else {
+		return Ok(ready_active(Ok(None)));
+	};
+
+	let data_dir = state.data_dir.clone();
+	let (tx, rx) = flume::bounded(1);
+	state.runtime.spawn(async move {
+		let result = fetch_active(data_dir.as_path(), request, provider, account).await;
+		let _ = tx.send(result);
+	});
+	Ok(rx)
+}
+
+fn ready_active(
+	result: ServiceResult<Option<ActiveAccountUsage>>,
+) -> Pending<Option<ActiveAccountUsage>> {
+	let (tx, rx) = flume::bounded(1);
+	let _ = tx.send(result);
+	rx
+}
+
+fn active_route(catalog: &Catalog, provider: &ProviderId<str>, model: &str) -> Option<RouteId> {
+	let unqualified = model
+		.strip_prefix(provider.as_str())
+		.and_then(|suffix| suffix.strip_prefix('/'))
+		.unwrap_or(model);
+	let spec = catalog
+		.model_for_provider(provider, ModelKey::from_ref(unqualified))
+		.or_else(|| catalog.model_for_provider(provider, ModelKey::from_ref(model)))
+		.or_else(|| catalog.resolve_alias(unqualified))
+		.or_else(|| catalog.resolve_alias(model))?;
+	spec
+		.routes
+		.iter()
+		.find(|route| {
+			catalog
+				.route(route)
+				.is_some_and(|definition| &definition.provider == provider)
+		})
+		.cloned()
+}
+
+async fn fetch_active(
+	data_dir: &Path,
+	request: ActiveUsageRequest,
+	provider: ProviderId,
+	account: AccountRecord,
+) -> ServiceResult<Option<ActiveAccountUsage>> {
+	let quota = usage_cmd::collect_quota(data_dir, Some(&provider), Some(&account.account))
+		.await
+		.map_err(ServiceError::failed)?;
+	if let Some(report) = quota
+		.reports
+		.into_iter()
+		.find(|report| report.provider == provider && report.account == account.account)
+	{
+		return Ok(Some(snapshot_from_report(request, &account, report)));
+	}
+	if let Some(snapshot) = snapshot_from_rows(request, &account, &quota.rows) {
+		return Ok(Some(snapshot));
+	}
+	if quota.refresh_errors.is_empty() {
+		Ok(None)
+	} else {
+		Err(ServiceError::Failed(Str::new(quota.refresh_errors.join("; "))))
+	}
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WindowClass {
+	FiveHour,
+	Daily,
+	SevenDay,
+	Monthly,
+}
+
+struct DisplayCandidate {
+	id:          Str,
+	class:       WindowClass,
+	percent:     f64,
+	reset_after: Option<Duration>,
+}
+
+struct UsageGroup {
+	model:      Option<Str>,
+	tier:       Option<Str>,
+	priority:   u8,
+	candidates: Vec<DisplayCandidate>,
+}
+
+#[derive(Default)]
+struct NormalizedUsage {
+	tier:      Option<Str>,
+	five_hour: Option<StatusUsageWindow>,
+	daily:     Option<StatusUsageWindow>,
+	seven_day: Option<StatusUsageWindow>,
+	monthly:   Option<StatusUsageWindow>,
+}
+
+fn snapshot_from_report(
+	request: ActiveUsageRequest,
+	account: &AccountRecord,
+	report: ProviderUsageReport,
+) -> ActiveAccountUsage {
+	let normalized = normalize_windows(
+		request.provider.as_str(),
+		request.model.as_str(),
+		report.plan.as_ref(),
+		&report.windows,
+	);
+	ActiveAccountUsage {
+		identity: AccountIdentity {
+			provider:            request.provider.clone(),
+			account:             account.account.as_inner().clone(),
+			principal:           report
+				.principal
+				.map(|principal| principal.into_inner())
+				.or_else(|| Some(account.principal.as_inner().clone())),
+			provider_account_id: report.account_meta.provider_account_id,
+			email:               report.account_meta.email,
+			project_id:          report.account_meta.project_id.or_else(|| {
+				account
+					.routing
+					.project
+					.as_ref()
+					.map(|id| id.as_inner().clone())
+			}),
+			organization_id:     report.account_meta.organization_id.or_else(|| {
+				account
+					.routing
+					.organization
+					.as_ref()
+					.map(|id| id.as_inner().clone())
+			}),
+		},
+		request,
+		tier: normalized.tier,
+		five_hour: normalized.five_hour,
+		daily: normalized.daily,
+		seven_day: normalized.seven_day,
+		monthly: normalized.monthly,
+	}
+}
+
+fn snapshot_from_rows(
+	request: ActiveUsageRequest,
+	account: &AccountRecord,
+	rows: &[Value],
+) -> Option<ActiveAccountUsage> {
+	let now = SystemTime::now();
+	let mut normalized = NormalizedUsage::default();
+	let mut monthly_priority = u8::MAX;
+	for row in rows {
+		let id = row["window"].as_str().unwrap_or_default();
+		let label = row["label"].as_str();
+		let Some(class) = classify_window(request.provider.as_str(), id, label, None) else {
+			continue;
+		};
+		let Some(percent) = fraction(row).filter(|value| value.is_finite()) else {
+			continue;
+		};
+		let percent = percent * 100.0;
+		let resets_at = row["resetAtMs"]
+			.as_u64()
+			.and_then(|millis| UNIX_EPOCH.checked_add(Duration::from_millis(millis)));
+		let window = StatusUsageWindow { percent, reset_after: rounded_reset(resets_at, now, class) };
+		set_window(&mut normalized, &mut monthly_priority, class, id, window);
+	}
+	if normalized.five_hour.is_none()
+		&& normalized.daily.is_none()
+		&& normalized.seven_day.is_none()
+		&& normalized.monthly.is_none()
+	{
+		return None;
+	}
+	Some(ActiveAccountUsage {
+		identity: AccountIdentity {
+			provider:            request.provider.clone(),
+			account:             account.account.as_inner().clone(),
+			principal:           Some(account.principal.as_inner().clone()),
+			provider_account_id: None,
+			email:               None,
+			project_id:          account
+				.routing
+				.project
+				.as_ref()
+				.map(|id| id.as_inner().clone()),
+			organization_id:     account
+				.routing
+				.organization
+				.as_ref()
+				.map(|id| id.as_inner().clone()),
+		},
+		request,
+		tier: normalized.tier,
+		five_hour: normalized.five_hour,
+		daily: normalized.daily,
+		seven_day: normalized.seven_day,
+		monthly: normalized.monthly,
+	})
+}
+
+fn normalize_windows(
+	provider: &str,
+	active_model: &str,
+	plan: Option<&Str>,
+	windows: &[ProviderUsageWindow],
+) -> NormalizedUsage {
+	let now = SystemTime::now();
+	let mut groups: Vec<UsageGroup> = Vec::new();
+	for window in windows {
+		let Some(class) =
+			classify_window(provider, window.id.as_str(), window.label.as_deref(), window.duration)
+		else {
+			continue;
+		};
+		let Some(percent) = used_fraction(window).map(|fraction| fraction * 100.0) else {
+			continue;
+		};
+		let Some((model, scoped_tier)) = window_scope(provider, active_model, window) else {
+			continue;
+		};
+		let tier = scoped_tier.or_else(|| plan.cloned());
+		let priority = if model.is_some() {
+			u8::from(tier.is_some())
+		} else if tier.is_some() {
+			3
+		} else {
+			2
+		};
+		let candidate = DisplayCandidate {
+			id: window.id.clone(),
+			class,
+			percent,
+			reset_after: rounded_reset(window.resets_at, now, class),
+		};
+		if let Some(group) = groups
+			.iter_mut()
+			.find(|group| group.model == model && group.tier == tier)
+		{
+			group.candidates.push(candidate);
+		} else {
+			groups.push(UsageGroup { model, tier, priority, candidates: vec![candidate] });
+		}
+	}
+	let Some(group) = groups.into_iter().min_by_key(|group| group.priority) else {
+		return NormalizedUsage::default();
+	};
+	let mut normalized = NormalizedUsage { tier: group.tier, ..NormalizedUsage::default() };
+	let mut monthly_priority = u8::MAX;
+	for candidate in group.candidates {
+		set_window(
+			&mut normalized,
+			&mut monthly_priority,
+			candidate.class,
+			candidate.id.as_str(),
+			StatusUsageWindow { percent: candidate.percent, reset_after: candidate.reset_after },
+		);
+	}
+	normalized
+}
+
+fn set_window(
+	normalized: &mut NormalizedUsage,
+	monthly_priority: &mut u8,
+	class: WindowClass,
+	id: &str,
+	window: StatusUsageWindow,
+) {
+	match class {
+		WindowClass::FiveHour if normalized.five_hour.is_none() => {
+			normalized.five_hour = Some(window);
+		},
+		WindowClass::Daily if normalized.daily.is_none() => normalized.daily = Some(window),
+		WindowClass::SevenDay if normalized.seven_day.is_none() => {
+			normalized.seven_day = Some(window);
+		},
+		WindowClass::Monthly => {
+			let priority = cursor_monthly_priority(id);
+			if priority < *monthly_priority {
+				normalized.monthly = Some(window);
+				*monthly_priority = priority;
+			}
+		},
+		WindowClass::FiveHour | WindowClass::Daily | WindowClass::SevenDay => {},
+	}
+}
+
+fn classify_window(
+	provider: &str,
+	id: &str,
+	label: Option<&str>,
+	duration: Option<Duration>,
+) -> Option<WindowClass> {
+	let id = id.to_ascii_lowercase();
+	let label = label.unwrap_or_default().to_ascii_lowercase();
+	if has_window_token(&id, "5h")
+		|| duration.is_some_and(|duration| duration_near(duration, Duration::from_secs(5 * 60 * 60)))
+	{
+		return Some(WindowClass::FiveHour);
+	}
+	if ["daily", "24h", "1d"]
+		.into_iter()
+		.any(|name| has_window_token(&id, name) || has_window_token(&label, name))
+		|| duration.is_some_and(|duration| duration_near(duration, Duration::from_secs(24 * 60 * 60)))
+	{
+		return Some(WindowClass::Daily);
+	}
+	if has_window_token(&id, "7d")
+		|| has_window_token(&label, "7d")
+		|| duration
+			.is_some_and(|duration| duration_near(duration, Duration::from_secs(7 * 24 * 60 * 60)))
+	{
+		return Some(WindowClass::SevenDay);
+	}
+	if matches!(provider, "cursor" | "opencode-go")
+		&& ((provider == "cursor" && id.starts_with("cursor:usd:individual-"))
+			|| has_window_token(&id, "monthly")
+			|| has_window_token(&id, "30d")
+			|| duration.is_some_and(|duration| {
+				duration_near(duration, Duration::from_secs(30 * 24 * 60 * 60))
+			})) {
+		return Some(WindowClass::Monthly);
+	}
+	None
+}
+
+fn has_window_token(value: &str, token: &str) -> bool {
+	value == token
+		|| value
+			.split(|character: char| !character.is_ascii_alphanumeric())
+			.any(|part| part == token)
+}
+
+fn duration_near(actual: Duration, expected: Duration) -> bool {
+	actual.abs_diff(expected) <= Duration::from_secs(60)
+}
+
+fn window_scope(
+	provider: &str,
+	active_model: &str,
+	window: &ProviderUsageWindow,
+) -> Option<(Option<Str>, Option<Str>)> {
+	let active_model = active_model
+		.strip_prefix(provider)
+		.and_then(|suffix| suffix.strip_prefix('/'))
+		.unwrap_or(active_model);
+	let note_model = window
+		.notes
+		.iter()
+		.find_map(|note| note.as_str().strip_prefix("model:"))
+		.map(str::trim)
+		.filter(|model| !model.is_empty());
+	let scope = window
+		.scope
+		.as_deref()
+		.map(str::trim)
+		.filter(|scope| !scope.is_empty());
+	let structured_model = scope.and_then(|scope| scope_field(scope, "model"));
+	let structured_tier = scope.and_then(|scope| scope_field(scope, "tier"));
+	let model = note_model.or(structured_model);
+	if let Some(model) = model {
+		if !same_model(model, active_model) {
+			return None;
+		}
+		let tier = structured_tier
+			.map(Str::new)
+			.or_else(|| tier_scope(scope).map(Str::new));
+		return Some((Some(Str::new(active_model)), tier));
+	}
+	let Some(scope) = scope else {
+		return Some((None, None));
+	};
+	if matches!(scope, "shared" | "account" | "default") {
+		return Some((None, None));
+	}
+	if same_model(scope, active_model) {
+		return Some((Some(Str::new(active_model)), None));
+	}
+	if provider == "anthropic"
+		&& active_model
+			.to_ascii_lowercase()
+			.contains(&scope.to_ascii_lowercase())
+	{
+		return Some((Some(Str::new(active_model)), Some(Str::new(scope))));
+	}
+	Some((None, Some(Str::new(scope))))
+}
+
+fn scope_field<'a>(scope: &'a str, key: &str) -> Option<&'a str> {
+	scope
+		.split(';')
+		.find_map(|field| field.trim().strip_prefix(key)?.strip_prefix('='))
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+}
+
+fn tier_scope(scope: Option<&str>) -> Option<&str> {
+	scope.filter(|scope| !matches!(*scope, "shared" | "account" | "default"))
+}
+
+fn same_model(candidate: &str, active: &str) -> bool {
+	candidate.eq_ignore_ascii_case(active)
+		|| candidate
+			.rsplit_once('/')
+			.is_some_and(|(_, tail)| tail.eq_ignore_ascii_case(active))
+		|| active
+			.rsplit_once('/')
+			.is_some_and(|(_, tail)| candidate.eq_ignore_ascii_case(tail))
+}
+
+fn used_fraction(window: &ProviderUsageWindow) -> Option<f64> {
+	let consumed = window.amount.consumed.map(quantity_value)?;
+	let fraction = match window.amount.limit.map(quantity_value) {
+		Some(limit) if limit > 0.0 => consumed / limit,
+		_ => match window.amount.remaining.map(quantity_value) {
+			Some(remaining) if consumed + remaining > 0.0 => consumed / (consumed + remaining),
+			_ if window.amount.unit == UsageUnit::Percent => consumed / 100.0,
+			_ => return None,
+		},
+	};
+	(fraction.is_finite() && fraction >= 0.0).then_some(fraction)
+}
+
+fn quantity_value(quantity: UsageQuantity) -> f64 {
+	quantity.units as f64 / 10_f64.powi(i32::from(quantity.decimal_exponent))
+}
+
+fn rounded_reset(
+	resets_at: Option<SystemTime>,
+	now: SystemTime,
+	class: WindowClass,
+) -> Option<Duration> {
+	let remaining = resets_at?.duration_since(now).unwrap_or_default();
+	let unit = match class {
+		WindowClass::FiveHour | WindowClass::Daily => 60,
+		WindowClass::SevenDay | WindowClass::Monthly => 60 * 60,
+	};
+	let rounded = remaining
+		.as_secs()
+		.saturating_add(unit / 2)
+		.checked_div(unit)?
+		.saturating_mul(unit);
+	Some(Duration::from_secs(rounded))
+}
+
+fn cursor_monthly_priority(id: &str) -> u8 {
+	match id {
+		"cursor:usd:individual-auto" => 0,
+		"cursor:usd:individual-plan" | "cursor:usd:individual-overall" => 1,
+		id if id.starts_with("cursor:usd:individual-") => 2,
+		_ => 3,
+	}
 }
 
 /// Fetches selectable saved Codex-reset accounts for the retained modal.

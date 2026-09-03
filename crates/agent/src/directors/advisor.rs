@@ -36,10 +36,11 @@ use omp_con::Ctx;
 use omp_core::{FastHashMap, FastHashSet, Str};
 use omp_dom::{Dom, Handle, KnownTag, Node, NodeSpec, Op, PropId, PropKey, Tag, Value};
 use omp_inference::{
-	ChatEvent, ChatRequest, ContentPart, ErrorKind, Message, OpaqueJson, Role, Setting, ToolChoice,
-	ToolDefinition, ToolInputConstraint, ToolResultContent,
+	ChatEvent, ChatRequest, Completion, ContentPart, ErrorKind, Message, OpaqueJson, Role, Setting,
+	ToolChoice, ToolDefinition, ToolInputConstraint, ToolResultContent,
 	pi_settings::{AI_ADVISOR_ENABLED, AI_ADVISOR_IMMUNE_TURNS, AI_ADVISOR_SYNC_BACKLOG},
 };
+use omp_journal::data::{ReceiptIdentity, ReceiptRole, TurnReceipt};
 use omp_session::{Session, projection::project_thread};
 use strum::{Display, EnumString};
 
@@ -376,19 +377,21 @@ impl Advisor {
 		};
 		let mut updates = Vec::with_capacity(8);
 		let mut ops = Vec::new();
+		let mut receipt = None;
 		let mut seen = earlier
 			.iter()
 			.map(|note| normalize_note(note.note.as_str()))
 			.collect::<FastHashSet<Str>>();
 		match outcome {
-			Ok(notes) => {
+			Ok(review) => {
+				receipt = review.receipt;
 				updates.push(StateUpdate::new("status", BindValue::Str(Str::new_static("running"))));
 				updates.push(StateUpdate::new("failures", BindValue::Int(0)));
 				updates.push(StateUpdate::new("delivered", BindValue::Int(items.len() as i64)));
 				updates.push(StateUpdate::new("compactions", BindValue::Int(compactions)));
 				// pi `AdvisorEmissionGuard`: noise, session dedupe, one accepted
 				// note per update; a suppressed note never burns the slot.
-				let accepted = notes.into_iter().find(|note| {
+				let accepted = review.notes.into_iter().find(|note| {
 					let key = normalize_note(note.note.as_str());
 					!key.is_empty() && !CONTENT_FREE.contains(&key.as_str()) && seen.insert(key)
 				});
@@ -448,6 +451,9 @@ impl Advisor {
 		}
 		let changed = !ops.is_empty();
 		ops.extend(update_ops(handle, updates));
+		if let Some(receipt) = receipt {
+			cx.session.receipt(receipt)?;
+		}
 		patch(cx.session, "advisor.review", ops)?;
 		Ok(changed)
 	}
@@ -726,30 +732,105 @@ fn text_message(role: Role, text: Str) -> Message {
 	Message { role, content: Arc::from([ContentPart::Text { text, proof: None }]), name: None }
 }
 
-/// Drains the advisor stream into its `advise` calls, in emission order.
+/// One completed advisor review: accepted tool notes plus its independent
+/// billing receipt.
+struct Review {
+	notes:   Vec<Note>,
+	receipt: Option<TurnReceipt>,
+}
+
+/// Drains the advisor stream into its `advise` calls and authoritative
+/// completion receipt.
 async fn collect_notes(
 	mut stream: omp_inference::ChatStream,
-) -> Result<Vec<Note>, omp_inference::Error> {
+) -> Result<Review, omp_inference::Error> {
 	let mut notes = Vec::new();
+	let mut receipt = None;
 	while let Some(event) = stream.next().await {
-		if let ChatEvent::ToolCallReady { call, .. } = event?
-			&& call.name.as_str() == "advise"
-			&& let Some(args) = call.arguments.0.as_object()
-			&& let Some(note) = args.get("note").and_then(serde_json::Value::as_str)
-		{
-			let note = note.trim();
-			if note.is_empty() {
-				continue;
-			}
-			let severity = args
-				.get("severity")
-				.and_then(serde_json::Value::as_str)
-				.and_then(|severity| severity.parse().ok())
-				.unwrap_or_default();
-			notes.push(Note { note: Str::new(note), severity });
+		match event? {
+			ChatEvent::ToolCallReady { call, .. } => {
+				if call.name.as_str() != "advise" {
+					continue;
+				}
+				let Some(args) = call.arguments.0.as_object() else {
+					continue;
+				};
+				let Some(note) = args.get("note").and_then(serde_json::Value::as_str) else {
+					continue;
+				};
+				let note = note.trim();
+				if note.is_empty() {
+					continue;
+				}
+				let severity = args
+					.get("severity")
+					.and_then(serde_json::Value::as_str)
+					.and_then(|severity| severity.parse().ok())
+					.unwrap_or_default();
+				notes.push(Note { note: Str::new(note), severity });
+			},
+			ChatEvent::Completed(completion) => receipt = advisor_receipt(&completion),
+			_ => {},
 		}
 	}
-	Ok(notes)
+	Ok(Review { notes, receipt })
+}
+
+/// Projects a successful auxiliary completion into the separate advisor
+/// `turn.receipt@1`. Successful production completions carry serving
+/// attribution; the selected plan is the credential-free fallback.
+fn advisor_receipt(completion: &Completion) -> Option<TurnReceipt> {
+	let provider = completion
+		.receipt
+		.serving_model
+		.as_ref()
+		.map(|serving| serving.provider.as_str())
+		.or_else(|| {
+			completion
+				.receipt
+				.plan
+				.provider
+				.as_ref()
+				.map(|provider| provider.as_str())
+		})?;
+	let model = completion
+		.receipt
+		.serving_model
+		.as_ref()
+		.map(|serving| serving.model.as_str())
+		.or_else(|| {
+			completion
+				.receipt
+				.plan
+				.model
+				.as_ref()
+				.map(|model| model.as_str())
+		})?;
+	let millis =
+		|duration: std::time::Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+	let usage = completion.usage;
+	Some(TurnReceipt {
+		tokens_in:                   usage.input_tokens,
+		tokens_out:                  usage.output_tokens,
+		cost_nano_usd:               completion
+			.receipt
+			.cost
+			.micro_usd
+			.max(0)
+			.saturating_mul(1_000)
+			.try_into()
+			.unwrap_or(u64::MAX),
+		cache_read:                  usage.cache_read_tokens,
+		cache_write:                 usage.cache_write_tokens,
+		ttft_ms:                     completion.receipt.timings.first_frame.map(millis),
+		duration_ms:                 Some(millis(completion.receipt.timings.total)),
+		premium_requests_millionths: usage.premium_requests_millionths,
+		identity:                    Some(ReceiptIdentity {
+			role:     ReceiptRole::Advisor,
+			provider: Str::new(provider),
+			model:    Str::new(model),
+		}),
+	})
 }
 
 /// pi `renderAdvisorDeltaChunks` + `formatSessionHistoryMarkdown` in watched
@@ -1138,6 +1219,45 @@ fn escape_xml_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn completion_projects_an_independent_advisor_receipt_with_serving_identity() {
+		let mut execution = omp_inference::ExecutionReceipt::default();
+		execution.serving_model = Some(omp_inference::ServingModelAttribution {
+			provider: omp_inference::ProviderId::from("anthropic"),
+			model:    omp_inference::ModelKey::from("claude-sonnet-4-5"),
+			attempt:  0,
+		});
+		execution.cost = omp_inference::Cost::from_micro_usd(80_000);
+		execution.timings.first_frame = Some(std::time::Duration::from_millis(420));
+		execution.timings.total = std::time::Duration::from_millis(1_500);
+		let receipt = advisor_receipt(&Completion {
+			reason:  omp_inference::FinishReason::Stop,
+			blocks:  1,
+			usage:   omp_inference::Usage {
+				input_tokens: 7_000,
+				output_tokens: 80,
+				cache_read_tokens: 2_000,
+				..omp_inference::Usage::default()
+			},
+			receipt: Box::new(execution),
+		})
+		.expect("serving identity");
+		assert_eq!(receipt.cost_nano_usd, 80_000_000);
+		assert_eq!(receipt.tokens_in, 7_000);
+		assert_eq!(receipt.tokens_out, 80);
+		assert_eq!(receipt.cache_read, 2_000);
+		assert_eq!(receipt.ttft_ms, Some(420));
+		assert_eq!(receipt.duration_ms, Some(1_500));
+		assert_eq!(
+			receipt.identity,
+			Some(ReceiptIdentity {
+				role:     ReceiptRole::Advisor,
+				provider: Str::new_static("anthropic"),
+				model:    Str::new_static("claude-sonnet-4-5"),
+			})
+		);
+	}
 
 	#[test]
 	fn channel_follows_pi_delivery_rules() {

@@ -129,6 +129,103 @@ async fn central_truncation_spills_and_notrunc_explicitly_opts_out() {
 }
 
 #[tokio::test]
+async fn central_projection_receipt_authorizes_only_complete_visible_source_rows() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let receipts = Arc::new(Mutex::new(Vec::new()));
+	let output = "alpha\nbravo\ncharlie";
+	let tools = registry([spec("visible", 1, output).visibility_probe(Arc::clone(&receipts))]);
+	let identity = tools.resolved_identity("visible").expect("identity");
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store")).with_limits(
+			10,
+			usize::MAX,
+			Duration::from_secs(5),
+		),
+	);
+	let mut session = session(&directory.path().join("visibility.oms"));
+	let (entry, args) = call(&mut session, &identity, "visible");
+	let report = dispatcher
+		.dispatch(
+			&mut session,
+			request(
+				entry,
+				identity,
+				args,
+				ToolCancellation::ReadOnly(CancelTree::new().begin_turn().read_only_tool()),
+				false,
+			),
+		)
+		.await
+		.expect("visibility dispatch");
+
+	assert_eq!(result_text(&session, "visible")[0], "alpha\nbrav");
+	let receipt = receipts.lock();
+	assert_eq!(receipt.len(), 1);
+	assert_eq!(receipt[0].source_key, "test-source");
+	assert_eq!(receipt[0].line, 1);
+	let artifact = report.spilled.expect("complete output is artifact-backed");
+	assert_eq!(
+		dispatcher
+			.policy()
+			.spill
+			.get(&artifact)
+			.expect("artifact reads")
+			.as_ref(),
+		output.as_bytes()
+	);
+}
+
+#[tokio::test]
+async fn central_line_clamp_never_authorizes_a_partially_visible_source_row() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let receipts = Arc::new(Mutex::new(Vec::new()));
+	let output = "abcdefghijk\nok";
+	let tools = registry([spec("visible-lines", 1, output).visibility_probe(Arc::clone(&receipts))]);
+	let identity = tools.resolved_identity("visible-lines").expect("identity");
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store")).with_limits(
+			64 * 1024,
+			5,
+			Duration::from_secs(5),
+		),
+	);
+	let mut session = session(&directory.path().join("line-visibility.oms"));
+	let (entry, args) = call(&mut session, &identity, "visible-lines");
+	let report = dispatcher
+		.dispatch(
+			&mut session,
+			request(
+				entry,
+				identity,
+				args,
+				ToolCancellation::ReadOnly(CancelTree::new().begin_turn().read_only_tool()),
+				false,
+			),
+		)
+		.await
+		.expect("line visibility dispatch");
+
+	assert_eq!(result_text(&session, "visible-lines")[0], "abcde…\nok");
+	let receipt = receipts.lock();
+	assert_eq!(receipt.len(), 1);
+	assert_eq!(receipt[0].line, 2);
+	let artifact = report
+		.spilled
+		.expect("line-clamped complete output is artifact-backed");
+	assert_eq!(
+		dispatcher
+			.policy()
+			.spill
+			.get(&artifact)
+			.expect("artifact reads")
+			.as_ref(),
+		output.as_bytes()
+	);
+}
+
+#[tokio::test]
 async fn typed_batches_publish_before_streaming_tool_settles() {
 	let directory = tempfile::tempdir().expect("temporary directory");
 	let tools =
@@ -362,16 +459,16 @@ impl ExternalToolExecutor for ScriptedExternal {
 			"text": "external progress"
 		}))
 		.expect("update serializes");
-		let outcome = serde_json::value::to_raw_value(&CallOutcome::<Payload, Fault>::Ok(Payload {
-			text: Str::new_static("external result"),
-		}))
-		.expect("outcome serializes");
+		let outcome = CallOutcome::<serde_json::Value, serde_json::Value>::Ok(
+			serde_json::json!({"text": "external result"}),
+		);
 		Box::pin(futures::stream::iter([
 			ExternalDispatchEvent::Update(update),
 			ExternalDispatchEvent::Done {
 				outcome,
 				parts: vec![Part::Text { text: Str::new_static("external result") }],
 				is_error: false,
+				source_artifact: None,
 			},
 		]))
 	}

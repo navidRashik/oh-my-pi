@@ -22,6 +22,7 @@ use omp_gui::{Effect, HostConfig, Scene, SceneFrame};
 use omp_tui::{
 	Dim, InputEvent, Key, Layer, MouseReport, Notification, OverlayOptions, Size, TerminalEvent,
 	debug::{self, DebugRequest},
+	paste::ClipboardReadOutcome,
 	notify_desktop,
 };
 use smallvec::SmallVec;
@@ -340,7 +341,9 @@ impl GuiScene {
 				let mut input = Vec::new();
 				for event in events {
 					match event {
-						TerminalEvent::Input(event) => input.push(event),
+						TerminalEvent::Input(event) | TerminalEvent::InputWithMeta { event, .. } => {
+							input.push(event)
+						},
 						TerminalEvent::Resize => {
 							let viewport = resize.unwrap_or(self.viewport);
 							Scene::resize(self, viewport, true);
@@ -483,6 +486,11 @@ impl Scene for GuiScene {
 			NativeEffect::Consumed => Effect::Consumed,
 			NativeEffect::Quit => Effect::Quit,
 		}
+	}
+
+	fn clipboard(&mut self, outcome: ClipboardReadOutcome, raw: bool) -> Effect {
+		let effect = self.host.deliver_clipboard(outcome, raw);
+		self.effect(Ok(effect))
 	}
 
 	fn poll(&mut self) -> Effect {

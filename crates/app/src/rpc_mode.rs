@@ -495,6 +495,24 @@ where
 									busy_response(id, command.as_str())
 								} else {
 									match message_text(&request.params) {
+										Some(text)
+											if current
+												.as_ref()
+												.is_some_and(|(_, session)| {
+													omp_agent::pause_state(session.dom()).active
+												}) =>
+										{
+											if let Some((_, session)) = current.as_mut() {
+												omp_agent::queue_prompt(session, Str::new(text), &[])
+													.into_diagnostic()?;
+											}
+											RpcResponse::success(
+												id,
+												command.as_str(),
+												json!({ "accepted": true, "queued": true, "paused": true }),
+											)
+											.into_diagnostic()?
+										},
 										Some(text) => {
 											start_turn(&mut current, &turn_tx, &outgoing_tx, text_input(text))?;
 											turn_running = true;
@@ -523,6 +541,24 @@ where
 									})
 								} else {
 									match message_text(&request.params) {
+										Some(text)
+											if current
+												.as_ref()
+												.is_some_and(|(_, session)| {
+													omp_agent::pause_state(session.dom()).active
+												}) =>
+										{
+											if let Some((_, session)) = current.as_mut() {
+												omp_agent::queue_prompt(session, Str::new(text), &[])
+													.into_diagnostic()?;
+											}
+											RpcResponse::success(
+												id,
+												command.as_str(),
+												json!({ "queued": true, "paused": true }),
+											)
+											.into_diagnostic()?
+										},
 										Some(text) => {
 											start_turn(&mut current, &turn_tx, &outgoing_tx, text_input(text))?;
 											turn_running = true;
@@ -561,6 +597,47 @@ where
 								let _ = mailbox.send(Up::Interrupt);
 								let response = RpcResponse::success_empty(id, command.as_str());
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
+							},
+							"pause" | "resume" => {
+								let active = command == "pause";
+								let mut queued = None;
+								if turn_running {
+									let _ = mailbox.send(Up::Pause { active });
+								} else if let Some((_, session)) = current.as_mut() {
+									let transition =
+										omp_agent::set_paused(session, active).into_diagnostic()?;
+									if !active {
+										queued = omp_agent::pop_queued_prompt(session)
+											.into_diagnostic()?
+											.map(|(text, attachments)| TurnInput { text, attachments });
+									}
+									let response = RpcResponse::success(
+										id.clone(),
+										command.as_str(),
+										json!({
+											"paused": transition.state.active,
+											"durationMs": transition.state.duration_ms,
+										}),
+									)
+									.into_diagnostic()?;
+									outgoing_tx.send(Outgoing::Frame(
+										serde_json::to_value(response).into_diagnostic()?,
+									)).into_diagnostic()?;
+								}
+								if turn_running {
+									let response = RpcResponse::success(
+										id,
+										command.as_str(),
+										json!({ "paused": active }),
+									).into_diagnostic()?;
+									outgoing_tx.send(Outgoing::Frame(
+										serde_json::to_value(response).into_diagnostic()?,
+									)).into_diagnostic()?;
+								}
+								if let Some(input) = queued {
+									start_turn(&mut current, &turn_tx, &outgoing_tx, input)?;
+									turn_running = true;
+								}
 							},
 							"cancel" => {
 								let _ = mailbox.send(Up::Cancel);

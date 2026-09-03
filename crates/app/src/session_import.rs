@@ -4,7 +4,7 @@ use std::{
 	fs,
 	io::{self, BufRead, BufReader, IsTerminal as _, Write},
 	path::{Path, PathBuf},
-	time::SystemTime,
+	time::{SystemTime, UNIX_EPOCH},
 };
 
 use miette::{IntoDiagnostic as _, miette};
@@ -16,12 +16,53 @@ use serde_json::Value;
 use crate::cli::ChatArgs;
 
 /// Foreign transcript dialect accepted by the one-shot importer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
 pub enum ForeignFormat {
 	/// Claude Code JSON-line events.
 	Claude,
 	/// Codex CLI rollout JSON-line events.
 	Codex,
+}
+
+/// Lightweight metadata for one importable foreign transcript.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForeignCandidate {
+	/// Stable source-local session identity.
+	pub id:            Str,
+	/// Source transcript path.
+	pub path:          PathBuf,
+	/// Project directory recorded by the source, or its containing directory.
+	pub cwd:           PathBuf,
+	/// Source-provided title, when present.
+	pub title:         Option<Str>,
+	/// Creation time, Unix milliseconds.
+	pub created_ms:    u64,
+	/// Last modification, Unix milliseconds.
+	pub modified_ms:   u64,
+	/// Exact user and assistant message count for transcripts small enough to
+	/// index eagerly.
+	pub messages:      u32,
+	/// First user message, when it occurs in the indexed prefix.
+	pub first_message: Option<Str>,
+}
+
+impl From<omp_chat::overlays::services::ForeignSessionSource> for ForeignFormat {
+	fn from(source: omp_chat::overlays::services::ForeignSessionSource) -> Self {
+		match source {
+			omp_chat::overlays::services::ForeignSessionSource::Claude => Self::Claude,
+			omp_chat::overlays::services::ForeignSessionSource::Codex => Self::Codex,
+		}
+	}
+}
+
+/// Enumerates transcripts for `format`, newest first, without materializing a
+/// native session.
+pub fn candidates(format: ForeignFormat) -> miette::Result<Vec<ForeignCandidate>> {
+	let root = foreign_root(format)?;
+	jsonl_candidates(&root)?
+		.into_iter()
+		.map(|path| inspect_candidate(format, path, &root))
+		.collect()
 }
 
 /// Lets the operator select a requested foreign session, imports it, and
@@ -32,22 +73,13 @@ pub(crate) fn prepare(args: &mut ChatArgs) -> miette::Result<()> {
 	} else {
 		ForeignFormat::Codex
 	};
-	let home = std::env::var_os("HOME")
-		.map(PathBuf::from)
-		.ok_or_else(|| miette!("HOME is unset"))?;
-	let root = match format {
-		ForeignFormat::Claude => home.join(".claude/projects"),
-		ForeignFormat::Codex => home.join(".codex/sessions"),
-	};
+	let root = foreign_root(format)?;
 	let candidates = jsonl_candidates(&root)?;
 	let source = match candidates.as_slice() {
 		[] => {
 			return Err(miette!(
 				"no importable {} sessions were found under {}",
-				match format {
-					ForeignFormat::Claude => "Claude Code",
-					ForeignFormat::Codex => "Codex",
-				},
+				format,
 				root.display(),
 			));
 		},
@@ -94,6 +126,49 @@ pub(crate) fn prepare(args: &mut ChatArgs) -> miette::Result<()> {
 	args.from_claude = false;
 	args.from_codex = false;
 	Ok(())
+}
+
+/// Imports a picker selection into a fresh native journal.
+///
+/// The selected path is revalidated against the source authority. Conversion
+/// happens in a hidden sibling file and becomes visible only after an atomic
+/// rename, so a failed import never leaves a resumable partial journal.
+pub fn import_selected(
+	format: ForeignFormat,
+	source: &Path,
+	destination: &Path,
+) -> miette::Result<PathBuf> {
+	let source = validate_selection(format, source)?;
+	if destination.extension().and_then(|value| value.to_str()) != Some("oms") {
+		return Err(miette!("native session destination must use the .oms extension"));
+	}
+	if destination.exists() {
+		return Err(miette!("native session destination already exists"));
+	}
+	let parent = destination
+		.parent()
+		.ok_or_else(|| miette!("native session destination has no parent directory"))?;
+	fs::create_dir_all(parent).into_diagnostic()?;
+	let staging = parent.join(format!(".{}.importing.oms", omp_core::Ulid::generate()));
+	let imported = import_file(format, &source, &staging);
+	let count = match imported {
+		Ok(count) => count,
+		Err(error) => {
+			let _ = fs::remove_file(&staging);
+			return Err(error);
+		},
+	};
+	if count == 0 {
+		let _ = fs::remove_file(&staging);
+		return Err(miette!(
+			"Selected {format} session contains no importable user or assistant messages"
+		));
+	}
+	if let Err(source) = fs::rename(&staging, destination) {
+		let _ = fs::remove_file(&staging);
+		return Err(source).into_diagnostic();
+	}
+	Ok(destination.to_path_buf())
 }
 
 /// Imports one foreign JSONL fixture into a replayable `.oms` journal.
@@ -179,8 +254,34 @@ pub fn import_file(
 						})
 					})
 					.ok_or_else(|| miette!("imported assistant node is absent"))?;
+				session
+					.patch(Txn {
+						cause: session
+							.head()
+							.ok_or_else(|| miette!("import head is absent"))?,
+						label: Some(Str::new_static("assistant.content")),
+						ops:   vec![Op::Ins {
+							parent: assistant,
+							after:  None,
+							node:   omp_dom::NodeSpec::new(omp_dom::Tag::Custom(Str::new_static(
+								omp_session::ASSISTANT_CONTENT_TAG,
+							)))
+							.with_prop(PropId::Kind, DomValue::Str(Str::new_static("text")))
+							.with_prop(
+								PropKey::Custom(Str::new_static(omp_session::PROVIDER_BLOCK_INDEX_PROP)),
+								DomValue::Int(0),
+							)
+							.with_prop(PropId::Text, DomValue::Str(Str::new_static(""))),
+						}],
+					})
+					.into_diagnostic()?;
+				let content = *session
+					.dom()
+					.children(assistant)
+					.last()
+					.ok_or_else(|| miette!("imported assistant content node is absent"))?;
 				let sid = session
-					.stream_open(assistant, PropId::Text.into())
+					.stream_open(content, PropId::Text.into())
 					.into_diagnostic()?;
 				session
 					.stream_append(sid, text.as_str())
@@ -194,6 +295,128 @@ pub fn import_file(
 	}
 	session.process_exit().into_diagnostic()?;
 	Ok(messages.len())
+}
+
+fn foreign_root(format: ForeignFormat) -> miette::Result<PathBuf> {
+	let home = std::env::var_os("HOME")
+		.map(PathBuf::from)
+		.ok_or_else(|| miette!("HOME is unset"))?;
+	Ok(match format {
+		ForeignFormat::Claude => home.join(".claude/projects"),
+		ForeignFormat::Codex => home.join(".codex/sessions"),
+	})
+}
+
+fn validate_selection(format: ForeignFormat, source: &Path) -> miette::Result<PathBuf> {
+	let source = match fs::canonicalize(source) {
+		Ok(path) => path,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {
+			return Err(miette!("Selected {format} session is no longer available"));
+		},
+		Err(error) => return Err(error).into_diagnostic(),
+	};
+	let root = match fs::canonicalize(foreign_root(format)?) {
+		Ok(path) => path,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {
+			return Err(miette!("Selected {format} session is no longer available"));
+		},
+		Err(error) => return Err(error).into_diagnostic(),
+	};
+	if source.extension().and_then(|value| value.to_str()) != Some("jsonl")
+		|| !source.starts_with(&root)
+	{
+		return Err(miette!(
+			"Selected {format} session is outside the {format} transcript directory"
+		));
+	}
+	Ok(source)
+}
+
+fn inspect_candidate(
+	format: ForeignFormat,
+	path: PathBuf,
+	root: &Path,
+) -> miette::Result<ForeignCandidate> {
+	const MAX_EAGER_INDEX_BYTES: u64 = 1024 * 1024;
+
+	let metadata = fs::metadata(&path).into_diagnostic()?;
+	let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+	let created = metadata.created().unwrap_or(modified);
+	let mut candidate = ForeignCandidate {
+		id: Str::new(
+			path
+				.file_stem()
+				.and_then(|value| value.to_str())
+				.unwrap_or_default(),
+		),
+		cwd: path.parent().unwrap_or(root).to_path_buf(),
+		path,
+		title: None,
+		created_ms: system_time_millis(created),
+		modified_ms: system_time_millis(modified),
+		messages: 0,
+		first_message: None,
+	};
+	let exact_count = metadata.len() <= MAX_EAGER_INDEX_BYTES;
+	let input = BufReader::new(fs::File::open(&candidate.path).into_diagnostic()?);
+	let mut indexed_bytes = 0_u64;
+	for line in input.lines() {
+		let line = line.into_diagnostic()?;
+		indexed_bytes = indexed_bytes.saturating_add(line.len() as u64 + 1);
+		if !exact_count && indexed_bytes > MAX_EAGER_INDEX_BYTES {
+			break;
+		}
+		let Ok(value) = serde_json::from_str::<Value>(&line) else {
+			continue;
+		};
+		let payload = value.get("payload").unwrap_or(&value);
+		if let Some(id) = value.get("sessionId").and_then(Value::as_str).or_else(|| {
+			(value.get("type").and_then(Value::as_str) == Some("session_meta"))
+				.then(|| payload.get("id").and_then(Value::as_str))
+				.flatten()
+		}) {
+			candidate.id = Str::new(id);
+		}
+		if let Some(cwd) = value
+			.get("cwd")
+			.and_then(Value::as_str)
+			.or_else(|| payload.get("cwd").and_then(Value::as_str))
+		{
+			candidate.cwd = PathBuf::from(cwd);
+		}
+		if candidate.title.is_none() {
+			candidate.title = value
+				.get("summary")
+				.and_then(Value::as_str)
+				.or_else(|| value.get("title").and_then(Value::as_str))
+				.or_else(|| payload.get("title").and_then(Value::as_str))
+				.filter(|title| !title.trim().is_empty())
+				.map(Str::new);
+		}
+		if let Some((role, text)) = foreign_message(format, &value) {
+			candidate.messages = candidate.messages.saturating_add(1);
+			if role == "user" && candidate.first_message.is_none() && !text.trim().is_empty() {
+				candidate.first_message = Some(text);
+			}
+		}
+		if !exact_count && candidate.first_message.is_some() {
+			candidate.messages = 0;
+			break;
+		}
+	}
+	if !exact_count {
+		candidate.messages = 0;
+	}
+	Ok(candidate)
+}
+
+fn system_time_millis(time: SystemTime) -> u64 {
+	time
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX)
 }
 
 fn foreign_message(format: ForeignFormat, value: &Value) -> Option<(&'static str, Str)> {

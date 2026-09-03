@@ -246,25 +246,21 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "theme.dark",
-		coverage:    Coverage::Deviation,
-		convar:      "",
-		declaration: "",
-		consumer:    "",
-		adr:         "docs/adr/0032-presentation-policy-in-the-renderer.md",
-		quote:       "Theme, charset, and appearance (dark/light) reach every component through one \
-		              ambient context supplied by the renderer, swappable at run time without \
-		              rebuilding the tree.",
+		coverage:    Coverage::Mapped,
+		convar:      "cl_theme_dark",
+		declaration: "crates/chat/src/settings.rs",
+		consumer:    "crates/app/src/chat_cmd.rs",
+		adr:         "",
+		quote:       "",
 	},
 	Row {
 		key:         "theme.light",
-		coverage:    Coverage::Deviation,
-		convar:      "",
-		declaration: "",
-		consumer:    "",
-		adr:         "docs/adr/0032-presentation-policy-in-the-renderer.md",
-		quote:       "Theme, charset, and appearance (dark/light) reach every component through one \
-		              ambient context supplied by the renderer, swappable at run time without \
-		              rebuilding the tree.",
+		coverage:    Coverage::Declared,
+		convar:      "cl_theme_light",
+		declaration: "crates/chat/src/settings.rs",
+		consumer:    "UNCONSUMED: terminal appearance switching remains separately audited",
+		adr:         "",
+		quote:       "",
 	},
 	Row {
 		key:         "symbolPreset",
@@ -592,10 +588,10 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "terminal.showProgress",
-		coverage:    Coverage::Declared,
-		convar:      "cl_terminal_show_progress",
-		declaration: "crates/chat/src/settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		coverage:    Coverage::Mapped,
+		convar:      "cl_show_progress",
+		declaration: "crates/chat/src/chrome.rs",
+		consumer:    "crates/chat/src/host.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -618,6 +614,15 @@ const ROWS: &[Row] = &[
 		quote:       "",
 	},
 	Row {
+		key:         "tui.reactions",
+		coverage:    Coverage::Declared,
+		convar:      "cl_tui_reactions",
+		declaration: "crates/chat/src/settings.rs",
+		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		adr:         "",
+		quote:       "",
+	},
+	Row {
 		key:         "tui.codexResetFireworks",
 		coverage:    Coverage::Mapped,
 		convar:      "cl_codex_fireworks",
@@ -628,10 +633,10 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "tui.titleState",
-		coverage:    Coverage::Declared,
-		convar:      "cl_tui_title_state",
-		declaration: "crates/chat/src/settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		coverage:    Coverage::Mapped,
+		convar:      "cl_title_state",
+		declaration: "crates/chat/src/chrome.rs",
+		consumer:    "crates/chat/src/host.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -857,6 +862,15 @@ const ROWS: &[Row] = &[
 		convar:      "ai_include_workspace_tree",
 		declaration: "crates/catalog/src/pi_settings.rs",
 		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		adr:         "",
+		quote:       "",
+	},
+	Row {
+		key:         "skillful",
+		coverage:    Coverage::Mapped,
+		convar:      "ai_skillful",
+		declaration: "crates/con/src/builtins.rs",
+		consumer:    "crates/agent/src/prompt/projection.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -3312,30 +3326,36 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "tools.xdev",
-		coverage:    Coverage::Declared,
-		convar:      "sv_tools_xdev",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
-		adr:         "",
-		quote:       "",
+		coverage:    Coverage::Deviation,
+		convar:      "",
+		declaration: "",
+		consumer:    "",
+		adr:         "docs/adr/0025-long-tail-behind-stable-surfaces.md",
+		quote:       "`dyn` is a builtin of the in-process shell (0028), not a real CLI, and is \
+		              also exposed as a Python function in `Eval` (0036). It is the only discovery \
+		              mechanism for non-roster tools.",
 	},
 	Row {
 		key:         "tools.xdevDocs",
-		coverage:    Coverage::Declared,
-		convar:      "sv_tools_xdev_docs",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
-		adr:         "",
-		quote:       "",
+		coverage:    Coverage::Deviation,
+		convar:      "",
+		declaration: "",
+		consumer:    "",
+		adr:         "docs/adr/0025-long-tail-behind-stable-surfaces.md",
+		quote:       "`dyn` is a builtin of the in-process shell (0028), not a real CLI, and is \
+		              also exposed as a Python function in `Eval` (0036). It is the only discovery \
+		              mechanism for non-roster tools.",
 	},
 	Row {
 		key:         "tools.xdevInlineDevices",
-		coverage:    Coverage::Declared,
-		convar:      "sv_tools_xdev_inline_devices",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
-		adr:         "",
-		quote:       "",
+		coverage:    Coverage::Deviation,
+		convar:      "",
+		declaration: "",
+		consumer:    "",
+		adr:         "docs/adr/0025-long-tail-behind-stable-surfaces.md",
+		quote:       "`dyn` is a builtin of the in-process shell (0028), not a real CLI, and is \
+		              also exposed as a Python function in `Eval` (0036). It is the only discovery \
+		              mechanism for non-roster tools.",
 	},
 	Row {
 		key:         "mcp.enableProjectConfig",
@@ -3893,13 +3913,10 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "live.voice",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "cl_live_voice",
 		declaration: "crates/app/src/voice/settings.rs",
-		consumer:    "UNCONSUMED: Convar cl_live_voice is declared in \
-		              app/src/voice/settings.rs:214, but no realtime voice streaming runtime reads \
-		              it (retained only in speech_catalog string const). A declared but unused \
-		              convar is wrong.",
+		consumer:    "crates/app/src/chat_voice.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -4469,7 +4486,7 @@ fn normalized(text: &str) -> String {
 }
 
 #[test]
-fn all_485_pi_settings_have_literal_control_plane_dispositions() {
+fn all_488_pi_settings_have_literal_control_plane_dispositions() {
 	let force_ctx = omp_con::Ctx::new();
 	let _force_link = [
 		omp_app::settings::LEGACY_CONVAR_MAPPINGS.len(),
@@ -4480,7 +4497,7 @@ fn all_485_pi_settings_have_literal_control_plane_dispositions() {
 		omp_catalog::pi_settings::LEGACY_CONVAR_MAPPINGS.len(),
 		omp_inference::pi_settings::LEGACY_CONVAR_MAPPINGS.len(),
 	];
-	assert_eq!(ROWS.len(), 485, "pi inventory must stay literal and complete");
+	assert_eq!(ROWS.len(), 488, "pi inventory must stay literal and complete");
 	let mut keys = BTreeSet::new();
 	let ctx = force_ctx;
 	for row in ROWS {
@@ -4570,7 +4587,7 @@ fn inventory_has_no_missing_or_wrong_status_variant() {
 			.iter()
 			.filter(|row| matches!(row.coverage, Coverage::Deviation))
 			.count(),
-		30
+		33
 	);
 }
 
@@ -4592,6 +4609,8 @@ struct PiUiEntry {
 	description: String,
 	warning:     Option<String>,
 	options:     Vec<String>,
+	#[serde(default)]
+	condition:   Option<String>,
 }
 
 fn current_pi_ui() -> Option<PiUi> {
@@ -4623,7 +4642,7 @@ for (const tab of SETTING_TABS) {
       : (getType(path) === "enum" ? [...(getEnumValues(path) ?? [])] : []);
     entries.push({
       path, tab, group: ui.group, label: ui.label, description: ui.description,
-      warning: ui.warning, options
+      warning: ui.warning, options, condition: ui.condition
     });
   }
 }
@@ -4640,6 +4659,137 @@ console.log(JSON.stringify({ tabs: SETTING_TABS, groups: TAB_GROUPS, entries }))
 		String::from_utf8_lossy(&output.stderr)
 	);
 	Some(serde_json::from_slice(&output.stdout).expect("pi metadata json"))
+}
+
+fn projected_ui_entry(entry: &omp_con::UiSpec) -> PiUiEntry {
+	let tab: &'static str = entry.tab.into();
+	let options = match entry.widget {
+		omp_con::UiWidget::Enum(values) => values.iter().map(|value| (*value).to_owned()).collect(),
+		omp_con::UiWidget::Submenu(options) | omp_con::UiWidget::MultiSelect { options, .. } => {
+			options
+				.iter()
+				.map(|option| option.value.to_owned())
+				.collect()
+		},
+		omp_con::UiWidget::Boolean
+		| omp_con::UiWidget::RuntimeSubmenu(_)
+		| omp_con::UiWidget::ProviderLimits
+		| omp_con::UiWidget::ConfigOnly
+		| omp_con::UiWidget::Text { .. } => Vec::new(),
+	};
+	PiUiEntry {
+		path: entry.pi_path.to_owned(),
+		convar: entry.convar.to_owned(),
+		tab: tab.to_owned(),
+		group: entry.group.to_owned(),
+		label: entry.label.to_owned(),
+		description: entry.description.to_owned(),
+		warning: entry.warning.map(str::to_owned),
+		options,
+		condition: entry.condition.map(|condition| {
+			let name: &'static str = condition.into();
+			name.to_owned()
+		}),
+	}
+}
+
+#[test]
+fn complete_interaction_tab_mechanically_matches_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| !matches!(row.coverage, Coverage::Deviation))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	let expected = pi
+		.entries
+		.into_iter()
+		.filter(|entry| entry.tab == "interaction")
+		.map(|mut entry| {
+			entry.convar = mappings[entry.path.as_str()].to_owned();
+			entry
+		})
+		.collect::<Vec<_>>();
+	let actual = omp_con::builtin_ui_entries()
+		.filter(|entry| entry.tab == omp_con::SettingTab::Interaction)
+		.map(projected_ui_entry)
+		.collect::<Vec<_>>();
+	assert_eq!(actual.len(), 44);
+	assert_eq!(actual, expected);
+}
+
+#[test]
+fn complete_context_tab_mechanically_matches_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| !matches!(row.coverage, Coverage::Deviation))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	let expected = pi
+		.entries
+		.into_iter()
+		.filter(|entry| entry.tab == "context")
+		.map(|mut entry| {
+			entry.convar = mappings[entry.path.as_str()].to_owned();
+			entry
+		})
+		.collect::<Vec<_>>();
+	let actual = omp_con::builtin_ui_entries()
+		.filter(|entry| {
+			entry.tab == omp_con::SettingTab::Context
+				&& !matches!(entry.widget, omp_con::UiWidget::ConfigOnly)
+		})
+		.map(projected_ui_entry)
+		.collect::<Vec<_>>();
+	assert_eq!(actual.len(), 26);
+	assert_eq!(actual, expected);
+}
+
+#[test]
+fn complete_files_tab_mechanically_matches_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| !matches!(row.coverage, Coverage::Deviation))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	let expected = pi
+		.entries
+		.into_iter()
+		.filter(|entry| entry.tab == "files" && mappings.contains_key(entry.path.as_str()))
+		.map(|mut entry| {
+			entry.convar = mappings[entry.path.as_str()].to_owned();
+			entry
+		})
+		.collect::<Vec<_>>();
+	let entries = omp_con::builtin_ui_entries()
+		.filter(|entry| entry.tab == omp_con::SettingTab::Files)
+		.collect::<Vec<_>>();
+	let actual = entries
+		.iter()
+		.filter(|entry| !matches!(entry.widget, omp_con::UiWidget::ConfigOnly))
+		.map(|entry| projected_ui_entry(entry))
+		.collect::<Vec<_>>();
+	assert_eq!(entries.len(), 25);
+	assert_eq!(
+		entries
+			.iter()
+			.filter(|entry| matches!(entry.widget, omp_con::UiWidget::ConfigOnly))
+			.count(),
+		5
+	);
+	assert_eq!(actual.len(), 20);
+	assert_eq!(actual, expected);
 }
 
 #[test]
@@ -4660,30 +4810,11 @@ fn curated_settings_metadata_mechanically_matches_current_pi_for_every_mapped_se
 	}
 
 	let actual = omp_con::builtin_ui_entries()
-		.map(|entry| {
-			let tab: &'static str = entry.tab.into();
-			let options = match entry.widget {
-				omp_con::UiWidget::Enum(values) => {
-					values.iter().map(|value| (*value).to_owned()).collect()
-				},
-				omp_con::UiWidget::Submenu(options)
-				| omp_con::UiWidget::MultiSelect { options, .. } => options
-					.iter()
-					.map(|option| option.value.to_owned())
-					.collect(),
-				omp_con::UiWidget::Boolean | omp_con::UiWidget::Text { .. } => Vec::new(),
-			};
-			PiUiEntry {
-				path: entry.pi_path.to_owned(),
-				convar: entry.convar.to_owned(),
-				tab: tab.to_owned(),
-				group: entry.group.to_owned(),
-				label: entry.label.to_owned(),
-				description: entry.description.to_owned(),
-				warning: entry.warning.map(str::to_owned),
-				options,
-			}
+		.filter(|entry| {
+			mappings.contains_key(entry.pi_path)
+				&& !matches!(entry.widget, omp_con::UiWidget::ConfigOnly)
 		})
+		.map(projected_ui_entry)
 		.collect::<Vec<_>>();
 	assert_eq!(actual, pi.entries);
 	assert_eq!(actual.len(), 120);

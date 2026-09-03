@@ -115,7 +115,8 @@ impl Director for ForceTool {
 		req.tool_choice = Setting::Require(ToolChoice::Named(self.name.clone()));
 		req.forced_call = Some(ForcedCall {
 			non_compliant_turns: u8::try_from(self.attempts).unwrap_or(u8::MAX),
-			escalations_left:    u8::from(self.attempts >= self.retries),
+			escalations_left:    u8::try_from(self.retries.saturating_sub(self.attempts))
+				.unwrap_or(u8::MAX),
 		});
 	}
 

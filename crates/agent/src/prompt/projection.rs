@@ -35,6 +35,9 @@ pub fn template_props(dom: &Dom) -> Props {
 		props.set("tools", roster.iter().cloned().collect::<Vec<_>>());
 		props.set("tool_inventory", compact_tool_inventory(&roster));
 	}
+	if let Some(skillful) = session_bool(dom, omp_con::AI_SKILLFUL.name()) {
+		props.set("include_skills", skillful);
+	}
 	props.set(
 		"turn_number",
 		i64::try_from(omp_session::components::lifecycle::turn_number(dom)).unwrap_or(i64::MAX),
@@ -94,6 +97,22 @@ fn inline_blob(
 	}
 	blob.inline = blobs.get(&reference)?;
 	Ok(())
+}
+
+/// Reads one journaled boolean convar directly from the authoritative DOM.
+///
+/// `Value::Display` uses command-stream spelling (`1`/`0`), while imported
+/// sessions may contain the equivalent words.
+fn session_bool(dom: &Dom, name: &str) -> Option<bool> {
+	omp_session::components::con::con_writes(dom)
+		.into_iter()
+		.rev()
+		.find(|write| write.name == name)
+		.and_then(|write| match write.value.as_str() {
+			"1" | "true" | "on" => Some(true),
+			"0" | "false" | "off" => Some(false),
+			_ => None,
+		})
 }
 
 fn default_props() -> Props {

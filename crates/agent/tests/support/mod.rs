@@ -26,8 +26,9 @@ use omp_journal::{Entry, EntryId, Journal, kind};
 use omp_proto::thread::v1::{item, part};
 use omp_session::{ComponentRegistry, Session, project_thread};
 use omp_tool::{
-	Claims, Constraint, Effects, Ev, IncomingParams, Part, Precedence, Presentation, PromptCaps,
-	Registry, Rev, Tool, ToolIdentity, ToolSpec, ToolTerminal,
+	Claims, Constraint, Effects, Ev, IncomingParams, Part, Precedence, Presentation,
+	ProjectionAuthorizationError, ProjectionSpan, PromptCaps, PromptProjection, Registry, Rev, Tool,
+	ToolIdentity, ToolSpec, ToolTerminal, VisibilityReceipt, VisibleSourceLine,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -44,13 +45,14 @@ pub struct Fault {
 }
 
 pub struct TestTool {
-	spec:    ToolSpec,
-	output:  Str,
-	update:  Option<Str>,
-	delay:   Duration,
-	barrier: Option<Arc<tokio::sync::Barrier>>,
-	started: Option<Arc<AtomicUsize>>,
-	fault:   bool,
+	spec:       ToolSpec,
+	output:     Str,
+	update:     Option<Str>,
+	delay:      Duration,
+	barrier:    Option<Arc<tokio::sync::Barrier>>,
+	started:    Option<Arc<AtomicUsize>>,
+	visibility: Option<Arc<Mutex<Vec<VisibleSourceLine>>>>,
+	fault:      bool,
 }
 
 pub fn tool_spec(name: &str, revision: u16) -> ToolSpec {
@@ -73,13 +75,14 @@ pub fn spec_family(name: &str, family: &str, revision: u16, output: &str) -> Tes
 	let mut tool = tool_spec(name, revision);
 	tool.rev.family = Str::new(family);
 	TestTool {
-		spec:    tool,
-		output:  Str::new(output),
-		update:  None,
-		delay:   Duration::ZERO,
-		barrier: None,
-		started: None,
-		fault:   false,
+		spec:       tool,
+		output:     Str::new(output),
+		update:     None,
+		delay:      Duration::ZERO,
+		barrier:    None,
+		started:    None,
+		visibility: None,
+		fault:      false,
 	}
 }
 
@@ -102,6 +105,11 @@ impl TestTool {
 
 	pub const fn faulting(mut self) -> Self {
 		self.fault = true;
+		self
+	}
+
+	pub fn visibility_probe(mut self, receipts: Arc<Mutex<Vec<VisibleSourceLine>>>) -> Self {
+		self.visibility = Some(receipts);
 		self
 	}
 }
@@ -154,6 +162,51 @@ impl Tool for TestTool {
 			Err(fault) => fault.message.clone(),
 		};
 		vec![Part::Text { text }]
+	}
+
+	fn projection(
+		&self,
+		view: Result<&Self::Payload, &Self::Fault>,
+		caps: &PromptCaps,
+	) -> PromptProjection {
+		let parts = self.prompt(view, caps);
+		let visibility = if self.visibility.is_some()
+			&& let [Part::Text { text }] = parts.as_slice()
+		{
+			let mut offset = 0;
+			text
+				.split_inclusive('\n')
+				.enumerate()
+				.map(|(index, row)| {
+					let content_len = row
+						.strip_suffix('\n')
+						.map_or(row.len(), |content| content.len());
+					let span = ProjectionSpan {
+						part:       0,
+						start_byte: offset,
+						end_byte:   offset.saturating_add(content_len),
+						source_key: Str::new_static("test-source"),
+						line:       index.saturating_add(1),
+					};
+					offset = offset.saturating_add(row.len());
+					span
+				})
+				.collect()
+		} else {
+			Vec::new()
+		};
+		PromptProjection { parts, visibility }
+	}
+
+	fn authorize_visibility(
+		&self,
+		_view: Result<&Self::Payload, &Self::Fault>,
+		receipt: &VisibilityReceipt,
+	) -> Result<(), ProjectionAuthorizationError> {
+		if let Some(receipts) = &self.visibility {
+			receipts.lock().extend(receipt.lines.iter().cloned());
+		}
+		Ok(())
 	}
 }
 

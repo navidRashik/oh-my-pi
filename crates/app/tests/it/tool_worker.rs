@@ -6,7 +6,7 @@ use std::{
 	io::Write as _,
 	path::{Path, PathBuf},
 	process::{Command, Stdio},
-	sync::Arc,
+	sync::{Arc, LazyLock},
 	time::{Duration, Instant},
 };
 
@@ -18,6 +18,7 @@ use omp_core::{
 use omp_envd::{
 	DeviceCatalogObserver, DeviceControlFactory, DeviceInvocationAdmission,
 	DynamicDeviceCatalogEntry, RegistryControlFactory,
+	blobs::{BlobHost, BlobId},
 	exthost::{
 		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
 		control::{
@@ -43,7 +44,7 @@ use omp_proto::{
 	thread::v1::{Blob, Part, part},
 	toolhost::v1::{
 		AdmitExtensions, AdmittedExtension, ArgIssue, HostFrame, LifecycleHostEnvelope, OutcomeKind,
-		PullReply, PullRequest, ToolComplete, host_frame, lifecycle_host_envelope,
+		PullReply, PullRequest, ToolResultStart, host_frame, lifecycle_host_envelope,
 	},
 };
 use serde_json::{Value, json};
@@ -178,63 +179,71 @@ OMP_TOOLS = [{
 
 #[test]
 fn completion_preserves_all_outcome_branches_and_presence_rules() {
-	let legacy = WorkerCompletion::try_from(ToolComplete {
-		call_id: "legacy".into(),
-		details_json: Bytes::from_static(b"{}"),
-		is_error: true,
+	let blob = || Blob {
+		hash: Bytes::from_static(&[7; 32]),
+		mime: "application/json".into(),
+		size: 2,
 		..Default::default()
-	})
-	.expect("legacy completion");
-	assert_eq!(legacy.kind, WorkerOutcomeKind::Faulted);
-
-	let rejected = WorkerCompletion::try_from(ToolComplete {
-		call_id: "args".into(),
-		details_json: Bytes::from_static(b"null"),
-		kind: OutcomeKind::ArgsRejected.into(),
-		args_issue: Some(ArgIssue {
-			path: vec!["count".into()],
-			expected: "integer".into(),
-			kind: "type".into(),
+	};
+	let faulted = WorkerCompletion::from_streamed_result(
+		ToolResultStart {
+			call_id: "faulted".into(),
+			kind: OutcomeKind::Faulted.into(),
 			..Default::default()
-		}),
-		..Default::default()
-	})
+		},
+		blob(),
+	)
+	.expect("typed fault completion");
+	assert_eq!(faulted.kind, WorkerOutcomeKind::Faulted);
+	assert!(faulted.details_json.is_none());
+	assert!(faulted.details_blob.is_some());
+
+	let rejected = WorkerCompletion::from_streamed_result(
+		ToolResultStart {
+			call_id: "args".into(),
+			kind: OutcomeKind::ArgsRejected.into(),
+			args_issue: Some(ArgIssue {
+				path: vec!["count".into()],
+				expected: "integer".into(),
+				kind: "type".into(),
+				..Default::default()
+			}),
+			..Default::default()
+		},
+		blob(),
+	)
 	.expect("structured argument rejection");
 	assert_eq!(rejected.kind, WorkerOutcomeKind::ArgsRejected);
 	assert!(rejected.args_issue.is_some());
 
-	let aborted = WorkerCompletion::try_from(ToolComplete {
-		call_id: "aborted".into(),
-		kind: OutcomeKind::Aborted.into(),
-		details_blob: Some(Blob {
-			hash: Bytes::from_static(&[7; 32]),
-			mime: "application/json".into(),
-			size: 2,
+	let aborted = WorkerCompletion::from_streamed_result(
+		ToolResultStart {
+			call_id: "aborted".into(),
+			kind: OutcomeKind::Aborted.into(),
 			..Default::default()
-		}),
-		..Default::default()
-	})
+		},
+		blob(),
+	)
 	.expect("spilled abort");
 	assert_eq!(aborted.kind, WorkerOutcomeKind::Aborted);
-	assert!(aborted.details_json.is_none());
-	assert!(aborted.details_blob.is_some());
 
 	assert!(
-		WorkerCompletion::try_from(ToolComplete {
-			call_id: "xor".into(),
-			details_json: Bytes::from_static(b"{}"),
-			details_blob: Some(Blob::default()),
-			..Default::default()
-		})
+		WorkerCompletion::from_streamed_result(
+			ToolResultStart { call_id: "unspecified".into(), ..Default::default() },
+			blob(),
+		)
 		.is_err()
 	);
 	assert!(
-		WorkerCompletion::try_from(ToolComplete {
-			call_id: "part".into(),
-			parts: vec![Part { kind: None }],
-			details_json: Bytes::from_static(b"{}"),
-			..Default::default()
-		})
+		WorkerCompletion::from_streamed_result(
+			ToolResultStart {
+				call_id: "part".into(),
+				parts: vec![Part { kind: None }],
+				kind: OutcomeKind::Ok.into(),
+				..Default::default()
+			},
+			blob(),
+		)
 		.is_err()
 	);
 }
@@ -506,14 +515,10 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 	assert_eq!(first_update["message"], "before kill");
 	assert_eq!(first_update["commit_seal"], "committed");
 	assert_eq!(completion_text(&first_complete), "before kill");
-	let first_details: Value = serde_json::from_slice(
-		first_complete
-			.details_json
-			.as_deref()
-			.expect("inline echo completion details"),
-	)
-	.expect("echo completion details JSON");
-	assert_eq!(first_details, first_update);
+	let first_outcome: Value =
+		serde_json::from_slice(&completion_details(&first_complete)).expect("echo outcome JSON");
+	let first_details = first_outcome.get("value").expect("echo outcome value");
+	assert_eq!(first_details, &first_update);
 	let mut rejected = open_committed(
 		&supervisor,
 		call("args-rejected", "reject_args", json!({}), Duration::from_secs(5)),
@@ -612,14 +617,9 @@ async fn same_binary_worker_kills_native_call_and_respawns() {
 			.expect("respawned worker did not serve the next invocation");
 	assert_eq!(second_update["message"], "after respawn");
 	assert_eq!(completion_text(&second_complete), "after respawn");
-	let second_details: Value = serde_json::from_slice(
-		second_complete
-			.details_json
-			.as_deref()
-			.expect("inline respawn echo details"),
-	)
-	.expect("respawn echo details JSON");
-	let second_pid = second_details["pid"]
+	let second_outcome: Value =
+		serde_json::from_slice(&completion_details(&second_complete)).expect("respawn outcome JSON");
+	let second_pid = second_outcome["value"]["pid"]
 		.as_i64()
 		.expect("respawned worker pid") as i32;
 	assert_ne!(second_pid, blocked_pid, "supervisor reused the cancelled worker process");
@@ -678,13 +678,15 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 
 	let first = py_eval_roundtrip(&supervisor, "py-eval-before", "6 * 7").await;
 	assert_eq!(
-		serde_json::from_slice::<Value>(completion_details(&first)).expect("py_eval result JSON"),
+		serde_json::from_slice::<Value>(&completion_details(&first)).expect("py_eval result JSON")
+			["value"],
 		json!({ "result": 42 })
 	);
 
 	let repr = py_eval_roundtrip(&supervisor, "py-eval-repr", "{3, 1, 2}").await;
 	assert_eq!(
-		serde_json::from_slice::<Value>(completion_details(&repr)).expect("py_eval repr JSON"),
+		serde_json::from_slice::<Value>(&completion_details(&repr)).expect("py_eval repr JSON")
+			["value"],
 		json!({ "result": "{1, 2, 3}" })
 	);
 
@@ -698,8 +700,9 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 				WorkerOutcomeKind::Aborted,
 				"Python exception flattened into the wrong terminal branch"
 			);
-			let details: Value =
-				serde_json::from_slice(completion_details(&complete)).expect("py_eval abort details");
+			let outcome: Value =
+				serde_json::from_slice(&completion_details(&complete)).expect("py_eval abort details");
+			let details = &outcome["value"]["abort"];
 			assert_eq!(details["kind"], "effects_unknown");
 			assert!(
 				details["reason"]
@@ -746,7 +749,8 @@ async fn opt_in_py_eval_survives_cancel_and_respawn() {
 			.await
 			.expect("respawned py_eval worker did not recover");
 	assert_eq!(
-		serde_json::from_slice::<Value>(completion_details(&second)).expect("respawn result JSON"),
+		serde_json::from_slice::<Value>(&completion_details(&second)).expect("respawn result JSON")
+			["value"],
 		json!({ "result": 42 })
 	);
 	assert_eq!(
@@ -870,8 +874,9 @@ async fn stable_roundtrip(
 		WorkerEvent::Aborted(abort) => panic!("sibling aborted: {}", abort.reason),
 		event => panic!("sibling emitted unexpected CONTROL event: {event:?}"),
 	};
-	let details =
-		serde_json::from_slice::<Value>(completion_details(&complete)).expect("sibling details JSON");
+	let outcome = serde_json::from_slice::<Value>(&completion_details(&complete))
+		.expect("sibling details JSON");
+	let details = &outcome["value"];
 	(
 		details["pid"].as_i64().expect("sibling pid") as i32,
 		details["env_socket"].as_str().map(ToOwned::to_owned),
@@ -999,8 +1004,23 @@ fn bind_test_control(config: &mut ExtHostConfig) -> Arc<CallbackDispatcherSlot> 
 	callbacks
 }
 
+fn test_result_store() -> BlobHost {
+	static STORE: LazyLock<BlobHost> = LazyLock::new(|| {
+		let root = tempfile::tempdir().expect("worker result CAS root").keep();
+		BlobHost::open(root).expect("worker result CAS")
+	});
+	STORE.clone()
+}
+
 fn test_config(executable: PathBuf) -> ExtHostConfig {
-	ExtHostConfig::new(executable, Principal::new(sf!("test"), sf!("Test")), sf!("test-session"), 1)
+	let mut config = ExtHostConfig::new(
+		executable,
+		Principal::new(sf!("test"), sf!("Test")),
+		sf!("test-session"),
+		1,
+	);
+	config.bind_result_store(test_result_store());
+	config
 }
 
 fn py_eval_manifest(key: &HostKey) -> ExtensionManifest {
@@ -1084,9 +1104,16 @@ fn completion_text(complete: &WorkerCompletion) -> &str {
 	}
 }
 
-fn completion_details(complete: &WorkerCompletion) -> &[u8] {
-	complete
-		.details_json
-		.as_deref()
-		.expect("completion carries inline JSON details")
+fn completion_details(complete: &WorkerCompletion) -> Bytes {
+	if let Some(details) = &complete.details_json {
+		return details.clone();
+	}
+	let blob = complete
+		.details_blob
+		.as_ref()
+		.expect("completion carries a result artifact");
+	let hash: [u8; 32] = blob.hash.as_ref().try_into().expect("result artifact hash");
+	test_result_store()
+		.get(BlobId { hash, size: blob.size })
+		.expect("read result artifact")
 }

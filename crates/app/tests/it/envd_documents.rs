@@ -294,8 +294,8 @@ fn blob_host_puts_stats_ranges_and_deletes_real_storage_content() {
 			length: 5,
 		})
 		.expect("ranged blob get");
-	assert_eq!(ranged.id, id);
-	assert_eq!(&ranged.data[..], &content[7..12]);
+	assert_eq!(ranged.id(), id);
+	assert_eq!(&ranged.read_all().expect("read selected range")[..], &content[7..12]);
 
 	let deleted = host.delete(&id.hash).expect("blob delete");
 	assert!(deleted.deleted);

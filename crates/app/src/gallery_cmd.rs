@@ -1,13 +1,9 @@
 //! Journal-derived tool-card lifecycle gallery and PNG capture command.
 
-use std::{
-	fs,
-	io::{self, IsTerminal as _},
-	path::PathBuf,
-};
+use std::{fs, path::PathBuf};
 
 use clap::{Args, ValueEnum};
-use miette::{IntoDiagnostic as _, miette};
+use miette::IntoDiagnostic as _;
 use omp_chat::gallery::{self, GallerySection};
 use omp_core::Str;
 use omp_tui::{IntoComponent as _, Ui, UiContext, dom};
@@ -57,11 +53,8 @@ pub struct GalleryArgs {
 	#[arg(short = 'e', long)]
 	pub expanded:   bool,
 	/// Emit text without terminal styling.
-	#[arg(long, conflicts_with = "ansi")]
+	#[arg(long)]
 	pub plain:      bool,
-	/// Emit terminal styling even when stdout is redirected (gallery QA).
-	#[arg(long, conflicts_with = "plain")]
-	pub ansi:       bool,
 	/// Capture one native PNG per card and lifecycle state.
 	#[arg(long)]
 	pub screenshot: bool,
@@ -85,7 +78,8 @@ fn run_tool(args: &GalleryArgs) -> miette::Result<()> {
 	if let Some(tool) = &args.tool
 		&& !names.contains(&tool.as_str())
 	{
-		return Err(miette!("unknown gallery card '{}'", tool));
+		println!("Unknown tool '{tool}'. Known tools: {}", names.join(", "));
+		return Ok(());
 	}
 	let sections = gallery::render_sections(args.tool.as_deref(), &states, width, args.expanded)
 		.into_diagnostic()?;
@@ -109,10 +103,10 @@ fn run_tool(args: &GalleryArgs) -> miette::Result<()> {
 			let rule = section_rule(&section, width);
 			println!(
 				"{}",
-				if args.ansi {
-					ansi_accent(rule, width)
-				} else {
+				if args.plain {
 					rule
+				} else {
+					ansi_accent(rule, width)
 				}
 			);
 			current = Some(section.tool);
@@ -121,15 +115,15 @@ fn run_tool(args: &GalleryArgs) -> miette::Result<()> {
 		let label = format!("  · {}", section.state);
 		println!(
 			"{}",
-			if args.ansi {
-				ansi_dim(label, width)
-			} else {
+			if args.plain {
 				label
+			} else {
+				ansi_dim(label, width)
 			}
 		);
 		println!(
 			"{}",
-			if args.plain || (!args.ansi && !io::stdout().is_terminal()) {
+			if args.plain {
 				omp_tui::frame_text(&section.frame)
 			} else {
 				omp_tui::frame_ansi(&section.frame)
@@ -167,7 +161,7 @@ const fn state_name(state: gallery::GalleryState) -> &'static str {
 }
 
 fn ansi_accent(text: String, width: u16) -> String {
-	let component = dom! { <text fg=accent>{text}</text> }.into_component();
+	let component = dom! { <text fg=accent bold>{text}</text> }.into_component();
 	omp_tui::frame_ansi(Ui::from_root(component, width, UiContext::default()).frame())
 }
 

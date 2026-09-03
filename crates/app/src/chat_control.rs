@@ -9,14 +9,15 @@
 //! publishes exactly one [`Event::Reset`] carrying the new snapshot.
 
 use std::{
-	fs,
-	path::PathBuf,
+	fs::{self, OpenOptions},
+	io::{self, Write as _},
+	path::{Path, PathBuf},
 	sync::Arc,
 	time::{SystemTime, UNIX_EPOCH},
 };
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_agent::{Kernel, LifecycleHooks, TurnInput, Up};
+use omp_agent::{Kernel, KernelEvent, LifecycleHooks, TurnInput, TurnStop, Up};
 use omp_chat::{
 	HostAction, HostCommand, HostMailbox,
 	commands::{CompactionMethod, ShakeMode, TodoOp},
@@ -25,10 +26,14 @@ use omp_chat::{
 		Outcome, Services,
 		git::{GitOp, GitOutcome, GitPatchAction, GitPatchScope},
 		hub::{AgentOp, AgentOutcome},
-		services::{Mutation, Mutations, ServiceError, ServiceOutcome},
-		sessions::SessionIndexOutcome,
+		services::{
+			CollabOp, CollabOutcome, CollabParticipant, CollabRole, CollabState, Mutation, Mutations,
+			ServiceError, ServiceOutcome,
+		},
+		sessions::{ForeignSessionImportOutcome, SessionIndexOutcome},
 	},
 };
+use omp_collab::host::{AuthorizedMutation, RemoteOperation};
 use omp_con::{Ctx, Severity};
 use omp_core::{Str, Ulid};
 use omp_dom::{Event, Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
@@ -36,6 +41,9 @@ use omp_driver::headless::kernel::{ComposedInference, KernelOptions, SessionHome
 use omp_journal::{EntryId, blob::BlobStore, data::Attachment};
 use omp_proto::toolhost::v1::HookEventId;
 use omp_session::{AttachmentInput, Session, SessionError, components::jobs};
+use omp_voice::transport::{
+	LiveDelegationAdmission, LiveDelegationRequest, LiveDelegationTerminal,
+};
 use parking_lot::RwLock;
 
 /// pi `background-tan-dispatch.md`.
@@ -74,12 +82,64 @@ fn store_attachments(
 		.collect()
 }
 
+/// Replaces `path` only after the complete plan is durable in a same-directory
+/// staging file. A failed write or sync leaves an existing destination intact.
+fn atomic_plan_save(path: &Path, content: &str) -> io::Result<()> {
+	let parent = path
+		.parent()
+		.filter(|parent| !parent.as_os_str().is_empty())
+		.unwrap_or(Path::new("."));
+	let file_name = path.file_name().ok_or_else(|| {
+		io::Error::new(io::ErrorKind::InvalidInput, "plan destination has no file name")
+	})?;
+	let temporary =
+		parent.join(format!(".{}.{}.tmp", file_name.to_string_lossy(), Ulid::generate()));
+	let result = (|| {
+		let mut file = OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&temporary)?;
+		file.write_all(content.as_bytes())?;
+		file.sync_all()?;
+		fs::rename(&temporary, path)?;
+		fs::File::open(parent)?.sync_all()
+	})();
+	if result.is_err() {
+		let _ = fs::remove_file(&temporary);
+	}
+	result
+}
+
+fn short_plan_path(path: &Path, project_root: &Path) -> String {
+	path
+		.strip_prefix(project_root)
+		.unwrap_or(path)
+		.to_string_lossy()
+		.replace('\\', "/")
+}
+
+fn broadcast_pause(
+	registry: &omp_driver::sessions::SessionRegistry,
+	active: bool,
+	exclude: Option<&str>,
+) {
+	for controller in registry.list() {
+		if exclude.is_some_and(|id| id == controller.id.as_str()) {
+			continue;
+		}
+		let _ = controller.up.send(Up::Pause { active });
+	}
+}
+
 /// What the idle loop does next after one command.
 enum Flow {
 	/// Keep waiting for commands.
 	Idle,
 	/// Run this turn.
 	Turn(TurnInput),
+	/// Run one provider-authenticated live delegation as an ordinary kernel
+	/// turn while retaining its transport correlation identity.
+	LiveTurn { id: Str, input: TurnInput },
 	/// Re-run the aborted tool tail of the last turn (pi `retry()`).
 	Retry,
 	/// Run one tool without inference (`!` / `$` prefix modes).
@@ -88,24 +148,15 @@ enum Flow {
 	Quit,
 }
 
-/// Builds the tool call behind a `!` / `$` composer line (pi
-/// `handleBashCommand` → `bash`, `handlePythonCommand` → `eval` with the Python
-/// kernel).
+/// Builds the closed user-local execution request behind a `!` / `$`
+/// composer line. The kernel selects the executor and marks the durable
+/// element as local; the app cannot turn an arbitrary tool into a local run.
 fn local_run(input: omp_chat::composer::LocalInput) -> omp_agent::LocalRun {
-	let (name, args) = match input.mode {
-		omp_chat::composer::PrefixMode::Bash => {
-			("bash", serde_json::json!({ "command": input.code.as_str() }))
-		},
-		omp_chat::composer::PrefixMode::Eval => {
-			("eval", serde_json::json!({ "language": "py", "code": input.code.as_str() }))
-		},
+	let kind = match input.mode {
+		omp_chat::composer::PrefixMode::Bash => omp_agent::LocalRunKind::Bash,
+		omp_chat::composer::PrefixMode::Eval => omp_agent::LocalRunKind::Eval,
 	};
-	omp_agent::LocalRun {
-		name:    Str::new_static(name),
-		args:    serde_json::value::to_raw_value(&args).expect("literal JSON serializes"),
-		intent:  None,
-		exclude: input.exclude,
-	}
+	omp_agent::LocalRun { kind, input: input.code, exclude: input.exclude }
 }
 
 /// A background `/tan` child finished.
@@ -117,55 +168,68 @@ struct TanDone {
 
 /// The chat controller: session owner, kernel driver, command applier.
 pub(crate) struct Controller<C = ComposedInference> {
-	kernel:       Kernel<C>,
-	lifecycle:    Option<LifecycleHooks>,
-	session:      Session,
-	home:         SessionHome,
-	relay:        flume::Sender<Event>,
-	forwarder:    Option<tokio::task::JoinHandle<()>>,
-	ctx:          Arc<Ctx>,
-	mutations:    Arc<dyn Mutations>,
-	services:     Arc<dyn Services>,
+	kernel:         Kernel<C>,
+	lifecycle:      Option<LifecycleHooks>,
+	session:        Session,
+	home:           SessionHome,
+	relay:          flume::Sender<Event>,
+	forwarder:      Option<tokio::task::JoinHandle<()>>,
+	ctx:            Arc<Ctx>,
+	mutations:      Arc<dyn Mutations>,
+	services:       Arc<dyn Services>,
+	/// Collaboration relay and replica owner.
+	collab:         omp_driver::collab::session::CollabCommandHandle,
+	/// Ordered events following the collaboration guest snapshot.
+	collab_replica: flume::Receiver<Event>,
+	/// Host-authenticated guest mutations.
+	collab_remote:  flume::Receiver<AuthorizedMutation>,
 	/// Environment authority (isolated workspaces for revived agents).
-	env:          omp_env::EnvClient,
-	up:           flume::Sender<Up>,
-	live_journal: Arc<RwLock<PathBuf>>,
-	data_dir:     PathBuf,
-	voice:        crate::chat_voice::PushToTalk,
-	paused:       bool,
+	env:            omp_env::EnvClient,
+	up:             flume::Sender<Up>,
+	live_events:    flume::Receiver<KernelEvent>,
+	live_next:      Option<LiveDelegationRequest>,
+	live_journal:   Arc<RwLock<PathBuf>>,
+	data_dir:       PathBuf,
+	voice:          crate::chat_voice::PushToTalk,
 	/// Commands that mutate the session, deferred while a turn runs.
-	pending:      Vec<HostCommand>,
-	tan_tx:       flume::Sender<TanDone>,
-	tan_rx:       flume::Receiver<TanDone>,
+	pending:        Vec<HostCommand>,
+	tan_tx:         flume::Sender<TanDone>,
+	tan_rx:         flume::Receiver<TanDone>,
 	/// Agents the controller revived from the hub and still running: their
 	/// settlement is journaled by the idle loop's poll tick, since no turn
 	/// may follow to commit it.
-	revived:      Vec<Str>,
+	revived:        Vec<Str>,
 	/// Journal deleted by `/drop` once the replacement session is live.
-	ephemeral:    Option<PathBuf>,
+	ephemeral:      Option<PathBuf>,
 	/// Pairs waiting `ask` calls with the host's answers.
-	ask:          omp_driver::headless::AskRoute,
+	ask:            omp_driver::headless::AskRoute,
 }
 
 impl<C: omp_agent::Inference> Controller<C> {
 	/// Takes ownership of the composed kernel and session and starts
 	/// relaying the session's DOM events onto `relay`.
 	pub(crate) fn new(
-		kernel: Kernel<C>,
+		mut kernel: Kernel<C>,
 		mut session: Session,
 		home: SessionHome,
 		relay: flume::Sender<Event>,
 		ctx: Arc<Ctx>,
 		mutations: Arc<dyn Mutations>,
 		services: Arc<dyn Services>,
+		collab: omp_driver::collab::session::CollabCommandHandle,
 		env: omp_env::EnvClient,
 		live_journal: Arc<RwLock<PathBuf>>,
 		data_dir: PathBuf,
+		live_auth: Option<omp_inference::auth::AuthManager>,
 		ephemeral: Option<PathBuf>,
 		ask: omp_driver::headless::AskRoute,
 	) -> (Self, omp_dom::Snapshot) {
 		let up = kernel.mailbox();
+		let live_events = kernel.subscribe();
 		let lifecycle = kernel.lifecycle_hooks();
+		let collab_replica = collab.replica_events();
+		let collab_remote = collab.remote_mutations();
+		let session_id = display_name(&session);
 		let (snapshot, events) = session.subscribe();
 		let forwarder = Some(forward(events, relay.clone()));
 		let (tan_tx, tan_rx) = flume::unbounded();
@@ -176,17 +240,24 @@ impl<C: omp_agent::Inference> Controller<C> {
 			home,
 			relay,
 			forwarder,
-			ctx,
+			ctx: Arc::clone(&ctx),
 			mutations,
 			services,
+			collab,
+			collab_replica,
+			collab_remote,
 			env,
 			up,
+			live_events,
+			live_next: None,
 			live_journal,
 			data_dir,
 			voice: crate::chat_voice::PushToTalk::new(
-				crate::audio_coordinator::InteractiveAudioController::new(),
+				crate::audio_coordinator::InteractiveAudioController::new(Arc::clone(&ctx)),
+				Arc::clone(&ctx),
+				live_auth,
+				session_id,
 			),
-			paused: false,
 			pending: Vec::new(),
 			tan_tx,
 			tan_rx,
@@ -232,6 +303,12 @@ impl<C: omp_agent::Inference> Controller<C> {
 					}
 					Flow::Idle
 				},
+				remote = self.collab_remote.recv_async(), if self.collab.presence().is_some_and(|facts| facts.role() == omp_collab::presence::CollabRole::Host) => {
+					match remote {
+						Ok(remote) => self.apply_remote_idle(remote).await?,
+						Err(_) => Flow::Idle,
+					}
+				},
 				() = tokio::time::sleep(REVIVED_POLL), if !self.revived.is_empty() => {
 					self.settle_revived()?;
 					Flow::Idle
@@ -240,7 +317,16 @@ impl<C: omp_agent::Inference> Controller<C> {
 			match flow {
 				Flow::Idle => {},
 				Flow::Turn(input) => {
-					let quit = self.run_turn(Some(input), &command_rx).await?
+					let quit = self.run_turn(Some(input), &command_rx, None).await?
+						|| self.after_turn(&command_rx).await?;
+					if quit {
+						self.shutdown()?;
+						return Ok(());
+					}
+				},
+				Flow::LiveTurn { id, input } => {
+					self.voice.delegation_started(&id, &self.ctx);
+					let quit = self.run_turn(Some(input), &command_rx, Some(id)).await?
 						|| self.after_turn(&command_rx).await?;
 					if quit {
 						self.shutdown()?;
@@ -248,8 +334,8 @@ impl<C: omp_agent::Inference> Controller<C> {
 					}
 				},
 				Flow::Retry => {
-					let quit =
-						self.run_turn(None, &command_rx).await? || self.after_turn(&command_rx).await?;
+					let quit = self.run_turn(None, &command_rx, None).await?
+						|| self.after_turn(&command_rx).await?;
 					if quit {
 						self.shutdown()?;
 						return Ok(());
@@ -270,10 +356,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 			}
 			// A queued prompt runs as soon as the controller is idle and
 			// not paused (pi `followUp`: "for when the agent yields").
-			if !self.paused
+			if !self.is_paused()
 				&& let Some(input) = self.pop_queued()?
 			{
-				let quit = self.run_turn(Some(input), &command_rx).await?
+				let quit = self.run_turn(Some(input), &command_rx, None).await?
 					|| self.after_turn(&command_rx).await?;
 				if quit {
 					self.shutdown()?;
@@ -310,6 +396,11 @@ impl<C: omp_agent::Inference> Controller<C> {
 	/// Commits process exit before observers see the bounded shutdown edge.
 	fn shutdown(&mut self) -> miette::Result<()> {
 		let session = display_name(&self.session);
+		self.voice.cancel(&self.ctx);
+		self.cancel_live_delegations();
+		self
+			.voice
+			.control_live(omp_chat::overlays::live::LiveControl::Stop, &self.ctx);
 		self
 			.kernel
 			.flush_session_state(&mut self.session)
@@ -326,14 +417,80 @@ impl<C: omp_agent::Inference> Controller<C> {
 		)
 	}
 
+	fn cancel_live_delegations(&mut self) {
+		self.live_next = None;
+		if self.voice.cancel_delegations(&self.ctx).is_some() {
+			let _ = self.up.send(Up::Interrupt);
+		}
+	}
+
+	fn is_paused(&self) -> bool {
+		omp_agent::pause_state(self.session.dom()).active
+	}
+
 	/// Applies one command while no turn is running.
 	async fn apply_idle(&mut self, command: HostCommand) -> miette::Result<Flow> {
+		if self
+			.collab
+			.presence()
+			.is_some_and(|facts| facts.role() == omp_collab::presence::CollabRole::Guest)
+		{
+			match command {
+				HostCommand::Submit(text) | HostCommand::Steer(text) => {
+					self
+						.forward_guest(omp_driver::collab::session::CollabOwnerCommand::Prompt {
+							text,
+							images: Vec::new(),
+						})
+						.await;
+					return Ok(Flow::Idle);
+				},
+				HostCommand::SubmitWithAttachments { text, attachments } => {
+					let images = attachments
+						.into_iter()
+						.map(|attachment| omp_proto::collab::v1::ImageAttachment {
+							data:      attachment.bytes,
+							mime_type: attachment.mime.to_string(),
+						})
+						.collect();
+					self
+						.forward_guest(omp_driver::collab::session::CollabOwnerCommand::Prompt {
+							text,
+							images,
+						})
+						.await;
+					return Ok(Flow::Idle);
+				},
+				HostCommand::Interrupt => {
+					self
+						.forward_guest(omp_driver::collab::session::CollabOwnerCommand::Abort)
+						.await;
+					return Ok(Flow::Idle);
+				},
+				HostCommand::Agent { id, op } => {
+					use omp_proto::collab::v1::{AgentCommand, agent_command};
+					let (command, text) = match op {
+						AgentOp::Kill => (agent_command::Command::Kill, None),
+						AgentOp::Revive => (agent_command::Command::Revive, None),
+						AgentOp::Send(text) => (agent_command::Command::Chat, Some(text.to_string())),
+					};
+					self
+						.forward_guest(omp_driver::collab::session::CollabOwnerCommand::Agent(
+							AgentCommand { command: command as i32, agent_id: id.to_string(), text },
+						))
+						.await;
+					return Ok(Flow::Idle);
+				},
+				_ => {},
+			}
+		}
 		// Console writes happen in the host's `Ctx`. Persist them at the next
 		// controller boundary; transition commands flush after their before
 		// hook so admission observes the pre-transition state.
 		if !matches!(
 			&command,
 			HostCommand::SessionOpen { .. }
+				| HostCommand::ForeignSessionImport { .. }
 				| HostCommand::SessionNew { .. }
 				| HostCommand::SessionDrop
 				| HostCommand::Fork { .. }
@@ -348,7 +505,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 		}
 		Ok(match command {
 			HostCommand::Submit(text) => {
-				if self.paused {
+				if self.is_paused() {
 					self.queue_prompt(text, Vec::new())?;
 					self.reply(Severity::Info, "Paused: prompt queued until you resume");
 					return Ok(Flow::Idle);
@@ -363,7 +520,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 					.session
 					.store_attachments(attachments)
 					.into_diagnostic()?;
-				if self.paused {
+				if self.is_paused() {
 					self.queue_prompt(text, attachments)?;
 					self.reply(Severity::Info, "Paused: prompt queued until you resume");
 					return Ok(Flow::Idle);
@@ -384,7 +541,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 				Flow::Idle
 			},
 			HostCommand::RunLocal { input, draft } => {
-				if self.paused {
+				if self.is_paused() {
 					self.refuse_local(draft);
 					return Ok(Flow::Idle);
 				}
@@ -395,7 +552,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 				Flow::Idle
 			},
 			HostCommand::Retry => {
-				if self.paused {
+				if self.is_paused() {
 					self.reply(Severity::Info, "Paused: resume before retrying");
 					Flow::Idle
 				} else {
@@ -407,15 +564,88 @@ impl<C: omp_agent::Inference> Controller<C> {
 				self.voice.set_active(active, &self.ctx);
 				Flow::Idle
 			},
-			HostCommand::LiveVoice { active } => {
-				self.voice.set_live(active, &self.ctx);
+			HostCommand::LiveVoice(control) => {
+				if matches!(
+					control,
+					omp_chat::overlays::live::LiveControl::Stop
+						| omp_chat::overlays::live::LiveControl::Reconnect
+				) {
+					self.cancel_live_delegations();
+				}
+				self.voice.control_live(control, &self.ctx);
 				Flow::Idle
+			},
+			HostCommand::LiveDelegation { id, request } => {
+				match self.voice.admit_delegation(id, request) {
+					LiveDelegationAdmission::Start(request) => {
+						self.record_loop_prompt(&request.request)?;
+						Flow::LiveTurn {
+							id:    request.id,
+							input: TurnInput { text: request.request, attachments: Vec::new() },
+						}
+					},
+					LiveDelegationAdmission::Interrupt { .. } => {
+						let _ = self.up.send(Up::Interrupt);
+						Flow::Idle
+					},
+					LiveDelegationAdmission::Ignored | LiveDelegationAdmission::Queued => Flow::Idle,
+				}
 			},
 			HostCommand::Quit => Flow::Quit,
 			other => {
 				self.apply_session_command(other).await?;
 				Flow::Idle
 			},
+		})
+	}
+
+	async fn forward_guest(&mut self, command: omp_driver::collab::session::CollabOwnerCommand) {
+		if let Err(error) = self.collab.request(command).await {
+			self.reply(Severity::Error, &format!("Collaboration request failed: {error}"));
+		}
+	}
+
+	async fn apply_remote_idle(&mut self, mutation: AuthorizedMutation) -> miette::Result<Flow> {
+		Ok(match mutation.operation {
+			RemoteOperation::Prompt(prompt) => {
+				let attachments: Vec<AttachmentInput> = prompt
+					.images
+					.into_iter()
+					.map(|image| AttachmentInput { mime: Str::new(image.mime_type), bytes: image.data })
+					.collect();
+				let attachments = self
+					.session
+					.store_attachments(attachments)
+					.into_diagnostic()?;
+				self.record_loop_prompt(&Str::new(&prompt.text))?;
+				Flow::Turn(TurnInput { text: Str::new(prompt.text), attachments })
+			},
+			RemoteOperation::Abort(_) => {
+				let _ = self.up.send(Up::Interrupt);
+				Flow::Idle
+			},
+			RemoteOperation::AgentCommand(command) => {
+				use omp_proto::collab::v1::agent_command;
+				let op = match agent_command::Command::try_from(command.command) {
+					Ok(agent_command::Command::Chat) => {
+						let Some(text) = command
+							.text
+							.as_deref()
+							.map(str::trim)
+							.filter(|text| !text.is_empty())
+						else {
+							return Ok(Flow::Idle);
+						};
+						AgentOp::Send(Str::new(text))
+					},
+					Ok(agent_command::Command::Kill) => AgentOp::Kill,
+					Ok(agent_command::Command::Revive) => AgentOp::Revive,
+					Err(_) => return Ok(Flow::Idle),
+				};
+				let _ = self.supervise_agent(&command.agent_id, op).await;
+				Flow::Idle
+			},
+			RemoteOperation::UiResponse(_) => Flow::Idle,
 		})
 	}
 
@@ -428,14 +658,20 @@ impl<C: omp_agent::Inference> Controller<C> {
 		&mut self,
 		input: Option<TurnInput>,
 		command_rx: &flume::Receiver<HostCommand>,
+		live_id: Option<Str>,
 	) -> miette::Result<bool> {
 		let mut quit = false;
 		let ask = self.ask.clone();
+		let pause_up = self.up.clone();
+		let live_sessions = Arc::clone(&self.home.live);
+		let current_id = runtime_id(&self.session);
+		let mut live_segment = String::new();
+		while self.live_events.try_recv().is_ok() {}
 		// The kernel holds the session for the turn; media steered in
 		// meanwhile is content-addressed through this handle to the same
 		// store (pi `steer(text, images)`).
 		let blobs = self.session.blobs().clone();
-		let failure = {
+		let result = {
 			let control = omp_agent::RunControl::default();
 			let turn = match input {
 				Some(input) => futures::future::Either::Left(self.kernel.run_turn(
@@ -450,7 +686,19 @@ impl<C: omp_agent::Inference> Controller<C> {
 			tokio::pin!(turn);
 			loop {
 				tokio::select! {
-					result = &mut turn => break result.err(),
+					result = &mut turn => break result,
+					event = self.live_events.recv_async() => {
+						if let (Some(id), Ok(event)) = (live_id.as_deref(), event) {
+							match event {
+								KernelEvent::InferenceStarted => live_segment.clear(),
+								KernelEvent::TextDelta(text) => {
+									live_segment.push_str(text.as_str());
+									self.voice.delegation_progress(id, text.as_str());
+								},
+								_ => {},
+							}
+						}
+					},
 					command = command_rx.recv_async() => match command {
 						Ok(HostCommand::Submit(text) | HostCommand::Steer(text)) => {
 							let _ = self.up.send(Up::Steer { text, attachments: Vec::new() });
@@ -473,6 +721,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 								},
 							}
 						},
+						Ok(HostCommand::Pause { active }) => {
+							let _ = pause_up.send(Up::Pause { active });
+							broadcast_pause(&live_sessions, active, Some(current_id.as_str()));
+						},
 						Ok(HostCommand::Interrupt) => {
 							let _ = self.up.send(Up::Interrupt);
 						},
@@ -486,7 +738,31 @@ impl<C: omp_agent::Inference> Controller<C> {
 						},
 						Ok(HostCommand::Overlay { .. }) => {},
 						Ok(HostCommand::PushToTalk { active }) => self.voice.set_active(active, &self.ctx),
-						Ok(HostCommand::LiveVoice { active }) => self.voice.set_live(active, &self.ctx),
+						Ok(HostCommand::LiveVoice(control)) => {
+							if matches!(
+								control,
+								omp_chat::overlays::live::LiveControl::Stop
+									| omp_chat::overlays::live::LiveControl::Reconnect
+							) {
+								self.live_next = None;
+								if self.voice.cancel_delegations(&self.ctx).is_some() {
+									let _ = self.up.send(Up::Interrupt);
+								}
+							}
+							self.voice.control_live(control, &self.ctx);
+						},
+						Ok(HostCommand::LiveDelegation { id, request }) => {
+							match self.voice.admit_delegation(id, request) {
+								LiveDelegationAdmission::Start(request) => {
+									self.live_next = Some(request);
+									let _ = self.up.send(Up::Interrupt);
+								},
+								LiveDelegationAdmission::Interrupt { .. } => {
+									let _ = self.up.send(Up::Interrupt);
+								},
+								LiveDelegationAdmission::Ignored | LiveDelegationAdmission::Queued => {},
+							}
+						},
 						Ok(HostCommand::Queue { prompt, attachments }) => {
 							let stored = store_attachments(&blobs, attachments);
 							match stored {
@@ -508,6 +784,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 							if matches!(
 								other,
 								HostCommand::SessionOpen { .. }
+									| HostCommand::ForeignSessionImport { .. }
 									| HostCommand::SessionNew { .. }
 									| HostCommand::SessionDrop
 									| HostCommand::Rewind { .. }
@@ -517,14 +794,81 @@ impl<C: omp_agent::Inference> Controller<C> {
 							self.pending.push(other);
 						},
 					},
+					remote = self.collab_remote.recv_async(), if self.collab.presence().is_some_and(|facts| facts.role() == omp_collab::presence::CollabRole::Host) => {
+						if let Ok(remote) = remote {
+							match remote.operation {
+								RemoteOperation::Prompt(prompt) => {
+									let stored = store_attachments(
+										&blobs,
+										prompt.images.into_iter().map(|image| AttachmentInput {
+											mime: Str::new(image.mime_type),
+											bytes: image.data,
+										}).collect(),
+									);
+									if let Ok(attachments) = stored {
+										let _ = self.up.send(Up::Steer {
+											text: Str::new(prompt.text),
+											attachments,
+										});
+									}
+								},
+								RemoteOperation::Abort(_) => {
+									let _ = self.up.send(Up::Interrupt);
+								},
+								RemoteOperation::AgentCommand(command) => {
+									use omp_proto::collab::v1::agent_command;
+									let op = match agent_command::Command::try_from(command.command) {
+										Ok(agent_command::Command::Chat) => {
+											command.text.map(Str::new).map(AgentOp::Send)
+										},
+										Ok(agent_command::Command::Kill) => Some(AgentOp::Kill),
+										Ok(agent_command::Command::Revive) => Some(AgentOp::Revive),
+										Err(_) => None,
+									};
+									if let Some(op) = op {
+										self.pending.push(HostCommand::Agent {
+											id: Str::new(command.agent_id),
+											op,
+										});
+									}
+								},
+								RemoteOperation::UiResponse(_) => {},
+							}
+						}
+					},
 				}
 				if quit {
-					break turn.await.err();
+					break turn.await;
 				}
 			}
 		};
-		if let Some(error) = failure {
-			if matches!(error, omp_agent::KernelError::NothingToRetry) {
+		if let Some(id) = live_id.as_deref() {
+			while let Ok(event) = self.live_events.try_recv() {
+				match event {
+					KernelEvent::InferenceStarted => live_segment.clear(),
+					KernelEvent::TextDelta(text) => {
+						live_segment.push_str(text.as_str());
+						self.voice.delegation_progress(id, text.as_str());
+					},
+					_ => {},
+				}
+			}
+			let terminal = match &result {
+				Ok(outcome) if outcome.stop == TurnStop::Completed => LiveDelegationTerminal::Completed,
+				Ok(outcome) if outcome.stop == TurnStop::Cancelled => LiveDelegationTerminal::Cancelled,
+				Ok(_) | Err(_) => LiveDelegationTerminal::Failed,
+			};
+			let final_text = if terminal == LiveDelegationTerminal::Completed {
+				live_segment.as_str()
+			} else {
+				""
+			};
+			self.live_next = self
+				.voice
+				.settle_delegation(id, terminal, final_text, &self.ctx);
+		}
+		if let Err(error) = result {
+			if matches!(&error, omp_agent::KernelError::NothingToRetry) {
 				// pi `input-controller.ts:1311`.
 				self.reply(Severity::Info, "Nothing to retry");
 				return Ok(quit);
@@ -546,21 +890,37 @@ impl<C: omp_agent::Inference> Controller<C> {
 		&mut self,
 		command_rx: &flume::Receiver<HostCommand>,
 	) -> miette::Result<bool> {
-		while !self.pending.is_empty() {
-			for command in std::mem::take(&mut self.pending) {
-				match command {
-					HostCommand::RunLocal { input, draft } => {
-						if self.paused {
-							self.refuse_local(draft);
-						} else if self.run_local(local_run(input), command_rx).await? {
-							return Ok(true);
-						}
-					},
-					other => self.apply_session_command(other).await?,
+		loop {
+			while !self.pending.is_empty() {
+				for command in std::mem::take(&mut self.pending) {
+					match command {
+						HostCommand::RunLocal { input, draft } => {
+							if self.is_paused() {
+								self.refuse_local(draft);
+							} else if self.run_local(local_run(input), command_rx).await? {
+								return Ok(true);
+							}
+						},
+						other => self.apply_session_command(other).await?,
+					}
 				}
 			}
+			let Some(next) = self.live_next.take() else {
+				return Ok(false);
+			};
+			self.voice.delegation_started(&next.id, &self.ctx);
+			self.record_loop_prompt(&next.request)?;
+			if self
+				.run_turn(
+					Some(TurnInput { text: next.request, attachments: Vec::new() }),
+					command_rx,
+					Some(next.id),
+				)
+				.await?
+			{
+				return Ok(true);
+			}
 		}
-		Ok(false)
 	}
 
 	/// Hands a `!` / `$` line back to the composer: the controller is paused
@@ -580,11 +940,38 @@ impl<C: omp_agent::Inference> Controller<C> {
 			HostCommand::PlanMode { engage } => {
 				crate::chat_cmd::set_plan_mode(&mut self.session, engage).into_diagnostic()?;
 			},
+			HostCommand::PlanSave { path, content } => {
+				let shown = short_plan_path(&path, &self.home.project_root);
+				if let Err(error) = atomic_plan_save(&path, content.as_str()) {
+					self.reply(Severity::Error, format!("Failed to save plan to {shown}: {error}"));
+					return Ok(());
+				}
+				self.director("plan", false, &[]).into_diagnostic()?;
+				self.reply(Severity::Info, format!("Saved plan to {shown}."));
+				let next = self.home.create(None).map_err(|error| miette!(error))?;
+				self.switch_to(next, "new").await?;
+				self.reply(Severity::Info, "✓ New session started");
+			},
 			HostCommand::SessionOpen { path } => {
 				let next = self.home.open(&path).map_err(|error| miette!(error))?;
 				let name = display_name(&next);
 				self.switch_to(next, "resume").await?;
 				self.reply(Severity::Info, format!("Resumed session {name}"));
+			},
+			HostCommand::ForeignSessionImport { source, path } => {
+				self
+					.kernel
+					.flush_session_state(&mut self.session)
+					.into_diagnostic()?;
+				self.kernel.resync_session_state(&self.session);
+				let destination = self.home.fresh_path();
+				let result = crate::session_import::import_selected(source.into(), &path, &destination)
+					.map_err(ServiceError::failed);
+				self.post_outcome(Outcome::ForeignSessionImport(ForeignSessionImportOutcome {
+					source,
+					selected: path,
+					result,
+				}));
 			},
 			HostCommand::SessionNew { model: _ } => {
 				let next = self.home.create(None).map_err(|error| miette!(error))?;
@@ -669,6 +1056,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 					})
 					.into_diagnostic();
 				}
+				self.cancel_live_delegations();
 				self
 					.kernel
 					.flush_session_state(&mut self.session)
@@ -741,7 +1129,13 @@ impl<C: omp_agent::Inference> Controller<C> {
 					}),
 				)?;
 			},
-			HostCommand::Compact { method, hint } => self.compact(method, hint).await?,
+			HostCommand::Compact { method, hint } => {
+				if self.is_paused() {
+					self.reply(Severity::Info, "Paused: resume before compacting");
+				} else {
+					self.compact(method, hint).await?;
+				}
+			},
 			HostCommand::Queue { prompt, attachments } => {
 				let attachments = self
 					.session
@@ -773,6 +1167,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 					self.reply(Severity::Warn, format!("{id}: {error}"));
 				}
 			},
+			HostCommand::Spawn { .. } if self.is_paused() => {
+				self.reply(Severity::Info, "Paused: resume before spawning agents");
+			},
 			HostCommand::Spawn { kind: SpawnKind::Tan, text } => self.spawn_tan(text)?,
 			HostCommand::Spawn { kind: SpawnKind::Btw, text } => {
 				// `/btw` streams through `Services::btw`; a stray spawn request
@@ -780,7 +1177,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 				let _ = self.up.send(Up::Steer { text, attachments: Vec::new() });
 			},
 			HostCommand::Pause { active } => {
-				self.paused = active;
+				omp_agent::set_paused(&mut self.session, active).into_diagnostic()?;
+				let current = runtime_id(&self.session);
+				broadcast_pause(&self.home.live, active, Some(current.as_str()));
 			},
 			HostCommand::Todo(op) => {
 				if let Err(error) = self.todo(op) {
@@ -808,11 +1207,24 @@ impl<C: omp_agent::Inference> Controller<C> {
 				},
 				Err(error) => self.reply(Severity::Warn, format!("Context reset failed: {error}")),
 			},
-			HostCommand::Move { path } => match self.relocate(&path).await {
-				Ok(()) => self.reply(Severity::Info, format!("✓ Moved to {}", path.display())),
-				Err(error) => self.reply(Severity::Warn, format!("Move failed: {error}")),
+			HostCommand::Move { path, create } => {
+				let ready = !create
+					|| match fs::create_dir_all(&path) {
+						Ok(()) => true,
+						Err(error) => {
+							self.reply(Severity::Warn, format!("Failed to create directory: {error}"));
+							false
+						},
+					};
+				if ready {
+					match self.relocate(&path).await {
+						Ok(()) => self.reply(Severity::Info, format!("✓ Moved to {}", path.display())),
+						Err(error) => self.reply(Severity::Warn, format!("Move failed: {error}")),
+					}
+				}
 			},
 			HostCommand::AskAnswer { id, answers } => self.answer_ask(&id, answers),
+			HostCommand::Collab(op) => self.apply_collab(op).await,
 			HostCommand::Service(mutation) => self.apply_mutation(mutation),
 			HostCommand::SessionIndex { scope } => {
 				let result = self
@@ -822,6 +1234,20 @@ impl<C: omp_agent::Inference> Controller<C> {
 				self.post_outcome(Outcome::SessionIndex(SessionIndexOutcome { scope, result }));
 			},
 			HostCommand::Git(op) => self.apply_git(op),
+			HostCommand::Prewalk => {
+				if let Err(error) = self.arm_prewalk() {
+					self.reply(Severity::Warn, format!("Prewalk: {error}"));
+				}
+			},
+			HostCommand::Agent { id, op: AgentOp::Revive } if self.is_paused() => {
+				self.post_outcome(Outcome::Agent(AgentOutcome {
+					id,
+					op: AgentOp::Revive,
+					result: Err(ServiceError::Failed(Str::new_static(
+						"Paused: resume before reviving agents",
+					))),
+				}));
+			},
 			HostCommand::Agent { id, op } => {
 				let result = self.supervise_agent(&id, op.clone()).await;
 				self.post_outcome(Outcome::Agent(AgentOutcome { id, op, result }));
@@ -839,7 +1265,8 @@ impl<C: omp_agent::Inference> Controller<C> {
 			| HostCommand::Approve { .. }
 			| HostCommand::Overlay { .. }
 			| HostCommand::PushToTalk { .. }
-			| HostCommand::LiveVoice { .. }
+			| HostCommand::LiveVoice(_)
+			| HostCommand::LiveDelegation { .. }
 			| HostCommand::Quit => {},
 		}
 		Ok(())
@@ -973,6 +1400,65 @@ impl<C: omp_agent::Inference> Controller<C> {
 		Ok(())
 	}
 
+	async fn apply_collab(&mut self, op: CollabOp) {
+		use omp_driver::collab::session::CollabOwnerCommand;
+		let request = match &op {
+			CollabOp::Start { relay, .. } => {
+				let origin = relay
+					.as_deref()
+					.unwrap_or(omp_collab::link::DEFAULT_RELAY_URL);
+				match omp_collab::link::RelayEndpoint::parse(origin) {
+					Ok(relay) => {
+						let (snapshot, events) = self.session.subscribe();
+						Ok(CollabOwnerCommand::Start { relay, snapshot, events })
+					},
+					Err(error) => Err(ServiceError::failed(error)),
+				}
+			},
+			CollabOp::Join { link, name } => omp_collab::link::CollabLink::parse(link.as_str())
+				.map(|link| CollabOwnerCommand::Join {
+					link,
+					display_name: name.clone().unwrap_or_else(|| Str::new_static("omp user")),
+				})
+				.map_err(ServiceError::failed),
+			CollabOp::Leave => Ok(CollabOwnerCommand::Leave),
+			CollabOp::Status => Ok(CollabOwnerCommand::Status),
+		};
+		let was_guest = self
+			.collab
+			.presence()
+			.is_some_and(|facts| facts.role() == omp_collab::presence::CollabRole::Guest);
+		let result = match request {
+			Ok(request) => self
+				.collab
+				.request(request)
+				.await
+				.map(|result| {
+					if matches!(op, CollabOp::Join { .. }) {
+						if let Some(snapshot) = self.collab.replica_snapshot() {
+							if let Some(forwarder) = self.forwarder.take() {
+								forwarder.abort();
+							}
+							let _ = self.relay.send(Event::Reset { snapshot });
+							self.forwarder =
+								Some(forward(self.collab_replica.clone(), self.relay.clone()));
+						}
+					} else if matches!(op, CollabOp::Leave) && was_guest {
+						if let Some(forwarder) = self.forwarder.take() {
+							forwarder.abort();
+						}
+						let (snapshot, events) = self.session.subscribe();
+						let _ = self.relay.send(Event::Reset { snapshot });
+						self.forwarder = Some(forward(events, self.relay.clone()));
+					}
+					collab_result(&op, result)
+				})
+				.map_err(ServiceError::failed),
+			Err(error) => Err(error),
+		};
+		self.post_outcome(Outcome::Collab(CollabOutcome { op, result }));
+	}
+
 	fn apply_mutation(&self, mutation: Mutation) {
 		let pending = match self.mutations.apply(mutation.clone()) {
 			Ok(pending) => pending,
@@ -1011,6 +1497,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 		let mut quit = false;
 		let ask = self.ask.clone();
 		let blobs = self.session.blobs().clone();
+		let pause_up = self.up.clone();
+		let live_sessions = Arc::clone(&self.home.live);
+		let current_id = runtime_id(&self.session);
+		while self.live_events.try_recv().is_ok() {}
 		let failure = {
 			let local =
 				self
@@ -1020,7 +1510,14 @@ impl<C: omp_agent::Inference> Controller<C> {
 			loop {
 				tokio::select! {
 					result = &mut local => break result.err(),
+					event = self.live_events.recv_async() => {
+						let _ = event;
+					},
 					command = command_rx.recv_async() => match command {
+						Ok(HostCommand::Pause { active }) => {
+							let _ = pause_up.send(Up::Pause { active });
+							broadcast_pause(&live_sessions, active, Some(current_id.as_str()));
+						},
 						Ok(HostCommand::Interrupt) => {
 							let _ = self.up.send(Up::Interrupt);
 						},
@@ -1052,6 +1549,31 @@ impl<C: omp_agent::Inference> Controller<C> {
 						},
 						Ok(HostCommand::AskAnswer { id, answers }) => answer_ask(&ask, &id, answers),
 						Ok(HostCommand::Overlay { .. }) => {},
+						Ok(HostCommand::LiveVoice(control)) => {
+							if matches!(
+								control,
+								omp_chat::overlays::live::LiveControl::Stop
+									| omp_chat::overlays::live::LiveControl::Reconnect
+							) {
+								self.live_next = None;
+								if self.voice.cancel_delegations(&self.ctx).is_some() {
+									let _ = self.up.send(Up::Interrupt);
+								}
+							}
+							self.voice.control_live(control, &self.ctx);
+						},
+						Ok(HostCommand::LiveDelegation { id, request }) => {
+							match self.voice.admit_delegation(id, request) {
+								LiveDelegationAdmission::Start(request) => {
+									self.live_next = Some(request);
+									let _ = self.up.send(Up::Interrupt);
+								},
+								LiveDelegationAdmission::Interrupt { .. } => {
+									let _ = self.up.send(Up::Interrupt);
+								},
+								LiveDelegationAdmission::Ignored | LiveDelegationAdmission::Queued => {},
+							}
+						},
 						Ok(other) => self.pending.push(other),
 					},
 				}
@@ -1082,6 +1604,17 @@ impl<C: omp_agent::Inference> Controller<C> {
 			}),
 		)
 		.await?;
+		self.voice.cancel(&self.ctx);
+		self.live_next = None;
+		if self.voice.switch_session(to.clone()).is_some() {
+			let _ = self.up.send(Up::Interrupt);
+		}
+		// A hosted room is bound to one authoritative patch stream. End it
+		// explicitly before replacing that authority rather than leaving a
+		// connected-looking room whose subscription has closed.
+		if self.collab.presence().is_some() {
+			self.apply_collab(CollabOp::Leave).await;
+		}
 		self
 			.kernel
 			.flush_session_state(&mut self.session)
@@ -1311,18 +1844,25 @@ impl<C: omp_agent::Inference> Controller<C> {
 		let mut stack = omp_agent::DirectorStack::from_dom(self.session.dom(), &registry);
 		let active = stack.active_ids().contains(&id);
 		if !engage {
-			return match omp_agent::find_director(self.session.dom(), id) {
-				Some((handle, _)) => {
-					let cause = self.session.head().ok_or(DirectorFailure::NoHead)?;
-					self.session.patch(Txn {
-						cause,
-						label: Some(Str::new_static("director.exit")),
-						ops: vec![Op::Rm(handle)],
-					})?;
-					Ok(())
+			stack.exit(&mut self.session, id)?;
+			return Ok(());
+		}
+		if id == "goal" {
+			match args.first().map(Str::as_str) {
+				Some("pause") => {
+					if !stack.pause(&mut self.session, id)? {
+						return Err(DirectorFailure::NotActive);
+					}
+					return Ok(());
 				},
-				None => Ok(()),
-			};
+				Some("resume") => {
+					if !stack.resume(&mut self.session, id)? {
+						return Err(DirectorFailure::NotPaused);
+					}
+					return Ok(());
+				},
+				_ => {},
+			}
 		}
 		let director: Box<dyn omp_agent::Director> = match id {
 			"advisor" => Box::new(Advisor::new()),
@@ -1372,9 +1912,47 @@ impl<C: omp_agent::Inference> Controller<C> {
 				}
 			},
 			"loop_mode" => {
-				let count = args.first().and_then(|value| value.parse::<u32>().ok());
-				let prompt = args.get(1).cloned().unwrap_or_default();
-				Box::new(LoopMode::new(prompt, count))
+				let kind = args
+					.first()
+					.map(Str::as_str)
+					.ok_or(DirectorFailure::MissingArgument("limit kind"))?;
+				match kind {
+					"unbounded" => {
+						Box::new(LoopMode::unbounded(args.get(1).cloned().unwrap_or_default()))
+					},
+					"iterations" => {
+						let limit = args
+							.get(1)
+							.ok_or(DirectorFailure::MissingArgument("iteration limit"))?
+							.parse::<u32>()
+							.ok()
+							.filter(|value| *value > 0)
+							.ok_or_else(|| DirectorFailure::InvalidArgument {
+								name:  "iteration limit",
+								value: args[1].clone(),
+							})?;
+						Box::new(LoopMode::iterations(args.get(2).cloned().unwrap_or_default(), limit))
+					},
+					"duration_ms" => {
+						let duration = args
+							.get(1)
+							.ok_or(DirectorFailure::MissingArgument("duration"))?
+							.parse::<u64>()
+							.ok()
+							.filter(|value| *value > 0)
+							.ok_or_else(|| DirectorFailure::InvalidArgument {
+								name:  "duration",
+								value: args[1].clone(),
+							})?;
+						Box::new(LoopMode::duration(args.get(2).cloned().unwrap_or_default(), duration))
+					},
+					_ => {
+						return Err(DirectorFailure::InvalidArgument {
+							name:  "limit kind",
+							value: args[0].clone(),
+						});
+					},
+				}
 			},
 			"force_tool" => {
 				let tool = args
@@ -1397,6 +1975,34 @@ impl<C: omp_agent::Inference> Controller<C> {
 			return Ok(());
 		}
 		stack.engage(&mut self.session, director)?;
+		Ok(())
+	}
+
+	fn arm_prewalk(&mut self) -> Result<(), DirectorFailure> {
+		if omp_agent::find_director(self.session.dom(), "prewalk").is_some() {
+			return Ok(());
+		}
+		let configured = crate::chat_cmd::AI_PREWALK_MODEL.get(&self.ctx);
+		let selector = if configured.is_empty() {
+			Str::new_static("@smol")
+		} else {
+			configured
+		};
+		let (target, thinking) = selector
+			.rsplit_once(':')
+			.filter(|(_, suffix)| {
+				matches!(suffix, &"off" | &"minimal" | &"low" | &"medium" | &"high" | &"xhigh")
+			})
+			.map_or_else(
+				|| (selector.clone(), None),
+				|(model, thinking)| (Str::new(model), Some(Str::new(thinking))),
+			);
+		let registry = omp_agent::DirectorRegistry::standard();
+		let mut stack = omp_agent::DirectorStack::from_dom(self.session.dom(), &registry);
+		stack.engage(
+			&mut self.session,
+			Box::new(omp_agent::directors::prewalk::Prewalk::new(target, thinking)),
+		)?;
 		Ok(())
 	}
 
@@ -1490,19 +2096,49 @@ impl<C: omp_agent::Inference> Controller<C> {
 						}
 					},
 					(ShakeMode::Thinking, Tag::Known(KnownTag::Assistant)) => {
-						let text = node
-							.prop(&PropId::Thinking.into())
-							.and_then(Value::as_str)
-							.unwrap_or_default();
-						if text.is_empty() {
-							continue;
+						let mut ordered = false;
+						for child in dom.children(*handle) {
+							let Some(content) = dom.get(*child) else {
+								continue;
+							};
+							if !matches!(
+								&content.tag,
+								Tag::Custom(tag)
+									if tag.as_str() == omp_session::ASSISTANT_CONTENT_TAG
+							) || content.prop(&PropId::Kind.into()).and_then(Value::as_str)
+								!= Some("thinking")
+							{
+								continue;
+							}
+							ordered = true;
+							let text = content
+								.prop(&PropId::Text.into())
+								.and_then(Value::as_str)
+								.unwrap_or_default();
+							if text.is_empty() {
+								continue;
+							}
+							freed += text.len();
+							ops.push(Op::Set {
+								h:     *child,
+								prop:  PropId::Text.into(),
+								value: Value::Str(Str::new_static("")),
+							});
 						}
-						freed += text.len();
-						ops.push(Op::Set {
-							h:     *handle,
-							prop:  PropId::Thinking.into(),
-							value: Value::Str(Str::new_static("")),
-						});
+						if !ordered {
+							let text = node
+								.prop(&PropId::Thinking.into())
+								.and_then(Value::as_str)
+								.unwrap_or_default();
+							if !text.is_empty() {
+								freed += text.len();
+								ops.push(Op::Set {
+									h:     *handle,
+									prop:  PropId::Thinking.into(),
+									value: Value::Str(Str::new_static("")),
+								});
+							}
+						}
 					},
 					(ShakeMode::Images, Tag::Known(KnownTag::User)) => {
 						// Attachments ride the user node's `data` prop (fold: blob refs).
@@ -1943,6 +2579,80 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()
 	Ok(())
 }
 
+fn collab_result(
+	op: &CollabOp,
+	result: omp_driver::collab::session::CollabCommandResult,
+) -> CollabState {
+	let Some(presence) = result.presence else {
+		return CollabState {
+			role:         None,
+			connection:   Str::new_static("disconnected"),
+			editor_link:  None,
+			viewer_link:  None,
+			participants: Vec::new(),
+			line:         Str::new_static("Collaboration ended."),
+		};
+	};
+	let role = match presence.role() {
+		omp_collab::presence::CollabRole::Host => CollabRole::Host,
+		omp_collab::presence::CollabRole::Guest => CollabRole::Guest,
+	};
+	let connection: &'static str = match presence.connection() {
+		omp_collab::presence::ConnectionState::Connecting => "connecting",
+		omp_collab::presence::ConnectionState::Connected => "connected",
+		omp_collab::presence::ConnectionState::Reconnecting => "reconnecting",
+		omp_collab::presence::ConnectionState::Disconnected => "disconnected",
+	};
+	let participants = (0..presence.participant_count())
+		.map(|index| CollabParticipant {
+			id:        u32::try_from(index).unwrap_or(u32::MAX),
+			name:      if index == 0 {
+				Str::new_static("Host")
+			} else {
+				Str::new(format!("Participant {index}"))
+			},
+			host:      index == 0,
+			read_only: index > 0 && presence.read_only(),
+		})
+		.collect();
+	let line = match (op, role) {
+		(CollabOp::Start { read_only: true, .. }, CollabRole::Host) => {
+			result.viewer_link.as_ref().map_or_else(
+				|| Str::new_static("Collaboration room started."),
+				|link| Str::new(format!("Collaboration room started (viewer): {link}")),
+			)
+		},
+		(CollabOp::Start { .. }, CollabRole::Host) => result.editor_link.as_ref().map_or_else(
+			|| Str::new_static("Collaboration room started."),
+			|link| Str::new(format!("Collaboration room started: {link}")),
+		),
+		(CollabOp::Join { .. }, CollabRole::Guest) => Str::new_static("Joined collaboration room."),
+		(CollabOp::Status, _) => Str::new(format!(
+			"Collaboration {connection}: {} participant(s).",
+			presence.participant_count()
+		)),
+		(CollabOp::Leave, _)
+		| (CollabOp::Start { .. }, CollabRole::Guest)
+		| (CollabOp::Join { .. }, CollabRole::Host) => Str::new_static("Collaboration updated."),
+	};
+	CollabState {
+		role: Some(role),
+		connection: Str::new_static(connection),
+		editor_link: result.editor_link,
+		viewer_link: result.viewer_link,
+		participants,
+		line,
+	}
+}
+
+fn runtime_id(session: &Session) -> Str {
+	session
+		.journal_path()
+		.file_stem()
+		.and_then(|name| name.to_str())
+		.map_or_else(|| Str::new_static("session"), Str::new)
+}
+
 fn display_name(session: &Session) -> Str {
 	session
 		.journal_path()
@@ -1980,8 +2690,12 @@ enum DirectorFailure {
 	NoHead,
 	#[error("no active engagement to update")]
 	NotActive,
+	#[error("no paused engagement to resume")]
+	NotPaused,
 	#[error("missing argument `{0}`")]
 	MissingArgument(&'static str),
+	#[error("invalid {name}: `{value}`")]
+	InvalidArgument { name: &'static str, value: Str },
 	#[error("Tool \"{0}\" is not currently active.")]
 	UnknownTool(Str),
 	#[error("unknown Director `{0}`")]
@@ -2309,6 +3023,9 @@ mod tests {
 			let (relay, _dom_events) = flume::unbounded();
 			let ctx = Arc::new(HostMailbox::new().attach(Ctx::builder()).build());
 			let live_journal = Arc::new(RwLock::new(journal.clone()));
+			let (collab_authority, collab) =
+				omp_driver::collab::session::CollabSessionAuthority::new();
+			let _collab_owner = omp_driver::collab::session::spawn_session_owner(collab_authority);
 			let (controller, _snapshot) = Controller::new(
 				kernel,
 				session,
@@ -2317,9 +3034,11 @@ mod tests {
 				Arc::clone(&ctx),
 				Arc::new(omp_chat::overlays::services::NoMutations),
 				services,
+				collab,
 				detached_env(),
 				live_journal,
 				dir.path().join("data"),
+				None,
 				None,
 				omp_driver::headless::AskRoute::new(),
 			);
@@ -2471,6 +3190,8 @@ mod tests {
 		let (relay, _dom_events) = flume::unbounded();
 		let ctx = Arc::new(HostMailbox::new().attach(Ctx::builder()).build());
 		let live_journal = Arc::new(RwLock::new(session.journal_path().to_path_buf()));
+		let (collab_authority, collab) = omp_driver::collab::session::CollabSessionAuthority::new();
+		let _collab_owner = omp_driver::collab::session::spawn_session_owner(collab_authority);
 		let (mut controller, _snapshot) = Controller::new(
 			kernel,
 			session,
@@ -2479,9 +3200,11 @@ mod tests {
 			ctx,
 			Arc::new(omp_chat::overlays::services::NoMutations),
 			Arc::new(NoServices),
+			collab,
 			detached_env(),
 			live_journal,
 			dir.path().to_path_buf(),
+			None,
 			None,
 			omp_driver::headless::AskRoute::new(),
 		);
@@ -2571,7 +3294,10 @@ mod tests {
 	async fn image_prompt_during_local_run_reaches_the_next_turn() {
 		const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x04\0\0\0\x03";
 		let harness = harness(Duration::from_millis(50));
-		harness.commands.send(sleep_command()).expect("local command");
+		harness
+			.commands
+			.send(sleep_command())
+			.expect("local command");
 		next_event(
 			&harness.events,
 			|event| matches!(event, KernelEvent::ToolReady { name, .. } if name == "bash"),
@@ -2616,17 +3342,14 @@ mod tests {
 			.select("user[steering=true]")
 			.expect("selector")
 			.find(|handle| {
-				dom.get(*handle)
-					.and_then(|node| node.content.as_deref())
-					== Some("inspect [Image #1]")
+				dom.get(*handle).and_then(|node| node.content.as_deref()) == Some("inspect [Image #1]")
 			})
 			.expect("image prompt is not dropped");
 		let node = dom.get(steering).expect("steering node");
 		let Some(Value::Json(raw)) = node.prop(&PropKey::from(PropId::Data)) else {
 			panic!("steering prompt carries attachment data: {node:?}");
 		};
-		let attachments: Vec<Attachment> =
-			serde_json::from_str(raw.get()).expect("attachment json");
+		let attachments: Vec<Attachment> = serde_json::from_str(raw.get()).expect("attachment json");
 		assert_eq!(attachments.len(), 1);
 		assert_eq!(attachments[0].mime, "image/png");
 		assert_eq!(
@@ -2718,8 +3441,7 @@ mod tests {
 		);
 	}
 
-	/// A paused controller hands the `!` line back instead of dropping it,
-	/// both when idle and when the run was deferred behind a turn.
+	/// A paused controller hands an idle `!` line back instead of dropping it.
 	#[tokio::test]
 	async fn paused_controller_refuses_local_runs_with_the_draft() {
 		let harness = harness(Duration::from_millis(300));
@@ -2747,12 +3469,20 @@ mod tests {
 				.all(|event| !matches!(event, KernelEvent::ToolReady { .. })),
 			"nothing ran"
 		);
-		// Deferred behind a turn: pausing during the turn wins over the
-		// queued run.
-		harness
-			.commands
-			.send(HostCommand::Pause { active: false })
-			.expect("resume");
+		harness.commands.send(HostCommand::Quit).expect("quit");
+		tokio::time::timeout(Duration::from_secs(5), harness.run)
+			.await
+			.expect("controller exits")
+			.expect("controller task")
+			.expect("controller run");
+	}
+
+	/// A pause received during a turn is journaled immediately and holds the
+	/// next runtime safe point until resume; the completed hold duration
+	/// survives replay.
+	#[tokio::test]
+	async fn pause_holds_a_running_turn_at_a_safe_point_and_replays_duration() {
+		let harness = harness(Duration::from_millis(40));
 		harness
 			.commands
 			.send(HostCommand::Submit(Str::new_static("hello")))
@@ -2760,35 +3490,89 @@ mod tests {
 		harness
 			.commands
 			.send(HostCommand::Pause { active: true })
-			.expect("pause mid-turn");
-		harness
-			.commands
-			.send(sleep_command())
-			.expect("deferred local command");
-		next_event(&harness.events, |event| {
-			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Completed })
-		})
-		.await;
-		let refused = tokio::time::timeout(Duration::from_secs(5), mailbox.next())
-			.await
-			.expect("refusal arrives")
-			.expect("mailbox open");
-		assert!(
-			matches!(refused, HostAction::LocalRefused { ref draft, .. } if draft == "!sleep 20")
-		);
+			.expect("pause");
+		tokio::time::sleep(Duration::from_millis(150)).await;
 		assert!(
 			harness
 				.events
 				.try_iter()
-				.all(|event| !matches!(event, KernelEvent::ToolReady { .. })),
-			"the deferred run never started"
+				.all(|event| !matches!(event, KernelEvent::TurnEnded { .. })),
+			"the candidate yield is held"
 		);
-		harness.commands.send(HostCommand::Quit).expect("quit");
-		tokio::time::timeout(Duration::from_secs(5), harness.run)
+		harness
+			.commands
+			.send(HostCommand::Pause { active: false })
+			.expect("resume");
+		next_event(&harness.events, |event| {
+			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Completed })
+		})
+		.await;
+		let (journal, _directory) = harness.quit().await;
+		let replayed = Session::open(&journal, omp_session::ComponentRegistry::standard())
+			.expect("replay paused session");
+		let pause = omp_agent::pause_state(replayed.dom());
+		assert!(!pause.active);
+		assert!(pause.duration_ms >= 100, "completed hold duration is durable");
+	}
+
+	#[tokio::test]
+	async fn paused_safe_point_remains_interruptible() {
+		let harness = harness(Duration::from_millis(40));
+		harness
+			.commands
+			.send(HostCommand::Submit(Str::new_static("hello")))
+			.expect("submit");
+		harness
+			.commands
+			.send(HostCommand::Pause { active: true })
+			.expect("pause");
+		tokio::time::sleep(Duration::from_millis(80)).await;
+		harness
+			.commands
+			.send(HostCommand::Interrupt)
+			.expect("interrupt");
+		next_event(&harness.events, |event| {
+			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Cancelled })
+		})
+		.await;
+		harness
+			.commands
+			.send(HostCommand::Pause { active: false })
+			.expect("resume");
+		harness.quit().await;
+	}
+
+	#[tokio::test]
+	async fn pause_protocol_broadcasts_to_live_subagents() {
+		let harness = harness(Duration::ZERO);
+		let (child_up, child_inbox) = flume::unbounded();
+		harness
+			.live
+			.register(Str::new_static("child"), omp_driver::sessions::KernelHandle {
+				id:       omp_driver::sessions::SessionId::new("child"),
+				name:     Str::new_static("child"),
+				up:       child_up,
+				snapshot: Arc::new(RwLock::new(omp_dom::Dom::new().snapshot())),
+			});
+		harness
+			.commands
+			.send(HostCommand::Pause { active: true })
+			.expect("pause");
+		let message = tokio::time::timeout(Duration::from_secs(2), child_inbox.recv_async())
 			.await
-			.expect("controller exits")
-			.expect("controller task")
-			.expect("controller run");
+			.expect("pause broadcast")
+			.expect("child inbox");
+		assert!(matches!(message, Up::Pause { active: true }));
+		harness
+			.commands
+			.send(HostCommand::Pause { active: false })
+			.expect("resume");
+		let message = tokio::time::timeout(Duration::from_secs(2), child_inbox.recv_async())
+			.await
+			.expect("resume broadcast")
+			.expect("child inbox");
+		assert!(matches!(message, Up::Pause { active: false }));
+		harness.quit().await;
 	}
 
 	/// `HostCommand::Git` mutates the project checkout and answers with
@@ -2886,9 +3670,10 @@ mod tests {
 				tokio::spawn(async move {
 					unit.cancelled().await;
 					omp_agent::JobSettlement {
-						status: Str::new_static("completed"),
-						output: None,
-						error:  None,
+						status:     Str::new_static("completed"),
+						output:     None,
+						error:      None,
+						completion: None,
 					}
 				}),
 			);
@@ -3155,5 +3940,24 @@ mod tests {
 		assert_eq!(severity, Severity::Info);
 		assert_eq!(text, "Nothing to retry");
 		harness.quit().await;
+	}
+
+	#[test]
+	fn atomic_plan_save_replaces_the_complete_destination() {
+		let directory = tempfile::tempdir().expect("temporary directory");
+		let path = directory.path().join("plan.md");
+		fs::write(&path, "old trailing bytes").expect("seed destination");
+		atomic_plan_save(&path, "new").expect("atomic save");
+		assert_eq!(fs::read_to_string(path).expect("saved plan"), "new");
+	}
+
+	#[test]
+	fn atomic_plan_save_rejects_a_missing_parent_without_creating_destination() {
+		let directory = tempfile::tempdir().expect("temporary directory");
+		let parent = directory.path().join("missing");
+		let path = parent.join("plan.md");
+		assert!(atomic_plan_save(&path, "plan").is_err());
+		assert!(!parent.exists());
+		assert!(!path.exists());
 	}
 }

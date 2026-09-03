@@ -193,6 +193,9 @@ pub(crate) struct Launch {
 	/// against `--theme` paths and the theme directories; `None` is the stock
 	/// palette.
 	pub theme:         Option<Arc<omp_tui::JsonTheme>>,
+	/// Every discovered named palette, retained for `/settings` runtime choices
+	/// and observer-local preview.
+	pub theme_catalog: Arc<omp_tui::ThemeCatalog>,
 	pub live_sessions: Arc<omp_driver::sessions::SessionRegistry>,
 	pub options:       KernelOptions,
 }
@@ -312,7 +315,7 @@ impl Launch {
 		for warning in &templates.warnings {
 			eprintln!("warning: {}: {}", warning.path.display(), warning.message);
 		}
-		let theme = resolve_theme(&ctx, &theme, &config_root, &project)?;
+		let (theme, theme_catalog) = resolve_theme(&ctx, &theme, &config_root, &project)?;
 
 		let resuming = continue_session || resume.is_some() || fork.is_some();
 		let settings = ModelSettings::from_con(&ctx).resolve_path_scopes(&project, &home);
@@ -455,6 +458,7 @@ impl Launch {
 			prompt,
 			templates: Arc::new(templates),
 			theme,
+			theme_catalog,
 			live_sessions,
 			options,
 		})
@@ -551,12 +555,9 @@ fn resolve_theme(
 	explicit: &[PathBuf],
 	config_root: &Path,
 	project: &Path,
-) -> miette::Result<Option<Arc<omp_tui::JsonTheme>>> {
-	let name = omp_con::CL_THEME.get(ctx);
-	let stock = name.is_empty() || name == STOCK_THEME;
-	if explicit.is_empty() && stock {
-		return Ok(None);
-	}
+) -> miette::Result<(Option<Arc<omp_tui::JsonTheme>>, Arc<omp_tui::ThemeCatalog>)> {
+	let override_name = omp_con::CL_THEME.get(ctx);
+	let stock = override_name.is_empty() || override_name == STOCK_THEME;
 	let catalog = omp_tui::ThemeCatalog::load(explicit, &[
 		config_root.join("agent/themes"),
 		project.join(".omp/themes"),
@@ -565,16 +566,25 @@ fn resolve_theme(
 	for warning in &catalog.warnings {
 		eprintln!("warning: {}: {}", warning.path.display(), warning.message);
 	}
-	if stock {
-		return Ok(catalog.first_explicit());
-	}
-	match catalog.get(&name) {
-		Some(theme) => Ok(Some(theme)),
-		None => {
-			eprintln!("warning: theme `{name}` not found; using the stock palette");
-			Ok(catalog.first_explicit())
-		},
-	}
+	let selected = if stock && !explicit.is_empty() {
+		catalog.first_explicit()
+	} else {
+		let name = if stock {
+			omp_chat::settings::CL_THEME_DARK.get(ctx)
+		} else {
+			override_name
+		};
+		match catalog.get(&name) {
+			Some(theme) => Some(theme),
+			None => {
+				if !name.is_empty() && name != STOCK_THEME && name != "titanium" && name != "light" {
+					eprintln!("warning: theme `{name}` not found; using the stock palette");
+				}
+				catalog.first_explicit()
+			},
+		}
+	};
+	Ok((selected, Arc::new(catalog)))
 }
 
 /// The launch's prompt templates as the chat console sees them
@@ -740,6 +750,33 @@ fn apply_launch_session(
 		AI_PREWALK_MODEL
 			.set(ctx, selector_with_thinking(target))
 			.into_diagnostic()?;
+		let configured_model = omp_con::AI_MODEL.get(ctx);
+		let current_model = if configured_model.is_empty() {
+			launch.model.as_str()
+		} else {
+			configured_model.as_str()
+		};
+		let current_thinking = omp_con::AI_THINKING.get(ctx);
+		let changes_model = current_model != target.model.as_str();
+		let changes_thinking = target
+			.thinking
+			.as_ref()
+			.is_some_and(|thinking| thinking.as_str() != current_thinking.as_str());
+		if (changes_model || changes_thinking)
+			&& omp_agent::find_director(session.dom(), "prewalk").is_none()
+		{
+			let registry = omp_agent::DirectorRegistry::standard();
+			let mut stack = omp_agent::DirectorStack::from_dom(session.dom(), &registry);
+			stack
+				.engage(
+					session,
+					Box::new(omp_agent::directors::prewalk::Prewalk::new(
+						target.model.clone(),
+						target.thinking.clone(),
+					)),
+				)
+				.into_diagnostic()?;
+		}
 	}
 	apply_launch_plan(session, launch.plan_mode, launch.plan_yolo.as_ref()).into_diagnostic()?;
 	omp_agent::directors::advisor::apply_launch(session, ctx).into_diagnostic()?;
@@ -801,6 +838,10 @@ pub(crate) async fn run(
 		eprintln!("warning: prompt template `{reserved}` shadows a built-in command; skipped");
 	}
 	let (mut kernel, session) = launch.compose().await?;
+	let live_auth = kernel
+		.inference()
+		.production_stack()
+		.map(|stack| stack.auth_manager.clone());
 	let ephemeral_path = ephemeral.then(|| session.journal_path().to_path_buf());
 	// The host's one DOM channel: the controller relays every live session's
 	// subscription onto it and publishes one `Reset` per session switch.
@@ -888,6 +929,8 @@ pub(crate) async fn run(
 	// Application feeds behind the dashboards and account commands: engines
 	// stay here, the actor only reads rows (ADR 0005).
 	let live_journal = Arc::new(parking_lot::RwLock::new(session.journal_path().to_path_buf()));
+	let (collab_authority, collab) = omp_driver::collab::session::CollabSessionAuthority::new();
+	let _collab_owner = omp_driver::collab::session::spawn_session_owner(collab_authority);
 	let (services, mutations): (
 		Arc<dyn omp_chat::overlays::Services>,
 		Arc<dyn omp_chat::overlays::services::Mutations>,
@@ -910,6 +953,7 @@ pub(crate) async fn run(
 				registry: Arc::clone(kernel.tool_registry()),
 				con: Arc::clone(ctx),
 				sessions: Arc::clone(live_sessions),
+				collab: collab.clone(),
 				env: composed.environment_client().clone(),
 				mcp: environment.mcp_inspector(),
 				reload: environment.extension_reload_handle(),
@@ -918,6 +962,7 @@ pub(crate) async fn run(
 					.production_stack()
 					.map(crate::chat_services::StackHandles::from_stack),
 				trace,
+				theme_catalog: Arc::clone(&launch.theme_catalog),
 				runtime: tokio::runtime::Handle::current(),
 			}));
 		(
@@ -931,6 +976,7 @@ pub(crate) async fn run(
 		Some(Arc::new(crate::voice::synth::EnvSpeechSynth::new(
 			kernel.inference().environment().search_bridge(),
 			Arc::clone(ctx),
+			kernel.inference().speech_rewriter(),
 		)));
 	let home = omp_driver::headless::kernel::SessionHome::new(
 		data_dir,
@@ -969,9 +1015,11 @@ pub(crate) async fn run(
 		Arc::clone(ctx),
 		mutations,
 		Arc::clone(&services),
+		collab,
 		env,
 		Arc::clone(&live_journal),
 		data_dir.clone(),
+		live_auth,
 		ephemeral_path.clone(),
 		ask_route,
 	);
@@ -1456,58 +1504,35 @@ fn engage_plan(
 	session: &mut omp_session::Session,
 	plan: omp_agent::directors::plan::Plan,
 ) -> Result<(), omp_agent::DirectorError> {
+	const PLAN: &str = "plan";
 	let registry = omp_agent::DirectorRegistry::standard();
 	let mut stack = omp_agent::DirectorStack::from_dom(session.dom(), &registry);
-	if stack.active_ids().contains(&"plan") {
+	if let Some((_, node)) = omp_agent::find_director(session.dom(), PLAN) {
+		if omp_agent::director_status(node) == Some("paused") {
+			stack.resume(session, PLAN)?;
+		}
 		return Ok(());
 	}
 	stack.engage(session, Box::new(plan)).map(drop)
 }
 
-/// pi `app.plan.toggle`: engages the plan Director (ADR 0015 `<meta>
-/// <directors>` element) or exits it by removing its frame, between turns.
+/// pi `app.plan.toggle`: engages/resumes the plan Director or pauses its
+/// journaled subtree between turns. Approval exits it through the generic
+/// Director command; a pause deliberately preserves plan and child state.
 pub(crate) fn set_plan_mode(
 	session: &mut omp_session::Session,
 	engage: bool,
 ) -> Result<(), omp_agent::DirectorError> {
-	use omp_dom::{KnownTag, Op, PropKey, Tag, Txn, Value};
 	const PLAN: &str = "plan";
+	let registry = omp_agent::DirectorRegistry::standard();
+	let mut stack = omp_agent::DirectorStack::from_dom(session.dom(), &registry);
 	if engage {
 		return engage_plan(
 			session,
 			omp_agent::directors::plan::Plan::new(omp_chat::commands::plan::DEFAULT_PLAN),
 		);
 	}
-	let registry = omp_agent::DirectorRegistry::standard();
-	let stack = omp_agent::DirectorStack::from_dom(session.dom(), &registry);
-	if !stack.active_ids().contains(&PLAN) {
-		return Ok(());
-	}
-	let dom = session.dom();
-	let Some(handle) = dom
-		.select("directors director[family=plan]")
-		.ok()
-		.and_then(|mut handles| handles.next())
-		.filter(|handle| {
-			dom.get(*handle).is_some_and(|node| {
-				node.tag == Tag::Known(KnownTag::Director)
-					&& node
-						.prop(&PropKey::Custom(Str::new_static("family")))
-						.and_then(Value::as_str)
-						== Some(PLAN)
-			})
-		})
-	else {
-		return Ok(());
-	};
-	let cause = session
-		.head()
-		.ok_or(omp_agent::DirectorError::MissingDirectors)?;
-	session.patch(Txn {
-		cause,
-		label: Some(Str::new_static("director.exit")),
-		ops: vec![Op::Rm(handle)],
-	})?;
+	stack.pause(session, PLAN)?;
 	Ok(())
 }
 

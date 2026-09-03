@@ -105,7 +105,7 @@ impl Director for Goal {
 		updates
 	}
 
-	fn evaluate(&self, _dom: &Dom, _cx: &DirectorCx<'_>, turn: &TurnView) -> DirectorEffect {
+	fn evaluate(&self, _dom: &Dom, _cx: &DirectorCx<'_>, _turn: &TurnView) -> DirectorEffect {
 		if self.done || self.dropped {
 			return DirectorEffect::new(Verdict::Done);
 		}
@@ -115,9 +115,6 @@ impl Director for Goal {
 		{
 			return DirectorEffect::new(Verdict::Done)
 				.with_aside("Goal token budget exhausted; returning control to the user.");
-		}
-		if !turn.had_tool_calls {
-			return DirectorEffect::new(Verdict::Yield);
 		}
 		DirectorEffect::new(Verdict::Continue {
 			reminder: Some(Str::new(format!("Continue toward the active goal: {}", self.objective))),

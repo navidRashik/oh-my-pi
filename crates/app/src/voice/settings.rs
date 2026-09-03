@@ -1,6 +1,9 @@
 //! Voice command-stream variables and one-shot legacy migration keys.
 
 use omp_core::Str;
+pub use omp_inference::speech_settings::{
+	AI_TTS_PROVIDER, CL_TTS_MODEL, CL_TTS_VOICE, KokoroVoice, TtsModel, TtsProvider,
+};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
@@ -60,36 +63,8 @@ pub enum SpeechMode {
 	Yield,
 }
 
-/// Backend preference for generated speech files.
-#[derive(
-	Clone,
-	Copy,
-	Debug,
-	Default,
-	Deserialize,
-	Display,
-	EnumString,
-	Eq,
-	IntoStaticStr,
-	PartialEq,
-	Serialize,
-	strum::VariantNames,
-)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
-pub enum TtsProvider {
-	/// Prefer local synthesis.
-	#[default]
-	Auto,
-	/// Require local Kokoro synthesis.
-	Local,
-	/// Require hosted xAI synthesis.
-	Xai,
-}
-
 omp_con::con_enum!(SttSubmitTrigger);
 omp_con::con_enum!(SpeechMode);
-omp_con::con_enum!(TtsProvider);
 
 /// Speech recognition model selection.
 #[derive(
@@ -109,54 +84,6 @@ pub enum SttModel {
 }
 
 omp_con::con_enum!(SttModel);
-
-/// Local speech synthesis model selection.
-#[derive(
-	Clone, Copy, Debug, Default, EnumString, Eq, IntoStaticStr, PartialEq, strum::VariantNames,
-)]
-#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
-pub enum TtsModel {
-	/// Kokoro-82M.
-	#[default]
-	Kokoro,
-}
-
-omp_con::con_enum!(TtsModel);
-
-/// Kokoro voice selection.
-#[derive(
-	Clone, Copy, Debug, Default, EnumString, Eq, IntoStaticStr, PartialEq, strum::VariantNames,
-)]
-#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
-pub enum KokoroVoice {
-	/// Heart, American female.
-	#[default]
-	AfHeart,
-	/// Bella, American female.
-	AfBella,
-	/// Nicole, American female.
-	AfNicole,
-	/// Aoede, American female.
-	AfAoede,
-	/// Kore, American female.
-	AfKore,
-	/// Sarah, American female.
-	AfSarah,
-	/// Michael, American male.
-	AmMichael,
-	/// Fenrir, American male.
-	AmFenrir,
-	/// Puck, American male.
-	AmPuck,
-	/// Emma, British female.
-	BfEmma,
-	/// George, British male.
-	BmGeorge,
-	/// Fable, British male.
-	BmFable,
-}
-
-omp_con::con_enum!(KokoroVoice);
 
 /// Realtime provider voice selection.
 #[derive(
@@ -196,10 +123,6 @@ omp_con::var! {
 	pub static CL_STT_MODEL = cl_stt_model: SttModel { default: SttModel::Parakeet, flags: archive };
 	/// Dictation submission policy.
 	pub static CL_STT_SUBMIT_TRIGGER = cl_stt_submit_trigger: SttSubmitTrigger { default: SttSubmitTrigger::Never, flags: archive };
-	/// Local synthesis model.
-	pub static CL_TTS_MODEL = cl_tts_model: TtsModel { default: TtsModel::Kokoro, flags: archive };
-	/// Direct local synthesis voice.
-	pub static CL_TTS_VOICE = cl_tts_voice: KokoroVoice { default: KokoroVoice::AfHeart, flags: archive };
 	/// Enables generated speech tools.
 	pub static CL_SPEECHGEN_ENABLED = cl_speechgen_enabled: bool { default: false, flags: archive };
 	/// Enables assistant vocalization.
@@ -212,8 +135,10 @@ omp_con::var! {
 	pub static CL_SPEECH_VOICE = cl_speech_voice: KokoroVoice { default: KokoroVoice::AfHeart, flags: archive };
 	/// Realtime provider voice.
 	pub static CL_LIVE_VOICE = cl_live_voice: LiveVoice { default: LiveVoice::Sol, flags: archive };
-	/// Generated-speech provider.
-	pub static AI_TTS_PROVIDER = ai_tts_provider: TtsProvider { default: TtsProvider::Auto, flags: archive };
+	/// Stable realtime microphone device ID; empty selects the system default.
+	pub static CL_LIVE_INPUT_DEVICE = cl_live_input_device: Str { default: Str::default(), flags: archive };
+	/// Stable realtime speaker device ID; empty selects the system default.
+	pub static CL_LIVE_OUTPUT_DEVICE = cl_live_output_device: Str { default: Str::default(), flags: archive };
 }
 
 /// Legacy settings keys and their command-stream replacements.

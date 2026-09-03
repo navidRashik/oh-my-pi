@@ -3,6 +3,7 @@
 //! Production application CLI, TUI, and command dispatch.
 
 pub mod acp_mode;
+mod acp_events;
 pub mod audio_coordinator;
 pub mod auth_broker_cmd;
 pub mod auth_cli;
@@ -41,7 +42,6 @@ pub mod grievances_cmd;
 #[cfg(feature = "gui")]
 mod gui;
 pub mod help_extra;
-pub mod image_attachment;
 pub mod images_cmd;
 pub mod keybindings;
 pub mod models_cmd;

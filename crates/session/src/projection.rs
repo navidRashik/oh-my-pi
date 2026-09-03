@@ -23,6 +23,16 @@ use thiserror::Error;
 /// Durable property carrying an explicit provider-session reset request.
 pub const PROVIDER_RESET_PROP: &str = "omp/session-provider-reset";
 
+/// Structural tag for one provider-ordered assistant text or thinking block.
+///
+/// The child carries [`PropId::Kind`] (`text` or `thinking`),
+/// [`PROVIDER_BLOCK_INDEX_PROP`], and a streamed [`PropId::Text`].
+pub const ASSISTANT_CONTENT_TAG: &str = "assistant-content";
+
+/// Provider content-array index shared by assistant content and artifact
+/// children.
+pub const PROVIDER_BLOCK_INDEX_PROP: &str = "index";
+
 /// Prop marking a `<user>` turn child that arrived as steering at a safe
 /// point (pi `steering: true`).
 pub const STEERING_PROP: &str = "steering";
@@ -379,7 +389,14 @@ fn project_window(dom: &Dom, window: Window, items: &mut Vec<Item>) {
 				Tag::Known(KnownTag::Assistant) => {
 					// Receipts are consumed one-for-one in ordered turn
 					// sequence; no completion can reuse another's accounting.
-					project_assistant(node, receipts.remove(child), issuing.contains(child), items);
+					project_assistant(
+						dom,
+						*child,
+						node,
+						receipts.remove(child),
+						issuing.contains(child),
+						items,
+					);
 				},
 				Tag::Custom(name) if local => {
 					project_local_tool(dom, *child, name.as_str(), node, items);
@@ -515,28 +532,14 @@ fn project_message(node: &Node, role: thread::Role, items: &mut Vec<Item>) {
 }
 
 fn project_assistant(
+	dom: &Dom,
+	handle: Handle,
 	node: &Node,
 	usage: Option<inference::Usage>,
 	issued_calls: bool,
 	items: &mut Vec<Item>,
 ) {
-	let mut parts = Vec::new();
-	if let Some(thinking) = prop_text(node, PropId::Thinking).filter(|text| !text.is_empty()) {
-		parts.push(thread::Part {
-			kind: Some(part::Kind::Thinking(thread::Thinking {
-				text: thinking.to_owned(),
-				..Default::default()
-			})),
-		});
-	}
-	if let Some(text) = node
-		.content
-		.as_deref()
-		.or_else(|| prop_text(node, PropId::Text))
-		.filter(|text| !text.is_empty())
-	{
-		parts.push(thread::Part { kind: Some(part::Kind::Text(text.to_owned())) });
-	}
+	let parts = assistant_parts(dom, handle, node);
 	// An assistant that produced neither content nor a call is the empty
 	// turn pi's recovery drops before retrying; providers reject empty
 	// assistant content and its receipt belongs to no surviving message.
@@ -554,6 +557,123 @@ fn project_assistant(
 		})),
 		props:         None,
 	});
+}
+
+/// Projects assistant content-array children in provider order. Legacy
+/// sessions without `<assistant-content>` children retain the former
+/// thinking → text → artifact projection.
+fn assistant_parts(dom: &Dom, assistant: Handle, node: &Node) -> Vec<thread::Part> {
+	let children = dom.children(assistant);
+	let ordered = children
+		.iter()
+		.any(|handle| dom.get(*handle).is_some_and(is_assistant_content));
+	let mut parts = Vec::new();
+	if !ordered {
+		if let Some(thinking) = prop_text(node, PropId::Thinking).filter(|text| !text.is_empty()) {
+			parts.push(thinking_part(thinking));
+		}
+		if let Some(text) = node
+			.content
+			.as_deref()
+			.or_else(|| prop_text(node, PropId::Text))
+			.filter(|text| !text.is_empty())
+		{
+			parts.push(text_part(text));
+		}
+	}
+	let mut content = children
+		.iter()
+		.enumerate()
+		.filter_map(|(position, handle)| {
+			let node = dom.get(*handle)?;
+			(ordered && is_assistant_content(node) || is_artifact(node)).then_some((
+				provider_block_index(node),
+				position,
+				*handle,
+				node,
+			))
+		})
+		.collect::<Vec<_>>();
+	content.sort_by_key(|(index, position, ..)| (*index, *position));
+	for (_, _, handle, child) in content {
+		if is_assistant_content(child) {
+			let Some(text) = dom
+				.stream_text(handle, &PropId::Text.into())
+				.or_else(|| prop_text(child, PropId::Text))
+				.filter(|text| !text.is_empty())
+			else {
+				continue;
+			};
+			match prop_text(child, PropId::Kind) {
+				Some("thinking") => parts.push(thinking_part(text)),
+				Some("text") => parts.push(text_part(text)),
+				_ => {},
+			}
+		} else if let Some(part) = artifact_part(child) {
+			parts.push(part);
+		}
+	}
+	parts
+}
+
+fn is_assistant_content(node: &Node) -> bool {
+	matches!(&node.tag, Tag::Custom(tag) if tag.as_str() == ASSISTANT_CONTENT_TAG)
+}
+
+fn is_artifact(node: &Node) -> bool {
+	matches!(&node.tag, Tag::Custom(tag) if tag.as_str() == "artifact")
+}
+
+fn provider_block_index(node: &Node) -> i64 {
+	node
+		.prop(&PropKey::Custom(Str::new_static(PROVIDER_BLOCK_INDEX_PROP)))
+		.and_then(|value| match value {
+			Value::Int(index) => Some(*index),
+			_ => None,
+		})
+		.unwrap_or(i64::MAX)
+}
+
+fn text_part(text: &str) -> thread::Part {
+	thread::Part { kind: Some(part::Kind::Text(text.to_owned())) }
+}
+
+fn thinking_part(text: &str) -> thread::Part {
+	thread::Part {
+		kind: Some(part::Kind::Thinking(thread::Thinking {
+			text: text.to_owned(),
+			..Default::default()
+		})),
+	}
+}
+
+fn artifact_part(artifact: &Node) -> Option<thread::Part> {
+	let uri = prop_text(artifact, PropId::Blob)?;
+	let mime = prop_text(artifact, PropId::Mime).unwrap_or("application/octet-stream");
+	let size = artifact
+		.prop(&PropKey::Custom(Str::new_static("size")))
+		.and_then(|value| match value {
+			Value::Int(value) => u64::try_from(*value).ok(),
+			_ => None,
+		})
+		.unwrap_or_default();
+	let Some(encoded) = uri.strip_prefix("artifact://sha256/") else {
+		return Some(text_part(uri));
+	};
+	let Ok(hash) = hex::decode(encoded).into_vec() else {
+		return Some(text_part(uri));
+	};
+	if hash.len() != 32 {
+		return Some(text_part(uri));
+	}
+	Some(thread::Part {
+		kind: Some(part::Kind::Blob(thread::Blob {
+			hash: hash.into(),
+			mime: mime.to_owned(),
+			size,
+			..Default::default()
+		})),
+	})
 }
 
 fn project_tool(dom: &Dom, handle: Handle, name: &str, node: &Node, items: &mut Vec<Item>) {

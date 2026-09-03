@@ -560,12 +560,13 @@ async fn settled_background_job_is_delivered_to_the_model_as_a_follow_up_turn() 
 		tokio::spawn(async move {
 			let _ = done_rx.recv_async().await;
 			omp_agent::JobSettlement {
-				status: Str::new_static("completed"),
-				output: Some(
+				status:     Str::new_static("completed"),
+				output:     Some(
 					serde_json::value::to_raw_value(&serde_json::json!({"text": "hello from child"}))
 						.expect("raw"),
 				),
-				error:  None,
+				error:      None,
+				completion: None,
 			}
 		}),
 	));

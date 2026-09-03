@@ -18,6 +18,7 @@ const FAMILY: &str = "family";
 const STATE_PREFIX: &str = "state/";
 const BIND_PREFIX: &str = "bind/";
 const ACTIVE: &str = "active";
+const PAUSED: &str = "paused";
 const QUEUED: &str = "queued";
 
 /// One heap-pinned future at the cold, type-erased inference boundary.
@@ -468,6 +469,20 @@ pub trait Director: Send + Sync {
 		Vec::new()
 	}
 
+	/// Returns a one-shot completion effect at a settled tool-turn boundary.
+	///
+	/// Most Directors only own candidate yields and return `None`. A Director
+	/// whose contract hands control off immediately after a successful action
+	/// may return a `Done` effect so the next inference uses the new state.
+	fn after_settled_turn(
+		&self,
+		_dom: &Dom,
+		_cx: &DirectorCx<'_>,
+		_turn: &TurnView,
+	) -> Option<DirectorEffect> {
+		None
+	}
+
 	/// Inspects one candidate yield.
 	fn on_yield(&self, _cx: &DirectorCx<'_>, _turn: &TurnView) -> Verdict {
 		Verdict::Pass
@@ -738,6 +753,84 @@ impl DirectorStack {
 		Ok(handle)
 	}
 
+	/// Pauses one engagement in place.
+	///
+	/// Its subtree stays materialized, so resuming restores the exact Director
+	/// and child state. Pausing releases its slots and promotes the oldest
+	/// compatible queued engagement.
+	pub fn pause(&mut self, session: &mut Session, family: &str) -> Result<bool, DirectorError> {
+		let Some((handle, node)) = find_director(session.dom(), family) else {
+			return Ok(false);
+		};
+		if director_status(node) == Some(PAUSED) {
+			return Ok(false);
+		}
+		if director_status(node) != Some(ACTIVE) {
+			return Ok(false);
+		}
+		patch(session, "director.pause", vec![Op::Set {
+			h:     handle,
+			prop:  custom(STATUS),
+			value: Value::Str(Str::new_static(PAUSED)),
+		}])?;
+		self.promote(session)?;
+		Ok(true)
+	}
+
+	/// Resumes one paused engagement, or queues it when an active Director
+	/// currently owns one of its slots.
+	pub fn resume(&mut self, session: &mut Session, family: &str) -> Result<bool, DirectorError> {
+		*self = Self::from_dom(session.dom(), &self.registry);
+		let Some((handle, node)) = find_director(session.dom(), family) else {
+			return Ok(false);
+		};
+		if director_status(node) != Some(PAUSED) {
+			return Ok(false);
+		}
+		let Some(director) = self.registry.construct(node) else {
+			return Err(DirectorError::UnknownDirector);
+		};
+		let contested = director.claims().iter().any(|slot| {
+			self
+				.active
+				.iter()
+				.any(|frame| frame.director.claims().contains(slot))
+		});
+		let root = directors_root(session.dom()).ok_or(DirectorError::MissingDirectors)?;
+		let parent = if contested {
+			root
+		} else {
+			self.active.last().map_or(root, |frame| frame.handle)
+		};
+		let mut ops = Vec::with_capacity(2);
+		if session.dom().parent(handle) != Some(parent) {
+			ops.push(Op::Mv {
+				h: handle,
+				parent,
+				after: session.dom().children(parent).last().copied(),
+			});
+		}
+		ops.push(Op::Set {
+			h:     handle,
+			prop:  custom(STATUS),
+			value: Value::Str(Str::new_static(if contested { QUEUED } else { ACTIVE })),
+		});
+		patch(session, "director.resume", ops)?;
+		*self = Self::from_dom(session.dom(), &self.registry);
+		Ok(true)
+	}
+
+	/// Removes one engagement and its nested members, then promotes the oldest
+	/// compatible queued engagement.
+	pub fn exit(&mut self, session: &mut Session, family: &str) -> Result<bool, DirectorError> {
+		let Some((handle, _)) = find_director(session.dom(), family) else {
+			return Ok(false);
+		};
+		patch(session, "director.exit", vec![Op::Rm(handle)])?;
+		self.promote(session)?;
+		Ok(true)
+	}
+
 	/// Runs asynchronous pre-inference hooks outermost to innermost.
 	pub async fn before_inference(
 		&self,
@@ -819,6 +912,47 @@ impl DirectorStack {
 			*self = Self::from_dom(session.dom(), &self.registry);
 		}
 		Ok(())
+	}
+
+	/// Applies one-shot Director handoffs immediately after a tool turn has
+	/// settled, before the kernel projects another inference request.
+	pub fn after_settled_turn(
+		&mut self,
+		session: &mut Session,
+		cx: &DirectorCx<'_>,
+		turn: &TurnView,
+	) -> Result<bool, DirectorError> {
+		*self = Self::from_dom(session.dom(), &self.registry);
+		for index in (0..self.active.len()).rev() {
+			let handle = self.active[index].handle;
+			let Some(effect) = self.active[index].director.after_settled_turn(
+				session.dom(),
+				&cx.for_director(
+					handle,
+					session
+						.dom()
+						.get(handle)
+						.expect("active Director handle must exist"),
+				),
+				turn,
+			) else {
+				continue;
+			};
+			let DirectorEffect { verdict, updates, asides, writes, continue_after_exit } = effect;
+			if !matches!(verdict, Verdict::Done) || !continue_after_exit {
+				continue;
+			}
+			let mut ops = update_ops(handle, updates);
+			for text in asides {
+				ops.push(developer_op(session.dom(), turn.turn, text));
+			}
+			ops.extend(con_write_ops(session, &writes)?);
+			ops.push(Op::Rm(handle));
+			patch(session, "director.turn-settled", ops)?;
+			self.promote(session)?;
+			return Ok(true);
+		}
+		Ok(false)
 	}
 
 	/// Walks candidate-yield ownership innermost to outermost.
@@ -1059,6 +1193,12 @@ pub fn state_bool(node: &Node, key: &str) -> Option<bool> {
 	}
 }
 
+/// Returns one materialized Director's lifecycle status.
+#[must_use]
+pub fn director_status(node: &Node) -> Option<&str> {
+	prop_str(node, STATUS)
+}
+
 /// Finds the materialized node for one Director family.
 #[must_use]
 pub fn find_director<'a>(dom: &'a Dom, family: &str) -> Option<(Handle, &'a Node)> {
@@ -1075,6 +1215,57 @@ pub fn turn_called(dom: &Dom, turn: Handle, tool: &str) -> bool {
 	dom.children(turn).iter().copied().any(|handle| {
 		dom.get(handle)
 			.is_some_and(|node| matches!(&node.tag, Tag::Custom(name) if name == tool))
+	})
+}
+
+/// Returns whether the session fold authenticated and successfully settled a
+/// call to `tool` in this turn.
+///
+/// This deliberately checks the typed tool-element shape and terminal status
+/// produced by `tool.call@1` + `tool.result@1`; assistant text and streamed
+/// argument fragments are never treated as evidence that an action ran.
+#[must_use]
+pub fn turn_settled_successfully(dom: &Dom, turn: Handle, tool: &str) -> bool {
+	dom.children(turn).iter().copied().any(|handle| {
+		let Some(node) = dom.get(handle) else {
+			return false;
+		};
+		if !matches!(&node.tag, Tag::Custom(name) if name == tool)
+			|| node
+				.prop(&PropKey::from(PropId::Status))
+				.and_then(Value::as_str)
+				!= Some("ok")
+			|| node
+				.prop(&PropKey::from(PropId::Cause))
+				.and_then(Value::as_str)
+				.is_none_or(|cause| cause.parse::<omp_journal::EntryId>().is_err())
+			|| node
+				.prop(&PropKey::from(PropId::Id))
+				.and_then(Value::as_str)
+				.is_none_or(str::is_empty)
+		{
+			return false;
+		}
+		let mut input = false;
+		let mut result = false;
+		let mut usage = false;
+		for child in dom
+			.children(handle)
+			.iter()
+			.filter_map(|child| dom.get(*child))
+		{
+			match &child.tag {
+				Tag::Known(KnownTag::Input) => input = true,
+				Tag::Known(KnownTag::Result)
+					if child.prop(&PropKey::from(PropId::Outcome)).is_some() =>
+				{
+					result = true;
+				},
+				Tag::Known(KnownTag::Usage) => usage = true,
+				Tag::Known(_) | Tag::Custom(_) => {},
+			}
+		}
+		input && result && usage
 	})
 }
 
@@ -1109,7 +1300,13 @@ pub fn turn_tokens(dom: &Dom, turn: Handle) -> u64 {
 	dom.children(turn)
 		.iter()
 		.filter_map(|handle| dom.get(*handle))
-		.filter(|node| node.tag == KnownTag::Usage.into())
+		.filter(|node| {
+			node.tag == KnownTag::Usage.into()
+				&& node
+					.prop(&PropKey::from(PropId::Kind))
+					.and_then(Value::as_str)
+					!= Some("advisor")
+		})
 		.map(|node| {
 			[PropId::TokensIn, PropId::TokensOut]
 				.into_iter()

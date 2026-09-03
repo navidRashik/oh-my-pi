@@ -1,10 +1,12 @@
 //! DOM-only message projection laws.
 
 use omp_core::{Hash32, Str};
-use omp_dom::{KnownTag, Tag};
+use omp_dom::{KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_journal::blob::{BlobRef, BlobStore};
 use omp_proto::thread::v1::{item, part};
-use omp_session::{ComponentRegistry, Session, project_thread};
+use omp_session::{
+	ASSISTANT_CONTENT_TAG, ComponentRegistry, PROVIDER_BLOCK_INDEX_PROP, Session, project_thread,
+};
 use serde_json::value::RawValue;
 
 fn raw(value: serde_json::Value) -> Box<RawValue> {
@@ -22,6 +24,78 @@ fn find_tag(session: &Session, tag: KnownTag) -> Vec<omp_dom::Handle> {
 				.is_some_and(|node| node.tag == Tag::Known(tag))
 		})
 		.collect()
+}
+
+fn insert_assistant_part(
+	session: &mut Session,
+	assistant: omp_dom::Handle,
+	index: i64,
+	kind: &str,
+) -> omp_dom::Handle {
+	session
+		.patch(Txn {
+			cause: session.head().expect("head"),
+			label: Some(Str::new_static("assistant.block")),
+			ops:   vec![Op::Ins {
+				parent: assistant,
+				after:  session.dom().children(assistant).last().copied(),
+				node:   NodeSpec::new(Tag::Custom(Str::new_static(ASSISTANT_CONTENT_TAG)))
+					.with_prop(PropId::Kind, Value::Str(Str::new(kind)))
+					.with_prop(
+						PropKey::Custom(Str::new_static(PROVIDER_BLOCK_INDEX_PROP)),
+						Value::Int(index),
+					),
+			}],
+		})
+		.expect("assistant part");
+	*session
+		.dom()
+		.children(assistant)
+		.last()
+		.expect("inserted assistant part")
+}
+
+fn insert_artifact(
+	session: &mut Session,
+	assistant: omp_dom::Handle,
+	index: i64,
+	byte: u8,
+) -> omp_dom::Handle {
+	let uri = Str::new(format!("artifact://sha256/{}", format!("{byte:02x}").repeat(32)));
+	session
+		.patch(Txn {
+			cause: session.head().expect("head"),
+			label: Some(Str::new_static("assistant.artifact")),
+			ops:   vec![Op::Ins {
+				parent: assistant,
+				after:  session.dom().children(assistant).last().copied(),
+				node:   NodeSpec::new(Tag::Custom(Str::new_static("artifact")))
+					.with_prop(PropId::Blob, Value::Str(uri))
+					.with_prop(PropId::Mime, Value::Str(Str::new_static("image/png")))
+					.with_prop(PropId::Kind, Value::Str(Str::new_static("image")))
+					.with_prop(
+						PropKey::Custom(Str::new_static(PROVIDER_BLOCK_INDEX_PROP)),
+						Value::Int(index),
+					),
+			}],
+		})
+		.expect("artifact");
+	*session
+		.dom()
+		.children(assistant)
+		.last()
+		.expect("inserted artifact")
+}
+
+fn stream_part(session: &mut Session, handle: omp_dom::Handle, text: &str, close: bool) -> u32 {
+	let sid = session
+		.stream_open(handle, PropId::Text.into())
+		.expect("part stream");
+	session.stream_append(sid, text).expect("part delta");
+	if close {
+		session.stream_close(sid).expect("part closes");
+	}
+	sid
 }
 
 #[test]
@@ -143,6 +217,94 @@ fn message_projection_is_a_pure_function_of_the_dom() {
 		first
 			.iter()
 			.any(|item| matches!(item.kind, Some(item::Kind::ToolResult(_))))
+	);
+}
+
+#[test]
+fn mixed_assistant_parts_project_in_provider_order_while_streaming() {
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let mut session =
+		Session::create(directory.path().join("mixed.oms"), ComponentRegistry::default())
+			.expect("session creates");
+	session.begin_turn().expect("turn starts");
+	session
+		.user("mixed output", Vec::new())
+		.expect("user appends");
+	session
+		.assistant_start("model", "provider", "route")
+		.expect("assistant starts");
+	let turn = *session
+		.dom()
+		.children(session.dom().body())
+		.last()
+		.expect("turn");
+	let assistant = *session.dom().children(turn).last().expect("assistant");
+
+	let after = insert_assistant_part(&mut session, assistant, 2, "text");
+	stream_part(&mut session, after, "after", true);
+	insert_artifact(&mut session, assistant, 1, 1);
+	let before = insert_assistant_part(&mut session, assistant, 0, "text");
+	stream_part(&mut session, before, "before", true);
+	let second_thought = insert_assistant_part(&mut session, assistant, 5, "thinking");
+	stream_part(&mut session, second_thought, "second", true);
+	insert_artifact(&mut session, assistant, 4, 2);
+	let first_thought = insert_assistant_part(&mut session, assistant, 3, "thinking");
+	stream_part(&mut session, first_thought, "first", true);
+	insert_artifact(&mut session, assistant, 6, 3);
+	let live = insert_assistant_part(&mut session, assistant, 7, "text");
+	let live_sid = stream_part(&mut session, live, "live", false);
+
+	let projected = project_thread(session.dom());
+	let parts = projected
+		.iter()
+		.find_map(|item| {
+			let item::Kind::Message(message) = item.kind.as_ref()? else {
+				return None;
+			};
+			(message.role == omp_proto::thread::v1::Role::Assistant as i32)
+				.then_some(message.parts.as_slice())
+		})
+		.expect("assistant message");
+	let shape = parts
+		.iter()
+		.map(|part| match part.kind.as_ref().expect("part kind") {
+			part::Kind::Text(text) => format!("text:{text}"),
+			part::Kind::Thinking(thinking) => format!("thinking:{}", thinking.text),
+			part::Kind::Blob(blob) => format!("blob:{}", blob.hash[0]),
+			other => panic!("unexpected assistant part: {other:?}"),
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(shape, [
+		"text:before",
+		"blob:1",
+		"text:after",
+		"thinking:first",
+		"blob:2",
+		"thinking:second",
+		"blob:3",
+		"text:live",
+	]);
+
+	session
+		.stream_append(live_sid, " tail")
+		.expect("live text suffix");
+	let projected = project_thread(session.dom());
+	let parts = projected
+		.iter()
+		.find_map(|item| {
+			let item::Kind::Message(message) = item.kind.as_ref()? else {
+				return None;
+			};
+			(message.role == omp_proto::thread::v1::Role::Assistant as i32)
+				.then_some(message.parts.as_slice())
+		})
+		.expect("assistant message");
+	assert!(
+		matches!(
+			parts[7].kind.as_ref(),
+			Some(part::Kind::Text(text)) if text == "live tail"
+		),
+		"an open child stream projects its growing prefix in place"
 	);
 }
 

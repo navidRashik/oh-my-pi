@@ -4,7 +4,9 @@
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use omp_chat::notices::voice::{SpeechSynth, SynthAudio};
+use omp_chat::notices::voice::{
+	SpeechSynth, SpeechSynthFailure, SynthAudio, SynthConfig, SynthFormat, SynthRequest,
+};
 use omp_core::Str;
 use omp_envd::search_backend::SearchBridgeHost;
 use omp_proto::inference::v1 as inference_pb;
@@ -14,45 +16,67 @@ const SAMPLE_RATE_HZ: u32 = 24_000;
 
 /// Synthesizes speech through the environment's inference facade.
 pub struct EnvSpeechSynth {
-	bridge: Arc<SearchBridgeHost>,
-	con:    Arc<omp_con::Ctx>,
+	bridge:   Arc<SearchBridgeHost>,
+	con:      Arc<omp_con::Ctx>,
+	rewriter: Option<omp_driver::headless::kernel::SpeechRewriteClient>,
 }
 
 impl EnvSpeechSynth {
-	/// Creates a synthesizer over the environment bridge; the voice comes from
-	/// `cl_speech_voice` at each request so a mid-session change applies.
+	/// Creates a synthesizer over the environment bridge. Model and voice are
+	/// sampled when each utterance starts, so mid-utterance settings cannot
+	/// splice different speakers into one playback stream.
 	#[must_use]
-	pub fn new(bridge: Arc<SearchBridgeHost>, con: Arc<omp_con::Ctx>) -> Self {
-		Self { bridge, con }
+	pub fn new(
+		bridge: Arc<SearchBridgeHost>,
+		con: Arc<omp_con::Ctx>,
+		rewriter: Option<omp_driver::headless::kernel::SpeechRewriteClient>,
+	) -> Self {
+		Self { bridge, con, rewriter }
 	}
 }
 
 impl SpeechSynth for EnvSpeechSynth {
-	fn synthesize(
-		&self,
-		text: Str,
-	) -> Pin<Box<dyn Future<Output = Result<SynthAudio, Str>> + Send + '_>> {
+	fn configuration(&self) -> SynthConfig {
 		let voice = <&'static str>::from(super::settings::CL_SPEECH_VOICE.get(&self.con));
 		let model = <&'static str>::from(super::settings::CL_TTS_MODEL.get(&self.con));
-		let request = inference_pb::SpeakRequest {
-			model:          model.to_owned(),
-			text:           text.to_string(),
-			voice:          voice.to_owned(),
+		SynthConfig {
+			model:       Str::new_static(model),
+			voice:       Str::new_static(voice),
+			format:      SynthFormat::Pcm16,
+			sample_rate: SAMPLE_RATE_HZ,
+		}
+	}
+
+	fn synthesize(
+		&self,
+		request: SynthRequest,
+	) -> Pin<Box<dyn Future<Output = Result<SynthAudio, SpeechSynthFailure>> + Send + '_>> {
+		let wire = inference_pb::SpeakRequest {
+			model:          request.config.model.to_string(),
+			text:           request.text.to_string(),
+			voice:          request.config.voice.to_string(),
 			encoding:       inference_pb::AudioEncoding::Pcm16 as i32,
-			sample_rate_hz: Some(SAMPLE_RATE_HZ),
+			sample_rate_hz: Some(request.config.sample_rate),
 			speed:          None,
 			instructions:   String::new(),
 			clone:          None,
 			props:          None,
 		};
 		Box::pin(async move {
-			let audio = self
-				.bridge
-				.speak(request)
-				.await
-				.map_err(|error| error.message)?;
+			let audio = tokio::select! {
+				biased;
+				() = request.cancel.cancelled() => return Err(SpeechSynthFailure::Cancelled),
+				audio = self.bridge.speak(wire) => audio.map_err(|error| {
+					tracing::debug!(
+						code = %error.code,
+						diagnostic = %error.message,
+						"vocalizer synthesis backend failed"
+					);
+					SpeechSynthFailure::Backend { code: error.code }
+				})?,
+			};
 			if audio.len() % 2 != 0 {
-				return Err(Str::new_static("speech synthesis returned malformed PCM16 audio"));
+				return Err(SpeechSynthFailure::MalformedAudio { bytes: audio.len() });
 			}
 			let samples = audio
 				.chunks_exact(2)
@@ -60,7 +84,35 @@ impl SpeechSynth for EnvSpeechSynth {
 					f32::from(i16::from_le_bytes([sample[0], sample[1]])) / f32::from(i16::MAX)
 				})
 				.collect();
-			Ok(SynthAudio { sample_rate: SAMPLE_RATE_HZ, samples })
+			Ok(SynthAudio { sample_rate: request.config.sample_rate, samples })
+		})
+	}
+
+	fn rewrite(
+		&self,
+		request: SynthRequest,
+	) -> Pin<Box<dyn Future<Output = Result<Option<Str>, SpeechSynthFailure>> + Send + '_>> {
+		Box::pin(async move {
+			let Some(rewriter) = &self.rewriter else {
+				return Ok(None);
+			};
+			rewriter
+				.rewrite(omp_voice::rewrite::SPEECH_REWRITE_PROMPT, request.text, request.cancel)
+				.await
+				.map(Some)
+				.map_err(|error| {
+					tracing::debug!(%error, "vocalizer enhanced rewrite failed");
+					match error {
+						omp_driver::headless::kernel::SpeechRewriteClientError::Cancelled => {
+							SpeechSynthFailure::Cancelled
+						},
+						omp_driver::headless::kernel::SpeechRewriteClientError::Timeout
+						| omp_driver::headless::kernel::SpeechRewriteClientError::Inference { .. }
+						| omp_driver::headless::kernel::SpeechRewriteClientError::EmptyOutput => {
+							SpeechSynthFailure::Backend { code: Str::new_static("speech_rewrite_failed") }
+						},
+					}
+				})
 		})
 	}
 }

@@ -7,6 +7,7 @@ pub mod force_tool;
 pub mod goal;
 pub mod loop_mode;
 pub mod plan;
+pub mod prewalk;
 pub mod todo_reminder;
 pub mod vibe;
 
@@ -39,6 +40,7 @@ pub fn register_standard(registry: &mut DirectorRegistry) {
 	registry.register("goal", |node| Box::new(goal::Goal::from_node(node)));
 	registry.register("loop_mode", |node| Box::new(loop_mode::LoopMode::from_node(node)));
 	registry.register("plan", |node| Box::new(plan::Plan::from_node(node)));
+	registry.register("prewalk", |node| Box::new(prewalk::Prewalk::from_node(node)));
 	registry
 		.register("todo_reminder", |node| Box::new(todo_reminder::TodoReminder::from_node(node)));
 	registry.register("vibe", |node| Box::new(vibe::Vibe::from_node(node)));

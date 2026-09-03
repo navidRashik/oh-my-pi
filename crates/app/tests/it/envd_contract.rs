@@ -17,6 +17,7 @@ use omp_env::{
 };
 use omp_envd::{
 	AttachOptions, EnvServer, ProjectEnvironment, RegistryBridges,
+	blobs::BlobHost,
 	eval::{
 		BridgeHostError, BridgeProgressSink, EvalSessionConfig, ParentBindingLease, ParentSessionHost,
 	},
@@ -494,12 +495,15 @@ fn test_manifest(
 }
 
 fn test_config() -> ExtHostConfig {
-	ExtHostConfig::new(
+	let root = tempfile::tempdir().expect("worker result CAS root").keep();
+	let mut config = ExtHostConfig::new(
 		PathBuf::from(env!("CARGO_BIN_EXE_omp")),
 		Principal::new(sf!("test"), sf!("Test")),
 		sf!("test-session"),
 		1,
-	)
+	);
+	config.bind_result_store(BlobHost::open(root).expect("worker result CAS"));
+	config
 }
 
 fn extension_worker(module: &str, python_site: Option<PathBuf>) -> ExtHostConfig {

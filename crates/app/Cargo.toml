@@ -92,7 +92,7 @@ omp-observability.workspace = true
 omp-tool.workspace = true
 omp-tui.workspace = true
 omp-vcs.workspace = true
-omp-voice.workspace = true
+omp-voice = { workspace = true, features = ["realtime-transport"] }
 omp-slopjson.workspace = true
 omp-shell.workspace = true
 omp-tools.workspace = true

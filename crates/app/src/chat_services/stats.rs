@@ -22,7 +22,9 @@ use omp_chat::overlays::services::{
 use omp_core::{FastHashMap, Str};
 use omp_journal::{
 	Entry, EntryId, Kind, KindName,
-	data::{Genesis, MsgAssistantEnd, MsgAssistantStart, ToolCall, ToolResult, TurnReceipt},
+	data::{
+		Genesis, MsgAssistantEnd, MsgAssistantStart, ReceiptRole, ToolCall, ToolResult, TurnReceipt,
+	},
 };
 
 use super::ServiceState;
@@ -166,14 +168,24 @@ pub fn fold(entries: &[Entry]) -> (Vec<MessageRow>, Vec<ToolCallRow>) {
 				continue;
 			};
 			let turn = turns.entry(by).or_default();
+			let advisor = receipt
+				.identity
+				.as_ref()
+				.filter(|identity| identity.role == ReceiptRole::Advisor);
 			messages.push(MessageRow {
 				entry_id:      Str::new(entry.id.to_string()),
 				folder:        folder.clone(),
-				model:         turn.model.clone(),
-				provider:      turn.provider.clone(),
+				model:         advisor
+					.map_or_else(|| turn.model.clone(), |identity| identity.model.clone()),
+				provider:      advisor
+					.map_or_else(|| turn.provider.clone(), |identity| identity.provider.clone()),
 				timestamp_ms:  stamp,
-				requests:      turn.requests.max(1),
-				errors:        turn.errors,
+				requests:      if advisor.is_some() {
+					1
+				} else {
+					turn.requests.max(1)
+				},
+				errors:        if advisor.is_some() { 0 } else { turn.errors },
 				duration_ms:   receipt.duration_ms,
 				ttft_ms:       receipt.ttft_ms,
 				input_tokens:  receipt.tokens_in,
@@ -182,8 +194,10 @@ pub fn fold(entries: &[Entry]) -> (Vec<MessageRow>, Vec<ToolCallRow>) {
 				cache_write:   receipt.cache_write,
 				cost_nano_usd: (receipt.cost_nano_usd > 0).then_some(receipt.cost_nano_usd),
 			});
-			turn.requests = 0;
-			turn.errors = 0;
+			if advisor.is_none() {
+				turn.requests = 0;
+				turn.errors = 0;
+			}
 		} else if entry.kind == tool_call {
 			if let Ok(payload) = serde_json::from_str::<ToolCall>(entry.data.as_str()) {
 				calls.insert(entry.id, tool_calls.len());
@@ -244,6 +258,7 @@ fn report(synced: u64, summary: StatsSummary) -> StatsReport {
 
 #[cfg(test)]
 mod tests {
+	use omp_journal::data::ReceiptIdentity;
 	use omp_session::{ComponentRegistry, Session};
 
 	use super::*;
@@ -286,6 +301,20 @@ mod tests {
 				ttft_ms:                     Some(100),
 				duration_ms:                 Some(1_000),
 				premium_requests_millionths: 0,
+				identity:                    None,
+			})
+			.unwrap();
+		session
+			.receipt(TurnReceipt {
+				tokens_in: 7,
+				tokens_out: 2,
+				cost_nano_usd: 80,
+				identity: Some(ReceiptIdentity {
+					role:     ReceiptRole::Advisor,
+					provider: Str::new_static("openai"),
+					model:    Str::new_static("gpt-5"),
+				}),
+				..TurnReceipt::default()
 			})
 			.unwrap();
 		session
@@ -302,6 +331,7 @@ mod tests {
 				ttft_ms:                     None,
 				duration_ms:                 None,
 				premium_requests_millionths: 0,
+				identity:                    None,
 			})
 			.unwrap();
 		path
@@ -316,12 +346,18 @@ mod tests {
 		let report = sync(data.path(), &sessions).unwrap();
 		assert_eq!(report.synced, 1);
 		assert_eq!(report.files, 1);
-		assert_eq!(report.requests, 2);
+		assert_eq!(report.requests, 3);
 		assert_eq!(report.errors, 1);
-		assert_eq!(report.input_tokens, 150);
-		assert_eq!(report.cost_nano_usd, 5_000);
+		assert_eq!(report.input_tokens, 157);
+		assert_eq!(report.cost_nano_usd, 5_080);
 		assert_eq!(report.unpriced, 1);
-		assert_eq!(report.by_model[0].key, "anthropic/claude-sonnet-4-5");
+		assert!(
+			report
+				.by_model
+				.iter()
+				.any(|row| row.key == "anthropic/claude-sonnet-4-5")
+		);
+		assert!(report.by_model.iter().any(|row| row.key == "gpt-5"));
 		assert_eq!(report.tools, vec![StatsTool {
 			tool:   Str::new_static("read"),
 			calls:  1,
@@ -330,7 +366,7 @@ mod tests {
 		// Unchanged files are not re-read; a removed file drops its rows.
 		let again = sync(data.path(), &sessions).unwrap();
 		assert_eq!(again.synced, 0);
-		assert_eq!(again.requests, 2);
+		assert_eq!(again.requests, 3);
 		fs::remove_file(path).unwrap();
 		let gone = sync(data.path(), &sessions).unwrap();
 		assert_eq!(gone.files, 0);

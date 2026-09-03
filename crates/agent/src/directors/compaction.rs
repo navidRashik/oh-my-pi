@@ -545,7 +545,13 @@ fn context_tokens(dom: &Dom, previous_boundary: Option<EntryId>, request: &ChatR
 			let Some(node) = dom.get(*child) else {
 				continue;
 			};
-			if node.tag != Tag::Known(KnownTag::Usage) || !after_boundary(node, previous_boundary) {
+			if node.tag != Tag::Known(KnownTag::Usage)
+				|| node
+					.prop(&PropKey::from(PropId::Kind))
+					.and_then(Value::as_str)
+					== Some("advisor")
+				|| !after_boundary(node, previous_boundary)
+			{
 				continue;
 			}
 			return [PropId::TokensIn, PropId::TokensOut, PropId::CacheRead, PropId::CacheWrite]

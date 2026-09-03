@@ -13,7 +13,8 @@
 use std::{fs, io, path::Path};
 
 use omp_chat::overlays::services::{
-	AgentRow, ServiceError, ServiceResult, SessionRow, SessionScope,
+	AgentRow, ForeignSessionRow, ForeignSessionSource, ServiceError, ServiceResult, SessionRow,
+	SessionScope,
 };
 use omp_con::AI_MODEL;
 use omp_core::Str;
@@ -31,6 +32,28 @@ const DEFAULT_AGENT: &str = "task";
 /// On-disk sessions in `scope`, pinned first, then newest first.
 pub fn rows(state: &ServiceState, scope: SessionScope) -> ServiceResult<Vec<SessionRow>> {
 	rows_in(&state.data_dir, &state.sessions_dir, &state.state_dir, scope)
+}
+
+/// Foreign Claude Code or Codex transcripts available for one-shot import.
+pub fn foreign_rows(source: ForeignSessionSource) -> ServiceResult<Vec<ForeignSessionRow>> {
+	crate::session_import::candidates(source.into())
+		.map_err(ServiceError::failed)
+		.map(|candidates| {
+			candidates
+				.into_iter()
+				.map(|candidate| ForeignSessionRow {
+					source,
+					id: candidate.id,
+					path: candidate.path,
+					cwd: candidate.cwd,
+					title: candidate.title,
+					created_ms: candidate.created_ms,
+					modified_ms: candidate.modified_ms,
+					messages: candidate.messages,
+					first_message: candidate.first_message,
+				})
+				.collect()
+		})
 }
 
 /// [`rows`] over explicit roots: `data_dir/projects/*/sessions` for every

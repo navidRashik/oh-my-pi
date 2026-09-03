@@ -6,21 +6,25 @@
 //! elements to kill boundaries owned by the runtime.
 
 use std::{
-	str::FromStr as _,
 	sync::atomic::{AtomicUsize, Ordering},
+	time::{SystemTime, UNIX_EPOCH},
 };
 
 use flume::Receiver;
 use omp_core::{FastHashMap, Str};
 use omp_dom::{Dom, Handle, KnownTag, Op, PropId, PropKey, Tag, Txn, Value};
-use omp_journal::EntryId;
+use omp_journal::{
+	EntryId,
+	blob::{BlobRef, BlobStore},
+	data::LaunchDaemonCompletion,
+};
 use omp_proto::toolhost::v1::HookEventId;
 use omp_session::{LifecycleWork, Session};
-use omp_tool::{InvocationFeed, RegistryError, ToolIdentity};
+use omp_tool::{CallOutcomeDetails, InvocationFeed, RegistryError, ToolIdentity};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use strum::{Display, EnumString};
+use strum::{Display, EnumString, IntoStaticStr};
 use tokio::{task::JoinHandle, time};
 use tokio_util::sync::CancellationToken;
 
@@ -39,36 +43,66 @@ pub enum JobKind {
 	Process,
 }
 
+#[derive(Clone, Copy, Debug, IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
+enum DeliveryJobType {
+	Bash,
+	Task,
+	Tool,
+}
+
+impl From<JobKind> for DeliveryJobType {
+	fn from(kind: JobKind) -> Self {
+		match kind {
+			JobKind::Tool => Self::Tool,
+			JobKind::Subagent => Self::Task,
+			JobKind::Process => Self::Bash,
+		}
+	}
+}
+
 /// Terminal result produced by one owned execution unit.
 #[derive(Debug)]
 pub struct JobSettlement {
 	/// Durable terminal status (`completed`, `cancelled`, or `failed`).
-	pub status: Str,
+	pub status:     Str,
 	/// Bounded typed output, when the job completed with a value.
-	pub output: Option<Box<RawValue>>,
+	pub output:     Option<Box<RawValue>>,
 	/// Stable terminal diagnostic, when present.
-	pub error:  Option<Str>,
+	pub error:      Option<Str>,
+	/// Typed one-shot completion for a supervised process.
+	pub completion: Option<LaunchDaemonCompletion>,
 }
 
 /// Durable fields projected from one `<job>` or `<subagent>` element.
 #[derive(Clone, Debug)]
 pub struct JobRecord {
 	/// Current DOM handle.
-	pub handle:  Handle,
+	pub handle:      Handle,
 	/// Stable durable identity.
-	pub id:      Str,
+	pub id:          Str,
 	/// Shared job kind.
-	pub kind:    JobKind,
+	pub kind:        JobKind,
 	/// Journal-derived lifecycle status.
-	pub status:  Str,
+	pub status:      Str,
+	/// User-facing execution type (`bash`, `task`, `eval`, or a tool identity).
+	pub job_type:    Str,
+	/// Nonempty work label captured when the job started.
+	pub label:       Str,
 	/// Owning session or agent identity, when present.
-	pub owner:   Option<Str>,
+	pub owner:       Option<Str>,
 	/// Start timestamp, when present.
-	pub started: Option<Str>,
+	pub started:     Option<Str>,
+	/// Exact elapsed wall time captured by the settlement patch.
+	pub duration_ms: Option<u64>,
 	/// Bounded serialized output projected from the DOM.
-	pub output:  Option<Box<RawValue>>,
+	pub output:      Option<Box<RawValue>>,
 	/// Terminal diagnostic projected from the DOM.
-	pub error:   Option<Str>,
+	pub error:       Option<Str>,
+	/// Tool-call entry owned by this detached job.
+	pub call:        Option<EntryId>,
+	/// Initial detached `tool.result@1` entry which created this job.
+	pub detached_at: Option<EntryId>,
 }
 
 /// Live execution state retained after a tool call stops blocking its turn.
@@ -95,10 +129,20 @@ struct RuntimeJob {
 	cancel:    CancellationToken,
 	task:      Option<JoinHandle<JobSettlement>>,
 	_detached: Option<DetachedCall>,
+	/// A terminal call outcome recovered before its job settlement patch
+	/// landed.
+	recovered: Option<RecoveredSettlement>,
 	/// A running detached tool call whose execution unit no longer exists
 	/// (re-derived by a forward rewind or a process restart): nothing can
 	/// ever settle it, so [`JobBoard::poll`] journals it `failed`.
 	orphaned:  bool,
+}
+
+#[derive(Clone)]
+struct RecoveredSettlement {
+	is_error: bool,
+	artifact: Option<BlobRef>,
+	error:    Option<Str>,
 }
 
 /// Stable diagnostic journaled on a detached tool call that lost its
@@ -117,7 +161,10 @@ pub struct JobBoard {
 	/// Largest settlement output published inline on a job element; larger
 	/// outputs are spilled to the session blob store (ADR 0009: the DOM and
 	/// every patch it emits stay bounded, the full result lives in the CAS).
-	output_bound: AtomicUsize,
+	output_bound:  AtomicUsize,
+	/// Dispatcher spill namespace. A detached artifact is copied into the
+	/// session namespace before its durable job settlement references it.
+	artifact_store: Mutex<Option<BlobStore>>,
 }
 
 impl Default for JobBoard {
@@ -126,7 +173,8 @@ impl Default for JobBoard {
 			jobs:         Mutex::default(),
 			factories:    Mutex::default(),
 			hooks:        Mutex::default(),
-			output_bound: AtomicUsize::new(crate::DispatchPolicy::DEFAULT_MAX_OUTPUT_BYTES),
+			output_bound:  AtomicUsize::new(crate::DispatchPolicy::DEFAULT_MAX_OUTPUT_BYTES),
+			artifact_store: Mutex::default(),
 		}
 	}
 }
@@ -142,6 +190,12 @@ impl JobBoard {
 	/// `max_output_bytes`.
 	pub fn set_output_bound(&self, bytes: usize) {
 		self.output_bound.store(bytes, Ordering::Relaxed);
+	}
+
+	/// Supplies the dispatcher namespace from which detached output is pinned
+	/// into the session blob store before the settlement patch is appended.
+	pub fn set_artifact_store(&self, store: BlobStore) {
+		*self.artifact_store.lock() = Some(store);
 	}
 
 	/// Installs the extension observer for `job_registered`/`job_settled`.
@@ -185,7 +239,7 @@ impl JobBoard {
 				"owner": record.owner.as_deref().unwrap_or("kernel"),
 				"artifact": artifact,
 				"failed": settlement.status.as_str() != "completed",
-				"duration": duration_since(record.started.as_deref()),
+				"duration": format!("{}s", elapsed_ms(record.started.as_deref(), now_ms()) / 1_000),
 			}),
 		);
 	}
@@ -202,6 +256,7 @@ impl JobBoard {
 			cancel,
 			task: None,
 			_detached: None,
+			recovered: None,
 			orphaned: false,
 		});
 		true
@@ -229,6 +284,7 @@ impl JobBoard {
 			cancel,
 			task: None,
 			_detached: Some(detached),
+			recovered: None,
 			orphaned: false,
 		});
 		true
@@ -251,6 +307,7 @@ impl JobBoard {
 			cancel,
 			task: Some(task),
 			_detached: None,
+			recovered: None,
 			orphaned: false,
 		});
 		true
@@ -274,6 +331,7 @@ impl JobBoard {
 			cancel,
 			task: Some(task),
 			_detached: None,
+			recovered: None,
 			orphaned: false,
 		});
 		true
@@ -288,18 +346,34 @@ impl JobBoard {
 			.map(|job| (job.record.id.clone(), job))
 			.collect();
 		for record in records {
-			let mut job = by_id.remove(&record.id).unwrap_or_else(|| RuntimeJob {
-				// A tool job only ever gains its execution unit at detachment
-				// (`adopt_tool_job`); one that reappears without it is
-				// unsettleable. Subagents and processes are re-derived from
-				// their factories or supervised by the environment.
-				orphaned:  record.kind == JobKind::Tool && is_live_status(record.status.as_str()),
-				record:    record.clone(),
-				cancel:    CancellationToken::new(),
-				task:      None,
-				_detached: None,
+			let mut job = by_id.remove(&record.id).unwrap_or_else(|| {
+				let recovered = recovered_tool_settlement(session.dom(), &record);
+				RuntimeJob {
+					// A detached tool whose terminal call result already
+					// reached the journal is adopted into its job node. Only
+					// a genuinely running call without an execution unit is
+					// orphaned.
+					orphaned: record.kind == JobKind::Tool
+						&& is_live_status(record.status.as_str())
+						&& recovered.is_none(),
+					recovered,
+					record: record.clone(),
+					cancel: CancellationToken::new(),
+					task: None,
+					_detached: None,
+				}
 			});
+			let retained_live_owner = is_live_status(job.record.status.as_str())
+				&& !job.orphaned
+				&& job.recovered.is_none();
 			job.record = record.clone();
+			if !is_live_status(record.status.as_str()) {
+				job.recovered = None;
+				job.orphaned = false;
+			} else if !retained_live_owner && job.task.is_none() && job._detached.is_none() {
+				job.recovered = recovered_tool_settlement(session.dom(), &record);
+				job.orphaned = record.kind == JobKind::Tool && job.recovered.is_none();
+			}
 			jobs.insert(record.handle, job);
 		}
 		for job in by_id.into_values() {
@@ -309,23 +383,38 @@ impl JobBoard {
 
 	/// Commits every already-settled owned task to the authoritative job node.
 	pub fn poll(&self, session: &mut Session) -> Result<Vec<JobRecord>, omp_session::SessionError> {
-		let orphaned = {
-			let mut jobs = self.jobs.lock();
+		let recovered = {
+			let jobs = self.jobs.lock();
 			jobs
-				.iter_mut()
+				.iter()
+				.filter_map(|(handle, job)| job.recovered.clone().map(|settlement| (*handle, settlement)))
+				.collect::<Vec<_>>()
+		};
+		for (handle, settlement) in recovered {
+			let settlement = self.materialize_recovered(session, settlement)?;
+			self.commit(session, handle, settlement)?;
+			if let Some(job) = self.jobs.lock().get_mut(&handle) {
+				job.recovered = None;
+			}
+		}
+		let orphaned = {
+			let jobs = self.jobs.lock();
+			jobs
+				.iter()
 				.filter(|(_, job)| job.orphaned)
-				.map(|(handle, job)| {
-					job.orphaned = false;
-					*handle
-				})
+				.map(|(handle, _)| *handle)
 				.collect::<Vec<_>>()
 		};
 		for handle in orphaned {
 			self.commit(session, handle, JobSettlement {
-				status: Str::new_static("failed"),
-				output: None,
-				error:  Some(Str::new_static(ORPHANED_TOOL_JOB)),
+				status:     Str::new_static("failed"),
+				output:     None,
+				error:      Some(Str::new_static(ORPHANED_TOOL_JOB)),
+				completion: None,
 			})?;
+			if let Some(job) = self.jobs.lock().get_mut(&handle) {
+				job.orphaned = false;
+			}
 		}
 		let detached = {
 			let mut jobs = self.jobs.lock();
@@ -336,37 +425,37 @@ impl JobBoard {
 					match detached.poll(session) {
 						Ok(Some(report)) => {
 							job._detached = None;
-							Some((*handle, JobSettlement {
-								status: Str::new_static(if report.is_error {
-									"failed"
-								} else {
-									"completed"
-								}),
-								output: report.spilled.and_then(|blob| {
-									serde_json::value::to_raw_value(&serde_json::json!({
-										"artifact": format!("artifact://sha256/{}", blob.to_hex()),
-									}))
-									.ok()
-								}),
-								error:  None,
-							}))
+							let settlement = recovered_tool_settlement(session.dom(), &job.record)
+								.unwrap_or(RecoveredSettlement {
+									is_error: report.is_error,
+									artifact: report.spilled,
+									error:    None,
+								});
+							job.recovered = Some(settlement.clone());
+							Some((*handle, settlement))
 						},
 						Ok(None) => None,
 						Err(error) => {
 							tracing::warn!(?error, "detached tool settlement failed");
 							job._detached = None;
-							Some((*handle, JobSettlement {
-								status: Str::new_static("failed"),
-								output: None,
-								error:  Some(Str::new_static("detached tool settlement failed")),
-							}))
+							let settlement = RecoveredSettlement {
+								is_error: true,
+								artifact: None,
+								error:    Some(Str::new_static("detached tool settlement failed")),
+							};
+							job.recovered = Some(settlement.clone());
+							Some((*handle, settlement))
 						},
 					}
 				})
 				.collect::<Vec<_>>()
 		};
 		for (handle, settlement) in detached {
+			let settlement = self.materialize_recovered(session, settlement)?;
 			self.commit(session, handle, settlement)?;
+			if let Some(job) = self.jobs.lock().get_mut(&handle) {
+				job.recovered = None;
+			}
 		}
 		let finished = {
 			let mut jobs = self.jobs.lock();
@@ -380,9 +469,10 @@ impl JobBoard {
 			let settlement = futures::FutureExt::now_or_never(&mut task)
 				.and_then(Result::ok)
 				.unwrap_or_else(|| JobSettlement {
-					status: Str::new_static("failed"),
-					output: None,
-					error:  Some(Str::new_static("job execution unit ended without a settlement")),
+					status:     Str::new_static("failed"),
+					output:     None,
+					error:      Some(Str::new_static("job execution unit ended without a settlement")),
+					completion: None,
 				});
 			self.commit(session, handle, settlement)?;
 		}
@@ -397,6 +487,7 @@ impl JobBoard {
 	pub fn has_finished_units(&self) -> bool {
 		self.jobs.lock().values().any(|job| {
 			job.orphaned
+				|| job.recovered.is_some()
 				|| job.task.as_ref().is_some_and(JoinHandle::is_finished)
 				|| job._detached.as_ref().is_some_and(|detached| {
 					detached.closed
@@ -427,6 +518,65 @@ impl JobBoard {
 		}
 	}
 
+	fn materialize_recovered(
+		&self,
+		session: &Session,
+		settlement: RecoveredSettlement,
+	) -> Result<JobSettlement, omp_session::SessionError> {
+		let output = settlement
+			.artifact
+			.map(|artifact| self.pin_artifact(session, artifact))
+			.transpose()?
+			.map(|artifact| {
+				serde_json::value::to_raw_value(&SpilledOutput {
+					artifact: Str::new(format!("artifact://sha256/{}", artifact.to_hex())),
+					byte_len: artifact.size,
+					text:     None,
+				})
+			})
+			.transpose()?;
+		Ok(JobSettlement {
+			status: Str::new_static(if settlement.is_error { "failed" } else { "completed" }),
+			output,
+			error: settlement.error,
+			completion: None,
+		})
+	}
+
+	fn pin_artifact(
+		&self,
+		session: &Session,
+		reference: BlobRef,
+	) -> Result<BlobRef, omp_session::SessionError> {
+		if session.blobs().has(&reference) {
+			if session.blobs().verify(&reference)? {
+				return Ok(reference);
+			}
+			let bytes = session.blobs().get(&reference)?;
+			return Err(omp_journal::blob::Error::DigestMismatch {
+				expected: reference.hash,
+				actual:   omp_core::Hash32::sum(&bytes),
+			}
+			.into());
+		}
+		let source = self
+			.artifact_store
+			.lock()
+			.clone()
+			.ok_or(omp_journal::blob::Error::NotFound)?;
+		let bytes = source.get(&reference)?;
+		let actual = omp_core::Hash32::sum(&bytes);
+		if actual != reference.hash {
+			return Err(omp_journal::blob::Error::DigestMismatch {
+				expected: reference.hash,
+				actual,
+			}
+			.into());
+		}
+		let pinned = session.blobs().put(&bytes)?;
+		Ok(pinned)
+	}
+
 	fn commit(
 		&self,
 		session: &mut Session,
@@ -448,7 +598,7 @@ impl JobBoard {
 		loop {
 			let records = self.poll(session)?;
 			if let Some(record) = records.into_iter().find(|record| {
-				record.status.as_str() != "running"
+				!is_live_status(record.status.as_str())
 					&& ids.is_none_or(|selected| {
 						selected.is_empty() || selected.iter().any(|id| id == &record.id)
 					})
@@ -456,7 +606,7 @@ impl JobBoard {
 				return Ok(Some(record));
 			}
 			let selected_live = self.list().into_iter().any(|record| {
-				record.status.as_str() == "running"
+				is_live_status(record.status.as_str())
 					&& ids.is_none_or(|selected| {
 						selected.is_empty() || selected.iter().any(|id| id == &record.id)
 					})
@@ -508,6 +658,7 @@ impl JobBoard {
 				cancel,
 				task: Some(task),
 				_detached: None,
+				recovered: None,
 				orphaned: false,
 			});
 		}
@@ -524,6 +675,17 @@ impl JobBoard {
 		session: &mut Session,
 		handle: Handle,
 	) -> Result<bool, omp_session::SessionError> {
+		let recovered = self
+			.jobs
+			.lock()
+			.get(&handle)
+			.and_then(|job| job.recovered.clone());
+		if let Some(recovered) = recovered {
+			let settlement = self.materialize_recovered(session, recovered)?;
+			self.commit(session, handle, settlement)?;
+			self.rebuild(session);
+			return Ok(true);
+		}
 		let Some(job) = self.jobs.lock().remove(&handle) else {
 			return Ok(false);
 		};
@@ -573,7 +735,94 @@ async fn terminate_runtime(mut job: RuntimeJob) -> JobSettlement {
 			let _ = task.await;
 		}
 	}
-	JobSettlement { status: Str::new_static("cancelled"), output: None, error: None }
+	JobSettlement {
+		status:     Str::new_static("cancelled"),
+		output:     None,
+		error:      None,
+		completion: None,
+	}
+}
+
+fn recovered_tool_settlement(dom: &Dom, record: &JobRecord) -> Option<RecoveredSettlement> {
+	if record.kind != JobKind::Tool || !is_live_status(record.status.as_str()) {
+		return None;
+	}
+	let call = record.call?;
+	let detached_at = record.detached_at?;
+	let handle = find_call(dom, dom.body(), call)?;
+	let node = dom.get(handle)?;
+	let latest = custom(node, "result_entry")?.parse::<EntryId>().ok()?;
+	if latest == detached_at {
+		return None;
+	}
+	let is_error = match prop(node, PropId::Status)? {
+		"ok" => false,
+		"error" => true,
+		_ => return None,
+	};
+	let artifact = call_artifact(dom, handle);
+	let error = is_error.then(|| {
+		dom.children(handle)
+			.iter()
+			.rev()
+			.filter_map(|handle| dom.get(*handle))
+			.find(|child| {
+				child.tag == Tag::Known(KnownTag::Diag)
+					&& prop(child, PropId::Severity) == Some("error")
+			})
+			.and_then(|child| prop(child, PropId::Text))
+			.map(Str::new)
+			.unwrap_or_else(|| Str::new_static("detached tool failed"))
+	});
+	Some(RecoveredSettlement { is_error, artifact, error })
+}
+
+fn find_call(dom: &Dom, parent: Handle, call: EntryId) -> Option<Handle> {
+	let call = call.to_string();
+	find_call_by_cause(dom, parent, &call)
+}
+
+fn find_call_by_cause(dom: &Dom, parent: Handle, call: &str) -> Option<Handle> {
+	for handle in dom.children(parent) {
+		let node = dom.get(*handle)?;
+		if matches!(node.tag, Tag::Custom(_)) && prop(node, PropId::Cause) == Some(call) {
+			return Some(*handle);
+		}
+		if let Some(found) = find_call_by_cause(dom, *handle, call) {
+			return Some(found);
+		}
+	}
+	None
+}
+
+fn call_artifact(dom: &Dom, call: Handle) -> Option<BlobRef> {
+	let node = dom.get(call)?;
+	if let (Some(address), Some(size)) =
+		(prop(node, PropId::Blob), custom_int(node, "size").and_then(|size| u64::try_from(size).ok()))
+		&& let Some(hash) = address.strip_prefix("artifact://sha256/")
+	{
+		return BlobRef::parse_hex(hash, size).ok();
+	}
+	let details = dom.children(call).iter().rev().find_map(|handle| {
+		let child = dom.get(*handle)?;
+		match child.tag {
+			Tag::Known(KnownTag::Result) => match child.prop(&PropKey::from(PropId::Outcome)) {
+				Some(Value::Json(raw)) => Some(raw),
+				_ => None,
+			},
+			Tag::Known(KnownTag::Diag) => match child.prop(&PropKey::from(PropId::Fault)) {
+				Some(Value::Json(raw)) => Some(raw),
+				_ => None,
+			},
+			_ => None,
+		}
+	})?;
+	let CallOutcomeDetails::Spilled { blob, byte_len } =
+		serde_json::from_str::<CallOutcomeDetails>(details.get()).ok()?
+	else {
+		return None;
+	};
+	BlobRef::parse_hex(blob.hash.as_str(), byte_len).ok()
 }
 
 /// Inline shape of a settlement output that exceeded the board's bound: the
@@ -645,11 +894,26 @@ fn commit_settlement(
 	let cause = session
 		.head()
 		.ok_or(omp_session::SessionError::NoActiveTurn)?;
-	let mut ops = vec![Op::Set {
-		h:     handle,
-		prop:  PropId::Status.into(),
-		value: Value::Str(settlement.status),
-	}];
+	let settled_at_ms = now_ms();
+	let duration_ms = settlement.completion.as_ref().map_or_else(
+		|| {
+			record(session.dom(), handle)
+				.map_or(0, |record| elapsed_ms(record.started.as_deref(), settled_at_ms))
+		},
+		|completion| completion.duration_ms,
+	);
+	let mut ops = vec![
+		Op::Set {
+			h:     handle,
+			prop:  PropId::Status.into(),
+			value: Value::Str(settlement.status.clone()),
+		},
+		Op::Set {
+			h:     handle,
+			prop:  PropId::DurationMs.into(),
+			value: Value::Int(i64::try_from(duration_ms).unwrap_or(i64::MAX)),
+		},
+	];
 	if let Some(output) = settlement.output {
 		let output = bounded_output(session, output, bound)?;
 		ops.push(Op::Set { h: handle, prop: PropId::Data.into(), value: Value::Json(output) });
@@ -660,6 +924,9 @@ fn commit_settlement(
 			prop:  PropKey::Custom(Str::new_static("error")),
 			value: Value::Str(error),
 		});
+	}
+	if let Some(completion) = settlement.completion {
+		ops.extend(crate::launch_completion_ops(session, handle, &completion)?);
 	}
 	session.patch(Txn { cause, label: Some(Str::new_static("jobs.settle")), ops })?;
 	Ok(())
@@ -690,56 +957,33 @@ pub fn undelivered(dom: &Dom) -> Vec<JobRecord> {
 		})
 		.collect::<Vec<_>>();
 	out.sort_by(|left, right| {
-		left
-			.started
-			.cmp(&right.started)
+		started_ms(left)
+			.cmp(&started_ms(right))
 			.then(left.id.cmp(&right.id))
 	});
 	out
 }
 
-/// Marks settled jobs as delivered to the model in one `patch@1`.
-pub fn mark_delivered(
-	session: &mut Session,
-	handles: &[Handle],
-) -> Result<(), omp_session::SessionError> {
-	if handles.is_empty() {
-		return Ok(());
-	}
-	let cause = session
-		.head()
-		.ok_or(omp_session::SessionError::NoActiveTurn)?;
-	session.patch(Txn {
-		cause,
-		label: Some(Str::new_static("jobs.delivered")),
-		ops: handles
-			.iter()
-			.map(|handle| Op::Set {
-				h:     *handle,
-				prop:  PropKey::Custom(Str::new_static(DELIVERED)),
-				value: Value::Bool(true),
-			})
-			.collect(),
-	})?;
-	Ok(())
-}
-
 /// Prop set on a settled job once its result reached the model.
 pub const DELIVERED: &str = "delivered";
 
-/// Human-readable elapsed time since an RFC 3339 `started` stamp (`"0s"`
-/// when absent or unparsable).
-fn duration_since(started: Option<&str>) -> String {
-	let Some(started) = started else {
-		return "0s".to_owned();
-	};
-	let Ok(started) = jiff::Timestamp::from_str(started) else {
-		return "0s".to_owned();
-	};
-	let elapsed = jiff::Timestamp::now()
-		.since(started)
-		.map_or(0, |span| span.get_seconds().max(0));
-	format!("{elapsed}s")
+fn now_ms() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn elapsed_ms(started: Option<&str>, settled_at_ms: u64) -> u64 {
+	started
+		.and_then(|started| started.parse::<u64>().ok())
+		.map_or(0, |started_at_ms| settled_at_ms.saturating_sub(started_at_ms))
+}
+
+fn started_ms(record: &JobRecord) -> Option<u64> {
+	record
+		.started
+		.as_deref()
+		.and_then(|started| started.parse().ok())
 }
 
 fn is_live_status(status: &str) -> bool {
@@ -785,8 +1029,21 @@ fn record(dom: &Dom, handle: Handle) -> Option<JobRecord> {
 		status: prop(node, PropId::Status)
 			.map(Str::new)
 			.unwrap_or_else(|| Str::new_static("running")),
+		job_type: prop(node, PropId::Name)
+			.filter(|value| !value.is_empty())
+			.map(Str::new)
+			.unwrap_or_else(|| fallback_job_type(kind)),
+		label: prop(node, PropId::Label)
+			.filter(|value| !value.is_empty())
+			.map(Str::new)
+			.unwrap_or_else(|| {
+				prop(node, PropId::Id)
+					.map(Str::new)
+					.unwrap_or_else(|| Str::new(handle.to_string()))
+			}),
 		owner: custom(node, "owner").map(Str::new),
 		started: custom(node, "started").map(Str::new),
+		duration_ms: prop_int(node, PropId::DurationMs).and_then(|value| u64::try_from(value).ok()),
 		output: node
 			.prop(&PropKey::from(PropId::Data))
 			.and_then(|value| match value {
@@ -794,6 +1051,8 @@ fn record(dom: &Dom, handle: Handle) -> Option<JobRecord> {
 				_ => None,
 			}),
 		error: custom(node, "error").map(Str::new),
+		call: custom(node, "call").and_then(|value| value.parse().ok()),
+		detached_at: prop(node, PropId::Cause).and_then(|value| value.parse().ok()),
 	})
 }
 
@@ -805,4 +1064,23 @@ fn custom<'a>(node: &'a omp_dom::Node, key: &'static str) -> Option<&'a str> {
 	node
 		.prop(&PropKey::Custom(Str::new_static(key)))
 		.and_then(Value::as_str)
+}
+
+fn prop_int(node: &omp_dom::Node, id: PropId) -> Option<i64> {
+	match node.prop(&PropKey::from(id)) {
+		Some(Value::Int(value)) => Some(*value),
+		_ => None,
+	}
+}
+
+fn custom_int(node: &omp_dom::Node, key: &'static str) -> Option<i64> {
+	match node.prop(&PropKey::Custom(Str::new_static(key))) {
+		Some(Value::Int(value)) => Some(*value),
+		_ => None,
+	}
+}
+
+fn fallback_job_type(kind: JobKind) -> Str {
+	let job_type: &'static str = DeliveryJobType::from(kind).into();
+	Str::new_static(job_type)
 }

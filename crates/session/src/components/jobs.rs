@@ -1,8 +1,54 @@
 use omp_core::Str;
 use omp_dom::{Dom, Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_journal::{Entry, EntryId, Kind, data::ToolResult, kind};
+use strum::{EnumString, IntoStaticStr};
 
 use crate::{Component, Draft};
+
+#[derive(Clone, Copy, Debug, EnumString)]
+#[strum(serialize_all = "lowercase")]
+enum ComponentJobKind {
+	Tool,
+	Subagent,
+	Process,
+}
+
+#[derive(Clone, Copy, Debug, EnumString)]
+#[strum(serialize_all = "lowercase")]
+enum DetachedJobKind {
+	Shell,
+	Task,
+	Eval,
+}
+
+#[derive(Clone, Copy, Debug, IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
+enum DeliveryJobType {
+	Bash,
+	Task,
+	Eval,
+	Tool,
+}
+
+impl From<ComponentJobKind> for DeliveryJobType {
+	fn from(kind: ComponentJobKind) -> Self {
+		match kind {
+			ComponentJobKind::Tool => Self::Tool,
+			ComponentJobKind::Subagent => Self::Task,
+			ComponentJobKind::Process => Self::Bash,
+		}
+	}
+}
+
+impl From<DetachedJobKind> for DeliveryJobType {
+	fn from(kind: DetachedJobKind) -> Self {
+		match kind {
+			DetachedJobKind::Shell => Self::Bash,
+			DetachedJobKind::Task => Self::Task,
+			DetachedJobKind::Eval => Self::Eval,
+		}
+	}
+}
 
 /// Durable fields used to insert one member of the shared job primitive.
 #[derive(Clone, Debug)]
@@ -26,17 +72,24 @@ pub struct JobSpec {
 /// [`crate::Session::patch`].
 pub fn insert(dom: &Dom, cause: EntryId, spec: JobSpec) -> Option<Txn> {
 	let jobs = jobs_handle(dom)?;
-	let tag = if spec.kind.as_str() == "subagent" {
-		KnownTag::Subagent
-	} else {
-		KnownTag::Job
+	let kind = spec
+		.kind
+		.parse::<ComponentJobKind>()
+		.unwrap_or(ComponentJobKind::Tool);
+	let tag = match kind {
+		ComponentJobKind::Subagent => KnownTag::Subagent,
+		ComponentJobKind::Tool | ComponentJobKind::Process => KnownTag::Job,
 	};
+	let job_type = DeliveryJobType::from(kind);
+	let job_type: &'static str = job_type.into();
 	let mut node = NodeSpec::new(tag)
-		.with_prop(PropId::Id, Value::Str(spec.id))
+		.with_prop(PropId::Id, Value::Str(spec.id.clone()))
 		.with_prop(PropId::Kind, Value::Str(spec.kind))
 		.with_prop(PropId::Status, Value::Str(Str::new_static("running")))
 		.with_prop(PropKey::Custom(Str::new_static("owner")), Value::Str(spec.owner))
-		.with_prop(PropKey::Custom(Str::new_static("started")), Value::Str(spec.started));
+		.with_prop(PropKey::Custom(Str::new_static("started")), Value::Str(spec.started))
+		.with_prop(PropId::Name, Value::Str(Str::new_static(job_type)))
+		.with_prop(PropId::Label, Value::Str(spec.id));
 	if let Some(agent) = spec.agent {
 		node = node.with_prop(PropKey::Custom(Str::new_static("agent")), Value::Str(agent));
 	}
@@ -98,15 +151,47 @@ impl Component for JobsComponent {
 			.and_then(serde_json::Value::as_str)
 			.map(Str::new)
 			.unwrap_or_else(|| Str::new(entry.id.to_string()));
+		let metadata = detached.get("job").and_then(|job| job.get("metadata"));
+		let label = metadata
+			.and_then(|metadata| metadata.get("label"))
+			.and_then(serde_json::Value::as_str)
+			.filter(|label| !label.is_empty())
+			.map(Str::new)
+			.unwrap_or_else(|| id.clone());
+		let job_type = metadata
+			.and_then(|metadata| metadata.get("kind"))
+			.and_then(serde_json::Value::as_str)
+			.and_then(|kind| kind.parse::<DetachedJobKind>().ok())
+			.map(DeliveryJobType::from)
+			.unwrap_or(DeliveryJobType::Tool);
+		let job_type: &'static str = job_type.into();
+		let started = metadata
+			.and_then(|metadata| metadata.get("started_at_ms"))
+			.and_then(serde_json::Value::as_u64)
+			.map(|started| Str::new(started.to_string()));
 		let Ok(raw) = serde_json::value::to_raw_value(detached) else {
 			return;
 		};
-		let node = NodeSpec::new(KnownTag::Job)
+		let mut node = NodeSpec::new(KnownTag::Job)
 			.with_prop(PropId::Id, Value::Str(id))
 			.with_prop(PropId::Kind, Value::Str(Str::new_static("tool")))
 			.with_prop(PropId::Status, Value::Str(Str::new_static("running")))
 			.with_prop(PropId::Cause, Value::Str(Str::new(entry.id.to_string())))
+			.with_prop(
+				PropKey::Custom(Str::new_static("call")),
+				Value::Str(Str::new(
+					entry
+						.by
+						.expect("journal enforces a cause for detached tool results")
+						.to_string(),
+				)),
+			)
+			.with_prop(PropId::Name, Value::Str(Str::new_static(job_type)))
+			.with_prop(PropId::Label, Value::Str(label))
 			.with_prop(PropId::Data, Value::Json(raw));
+		if let Some(started) = started {
+			node = node.with_prop(PropKey::Custom(Str::new_static("started")), Value::Str(started));
+		}
 		let after = dom.children(jobs).last().copied();
 		draft.insert(jobs, after, node);
 	}

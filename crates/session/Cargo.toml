@@ -22,6 +22,7 @@ omp-proto = { workspace = true }
 omp-tool = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+strum = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

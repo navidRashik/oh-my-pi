@@ -50,6 +50,12 @@ pub enum Up {
 	/// Hands back every steering aside not yet consumed at a safe point (pi
 	/// `app.message.dequeue`): the host restores them to its composer.
 	Unqueue(flume::Sender<Vec<Str>>),
+	/// Journals the global runtime gate. Active inference and execution units
+	/// settle to their next safe point; no continuation starts while paused.
+	Pause {
+		/// `true` holds runtime work; `false` releases it.
+		active: bool,
+	},
 	/// Interrupts the current inference/tool turn while preserving mutations.
 	Interrupt,
 	/// Cancels the whole session and every execution scope.
@@ -141,7 +147,7 @@ pub(crate) fn queue_peer(session: &mut Session, text: Str) -> Result<(), Session
 /// under `<queues><prompts>` (the controller's `queue.push` shape); its
 /// attachments ride the same `data` prop a `msg.user@1` fold writes, so the
 /// controller's pop hands them to the next turn typed.
-pub(crate) fn queue_prompt(
+pub fn queue_prompt(
 	session: &mut Session,
 	text: Str,
 	attachments: &[Attachment],

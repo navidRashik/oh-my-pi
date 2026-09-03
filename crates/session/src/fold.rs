@@ -1,4 +1,4 @@
-use omp_core::Str;
+use omp_core::{Str, StrMut};
 use omp_dom::{
 	Applied, Dom, Handle, KnownTag, NodeSpec, Op, PropId, PropKey, StreamOp, Tag, Txn, Value,
 };
@@ -94,9 +94,7 @@ impl Session {
 		let node = entry_node(KnownTag::Assistant, entry)
 			.with_prop(PropId::Model, Value::Str(payload.model))
 			.with_prop(PropId::Provider, Value::Str(payload.provider))
-			.with_prop(PropId::Route, Value::Str(payload.route))
-			.with_prop(PropId::Text, Value::Str(Str::new_static("")))
-			.with_prop(PropId::Thinking, Value::Str(Str::new_static("")));
+			.with_prop(PropId::Route, Value::Str(payload.route));
 		self.insert_last(entry, turn, node)?;
 		self.current_assistant = Some(entry.id);
 		Ok(())
@@ -144,7 +142,8 @@ impl Session {
 	fn fold_assistant_end(&mut self, entry: &Entry) -> Result<(), SessionError> {
 		let payload: MsgAssistantEnd = serde_json::from_str(entry.data.as_str())?;
 		let assistant = self.current_assistant_handle()?;
-		self.apply_ops(entry, vec![
+		let (text, thinking) = self.aggregate_assistant_content(assistant);
+		let mut ops = vec![
 			Op::Set {
 				h:     assistant,
 				prop:  PropId::StopReason.into(),
@@ -155,9 +154,79 @@ impl Session {
 				prop:  PropId::Order.into(),
 				value: Value::Str(Str::new(entry.id.to_string())),
 			},
-		])?;
+		];
+		if let Some(text) = text {
+			ops.push(Op::Set {
+				h:     assistant,
+				prop:  PropId::Text.into(),
+				value: Value::Str(text),
+			});
+		}
+		if let Some(thinking) = thinking {
+			ops.push(Op::Set {
+				h:     assistant,
+				prop:  PropId::Thinking.into(),
+				value: Value::Str(thinking),
+			});
+		}
+		self.apply_ops(entry, ops)?;
 		self.current_assistant = None;
 		Ok(())
+	}
+
+	/// Materializes the legacy aggregate assistant properties exactly once at
+	/// finalization. Ordered children remain authoritative; the aggregates are
+	/// a compatibility projection for consumers that have not yet learned the
+	/// provider-content child shape.
+	fn aggregate_assistant_content(&self, assistant: Handle) -> (Option<Str>, Option<Str>) {
+		let mut children = self
+			.dom
+			.children(assistant)
+			.iter()
+			.enumerate()
+			.filter_map(|(position, handle)| {
+				let node = self.dom.get(*handle)?;
+				let Tag::Custom(tag) = &node.tag else {
+					return None;
+				};
+				if tag.as_str() != crate::ASSISTANT_CONTENT_TAG {
+					return None;
+				}
+				let index = node
+					.prop(&PropKey::Custom(Str::new_static(crate::PROVIDER_BLOCK_INDEX_PROP)))
+					.and_then(|value| match value {
+						Value::Int(index) => Some(*index),
+						_ => None,
+					})
+					.unwrap_or(i64::MAX);
+				Some((index, position, *handle))
+			})
+			.collect::<Vec<_>>();
+		children.sort_by_key(|(index, position, _)| (*index, *position));
+
+		let mut text = None::<StrMut>;
+		let mut thinking = None::<StrMut>;
+		for (_, _, handle) in children {
+			let Some(node) = self.dom.get(handle) else {
+				continue;
+			};
+			let Some(value) = self
+				.dom
+				.stream_text(handle, &PropId::Text.into())
+				.or_else(|| node.prop(&PropId::Text.into()).and_then(Value::as_str))
+			else {
+				continue;
+			};
+			let target = match node.prop(&PropId::Kind.into()).and_then(Value::as_str) {
+				Some("text") => &mut text,
+				Some("thinking") => &mut thinking,
+				_ => continue,
+			};
+			target
+				.get_or_insert_with(|| StrMut::new(""))
+				.push_str(value);
+		}
+		(text.map(StrMut::freeze), thinking.map(StrMut::freeze))
 	}
 
 	fn fold_tool_call(&mut self, entry: &Entry) -> Result<(), SessionError> {
@@ -272,9 +341,13 @@ impl Session {
 	fn fold_tool_result(&mut self, entry: &Entry) -> Result<(), SessionError> {
 		let payload: ToolResult = serde_json::from_str(entry.data.as_str())?;
 		let call = self.entry_call_handle(entry)?;
-		let (status, raw, prompt_parts) = match payload {
-			ToolResult::Outcome { outcome, prompt_parts } => ("ok", outcome, prompt_parts),
-			ToolResult::Fault { fault, prompt_parts } => ("error", fault, prompt_parts),
+		let (status, raw, prompt_parts, source_blob) = match payload {
+			ToolResult::Outcome { outcome, prompt_parts, source_blob } => {
+				("ok", outcome, prompt_parts, source_blob)
+			},
+			ToolResult::Fault { fault, prompt_parts, source_blob } => {
+				("error", fault, prompt_parts, source_blob)
+			},
 		};
 		let text = prompt_parts
 			.as_deref()
@@ -292,7 +365,31 @@ impl Session {
 				prop:  PropId::Status.into(),
 				value: Value::Str(Str::new_static(status)),
 			},
+			Op::Set {
+				h:     call,
+				prop:  PropKey::Custom(Str::new_static("result_entry")),
+				value: Value::Str(Str::new(entry.id.to_string())),
+			},
 		];
+		if let Some(source_blob) = source_blob {
+			ops.extend([
+				Op::Set {
+					h:     call,
+					prop:  PropId::Blob.into(),
+					value: Value::Str(blob_address(&source_blob)),
+				},
+				Op::Set {
+					h:     call,
+					prop:  PropId::Mime.into(),
+					value: Value::Str(Str::new_static("application/json")),
+				},
+				Op::Set {
+					h:     call,
+					prop:  PropKey::Custom(Str::new_static("size")),
+					value: unsigned(source_blob.size),
+				},
+			]);
+		}
 		if status == "error" {
 			// A fault is its own `<diag severity=error>` (ADR 0008): it never
 			// overwrites a warning the tool emitted earlier.
@@ -343,6 +440,13 @@ impl Session {
 		if payload.premium_requests_millionths != 0 {
 			node =
 				node.with_prop(PropId::PremiumRequests, unsigned(payload.premium_requests_millionths));
+		}
+		if let Some(identity) = payload.identity {
+			let kind: &'static str = identity.role.into();
+			node = node
+				.with_prop(PropId::Kind, Value::Str(Str::new_static(kind)))
+				.with_prop(PropId::Provider, Value::Str(identity.provider))
+				.with_prop(PropId::Model, Value::Str(identity.model));
 		}
 		if let Some(ttft) = payload.ttft_ms {
 			node = node.with_prop(PropId::TtftMs, unsigned(ttft));
@@ -553,23 +657,34 @@ fn project_update(
 		return Ok(());
 	}
 	if let Some(diag) = object.and_then(|map| map.get("diag").or_else(|| map.get("diagnostic"))) {
-		// Every warning is its own structured child (ADR 0008); a tool that
-		// warns twice keeps both on the element and on replay.
+		// Every diagnostic is its own structured child (ADR 0008); a tool
+		// that emits several keeps all of them on the element and on replay.
+		// Data remains the typed authority. Text is only the human projection:
+		// serializing the object there leaks transport JSON into every card.
 		let severity = diag
 			.get("severity")
 			.and_then(serde_json::Value::as_str)
 			.unwrap_or("info");
-		let text = match diag {
-			serde_json::Value::String(text) => Str::new(text),
-			_ => Str::new(serde_json::to_string(diag)?),
-		};
-		let node = NodeSpec::new(KnownTag::Diag)
+		let mut node = NodeSpec::new(KnownTag::Diag)
 			.with_prop(PropId::Severity, Value::Str(Str::new(severity)))
-			.with_prop(PropId::Text, Value::Str(text))
 			.with_prop(
 				PropId::Data,
 				Value::Json(RawValue::from_string(serde_json::to_string(diag)?)?),
 			);
+		let text = match diag {
+			serde_json::Value::String(text) => Some(text.as_str()),
+			serde_json::Value::Object(fields) => fields
+				.get("text")
+				.or_else(|| fields.get("message"))
+				.and_then(serde_json::Value::as_str),
+			_ => None,
+		};
+		if let Some(text) = text {
+			node = node.with_prop(PropId::Text, Value::Str(Str::new(text)));
+		}
+		if let Some(kind) = diag.get("kind").and_then(serde_json::Value::as_str) {
+			node = node.with_prop(PropId::Kind, Value::Str(Str::new(kind)));
+		}
 		ops.push(Op::Ins {
 			parent: call,
 			after: last_child_with_tag(dom, call, KnownTag::Diag)

@@ -7,15 +7,16 @@ use omp_agent::{
 	ApprovalDecision, ApprovalScope, ApprovalSource, Inference, Kernel, RunControl, TurnInput, Up,
 };
 use omp_core::{Str, base64};
-use omp_dom::Event;
 use omp_driver::{headless::kernel::SessionHome, sessions::SessionIndex};
 use omp_session::{AttachmentInput, Session, SessionError};
 use serde_json::{Map, Value, json};
 use tokio::io::{
-	AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, stdin, stdout,
+	AsyncBufRead, AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, stdin,
+	stdout,
 };
 
 use crate::{
+	acp_events::AcpEventMapper,
 	chat_cmd::{Launch, LaunchEnv},
 	cli::{AcpArgs, ChatArgs},
 };
@@ -40,6 +41,11 @@ async fn run_inner(args: ChatArgs) -> miette::Result<()> {
 	let ctx = Arc::new(crate::process_ctx(&project)?);
 	let env = LaunchEnv::production(&project, args.gateway.is_some())?;
 	let launch = Launch::prepare(args, ctx, env).await?;
+	let mut input = BufReader::new(stdin());
+	let mut output = stdout();
+	let Some(terminal_auth) = initialize_transport(&mut input, &mut output).await? else {
+		return Ok(());
+	};
 	let (kernel, session) = launch.compose().await?;
 	let home = SessionHome::new(
 		&launch.data_dir,
@@ -48,8 +54,77 @@ async fn run_inner(args: ChatArgs) -> miette::Result<()> {
 		launch.model.clone(),
 		kernel.mailbox(),
 	)
-	.into_diagnostic()?;
-	serve_acp(kernel, session, home, stdin(), stdout()).await
+	.into_diagnostic()?
+	.with_facts_of(&session);
+	serve_acp_state(kernel, session, home, input, output, true, terminal_auth).await
+}
+
+async fn initialize_transport<R, W>(
+	input: &mut R,
+	output: &mut W,
+) -> miette::Result<Option<bool>>
+where
+	R: AsyncBufRead + Unpin,
+	W: AsyncWrite + Unpin,
+{
+	let mut line = String::new();
+	loop {
+		line.clear();
+		if input.read_line(&mut line).await.into_diagnostic()? == 0 {
+			return Ok(None);
+		}
+		if line.trim().is_empty() {
+			continue;
+		}
+		let frame: Value = match serde_json::from_str(&line) {
+			Ok(frame) => frame,
+			Err(source) => {
+				write_frame(output, &error(Value::Null, -32700, &source.to_string())).await?;
+				continue;
+			},
+		};
+		let id = frame.get("id").cloned();
+		if frame.get("method").and_then(Value::as_str) != Some("initialize") {
+			if let Some(id) = id {
+				write_frame(
+					output,
+					&error(id, -32002, "initialize must complete before other requests"),
+				)
+				.await?;
+			}
+			continue;
+		}
+		let params = frame.get("params").and_then(Value::as_object);
+		let version = params
+			.and_then(|params| params.get("protocolVersion"))
+			.and_then(Value::as_u64)
+			.unwrap_or(1);
+		if version != 1 {
+			if let Some(id) = id {
+				write_frame(output, &error(id, -32602, "unsupported ACP protocol version")).await?;
+			}
+			continue;
+		}
+		let terminal_auth = params
+			.and_then(|params| params.get("clientCapabilities"))
+			.and_then(|capabilities| capabilities.pointer("/auth/terminal"))
+			.and_then(Value::as_bool)
+			.unwrap_or(false);
+		if let Some(id) = id {
+			write_frame(output, &success(id, initialize_response(terminal_auth))).await?;
+		}
+		return Ok(Some(terminal_auth));
+	}
+}
+
+async fn write_frame<W: AsyncWrite + Unpin>(
+	output: &mut W,
+	value: &Value,
+) -> miette::Result<()> {
+	let mut bytes = serde_json::to_vec(value).into_diagnostic()?;
+	bytes.push(b'\n');
+	output.write_all(&bytes).await.into_diagnostic()?;
+	output.flush().await.into_diagnostic()
 }
 
 struct TurnCompletion<C> {
@@ -67,17 +142,35 @@ enum InputEvent<C> {
 /// Serves ACP over caller-provided NDJSON transport halves.
 #[doc(hidden)]
 pub async fn serve_acp<C, R, W>(
-	mut kernel: Kernel<C>,
-	mut session: Session,
+	kernel: Kernel<C>,
+	session: Session,
 	home: SessionHome,
 	input: R,
-	mut output: W,
+	output: W,
 ) -> miette::Result<()>
 where
 	C: Inference + Send + Sync + 'static,
 	R: AsyncRead + Unpin,
 	W: AsyncWrite + Unpin + Send + 'static,
 {
+	serve_acp_state(kernel, session, home, input, output, false, false).await
+}
+
+async fn serve_acp_state<C, R, W>(
+	mut kernel: Kernel<C>,
+	mut session: Session,
+	home: SessionHome,
+	input: R,
+	mut output: W,
+	mut initialized: bool,
+	mut terminal_auth: bool,
+) -> miette::Result<()>
+where
+	C: Inference + Send + Sync + 'static,
+	R: AsyncRead + Unpin,
+	W: AsyncWrite + Unpin + Send + 'static,
+{
+	kernel.reconcile_jobs(&mut session).into_diagnostic()?;
 	home.register(&session);
 	let mut session_id = session_identifier(&session);
 	let (output_tx, output_rx) = flume::unbounded::<Value>();
@@ -90,17 +183,33 @@ where
 		}
 		Ok::<(), miette::Report>(())
 	});
-	let (_, events) = session.subscribe();
-	let mut forwarder = Some(forward_events(events, output_tx.clone(), session_id.clone()));
+	let (snapshot, events) = session.subscribe();
+	let mut forwarder = Some(
+		start_forwarder(
+			snapshot,
+			events,
+			output_tx.clone(),
+			session_id.clone(),
+			home.project_root.clone(),
+			session.blobs().clone(),
+			false,
+		)
+		.await?,
+	);
 	let mailbox = kernel.mailbox();
 	// pi `acp-permission-gate.ts`: every journaled approval prompt becomes
 	// one `session/request_permission` request; the client's selected
 	// option answers the prompt (`session/approve` remains for clients that
 	// answer by prompt id).
-	let permission_requests = request_permissions(kernel.subscribe(), output_tx.clone());
+	let permission_session = Arc::new(parking_lot::RwLock::new(session_id.clone()));
+	let permission_requests = request_permissions(
+		kernel.subscribe(),
+		output_tx.clone(),
+		Arc::clone(&permission_session),
+	);
 	let mut controller = Some((kernel, session));
 	let mut active: Option<tokio::task::JoinHandle<TurnCompletion<C>>> = None;
-	let mut initialized = false;
+	let mut closed = false;
 	let mut lines = BufReader::new(input).lines();
 
 	loop {
@@ -115,14 +224,20 @@ where
 		let line = match input_event {
 			InputEvent::Turn(completed) => {
 				active = None;
-				restore_turn(completed, &mut controller, &output_tx)?;
+				restore_turn(completed, &mut controller, &output_tx, forwarder.as_ref()).await?;
 				continue;
 			},
 			InputEvent::Line(Some(line)) => line,
 			InputEvent::Line(None) => {
 				if let Some(turn) = active.take() {
 					let _ = mailbox.send(Up::Interrupt);
-					restore_turn(turn.await.into_diagnostic()?, &mut controller, &output_tx)?;
+					restore_turn(
+						turn.await.into_diagnostic()?,
+						&mut controller,
+						&output_tx,
+						forwarder.as_ref(),
+					)
+					.await?;
 				}
 				break;
 			},
@@ -168,6 +283,19 @@ where
 			}
 			continue;
 		}
+		if method == "session/prompt"
+			&& targets_session(&params, session_id.as_str())
+			&& let Some(turn) = active.take()
+		{
+			let _ = mailbox.send(Up::Interrupt);
+			restore_turn(
+				turn.await.into_diagnostic()?,
+				&mut controller,
+				&output_tx,
+				forwarder.as_ref(),
+			)
+			.await?;
+		}
 		let result = match method {
 			"initialize" => {
 				let version = params
@@ -178,25 +306,28 @@ where
 					Err((-32602, "unsupported ACP protocol version"))
 				} else {
 					initialized = true;
-					Ok(json!({
-						"protocolVersion": 1,
-						"agentInfo": {
-							"name": "oh-my-pi",
-							"title": "Oh My Pi",
-							"version": env!("CARGO_PKG_VERSION"),
-						},
-						"authMethods": [],
-						"agentCapabilities": {
-							"loadSession": true,
-							"sessionCapabilities": {"list": {}, "fork": {}, "resume": {}, "close": {}},
-							"promptCapabilities": {"image": true, "embeddedContext": true},
-						},
-					}))
+					terminal_auth = params
+						.pointer("/clientCapabilities/auth/terminal")
+						.and_then(Value::as_bool)
+						.unwrap_or(false);
+					Ok(initialize_response(terminal_auth))
 				}
 			},
-			"authenticate" => Ok(json!({})),
+			"authenticate" => {
+				let method = params.get("methodId").and_then(Value::as_str);
+				if matches!(method, Some("agent"))
+					|| terminal_auth && matches!(method, Some("terminal"))
+				{
+					Ok(json!({}))
+				} else {
+					Err((-32602, "unknown ACP authentication method"))
+				}
+			},
 			"session/new" if active.is_some() => Err((-32001, "a turn is already running")),
 			"session/new" => {
+				if let Err(message) = validate_session_cwd(&home, &params) {
+					Err((-32602, message))
+				} else {
 				let next = match home.create(None) {
 					Ok(next) => next,
 					Err(source) => {
@@ -215,14 +346,20 @@ where
 					&output_tx,
 					&mut forwarder,
 					&mut session_id,
+					&permission_session,
 				)
 				.await?;
-				Ok(session_descriptor(session_id.as_str()))
+				closed = false;
+				Ok(new_session_descriptor(session_id.as_str(), home.model.as_str()))
+				}
 			},
 			"session/load" | "session/resume" if active.is_some() => {
 				Err((-32001, "a turn is already running"))
 			},
 			"session/load" | "session/resume" => {
+				if let Err(message) = validate_session_cwd(&home, &params) {
+					Err((-32602, message))
+				} else {
 				let selector = match requested_session(&params) {
 					Ok(selector) => selector,
 					Err(message) => {
@@ -252,9 +389,12 @@ where
 					&output_tx,
 					&mut forwarder,
 					&mut session_id,
+					&permission_session,
 				)
 				.await?;
-				Ok(session_descriptor(session_id.as_str()))
+				closed = false;
+				Ok(session_state(home.model.as_str()))
+				}
 			},
 			// pi `listSessions`: stored sessions newest first, paged by an
 			// offset cursor, optionally scoped to one `cwd`. The live session
@@ -268,6 +408,9 @@ where
 			// branch tree travels) and switch authority to the copy.
 			"session/fork" if active.is_some() => Err((-32001, "a turn is already running")),
 			"session/fork" => {
+				if let Err(message) = validate_session_cwd(&home, &params) {
+					Err((-32602, message))
+				} else {
 				let selector = match requested_session(&params) {
 					Ok(selector) => selector,
 					Err(message) => {
@@ -297,11 +440,17 @@ where
 					&output_tx,
 					&mut forwarder,
 					&mut session_id,
+					&permission_session,
 				)
 				.await?;
-				Ok(session_descriptor(session_id.as_str()))
+				closed = false;
+				Ok(new_session_descriptor(session_id.as_str(), home.model.as_str()))
+				}
 			},
-			"session/prompt" if active.is_some() => Err((-32001, "a turn is already running")),
+			"session/prompt" if closed => Err((-32000, "ACP session is closed")),
+			"session/prompt" if !targets_session(&params, session_id.as_str()) => {
+				Err((-32000, "unsupported ACP session"))
+			},
 			"session/prompt" => match prompt_input(&params) {
 				Ok(prompt) => {
 					let (mut kernel, mut session) = controller
@@ -319,20 +468,30 @@ where
 							continue;
 						},
 					};
+					let turn_output = output_tx.clone();
+					let turn_session = session_id.clone();
 					active = Some(tokio::spawn(async move {
 						let response = match kernel
 							.run_turn(&mut session, input, RunControl::default())
 							.await
 						{
-							Ok(outcome) => Ok(json!({
-								"stopReason": if outcome.stop == omp_agent::TurnStop::Cancelled {
-									"cancelled"
-								} else {
-									"end_turn"
-								},
-								"text": outcome.assistant_text,
-							})),
-							Err(_) => Err((-32000, "agent turn failed")),
+							Ok(outcome) => Ok(prompt_response(&session, &outcome)),
+							Err(source) => {
+								let text = source.to_string();
+								let message_id = session
+									.head()
+									.map(|entry| entry.to_string())
+									.unwrap_or_else(|| "error".to_owned());
+								let _ = turn_output.send(session_update(
+									turn_session.as_str(),
+									json!({
+										"sessionUpdate": "agent_message_chunk",
+										"content": {"type": "text", "text": text},
+										"messageId": message_id,
+									}),
+								));
+								Ok(json!({"stopReason": error_stop_reason(&text)}))
+							},
 						};
 						TurnCompletion { kernel, session, id, response }
 					}));
@@ -342,6 +501,9 @@ where
 			},
 			// ACP names the notification `cancel`; `session/cancel` is the
 			// legacy spelling earlier omp clients used.
+			"cancel" | "session/cancel" if !targets_session(&params, session_id.as_str()) => {
+				Err((-32000, "unsupported ACP session"))
+			},
 			"cancel" | "session/cancel" => {
 				if active.is_some() {
 					let _ = mailbox.send(Up::Interrupt);
@@ -357,36 +519,69 @@ where
 				},
 				Err(message) => Err((-32602, message)),
 			},
-			"session/close" | "shutdown" => {
+			"session/close" if !targets_session(&params, session_id.as_str()) => Ok(json!({})),
+			"session/close" if active.is_some() => Err((-32001, "a turn is already running")),
+			"session/close" => {
+				if !closed {
+					if let Some((_, session)) = controller.as_mut() {
+						session.session_switch().into_diagnostic()?;
+						home.unregister(session);
+					}
+					closed = true;
+				}
+				Ok(json!({}))
+			},
+			"shutdown" => {
 				if let Some(id) = id {
 					output_tx.send(success(id, json!({}))).into_diagnostic()?;
 				}
 				if let Some(turn) = active.take() {
 					let _ = mailbox.send(Up::Interrupt);
-					restore_turn(turn.await.into_diagnostic()?, &mut controller, &output_tx)?;
+					restore_turn(
+						turn.await.into_diagnostic()?,
+						&mut controller,
+						&output_tx,
+						forwarder.as_ref(),
+					)
+					.await?;
 				}
 				break;
 			},
 			_ => Err((-32601, "unknown ACP method")),
 		};
 		if let Some(id) = id {
+			let succeeded = result.is_ok();
 			let response = match result {
 				Ok(value) => success(id, value),
 				Err((code, message)) => error(id, code, message),
 			};
 			output_tx.send(response).into_diagnostic()?;
+			if succeeded
+				&& matches!(
+					method,
+					"session/new" | "session/load" | "session/resume" | "session/fork"
+				)
+			{
+				schedule_bootstrap_updates(
+					output_tx.clone(),
+					session_id.clone(),
+					home.model.clone(),
+				);
+			}
 		}
 	}
 
 	let (kernel, mut session) = controller
 		.take()
 		.expect("ACP controller owns its kernel and session after active turn completion");
-	session.process_exit().into_diagnostic()?;
-	home.unregister(&session);
+	if !closed {
+		session.process_exit().into_diagnostic()?;
+		home.unregister(&session);
+	}
 	drop(session);
 	drop(kernel);
 	if let Some(forwarder) = forwarder {
-		forwarder.await.into_diagnostic()??;
+		forwarder.finish().await?;
 	}
 	drop(output_tx);
 	writer.await.into_diagnostic()??;
@@ -415,6 +610,7 @@ impl PermissionRequests {
 		let (approved, scope) = match option {
 			Some("allow_once") => (true, ApprovalScope::Once),
 			Some("allow_always") => (true, ApprovalScope::Session),
+			Some("reject_always") => (false, ApprovalScope::Session),
 			_ => (false, ApprovalScope::Once),
 		};
 		Some((prompt_id, ApprovalDecision {
@@ -431,6 +627,7 @@ impl PermissionRequests {
 fn request_permissions(
 	events: flume::Receiver<omp_agent::KernelEvent>,
 	output: flume::Sender<Value>,
+	session_id: Arc<parking_lot::RwLock<Str>>,
 ) -> PermissionRequests {
 	let pending = Arc::new(parking_lot::Mutex::new(std::collections::BTreeMap::new()));
 	let table = Arc::clone(&pending);
@@ -444,17 +641,39 @@ fn request_permissions(
 			next_id += 1;
 			table.lock().insert(id, ticket.ticket_id.clone());
 			let first = ticket.reasons.first();
+			let mut tool_call = json!({
+				"toolCallId": ticket.invocation_id.as_deref().unwrap_or(ticket.ticket_id.as_str()),
+				"title": first.map_or("Approval required", |spec| spec.title.as_str()),
+				"status": "pending",
+				"rawInput": {
+					"subject": first.map(|spec| spec.subject.as_str()),
+					"body": first.map(|spec| spec.body.as_str()),
+				},
+			});
+			if let Some(spec) = first {
+				let kind = match spec.kind.as_str() {
+					"exec" | "execute" | "bash" | "shell" => "execute",
+					"write" | "edit" => "edit",
+					"delete" => "delete",
+					"move" => "move",
+					"read" => "read",
+					_ => "other",
+				};
+				tool_call["kind"] = Value::String(kind.to_owned());
+				if kind == "execute" {
+					tool_call["content"] = json!([{
+						"type": "content",
+						"content": {"type": "text", "text": format!("$ {}", spec.subject)},
+					}]);
+				}
+			}
 			let request = json!({
 				"jsonrpc": "2.0",
 				"id": id,
 				"method": "session/request_permission",
 				"params": {
-					"toolCall": {
-						"toolCallId": ticket.invocation_id.as_deref().unwrap_or(ticket.ticket_id.as_str()),
-						"title": first.map_or("Approval required", |spec| spec.title.as_str()),
-						"status": "pending",
-						"rawInput": {"subject": first.map(|spec| spec.subject.as_str()), "body": first.map(|spec| spec.body.as_str())},
-					},
+					"sessionId": session_id.read().clone(),
+					"toolCall": tool_call,
 					"options": [
 						{"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
 						{"optionId": "allow_always", "name": "Always allow", "kind": "allow_always"},
@@ -471,31 +690,88 @@ fn request_permissions(
 	PermissionRequests { pending, _task: Arc::new(task) }
 }
 
-fn forward_events(
-	events: flume::Receiver<Event>,
+struct EventForwarder {
+	flush: flume::Sender<tokio::sync::oneshot::Sender<()>>,
+	task:  tokio::task::JoinHandle<miette::Result<()>>,
+}
+
+impl EventForwarder {
+	async fn flush(&self) -> miette::Result<()> {
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self.flush.send_async(tx).await.into_diagnostic()?;
+		rx.await.into_diagnostic()
+	}
+
+	async fn finish(self) -> miette::Result<()> {
+		drop(self.flush);
+		self.task.await.into_diagnostic()?
+	}
+}
+
+async fn start_forwarder(
+	snapshot: omp_dom::Snapshot,
+	events: flume::Receiver<omp_dom::Event>,
 	output: flume::Sender<Value>,
 	session_id: Str,
-) -> tokio::task::JoinHandle<miette::Result<()>> {
-	tokio::spawn(async move {
-		while let Ok(event) = events.recv_async().await {
-			if output
-				.send(acp_event_value(session_id.as_str(), event)?)
-				.is_err()
-			{
-				break;
+	cwd: std::path::PathBuf,
+	blobs: omp_journal::blob::BlobStore,
+	replay: bool,
+) -> miette::Result<EventForwarder> {
+	let (flush_tx, flush_rx) = flume::unbounded::<tokio::sync::oneshot::Sender<()>>();
+	let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+	let task = tokio::spawn(async move {
+		let mut mapper = AcpEventMapper::new(&snapshot, cwd, blobs);
+		if replay {
+			for update in mapper.replay_updates().into_diagnostic()? {
+				if output.send(session_update(session_id.as_str(), update)).is_err() {
+					let _ = ready_tx.send(());
+					return Ok(());
+				}
+			}
+		}
+		let _ = ready_tx.send(());
+		loop {
+			tokio::select! {
+				biased;
+				flush = flush_rx.recv_async() => {
+					let Ok(flush) = flush else { break };
+					while let Ok(event) = events.try_recv() {
+						for update in mapper.map_event(&event).into_diagnostic()? {
+							if output.send(session_update(session_id.as_str(), update)).is_err() {
+								let _ = flush.send(());
+								return Ok(());
+							}
+						}
+					}
+					let _ = flush.send(());
+				},
+				event = events.recv_async() => {
+					let Ok(event) = event else { break };
+					for update in mapper.map_event(&event).into_diagnostic()? {
+						if output.send(session_update(session_id.as_str(), update)).is_err() {
+							return Ok(());
+						}
+					}
+				},
 			}
 		}
 		Ok(())
-	})
+	});
+	ready_rx.await.into_diagnostic()?;
+	Ok(EventForwarder { flush: flush_tx, task })
 }
 
-fn restore_turn<C>(
+async fn restore_turn<C>(
 	completed: TurnCompletion<C>,
 	controller: &mut Option<(Kernel<C>, Session)>,
 	output: &flume::Sender<Value>,
+	forwarder: Option<&EventForwarder>,
 ) -> miette::Result<()> {
 	let TurnCompletion { kernel, session, id, response } = completed;
 	*controller = Some((kernel, session));
+	if let Some(forwarder) = forwarder {
+		forwarder.flush().await?;
+	}
 	if let Some(id) = id {
 		let response = match response {
 			Ok(value) => success(id, value),
@@ -511,25 +787,36 @@ async fn switch_session<C>(
 	mut next: Session,
 	home: &SessionHome,
 	output: &flume::Sender<Value>,
-	forwarder: &mut Option<tokio::task::JoinHandle<miette::Result<()>>>,
+	forwarder: &mut Option<EventForwarder>,
 	session_id: &mut Str,
+	permission_session: &parking_lot::RwLock<Str>,
 ) -> miette::Result<()> {
-	let (snapshot, events) = next.subscribe();
 	let (kernel, mut previous) = controller
 		.take()
 		.expect("idle ACP controller owns its kernel and session");
+	kernel.reconcile_jobs(&mut next).into_diagnostic()?;
+	let (snapshot, events) = next.subscribe();
 	let _ = previous.session_switch();
 	home.unregister(&previous);
 	drop(previous);
 	if let Some(previous_forwarder) = forwarder.take() {
-		previous_forwarder.await.into_diagnostic()??;
+		previous_forwarder.finish().await?;
 	}
 	home.register(&next);
 	*session_id = session_identifier(&next);
-	output
-		.send(acp_event_value(session_id.as_str(), Event::Reset { snapshot })?)
-		.into_diagnostic()?;
-	*forwarder = Some(forward_events(events, output.clone(), session_id.clone()));
+	*permission_session.write() = session_id.clone();
+	*forwarder = Some(
+		start_forwarder(
+			snapshot,
+			events,
+			output.clone(),
+			session_id.clone(),
+			home.project_root.clone(),
+			next.blobs().clone(),
+			true,
+		)
+		.await?,
+	);
 	*controller = Some((kernel, next));
 	Ok(())
 }
@@ -548,6 +835,31 @@ fn requested_session(params: &Map<String, Value>) -> Result<&str, &'static str> 
 		.or_else(|| params.get("session"))
 		.and_then(Value::as_str)
 		.ok_or("sessionId is required")
+}
+
+fn targets_session(params: &Map<String, Value>, current: &str) -> bool {
+	params
+		.get("sessionId")
+		.and_then(Value::as_str)
+		.is_none_or(|requested| requested == current)
+}
+
+fn validate_session_cwd(
+	home: &SessionHome,
+	params: &Map<String, Value>,
+) -> Result<(), &'static str> {
+	let Some(cwd) = params.get("cwd").and_then(Value::as_str) else {
+		return Ok(());
+	};
+	let path = Path::new(cwd);
+	if !path.is_absolute() {
+		return Err("cwd must be an absolute path");
+	}
+	let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+	if path != home.project_root {
+		return Err("cwd does not match the configured ACP project");
+	}
+	Ok(())
 }
 
 /// `session/list {cwd?, cursor?}` → `{sessions, nextCursor?}` (pi
@@ -612,12 +924,132 @@ fn list_sessions(home: &SessionHome, params: &Map<String, Value>) -> Result<Valu
 	Ok(result)
 }
 
-fn session_descriptor(session_id: &str) -> Value {
+fn schedule_bootstrap_updates(output: flume::Sender<Value>, session_id: Str, model: Str) {
+	tokio::spawn(async move {
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		for update in [
+			json!({"sessionUpdate": "current_mode_update", "currentModeId": "default"}),
+			json!({
+				"sessionUpdate": "config_option_update",
+				"configOptions": session_state(model.as_str())["configOptions"].clone(),
+			}),
+			json!({"sessionUpdate": "available_commands_update", "availableCommands": []}),
+			json!({
+				"sessionUpdate": "session_info_update",
+				"updatedAt": jiff::Timestamp::now().to_string(),
+			}),
+		] {
+			if output.send(session_update(session_id.as_str(), update)).is_err() {
+				break;
+			}
+		}
+	});
+}
+
+fn initialize_response(terminal_auth: bool) -> Value {
+	let mut auth = vec![json!({
+		"id": "agent",
+		"name": "Use existing local credentials",
+		"description": "Authenticate via the provider keys/OAuth state already configured under ~/.o2.",
+	})];
+	if terminal_auth {
+		auth.push(json!({
+			"type": "terminal",
+			"id": "terminal",
+			"name": "Set up Oh My Pi in terminal",
+			"description": "Launch the omp TUI to add provider keys and select models.",
+			"args": ["--acp-terminal-auth"],
+		}));
+	}
 	json!({
-		"sessionId": session_id,
-		"modes": {"currentModeId": "default", "availableModes": []},
-		"models": {"currentModelId": "configured", "availableModels": []},
+		"protocolVersion": 1,
+		"agentInfo": {
+			"name": "oh-my-pi",
+			"title": "Oh My Pi",
+			"version": env!("CARGO_PKG_VERSION"),
+		},
+		"authMethods": auth,
+		"agentCapabilities": {
+			"loadSession": true,
+			"mcpCapabilities": {"http": true, "sse": true},
+			"sessionCapabilities": {"list": {}, "fork": {}, "resume": {}, "close": {}},
+			"promptCapabilities": {"image": true, "embeddedContext": true},
+		},
 	})
+}
+
+fn session_state(model: &str) -> Value {
+	json!({
+		"configOptions": [{
+			"type": "select",
+			"id": "model",
+			"name": "Model",
+			"currentValue": model,
+			"options": [{"value": model, "name": model}],
+		}],
+		"modes": {
+			"currentModeId": "default",
+			"availableModes": [{
+				"id": "default",
+				"name": "Default",
+				"description": "Standard coding-agent behavior",
+			}],
+		},
+	})
+}
+
+fn new_session_descriptor(session_id: &str, model: &str) -> Value {
+	let mut descriptor = session_state(model);
+	descriptor["sessionId"] = Value::String(session_id.to_owned());
+	descriptor
+}
+
+fn prompt_response(session: &Session, outcome: &omp_agent::TurnOutcome) -> Value {
+	let stop_reason = if outcome.stop == omp_agent::TurnStop::Cancelled {
+		"cancelled"
+	} else {
+		session
+			.dom()
+			.children(session.dom().body())
+			.iter()
+			.rev()
+			.filter_map(|turn| session.dom().get(*turn))
+			.flat_map(|turn| turn.kids.iter().rev())
+			.filter_map(|handle| session.dom().get(*handle))
+			.find(|node| node.tag == omp_dom::Tag::Known(omp_dom::KnownTag::Assistant))
+			.and_then(|node| node.prop(&omp_dom::PropId::StopReason.into()))
+			.and_then(omp_dom::Value::as_str)
+			.map(|reason| match reason {
+				"length" => "max_tokens",
+				"aborted" | "cancelled" => "cancelled",
+				"refusal" | "content_filter" => "refusal",
+				_ => "end_turn",
+			})
+			.unwrap_or("end_turn")
+	};
+	let mut response = json!({"stopReason": stop_reason});
+	let total = outcome.tokens_in.saturating_add(outcome.tokens_out);
+	if total != 0 {
+		response["usage"] = json!({
+			"totalTokens": total,
+			"inputTokens": outcome.tokens_in,
+			"outputTokens": outcome.tokens_out,
+		});
+	}
+	response
+}
+
+fn error_stop_reason(message: &str) -> &'static str {
+	let message = message.to_ascii_lowercase();
+	if message.contains("content_filter")
+		|| message.contains("content filter")
+		|| message.contains("refusal")
+		|| message.contains("refused")
+	{
+		"refusal"
+	} else {
+		"end_turn"
+	}
 }
 
 /// A `session/prompt` request reduced to the turn text and its image blocks
@@ -659,12 +1091,11 @@ fn prompt_input(params: &Map<String, Value>) -> Result<PromptInput, &'static str
 	for block in blocks {
 		match block.get("type").and_then(Value::as_str) {
 			Some("text") => {
-				texts.push(Cow::Borrowed(
-					block
-						.get("text")
-						.and_then(Value::as_str)
-						.unwrap_or_default(),
-				));
+				let text = block
+					.get("text")
+					.and_then(Value::as_str)
+					.ok_or("text content block requires text")?;
+				texts.push(Cow::Borrowed(text));
 			},
 			Some("image") => {
 				let data = block
@@ -680,7 +1111,12 @@ fn prompt_input(params: &Map<String, Value>) -> Result<PromptInput, &'static str
 			Some("resource") => {
 				let resource = block
 					.get("resource")
-					.ok_or("resource block requires a resource")?;
+					.and_then(Value::as_object)
+					.ok_or("resource block requires a resource object")?;
+				let uri = resource
+					.get("uri")
+					.and_then(Value::as_str)
+					.ok_or("resource block requires a resource uri")?;
 				if let Some(text) = resource.get("text").and_then(Value::as_str) {
 					texts.push(Cow::Borrowed(text));
 				} else if let Some(mime) = resource
@@ -691,24 +1127,33 @@ fn prompt_input(params: &Map<String, Value>) -> Result<PromptInput, &'static str
 				{
 					images.push(decode_image(blob, mime)?);
 				} else {
-					let uri = resource
-						.get("uri")
-						.and_then(Value::as_str)
-						.unwrap_or_default();
 					texts.push(Cow::Owned(format!("[embedded resource: {uri}]")));
 				}
 			},
 			Some("resource_link") => {
+				let uri = block
+					.get("uri")
+					.and_then(Value::as_str)
+					.ok_or("resource_link content block requires uri")?;
 				texts.push(Cow::Borrowed(
 					block
 						.get("title")
 						.or_else(|| block.get("name"))
-						.or_else(|| block.get("uri"))
 						.and_then(Value::as_str)
-						.unwrap_or_default(),
+						.unwrap_or(uri),
 				));
 			},
-			Some("audio") => texts.push(Cow::Borrowed("[audio omitted]")),
+			Some("audio") => {
+				block
+					.get("data")
+					.and_then(Value::as_str)
+					.ok_or("audio content block requires base64 data")?;
+				block
+					.get("mimeType")
+					.and_then(Value::as_str)
+					.ok_or("audio content block requires mimeType")?;
+				texts.push(Cow::Borrowed("[audio omitted]"));
+			},
 			_ => return Err("unsupported prompt content block"),
 		}
 	}
@@ -737,12 +1182,12 @@ fn approval(params: &Map<String, Value>) -> Result<(Str, ApprovalDecision), &'st
 		.get("approved")
 		.and_then(Value::as_bool)
 		.unwrap_or(false);
-	let scope = params
-		.get("scope")
-		.and_then(Value::as_str)
-		.unwrap_or("once")
-		.parse::<ApprovalScope>()
-		.expect("approval scope parsing is infallible");
+	let scope = match params.get("scope").and_then(Value::as_str).unwrap_or("once") {
+		"once" => ApprovalScope::Once,
+		"call" => ApprovalScope::Call,
+		"session" | "always" => ApprovalScope::Session,
+		_ => return Err("session/approve has an invalid scope"),
+	};
 	Ok((Str::new(id), ApprovalDecision {
 		approved,
 		scope,
@@ -753,28 +1198,12 @@ fn approval(params: &Map<String, Value>) -> Result<(Str, ApprovalDecision), &'st
 	}))
 }
 
-fn acp_event_value(session_id: &str, event: Event) -> miette::Result<Value> {
-	let update = match event {
-		Event::Patch(patch) => json!({
-			"sessionUpdate": "patch",
-			"event": "patch@1",
-			"data": serde_json::to_value(patch).into_diagnostic()?,
-		}),
-		Event::Reset { snapshot } => json!({
-			"sessionUpdate": "snapshot",
-			"data": serde_json::from_slice::<Value>(snapshot.as_bytes()).into_diagnostic()?,
-		}),
-		Event::Stream { cause, sid, op, node, prop, text } => json!({
-			"sessionUpdate": "patch",
-			"event": "stream@1",
-			"data": {"cause": cause, "sid": sid, "op": op, "node": node, "prop": prop, "text": text},
-		}),
-	};
-	Ok(json!({
+fn session_update(session_id: &str, update: Value) -> Value {
+	json!({
 		"jsonrpc": "2.0",
 		"method": "session/update",
 		"params": {"sessionId": session_id, "update": update},
-	}))
+	})
 }
 
 fn success(id: Value, result: Value) -> Value {
@@ -791,6 +1220,25 @@ mod tests {
 
 	fn params(value: Value) -> Map<String, Value> {
 		value.as_object().expect("object params").clone()
+	}
+
+	#[test]
+	fn initialize_capabilities_and_terminal_auth_match_pi() {
+		let ordinary = initialize_response(false);
+		assert_eq!(ordinary["protocolVersion"], 1);
+		assert_eq!(ordinary["agentInfo"]["name"], "oh-my-pi");
+		assert_eq!(ordinary["agentCapabilities"]["loadSession"], true);
+		assert_eq!(ordinary["agentCapabilities"]["mcpCapabilities"]["http"], true);
+		assert_eq!(ordinary["agentCapabilities"]["mcpCapabilities"]["sse"], true);
+		assert_eq!(ordinary["agentCapabilities"]["promptCapabilities"]["embeddedContext"], true);
+		assert_eq!(ordinary["agentCapabilities"]["promptCapabilities"]["image"], true);
+		assert_eq!(ordinary["authMethods"].as_array().map(Vec::len), Some(1));
+		assert!(ordinary["authMethods"][0].get("type").is_none());
+
+		let terminal = initialize_response(true);
+		assert_eq!(terminal["authMethods"].as_array().map(Vec::len), Some(2));
+		assert_eq!(terminal["authMethods"][1]["type"], "terminal");
+		assert_eq!(terminal["authMethods"][1]["args"], json!(["--acp-terminal-auth"]));
 	}
 
 	#[test]

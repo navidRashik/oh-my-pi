@@ -20,7 +20,7 @@ use std::{
 
 use flume::{Receiver, r#async::RecvStream};
 use futures::{Stream, StreamExt as _};
-use omp_core::{FastHashMap, Str, sf};
+use omp_core::{FastHashMap, Hash32, Str, sf};
 use omp_dom::{Handle, KnownTag, PropId, Sid, Tag};
 use omp_journal::{
 	EntryId,
@@ -30,8 +30,9 @@ use omp_session::{Session, SessionError};
 use omp_tool::{
 	Abort, ArtifactLifetime, BlobRef as ToolBlobRef, CallOutcome, CallOutcomeDetails, CapsBase,
 	Effects, ErasedEv, ErasedOutcome, ExpectedArtifact, IncomingParams, Interrupt, InvocationFeed,
-	JobKind, JobMetadata, JobOwner, JobRef, ModelClass, Part, PromptCaps, Registry, RegistryError,
-	Rev, ToolIdentity, ToolRoute, ToolSpec,
+	JobKind, JobMetadata, JobOwner, JobRef, ModelClass, OutputProjection, OutputRequest, Part,
+	ProjectionSpan, PromptCaps, Registry, RegistryError, Rev, ToolIdentity, ToolRoute, ToolSpec,
+	VisibilityReceipt, VisibleSourceLine,
 };
 use serde_json::value::RawValue;
 use thiserror::Error;
@@ -77,30 +78,36 @@ impl ToolCancellation {
 /// Central policy applied once to every tool call.
 #[derive(Clone, Debug)]
 pub struct DispatchPolicy {
-	/// Maximum inline output bytes.
-	pub max_output_bytes: usize,
+	/// Maximum inline output bytes under the ordinary policy.
+	pub max_output_bytes:          usize,
+	/// Fixed host-memory and transcript ceiling for a `notrunc` request.
+	pub max_complete_output_bytes: usize,
 	/// Maximum bytes retained from one output line.
-	pub max_line_bytes:   usize,
+	pub max_line_bytes:            usize,
 	/// Maximum time a call may block the turn.
-	pub blocking_limit:   Duration,
+	pub blocking_limit:            Duration,
 	/// Bounded wait after a stop request before a call that has not settled
 	/// is forcibly terminated and journaled as effects-unknown (ADR 0011).
 	/// Execution units apply their own courtesy grace inside this bound.
-	pub interrupt_grace:  Duration,
+	pub interrupt_grace:           Duration,
 	/// Content-addressed store for complete spilled output.
-	pub spill:            BlobStore,
+	pub spill:                     BlobStore,
 }
 
 impl DispatchPolicy {
 	/// Standard inline output bound shared by tool terminals and job
 	/// settlements.
 	pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+	/// Hard ceiling retained inline for an explicit complete-output request.
+	pub const MAX_COMPLETE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
-	/// Creates the standard 64 KiB / 512-byte / 30-second / 1-second policy.
+	/// Creates the standard 64 KiB / 8 MiB hard / 512-byte / 30-second /
+	/// 1-second policy.
 	#[must_use]
 	pub const fn new(spill: BlobStore) -> Self {
 		Self {
 			max_output_bytes: Self::DEFAULT_MAX_OUTPUT_BYTES,
+			max_complete_output_bytes: Self::MAX_COMPLETE_OUTPUT_BYTES,
 			max_line_bytes: 512,
 			blocking_limit: Duration::from_secs(30),
 			interrupt_grace: Duration::from_secs(1),
@@ -133,12 +140,12 @@ impl DispatchPolicy {
 /// Per-call policy choices parsed from model arguments.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DispatchOptions {
-	/// Explicitly bypasses both central inline limits.
+	/// Requests complete inline output up to the fixed host security ceiling.
 	pub notrunc: bool,
 }
 
 impl DispatchOptions {
-	/// Reads the caller-owned `notrunc` escape hatch from canonical arguments.
+	/// Reads the caller-owned `notrunc` preference from canonical arguments.
 	#[must_use]
 	pub fn from_args(args: &RawValue) -> Self {
 		let notrunc = serde_json::from_str::<serde_json::Value>(args.get())
@@ -146,6 +153,16 @@ impl DispatchOptions {
 			.and_then(|value| value.get("notrunc").and_then(serde_json::Value::as_bool))
 			.unwrap_or(false);
 		Self { notrunc }
+	}
+
+	/// Typed caller request forwarded across environment execution boundaries.
+	#[must_use]
+	pub const fn output_request(self) -> OutputRequest {
+		if self.notrunc {
+			OutputRequest::Complete
+		} else {
+			OutputRequest::Bounded
+		}
 	}
 }
 
@@ -177,6 +194,9 @@ pub struct ExternalDispatchRequest {
 	pub route:          ToolRoute,
 	/// Maximum time the invocation may block this turn.
 	pub blocking_limit: Duration,
+	/// Caller-selected output projection policy. The environment still enforces
+	/// its fixed security ceiling.
+	pub output_request: OutputRequest,
 	/// Turn/session cancellation the executor must honor (ADR 0011): once
 	/// cancelled, the invocation is interrupted and settles aborted.
 	pub cancellation:   CancellationToken,
@@ -188,12 +208,27 @@ pub enum ExternalDispatchEvent {
 	Update(Box<RawValue>),
 	/// Durable structured outcome and its canonical model-facing projection.
 	Done {
-		/// Serialized `CallOutcome` truth.
-		outcome:  Box<RawValue>,
+		/// Typed `CallOutcome` truth decoded once at the environment boundary.
+		outcome:         CallOutcome<serde_json::Value, serde_json::Value>,
 		/// Canonical bounded-later model-facing parts.
-		parts:    Vec<Part>,
+		parts:           Vec<Part>,
 		/// Whether the outcome is model-facing error content.
-		is_error: bool,
+		is_error:        bool,
+		/// Verified environment artifact adopted into the session CAS.
+		source_artifact: Option<BlobRef>,
+	},
+	/// Durable outcome with typed trust-boundary projection facts.
+	DoneProjected {
+		/// Typed `CallOutcome` truth decoded once at the environment boundary.
+		outcome:         CallOutcome<serde_json::Value, serde_json::Value>,
+		/// Environment-bounded model-facing parts.
+		parts:           Vec<Part>,
+		/// Whether the outcome is model-facing error content.
+		is_error:        bool,
+		/// Verified environment artifact adopted into the session CAS.
+		source_artifact: Option<BlobRef>,
+		/// Facts for the projection already applied by the environment host.
+		projection:      OutputProjection,
 	},
 	/// Execution stopped without a normal typed verdict.
 	Aborted(Abort),
@@ -246,6 +281,8 @@ pub enum Received {
 	Steering,
 	/// The authoritative session rewound and runtime lifecycle must follow.
 	Rewound(omp_session::LifecycleWork),
+	/// The journal-derived global runtime gate changed.
+	PauseChanged,
 	/// The turn or session was cancelled.
 	Cancelled,
 	/// A journaled approval prompt was decided; a call waiting on it
@@ -338,6 +375,10 @@ impl CallControl {
 				let _ = reply.send(steering::unqueue_steering(session)?);
 				Ok(Received::None)
 			},
+			Up::Pause { active } => {
+				crate::set_paused(session, active)?;
+				Ok(Received::PauseChanged)
+			},
 			Up::Interrupt => {
 				self.turn.cancel_turn();
 				Ok(Received::Cancelled)
@@ -407,6 +448,10 @@ pub(crate) fn journal_env_event(
 		},
 		crate::EnvEvent::CheckpointControl { operation, payload } => {
 			checkpoint_control(session, operation.as_str(), payload.as_str())
+		},
+		crate::EnvEvent::IrcTraffic { payload } => {
+			crate::append_irc_traffic(session, turn, &payload)?;
+			Ok(None)
 		},
 		crate::EnvEvent::Notice { kind, name, body } => {
 			steering::append_named_notice(session, turn, kind, name, body)?;
@@ -534,7 +579,7 @@ pub(crate) struct OutputStream {
 	last:    Option<u64>,
 	/// Bytes of a UTF-8 sequence split across frames, completed by the next.
 	carry:   Vec<u8>,
-	/// Inline byte budget; `None` when the caller opted out with `notrunc`.
+	/// Inline byte budget. Production paths always set a finite host ceiling.
 	limit:   Option<usize>,
 	/// Bytes revealed inline so far.
 	shown:   usize,
@@ -675,17 +720,16 @@ impl OutputStream {
 
 	/// Closes the stream, flushing any dangling partial sequence lossily, and
 	/// finalizes the complete-output artifact when bytes were diverted.
-	fn close(&mut self, session: &mut Session) -> Result<Option<BlobRef>, DispatchError> {
+	fn close(
+		&mut self,
+		session: &mut Session,
+		call: EntryId,
+		spill: &BlobStore,
+	) -> Result<Option<BlobRef>, DispatchError> {
 		if !self.carry.is_empty() {
 			let tail = String::from_utf8_lossy(&self.carry).into_owned();
 			self.carry.clear();
-			if let Some(stage) = self.stage.as_mut() {
-				stage
-					.write_all(tail.as_bytes())
-					.map_err(omp_journal::blob::Error::from)?;
-			} else if let Some(sid) = self.sid {
-				session.stream_append(sid, &tail)?;
-			}
+			self.reveal(session, call, spill, &tail)?;
 		}
 		if let Some(sid) = self.sid.take() {
 			session.stream_close(sid)?;
@@ -714,6 +758,8 @@ pub(crate) fn result_handle(session: &Session, call: EntryId) -> Result<Handle, 
 pub struct DispatchReport {
 	/// Whether the model-facing terminal is an error.
 	pub is_error:      bool,
+	/// Typed facts for the single model-facing output projection.
+	pub projection:    OutputProjection,
 	/// Complete-output artifact created by central bounding.
 	pub spilled:       Option<BlobRef>,
 	/// Number of individual lines clamped.
@@ -937,8 +983,14 @@ impl PreparedCall {
 	}
 
 	fn output(&mut self, policy: &DispatchPolicy) -> &mut OutputStream {
-		let limit = (!self.options.notrunc).then_some(policy.max_output_bytes);
-		self.output.get_or_insert_with(|| OutputStream::new(limit))
+		let limit = if self.options.notrunc {
+			policy.max_complete_output_bytes
+		} else {
+			policy.max_output_bytes
+		};
+		self
+			.output
+			.get_or_insert_with(|| OutputStream::new(Some(limit)))
 	}
 
 	/// Discards a speculative execution unit before replacing transformed input.
@@ -962,6 +1014,7 @@ impl Dispatcher {
 	pub fn new(registry: Arc<Registry>, policy: DispatchPolicy) -> Self {
 		let jobs = Arc::new(JobBoard::new());
 		jobs.set_output_bound(policy.max_output_bytes);
+		jobs.set_artifact_store(policy.spill.clone());
 		Self {
 			committer: Committer {
 				registry,
@@ -1003,6 +1056,7 @@ impl Dispatcher {
 	#[must_use]
 	pub fn with_job_board(mut self, jobs: Arc<JobBoard>) -> Self {
 		jobs.set_output_bound(self.committer.policy.max_output_bytes);
+		jobs.set_artifact_store(self.committer.policy.spill.clone());
 		self.jobs = jobs;
 		self
 	}
@@ -1281,7 +1335,7 @@ impl Dispatcher {
 								}
 							}
 						},
-						Received::None | Received::Cancelled => {},
+						Received::None | Received::PauseChanged | Received::Cancelled => {},
 					}
 					// A cancellation while a prompt is open withdraws the
 					// prompt and settles the call as interrupted.
@@ -1384,6 +1438,9 @@ impl Dispatcher {
 		calls: &mut [PreparedCall],
 		control: Option<&CallControl>,
 	) -> Result<(), DispatchError> {
+		if control.is_some() && crate::pause_state(session.dom()).active {
+			return Ok(());
+		}
 		loop {
 			let Some(index) = (0..calls.len()).find(|index| {
 				let call = &calls[*index];
@@ -1508,6 +1565,7 @@ impl Dispatcher {
 						args,
 						route: route.clone(),
 						blocking_limit: self.committer.policy.blocking_limit,
+						output_request: call.options.output_request(),
 						cancellation: call.interrupt.clone(),
 					};
 					let event_tx = event_tx.take().expect("external unit starts once");
@@ -1606,10 +1664,15 @@ impl Dispatcher {
 			CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => Vec::new(),
 		};
 		let outcome = serde_json::value::to_raw_value(&outcome)?;
-		let staged =
-			self
-				.committer
-				.stage_external(session, call, outcome, parts, is_error, &mut output)?;
+		let staged = self.committer.stage_external(
+			session,
+			call,
+			outcome,
+			parts,
+			&[],
+			is_error,
+			&mut output,
+		)?;
 		let staged = self
 			.committer
 			.gate_result(session, call, staged, &mut output)
@@ -1678,9 +1741,16 @@ impl Dispatcher {
 		// The stream keeps flowing into the element after detachment; the
 		// terminal below closes nothing that is still open.
 		let output_sid = output.sid.take();
-		self
-			.committer
-			.commit_terminal(session, call, outcome, prompt, false, false, &mut output)?;
+		self.committer.commit_terminal(
+			session,
+			call,
+			outcome,
+			prompt,
+			false,
+			false,
+			None,
+			&mut output,
+		)?;
 		output.sid = output_sid;
 		let detached = crate::jobs::DetachedCall {
 			committer: self.committer.clone(),
@@ -1703,6 +1773,13 @@ impl Dispatcher {
 		call.phase = Phase::Settled;
 		call.report = Some(DispatchReport {
 			is_error:      false,
+			projection:    OutputProjection {
+				request:      call.options.output_request(),
+				source_bytes: 0,
+				inline_bytes: 0,
+				omitted:      false,
+				artifact:     None,
+			},
 			spilled:       None,
 			lines_clamped: 0,
 			detached:      Some(job),
@@ -1714,7 +1791,7 @@ impl Dispatcher {
 
 impl Default for OutputStream {
 	fn default() -> Self {
-		Self::new(None)
+		Self::new(Some(DispatchPolicy::MAX_COMPLETE_OUTPUT_BYTES))
 	}
 }
 
@@ -1945,7 +2022,7 @@ impl Committer {
 		if let Some(value) = replacement {
 			staged.outcome = serde_json::value::to_raw_value(value)?;
 		}
-		staged.force_spill = transformed
+		staged.force_spill |= transformed
 			.get("spill")
 			.and_then(serde_json::Value::as_bool)
 			== Some(true);
@@ -1980,10 +2057,42 @@ impl Committer {
 				self.commit_update(session, call, update, output)?;
 				Ok(None)
 			},
-			DispatchEvent::External(ExternalDispatchEvent::Done { outcome, parts, is_error }) => {
-				Ok(Some(Settled::Staged(
-					self.stage_external(session, call, outcome, parts, is_error, output)?,
-				)))
+			DispatchEvent::External(ExternalDispatchEvent::Done {
+				outcome,
+				parts,
+				is_error,
+				source_artifact,
+			}) => {
+				let outcome = serde_json::value::to_raw_value(&outcome)?;
+				Ok(Some(Settled::Staged(self.stage_external_from_artifact(
+					session,
+					call,
+					outcome,
+					parts,
+					is_error,
+					source_artifact,
+					None,
+					output,
+				)?)))
+			},
+			DispatchEvent::External(ExternalDispatchEvent::DoneProjected {
+				outcome,
+				parts,
+				is_error,
+				source_artifact,
+				projection,
+			}) => {
+				let outcome = serde_json::value::to_raw_value(&outcome)?;
+				Ok(Some(Settled::Staged(self.stage_external_from_artifact(
+					session,
+					call,
+					outcome,
+					parts,
+					is_error,
+					source_artifact,
+					Some(projection),
+					output,
+				)?)))
 			},
 			DispatchEvent::External(ExternalDispatchEvent::Aborted(abort)) => {
 				Ok(Some(Settled::Report(self.commit_abort(session, call, abort, output)?)))
@@ -2032,10 +2141,18 @@ impl Committer {
 					vec![Part::Text { text: sf!("detached job {}", job.id) }],
 					false,
 					false,
+					None,
 					output,
 				)?;
 				Ok(Settled::Report(DispatchReport {
 					is_error:      false,
+					projection:    OutputProjection {
+						request:      call.options.output_request(),
+						source_bytes: 0,
+						inline_bytes: 0,
+						omitted:      false,
+						artifact:     None,
+					},
 					spilled:       None,
 					lines_clamped: 0,
 					detached:      Some(job),
@@ -2068,6 +2185,7 @@ impl Committer {
 					call,
 					raw,
 					projected.parts.to_vec(),
+					&projected.visibility,
 					projected.is_error,
 					output,
 				)?))
@@ -2084,30 +2202,119 @@ impl Committer {
 		call: &PreparedCall,
 		outcome: Box<RawValue>,
 		parts: Vec<Part>,
+		visibility: &[ProjectionSpan],
 		is_error: bool,
 		output: &mut OutputStream,
 	) -> Result<StagedTerminal, DispatchError> {
-		let bounded = bound_parts(&parts, call.options, &self.policy)?;
-		let stream_spill = output.close(session)?;
+		self.stage_external_inner(
+			session, call, outcome, parts, visibility, is_error, None, None, output,
+		)
+	}
+
+	fn stage_external_from_artifact(
+		&self,
+		session: &mut Session,
+		call: &PreparedCall,
+		outcome: Box<RawValue>,
+		parts: Vec<Part>,
+		is_error: bool,
+		source_artifact: Option<BlobRef>,
+		transport_projection: Option<OutputProjection>,
+		output: &mut OutputStream,
+	) -> Result<StagedTerminal, DispatchError> {
+		self.stage_external_inner(
+			session,
+			call,
+			outcome,
+			parts,
+			&[],
+			is_error,
+			source_artifact,
+			transport_projection,
+			output,
+		)
+	}
+
+	fn stage_external_inner(
+		&self,
+		session: &mut Session,
+		call: &PreparedCall,
+		outcome: Box<RawValue>,
+		parts: Vec<Part>,
+		visibility: &[ProjectionSpan],
+		is_error: bool,
+		source_artifact: Option<BlobRef>,
+		transport_projection: Option<OutputProjection>,
+		output: &mut OutputStream,
+	) -> Result<StagedTerminal, DispatchError> {
+		let transport_spill = (call.identity.name == "bash")
+			.then(|| transport_output_spill(outcome.get()))
+			.flatten()
+			.or_else(|| {
+				transport_projection
+					.as_ref()
+					.is_some_and(|projection| projection.omitted)
+					.then(|| source_artifact.clone())
+					.flatten()
+			});
+		let bounded = bound_parts(&parts, visibility, call.options, &self.policy, transport_spill)?;
+		let stream_inline_bytes = u64::try_from(output.shown).unwrap_or(u64::MAX);
+		let stream_spill = output.close(session, call.call, &self.policy.spill)?;
+		let stream_was_spilled = stream_spill.is_some();
 		let spilled = bounded.spilled.or(stream_spill);
+		let transport_source_bytes = transport_projection
+			.as_ref()
+			.map_or(0, |projection| projection.source_bytes);
+		let source_bytes =
+			spilled
+				.as_ref()
+				.map_or(bounded.source_bytes.max(transport_source_bytes), |artifact| {
+					artifact
+						.size
+						.max(bounded.source_bytes)
+						.max(transport_source_bytes)
+				});
+		let projection = OutputProjection {
+			request: call.options.output_request(),
+			source_bytes,
+			inline_bytes: bounded.inline_bytes.max(stream_inline_bytes),
+			omitted: bounded.omitted
+				|| stream_was_spilled
+				|| transport_projection
+					.as_ref()
+					.is_some_and(|projection| projection.omitted),
+			artifact: transport_projection
+				.as_ref()
+				.filter(|projection| projection.omitted)
+				.and_then(|projection| projection.artifact.clone())
+				.or_else(|| spilled.as_ref().map(projection_blob)),
+		};
 		if let Some(artifact) = &spilled {
+			let address = artifact_address(artifact);
 			let diag = serde_json::value::to_raw_value(&serde_json::json!({
 				"diag": {
-					"kind": "truncated",
+					"kind": "output_bounded",
 					"severity": "info",
-					"artifact": artifact_address(artifact),
+					"text": format!("Output exceeded inline limits; full output: {address}"),
+					"artifact": address,
 					"lines_clamped": bounded.lines_clamped,
 				}
 			}))?;
 			self.commit_update(session, call, diag, output)?;
 		}
+		let visibility_verdict =
+			(!visibility.is_empty()).then(|| bytes::Bytes::copy_from_slice(outcome.get().as_bytes()));
 		Ok(StagedTerminal {
 			outcome,
 			parts: bounded.parts,
 			is_error,
+			projection,
 			spilled,
 			lines_clamped: bounded.lines_clamped,
-			force_spill: false,
+			visibility: bounded.visibility,
+			visibility_verdict,
+			force_spill: source_artifact.is_some(),
+			source_artifact,
 		})
 	}
 
@@ -2119,21 +2326,40 @@ impl Committer {
 		staged: StagedTerminal,
 		output: &mut OutputStream,
 	) -> Result<DispatchReport, DispatchError> {
+		let StagedTerminal {
+			outcome,
+			parts,
+			is_error,
+			projection,
+			spilled,
+			lines_clamped,
+			visibility,
+			visibility_verdict,
+			force_spill,
+			source_artifact,
+		} = staged;
 		self.commit_terminal(
 			session,
 			call,
-			staged.outcome,
-			staged.parts,
-			staged.is_error,
-			staged.force_spill,
+			outcome,
+			parts,
+			is_error,
+			force_spill,
+			source_artifact,
 			output,
 		)?;
+		if let Some(verdict) = &visibility_verdict {
+			self
+				.registry
+				.authorize_visibility(&call.identity, verdict, &visibility)?;
+		}
 		Ok(DispatchReport {
-			is_error:      staged.is_error,
-			spilled:       staged.spilled,
-			lines_clamped: staged.lines_clamped,
-			detached:      None,
-			duration:      Duration::ZERO,
+			is_error,
+			projection,
+			spilled,
+			lines_clamped,
+			detached: None,
+			duration: Duration::ZERO,
 		})
 	}
 
@@ -2146,7 +2372,7 @@ impl Committer {
 		is_error: bool,
 		output: &mut OutputStream,
 	) -> Result<DispatchReport, DispatchError> {
-		let staged = self.stage_external(session, call, outcome, parts, is_error, output)?;
+		let staged = self.stage_external(session, call, outcome, parts, &[], is_error, output)?;
 		self.commit_staged(session, call, staged, output)
 	}
 
@@ -2213,20 +2439,36 @@ impl Committer {
 		parts: Vec<Part>,
 		is_error: bool,
 		force_spill: bool,
+		source_artifact: Option<BlobRef>,
 		output: &mut OutputStream,
 	) -> Result<(), DispatchError> {
-		output.close(session)?;
+		output.close(session, call.call, &self.policy.spill)?;
 		// The raw outcome is published on the element and travels in every
 		// snapshot and patch: bound it under the same policy as the prompt
 		// projection so an actor never receives an unbounded payload (ADR
-		// 0009). `notrunc` keeps it inline by explicit caller choice; a
-		// `tool_result` hook may demand the spill regardless.
-		let inline = !force_spill
-			&& (call.options.notrunc || outcome.get().len() <= self.policy.max_output_bytes);
+		// 0009). `notrunc` selects the larger fixed security ceiling; it never
+		// disables host memory bounds. A `tool_result` hook may demand the spill
+		// regardless.
+		let inline_limit = if call.options.notrunc {
+			self.policy.max_complete_output_bytes
+		} else {
+			self.policy.max_output_bytes
+		};
+		let inline = !force_spill && outcome.get().len() <= inline_limit;
 		let outcome = if inline {
 			outcome
 		} else {
-			let artifact = self.policy.spill.put(outcome.get().as_bytes())?;
+			let outcome_bytes = outcome.get().as_bytes();
+			let artifact = match source_artifact {
+				Some(artifact)
+					if artifact.size == u64::try_from(outcome_bytes.len()).unwrap_or(u64::MAX)
+						&& artifact.hash == Hash32::sum(outcome_bytes) =>
+				{
+					artifact
+				},
+				Some(_) => session.blobs().put(outcome_bytes)?,
+				None => self.policy.spill.put(outcome_bytes)?,
+			};
 			serde_json::value::to_raw_value(&CallOutcomeDetails::Spilled {
 				blob:     ToolBlobRef {
 					hash:       Str::new(artifact.to_hex()),
@@ -2237,10 +2479,19 @@ impl Committer {
 			})?
 		};
 		let parts = serde_json::value::to_raw_value(&parts)?;
-		if is_error {
-			session.fail_projected(call.call, outcome, parts)?;
-		} else {
-			session.settle_projected(call.call, outcome, parts)?;
+		match (is_error, source_artifact) {
+			(true, Some(source_artifact)) => {
+				session.fail_projected_from_blob(call.call, outcome, parts, source_artifact)?;
+			},
+			(false, Some(source_artifact)) => {
+				session.settle_projected_from_blob(call.call, outcome, parts, source_artifact)?;
+			},
+			(true, None) => {
+				session.fail_projected(call.call, outcome, parts)?;
+			},
+			(false, None) => {
+				session.settle_projected(call.call, outcome, parts)?;
+			},
 		}
 		self
 			.events
@@ -2251,12 +2502,16 @@ impl Committer {
 
 /// A completed terminal bounded and diagnosed but not yet journaled.
 pub(crate) struct StagedTerminal {
-	outcome:       Box<RawValue>,
-	parts:         Vec<Part>,
-	is_error:      bool,
-	spilled:       Option<BlobRef>,
-	lines_clamped: u64,
-	force_spill:   bool,
+	outcome:            Box<RawValue>,
+	parts:              Vec<Part>,
+	is_error:           bool,
+	projection:         OutputProjection,
+	spilled:            Option<BlobRef>,
+	lines_clamped:      u64,
+	visibility:         VisibilityReceipt,
+	visibility_verdict: Option<bytes::Bytes>,
+	force_spill:        bool,
+	source_artifact:    Option<BlobRef>,
 }
 
 /// What one execution-unit event settled into.
@@ -2320,50 +2575,98 @@ fn timeout_job(identity: &ToolIdentity) -> JobRef {
 struct BoundedParts {
 	parts:         Vec<Part>,
 	spilled:       Option<BlobRef>,
+	source_bytes:  u64,
+	inline_bytes:  u64,
+	omitted:       bool,
 	lines_clamped: u64,
+	visibility:    VisibilityReceipt,
 }
 
 fn bound_parts(
 	parts: &[Part],
+	visibility: &[ProjectionSpan],
 	options: DispatchOptions,
 	policy: &DispatchPolicy,
+	transport_spill: Option<BlobRef>,
 ) -> Result<BoundedParts, DispatchError> {
-	if options.notrunc {
+	const CONTINUATION_BYTES: usize = "artifact://sha256/".len() + 64;
+	let inline_limit = if options.notrunc {
+		policy.max_complete_output_bytes
+	} else {
+		policy.max_output_bytes
+	};
+	let source_bytes = parts.iter().fold(0_usize, |total, part| {
+		total.saturating_add(match part {
+			Part::Text { text } => text.len(),
+			Part::Json { json } => json.len(),
+			Part::Blob { alt, .. } => alt.as_ref().map_or(0, Str::len),
+		})
+	});
+	if options.notrunc && source_bytes <= inline_limit {
+		let mut parts = parts.to_vec();
+		if let Some(artifact) = transport_spill {
+			parts.push(Part::Text { text: artifact_address(&artifact) });
+		}
+		let inline_bytes = u64::try_from(source_bytes).unwrap_or(u64::MAX);
+		let source_bytes = transport_spill
+			.as_ref()
+			.map_or(inline_bytes, |artifact| artifact.size.max(inline_bytes));
 		return Ok(BoundedParts {
-			parts:         parts.to_vec(),
-			spilled:       None,
+			parts,
+			spilled: transport_spill.clone(),
+			source_bytes,
+			inline_bytes,
+			omitted: transport_spill.is_some(),
 			lines_clamped: 0,
+			visibility: visibility_receipt(visibility.iter()),
 		});
 	}
-	let mut output = Vec::with_capacity(parts.len());
+	let text_limit = inline_limit
+		.checked_sub(CONTINUATION_BYTES)
+		.unwrap_or(inline_limit);
+	let line_limit = if options.notrunc {
+		usize::MAX
+	} else {
+		policy.max_line_bytes
+	};
+	let mut output = Vec::with_capacity(parts.len().saturating_add(1));
 	let mut full = String::new();
 	let mut shown_bytes = 0;
 	let mut lines_clamped = 0;
 	let mut changed = false;
-	for part in parts {
+	let mut visible_spans = Vec::new();
+	for (part_index, part) in parts.iter().enumerate() {
 		match part {
 			Part::Text { text } => {
 				full.push_str(text.as_str());
-				let (line_bounded, count) = clamp_lines(text.as_str(), policy.max_line_bytes);
-				lines_clamped += count;
-				changed |= count != 0;
-				let available = policy.max_output_bytes.saturating_sub(shown_bytes);
-				let visible = utf8_prefix(&line_bounded, available);
+				let bounded = clamp_text(text.as_str(), line_limit);
+				lines_clamped += bounded.lines_clamped;
+				changed |= bounded.lines_clamped != 0;
+				let available = text_limit.saturating_sub(shown_bytes);
+				let visible = utf8_prefix(&bounded.text, available);
 				shown_bytes += visible.len();
-				changed |= visible.len() != line_bounded.len();
+				changed |= visible.len() != bounded.text.len();
+				visible_spans.extend(visibility.iter().filter(|span| {
+					span.part == part_index
+						&& bounded.source_range_visible(span.start_byte, span.end_byte, visible.len())
+				}));
 				output.push(Part::Text { text: Str::new(visible) });
 			},
 			Part::Json { json } => {
 				let text = std::str::from_utf8(json)
 					.map_err(|source| DispatchError::ProjectionUtf8 { source })?;
 				full.push_str(text);
-				let (line_bounded, count) = clamp_lines(text, policy.max_line_bytes);
-				lines_clamped += count;
-				changed |= count != 0;
-				let available = policy.max_output_bytes.saturating_sub(shown_bytes);
-				let visible = utf8_prefix(&line_bounded, available);
+				let bounded = clamp_text(text, line_limit);
+				lines_clamped += bounded.lines_clamped;
+				changed |= bounded.lines_clamped != 0;
+				let available = text_limit.saturating_sub(shown_bytes);
+				let visible = utf8_prefix(&bounded.text, available);
 				shown_bytes += visible.len();
-				changed |= visible.len() != line_bounded.len();
+				changed |= visible.len() != bounded.text.len();
+				visible_spans.extend(visibility.iter().filter(|span| {
+					span.part == part_index
+						&& bounded.source_range_visible(span.start_byte, span.end_byte, visible.len())
+				}));
 				output.push(Part::Text { text: Str::new(visible) });
 			},
 			Part::Blob { blob, alt } => {
@@ -2374,23 +2677,115 @@ fn bound_parts(
 			},
 		}
 	}
-	let spilled = changed
-		.then(|| policy.spill.put(full.as_bytes()))
-		.transpose()?;
+	let spilled = match transport_spill {
+		Some(artifact) => Some(artifact),
+		None if changed => Some(policy.spill.put(full.as_bytes())?),
+		None => None,
+	};
 	if let Some(artifact) = spilled {
 		output.push(Part::Text { text: artifact_address(&artifact) });
 	}
-	Ok(BoundedParts { parts: output, spilled, lines_clamped })
+	let source_bytes = u64::try_from(source_bytes).unwrap_or(u64::MAX);
+	let source_bytes = transport_spill
+		.as_ref()
+		.map_or(source_bytes, |artifact| artifact.size.max(source_bytes));
+	Ok(BoundedParts {
+		parts: output,
+		spilled,
+		source_bytes,
+		inline_bytes: u64::try_from(shown_bytes).unwrap_or(u64::MAX),
+		omitted: changed || transport_spill.is_some(),
+		lines_clamped,
+		visibility: visibility_receipt(visible_spans),
+	})
 }
 
-fn clamp_lines(text: &str, maximum: usize) -> (String, u64) {
+fn visibility_receipt<'a>(
+	spans: impl IntoIterator<Item = &'a ProjectionSpan>,
+) -> VisibilityReceipt {
+	let mut lines = spans
+		.into_iter()
+		.map(|span| VisibleSourceLine { source_key: span.source_key.clone(), line: span.line })
+		.collect::<Vec<_>>();
+	lines.sort_unstable();
+	lines.dedup();
+	VisibilityReceipt { lines }
+}
+
+/// Recovers the environment transport's authoritative full-output artifact
+/// from a typed `bash` outcome. Callers must gate this helper by tool identity
+/// so an extension payload cannot spoof transport metadata.
+fn transport_output_spill(outcome: &str) -> Option<BlobRef> {
+	fn find(value: &serde_json::Value) -> Option<&serde_json::Value> {
+		match value {
+			serde_json::Value::Object(object) => object
+				.get("spilled_output")
+				.filter(|value| !value.is_null())
+				.or_else(|| object.values().find_map(find)),
+			serde_json::Value::Array(values) => values.iter().find_map(find),
+			_ => None,
+		}
+	}
+
+	let value = serde_json::from_str::<serde_json::Value>(outcome).ok()?;
+	let wire = serde_json::from_value::<ToolBlobRef>(find(&value)?.clone()).ok()?;
+	BlobRef::parse_hex(wire.hash.as_str(), wire.byte_len).ok()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SourceSegment {
+	source_start: usize,
+	output_start: usize,
+	len:          usize,
+}
+
+struct ClampedText {
+	text:          String,
+	segments:      Vec<SourceSegment>,
+	lines_clamped: u64,
+}
+
+impl ClampedText {
+	fn source_range_visible(
+		&self,
+		start_byte: usize,
+		end_byte: usize,
+		visible_output_bytes: usize,
+	) -> bool {
+		if start_byte >= end_byte {
+			return false;
+		}
+		let mut covered = start_byte;
+		for segment in &self.segments {
+			if segment.output_start >= visible_output_bytes {
+				break;
+			}
+			let retained = segment
+				.len
+				.min(visible_output_bytes.saturating_sub(segment.output_start));
+			let segment_start = segment.source_start;
+			let segment_end = segment_start.saturating_add(retained);
+			if segment_end <= covered || segment_start > covered {
+				continue;
+			}
+			covered = segment_end;
+			if covered >= end_byte {
+				return true;
+			}
+		}
+		false
+	}
+}
+
+fn clamp_text(text: &str, maximum: usize) -> ClampedText {
 	let mut output = String::with_capacity(text.len().min(maximum.saturating_mul(2)));
+	let mut segments = Vec::<SourceSegment>::new();
 	let mut line_bytes: usize = 0;
 	let mut eliding = false;
-	let mut clamped = 0;
-	for character in text.chars() {
+	let mut lines_clamped = 0;
+	for (source_start, character) in text.char_indices() {
 		if character == '\n' {
-			output.push(character);
+			push_source_character(&mut output, &mut segments, source_start, character);
 			line_bytes = 0;
 			eliding = false;
 			continue;
@@ -2401,13 +2796,32 @@ fn clamp_lines(text: &str, maximum: usize) -> (String, u64) {
 		if line_bytes.saturating_add(character.len_utf8()) > maximum {
 			output.push('…');
 			eliding = true;
-			clamped += 1;
+			lines_clamped += 1;
 			continue;
 		}
-		output.push(character);
+		push_source_character(&mut output, &mut segments, source_start, character);
 		line_bytes += character.len_utf8();
 	}
-	(output, clamped)
+	ClampedText { text: output, segments, lines_clamped }
+}
+
+fn push_source_character(
+	output: &mut String,
+	segments: &mut Vec<SourceSegment>,
+	source_start: usize,
+	character: char,
+) {
+	let output_start = output.len();
+	output.push(character);
+	let len = character.len_utf8();
+	if let Some(last) = segments.last_mut()
+		&& last.source_start.saturating_add(last.len) == source_start
+		&& last.output_start.saturating_add(last.len) == output_start
+	{
+		last.len = last.len.saturating_add(len);
+	} else {
+		segments.push(SourceSegment { source_start, output_start, len });
+	}
 }
 
 /// The longest prefix of `text` within `maximum` bytes that ends on a char
@@ -2461,6 +2875,14 @@ mod checkpoint_tests {
 			.collect::<Vec<_>>();
 		assert_eq!(texts, ["before"]);
 		assert_eq!(session.dom().count("rewind-checkpoint").expect("selector"), 0);
+	}
+}
+
+fn projection_blob(blob: &BlobRef) -> ToolBlobRef {
+	ToolBlobRef {
+		hash:       Str::new(blob.to_hex()),
+		media_type: Str::new_static("application/octet-stream"),
+		byte_len:   blob.size,
 	}
 }
 

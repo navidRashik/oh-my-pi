@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod local;
 #[path = "loop.rs"]
 pub mod loop_;
+pub mod pause;
 pub mod prompt;
 pub mod registry;
 pub mod steering;
@@ -32,6 +33,7 @@ pub use hooks::*;
 pub use jobs::*;
 pub use local::*;
 pub use loop_::*;
+pub use pause::*;
 pub use prompt::*;
 pub use registry::*;
 pub use steering::*;
