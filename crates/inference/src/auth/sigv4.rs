@@ -415,11 +415,7 @@ mod tests {
 	}
 
 	fn spec(unsigned_headers: Vec<omp_core::Str>) -> SigV4Spec {
-		SigV4Spec {
-			service: "service".into(),
-			region: "us-east-1".into(),
-			unsigned_headers,
-		}
+		SigV4Spec { service: "service".into(), region: "us-east-1".into(), unsigned_headers }
 	}
 
 	#[test]
@@ -442,8 +438,13 @@ mod tests {
 			.uri("https://example.amazonaws.com/")
 			.body(Bytes::new())
 			.expect("request");
-		sign_request(&credential(None), &spec(Vec::new()), UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS), &mut request)
-			.expect("signature");
+		sign_request(
+			&credential(None),
+			&spec(Vec::new()),
+			UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS),
+			&mut request,
+		)
+		.expect("signature");
 
 		assert_eq!(request.headers()[HOST], "example.amazonaws.com");
 		assert_eq!(request.headers()["x-amz-date"], "20150830T123600Z");
@@ -459,8 +460,13 @@ mod tests {
 		);
 
 		let first = request.headers()[AUTHORIZATION].clone();
-		sign_request(&credential(None), &spec(Vec::new()), UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS), &mut request)
-			.expect("repeat signature");
+		sign_request(
+			&credential(None),
+			&spec(Vec::new()),
+			UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS),
+			&mut request,
+		)
+		.expect("repeat signature");
 		assert_eq!(request.headers()[AUTHORIZATION], first);
 	}
 
@@ -472,8 +478,13 @@ mod tests {
 			.header("content-type", "application/json")
 			.body(Bytes::from_static(br#"{"hello":"world"}"#))
 			.expect("request");
-		sign_request(&credential(None), &spec(Vec::new()), UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS), &mut request)
-			.expect("signature");
+		sign_request(
+			&credential(None),
+			&spec(Vec::new()),
+			UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS),
+			&mut request,
+		)
+		.expect("signature");
 
 		assert_eq!(
 			request.headers()["x-amz-content-sha256"],
@@ -525,9 +536,7 @@ mod tests {
 			request.headers()[AUTHORIZATION]
 				.to_str()
 				.expect("authorization")
-				.contains(
-					"SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
-				)
+				.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token")
 		);
 		let debug = format!("{credential:?} {request:?}");
 		assert!(!debug.contains(SECRET_KEY));
@@ -544,8 +553,13 @@ mod tests {
 			.header("x-amz-security-token", "caller-token")
 			.body(Bytes::new())
 			.expect("request");
-		sign_request(&credential(None), &spec(Vec::new()), UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS), &mut request)
-			.expect("signature");
+		sign_request(
+			&credential(None),
+			&spec(Vec::new()),
+			UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS),
+			&mut request,
+		)
+		.expect("signature");
 		assert!(!request.headers().contains_key("x-amz-security-token"));
 		assert!(
 			!request.headers()[AUTHORIZATION]
@@ -567,22 +581,13 @@ mod tests {
 			"%F0%90%80%80=a&%EE%80%80=b"
 		);
 		assert_eq!(canonical_query("a=1&&b=2&").expect("empty pairs"), "a=1&b=2");
-		assert_eq!(
-			canonical_query("bad=%ZZ"),
-			Err(SigV4Error::InvalidQueryEncoding)
-		);
-		assert_eq!(
-			canonical_query("bad=%E0%A4%A"),
-			Err(SigV4Error::InvalidQueryEncoding)
-		);
+		assert_eq!(canonical_query("bad=%ZZ"), Err(SigV4Error::InvalidQueryEncoding));
+		assert_eq!(canonical_query("bad=%E0%A4%A"), Err(SigV4Error::InvalidQueryEncoding));
 	}
 
 	#[test]
 	fn canonical_path_preserves_segments_and_double_encodes_percent() {
-		assert_eq!(
-			canonical_path("/a//b/./c/../d:+/%2f/%2F"),
-			"/a//b/./c/../d%3A%2B/%252f/%252F"
-		);
+		assert_eq!(canonical_path("/a//b/./c/../d:+/%2f/%2F"), "/a//b/./c/../d%3A%2B/%252f/%252F");
 		assert_eq!(canonical_path("/model/a:b.c/converse-stream"), "/model/a%3Ab.c/converse-stream");
 	}
 

@@ -33,8 +33,10 @@ pub struct RawDiscoveryPage {
 	pub next_cursor: Option<Str>,
 }
 
-/// Wire codec identifier of `openai-responses` routes.
-const OPENAI_RESPONSES_CODEC: &str = "openai-responses";
+/// Returns whether a route uses the OpenAI Responses wire contract.
+fn is_responses_codec(codec: &str) -> bool {
+	matches!(codec, "openai-responses" | "bedrock-mantle")
+}
 
 /// Sibling-catalog responses-route hints for gateway-first discovered ids.
 ///
@@ -269,8 +271,7 @@ fn responses_route_hints(catalog: &Catalog, route: &RouteDef) -> Option<Response
 		.routes()
 		.iter()
 		.filter(|definition| {
-			definition.provider == route.provider
-				&& definition.codec.as_str() == OPENAI_RESPONSES_CODEC
+			definition.provider == route.provider && is_responses_codec(definition.codec.as_str())
 		})
 		.max_by(|left, right| {
 			left
@@ -283,7 +284,7 @@ fn responses_route_hints(catalog: &Catalog, route: &RouteDef) -> Option<Response
 	let responses_routes: BTreeSet<_> = catalog
 		.routes()
 		.iter()
-		.filter(|definition| definition.codec.as_str() == OPENAI_RESPONSES_CODEC)
+		.filter(|definition| is_responses_codec(definition.codec.as_str()))
 		.map(|definition| &definition.id)
 		.collect();
 	let owners: BTreeMap<_, _> = catalog

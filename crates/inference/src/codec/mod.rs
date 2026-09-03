@@ -64,6 +64,7 @@ pub use provider_hooks::{
 };
 
 pub mod bedrock;
+pub mod bedrock_mantle;
 pub mod devin;
 pub mod gitlab;
 pub mod native;
@@ -1381,7 +1382,7 @@ mod tests {
 				openai_chat::join_uri(base, openai_chat::OpenAiChatProfile::default().path.as_str())
 			},
 			"openai-codex" => openai_codex::resolve_codex_responses_url(base),
-			"openai-responses" => openai_responses::responses_uri(base),
+			"openai-responses" | "bedrock-mantle" => openai_responses::responses_uri(base),
 			"search-exa" | "search-kagi" | "search-tavily" => openai_chat::join_uri(base, "/search"),
 			"search-firecrawl" => openai_chat::join_uri(base, "/search"),
 			"search-brave" => openai_chat::join_uri(base, "/res/v1/web/search"),

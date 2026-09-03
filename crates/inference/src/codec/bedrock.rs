@@ -250,6 +250,8 @@ struct ConverseStreamRequest {
 	guardrail_config: Option<GuardrailConfig>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	additional_model_request_fields: Option<AdditionalModelRequestFields>,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	additional_model_response_field_paths: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -462,6 +464,13 @@ struct ThinkingConfig {
 	budget_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	display:       Option<&'static str>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	block_binding: Option<ThinkingBlockBinding>,
+}
+
+#[derive(Serialize)]
+struct ThinkingBlockBinding {
+	prefix_mismatch_behavior: &'static str,
 }
 
 #[derive(Serialize)]
@@ -546,10 +555,8 @@ fn encode_converse_request(
 		let long_retention = matches!(retention, CacheRetention::Long)
 			&& context.policy.cache.supports_long_retention == Some(true);
 		if remaining > 0
-			&& let Some(message) = messages
-				.iter_mut()
-				.rev()
-				.find(|message| message.role == "user")
+			&& let Some(message) = messages.last_mut()
+			&& message.role == "user"
 		{
 			message
 				.content
@@ -564,6 +571,33 @@ fn encode_converse_request(
 	let inference_config = inference_config(request);
 	let mut tool_config = tool_config(request, history_has_tools, context)?;
 	let mut additional_model_request_fields = reasoning_config(request, context)?;
+	let prefix_binding = context
+		.thinking_policy
+		.is_some_and(|policy| policy.prefix_binding == Some(true));
+	if prefix_binding {
+		let fields = additional_model_request_fields.get_or_insert(AdditionalModelRequestFields {
+			thinking:       None,
+			output_config:  None,
+			reasoning:      None,
+			anthropic_beta: Vec::new(),
+		});
+		let thinking = fields.thinking.get_or_insert(ThinkingConfig {
+			kind:          "adaptive",
+			budget_tokens: None,
+			display:       None,
+			block_binding: None,
+		});
+		thinking.block_binding =
+			Some(ThinkingBlockBinding { prefix_mismatch_behavior: "drop_block" });
+		if !fields
+			.anthropic_beta
+			.contains(&"thinking-binding-controls-2026-08-01")
+		{
+			fields
+				.anthropic_beta
+				.push("thinking-binding-controls-2026-08-01");
+		}
+	}
 	// Pi `amazon-bedrock.ts`: Converse rejects thinking together with a
 	// forced (`any`/`tool`) choice. Prefix-bound models (Fable 5.1+) cannot
 	// switch thinking off, so their forced choice downgrades to `auto`;
@@ -574,10 +608,7 @@ fn encode_converse_request(
 			config.tool_choice,
 			Some(ToolChoiceEnvelope::Any { .. } | ToolChoiceEnvelope::Tool { .. })
 		) {
-		if context
-			.thinking_policy
-			.is_some_and(|policy| policy.prefix_binding == Some(true))
-		{
+		if prefix_binding {
 			config.tool_choice = Some(ToolChoiceEnvelope::Auto { auto: EmptyObject {} });
 		} else {
 			additional_model_request_fields = None;
@@ -589,6 +620,9 @@ fn encode_converse_request(
 		trace:                  guardrail.trace,
 		stream_processing_mode: guardrail.stream_mode,
 	});
+	let additional_model_response_field_paths = prefix_binding
+		.then_some(vec!["/input_transformations"])
+		.unwrap_or_default();
 	let wire = ConverseStreamRequest {
 		messages,
 		system,
@@ -596,6 +630,7 @@ fn encode_converse_request(
 		tool_config,
 		guardrail_config,
 		additional_model_request_fields,
+		additional_model_response_field_paths,
 	};
 	serde_json::to_vec(&wire)
 		.map(Bytes::from)
@@ -611,7 +646,7 @@ fn encode_message(
 	wire_tool_ids: &mut BTreeMap<Str, Str>,
 	explicit_cache: &mut bool,
 ) -> Result<(), Error> {
-	if matches!(message.role, Role::System | Role::Developer) {
+	if message.role == Role::System {
 		for part in message.content.iter() {
 			match part {
 				ContentPart::Text { text, proof: None } if !text.trim().is_empty() => {
@@ -647,8 +682,8 @@ fn encode_message(
 
 	let role = match message.role {
 		Role::Assistant => "assistant",
-		Role::User | Role::Tool => "user",
-		Role::System | Role::Developer => unreachable!("handled above"),
+		Role::Developer | Role::User | Role::Tool => "user",
+		Role::System => unreachable!("handled above"),
 	};
 	let mut content = Vec::new();
 	for part in message.content.iter() {
@@ -665,7 +700,7 @@ fn encode_message(
 			},
 			ContentPart::Text { .. } => {},
 			ContentPart::Reasoning { text, proof } if message.role == Role::Assistant => {
-				if text.trim().is_empty() {
+				if text.trim().is_empty() && proof.is_none() {
 					continue;
 				}
 				if let Some(proof) = proof {
@@ -895,6 +930,11 @@ fn tool_config(
 	history_has_tools: bool,
 	context: &EncodeContext<'_>,
 ) -> Result<Option<ToolConfig>, Error> {
+	if matches!(setting_value(&request.tool_choice), Some(ToolChoice::Disabled))
+		&& !history_has_tools
+	{
+		return Ok(None);
+	}
 	if request.tools.is_empty() && !history_has_tools {
 		return Ok(None);
 	}
@@ -959,12 +999,7 @@ fn tool_config(
 					tool: NamedToolChoice { name: wire_tool_name(name, context) },
 				})
 			},
-			Some(ToolChoice::Disabled) => {
-				return Err(encoding_error(
-					ErrorKind::CapabilityMismatch,
-					"bedrock.tool_choice.disabled",
-				));
-			},
+			Some(ToolChoice::Disabled) => None,
 		}
 	};
 	Ok(Some(ToolConfig { tools, tool_choice }))
@@ -1031,7 +1066,12 @@ fn reasoning_config(
 	}
 	let fields = match mode {
 		ThinkingMode::AnthropicAdaptive => AdditionalModelRequestFields {
-			thinking:       Some(ThinkingConfig { kind: "adaptive", budget_tokens: None, display }),
+			thinking:       Some(ThinkingConfig {
+				kind: "adaptive",
+				budget_tokens: None,
+				display,
+				block_binding: None,
+			}),
 			output_config:  Some(OutputConfig { effort: native_effort }),
 			reasoning:      None,
 			anthropic_beta: Vec::new(),
@@ -1043,20 +1083,22 @@ fn reasoning_config(
 					"bedrock.thinking_selection.budget_missing",
 				)
 			})?;
+			let anthropic_beta = if context.policy.reasoning.interleaved_thinking == Some(true) {
+				vec!["interleaved-thinking-2025-05-14"]
+			} else {
+				Vec::new()
+			};
 			AdditionalModelRequestFields {
-				thinking:       Some(ThinkingConfig {
+				thinking: Some(ThinkingConfig {
 					kind: "enabled",
 					budget_tokens: Some(budget),
 					display,
+					block_binding: None,
 				}),
-				output_config:  (mode == ThinkingMode::AnthropicBudgetEffort)
+				output_config: (mode == ThinkingMode::AnthropicBudgetEffort)
 					.then_some(OutputConfig { effort: native_effort }),
-				reasoning:      None,
-				anthropic_beta: if context.policy.reasoning.interleaved_thinking == Some(true) {
-					vec!["interleaved-thinking-2025-05-14"]
-				} else {
-					Vec::new()
-				},
+				reasoning: None,
+				anthropic_beta,
 			}
 		},
 		ThinkingMode::Effort => AdditionalModelRequestFields {
@@ -1450,19 +1492,30 @@ impl FoundationModelSummary {
 }
 #[derive(Default)]
 struct BedrockDecoder {
-	parts:         BTreeMap<u32, DecodedPart>,
-	ignored:       BTreeSet<u32>,
-	usage:         Option<Usage>,
-	stop:          Option<FinishReason>,
-	blocks:        u32,
-	sentinel_seen: bool,
-	terminal:      bool,
-	committed:     bool,
+	parts:             BTreeMap<u32, DecodedPart>,
+	ignored:           BTreeSet<u32>,
+	usage:             Option<Usage>,
+	stop:              Option<FinishReason>,
+	blocks:            u32,
+	sentinel_injected: bool,
+	terminal:          bool,
+	committed:         bool,
 }
 
 impl BedrockDecoder {
-	fn new(_: &DecodeContext<'_>) -> Self {
-		Self::default()
+	fn new(context: &DecodeContext<'_>) -> Self {
+		let sentinel_injected = match context.operation_call {
+			OperationCall::Chat(request) => {
+				request.tools.is_empty()
+					&& request.messages.iter().any(|message| {
+						message.content.iter().any(|part| {
+							matches!(part, ContentPart::ToolCall { .. } | ContentPart::ToolResult { .. })
+						})
+					})
+			},
+			_ => false,
+		};
+		Self { sentinel_injected, ..Self::default() }
 	}
 
 	fn decode_message(
@@ -1503,13 +1556,9 @@ impl BedrockDecoder {
 			"contentBlockStop" => WireEventKind::ContentBlockStop,
 			"messageStop" => WireEventKind::MessageStop,
 			"metadata" => WireEventKind::Metadata,
-			_ => {
-				return Err(stream_error(
-					ErrorKind::Protocol,
-					"bedrock.eventstream.event_type",
-					self.committed,
-				));
-			},
+			// AWS may add event types independently of this client. Unknown
+			// events carry no canonical semantics and are ignored like pi.
+			_ => return Ok(()),
 		};
 		let event: WireEvent = serde_json::from_slice(&message.payload).map_err(|_| {
 			stream_error(ErrorKind::Protocol, "bedrock.event.invalid_json", self.committed)
@@ -1566,9 +1615,8 @@ impl BedrockDecoder {
 		}
 		if let (Some(index), Some(start)) = (event.content_block_index, event.start) {
 			if let Some(tool) = start.tool_use {
-				if tool.name == NO_TOOLS_SENTINEL_NAME {
+				if self.sentinel_injected && tool.name == NO_TOOLS_SENTINEL_NAME {
 					self.ignored.insert(index);
-					self.sentinel_seen = true;
 					return Ok(());
 				}
 				if tool.name.is_empty() || tool.tool_use_id.is_empty() {
@@ -1681,7 +1729,7 @@ impl BedrockDecoder {
 			return Ok(());
 		}
 		if let Some(reason) = event.stop_reason {
-			self.stop = Some(map_stop(reason.as_str(), self.sentinel_seen)?);
+			self.stop = Some(map_stop(reason.as_str(), self.sentinel_injected)?);
 			if self.usage.is_some() {
 				self.complete(emit);
 			}
@@ -2206,10 +2254,10 @@ struct WireException {
 	original_status_code: Option<u32>,
 }
 
-fn map_stop(reason: &str, sentinel_seen: bool) -> Result<FinishReason, Error> {
+fn map_stop(reason: &str, sentinel_injected: bool) -> Result<FinishReason, Error> {
 	let reason = match reason {
 		"end_turn" | "stop_sequence" => FinishReason::Stop,
-		"tool_use" if sentinel_seen => FinishReason::Stop,
+		"tool_use" if sentinel_injected => FinishReason::Stop,
 		"tool_use" => FinishReason::ToolCalls,
 		"max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
 		"content_filtered" | "guardrail_intervened" => FinishReason::ContentFilter,
@@ -2230,8 +2278,11 @@ fn aws_exception_error(code: &str, message: Str, status: Option<u16>, committed:
 		"accessDeniedException" | "AccessDeniedException" | "notAuthorized" => {
 			(ErrorKind::Authentication, RetryAction::Never)
 		},
-		"throttlingException" | "ThrottlingException" | "modelTimeoutException" => {
+		"throttlingException" | "ThrottlingException" => {
 			(ErrorKind::RateLimited, RetryAction::SameRoute { after: Duration::ZERO })
+		},
+		"modelTimeoutException" | "ModelTimeoutException" => {
+			(ErrorKind::DeadlineExceeded, RetryAction::SameRoute { after: Duration::ZERO })
 		},
 		"serviceUnavailableException"
 		| "ServiceUnavailableException"
@@ -2291,7 +2342,7 @@ mod tests {
 	use crate::{
 		call::{NegotiationPolicy, ReasoningRequest, Sampling, ToolDefinition, ToolInputConstraint},
 		id::RequestId,
-		transport::{EventStreamDecoder, FramingError},
+		transport::{EventStreamDecoder, EventStreamHeader, EventStreamHeaderValue, FramingError},
 	};
 
 	fn encode_fixture(request: &ChatRequest, options: &BedrockOptions) -> Bytes {
@@ -2471,6 +2522,29 @@ mod tests {
 	}
 
 	#[test]
+	fn developer_messages_demote_to_user_role() {
+		let request = base_request(vec![
+			text_message(Role::System, "System instruction."),
+			text_message(Role::Developer, "Developer instruction."),
+			text_message(Role::User, "Question."),
+		]);
+		let body: Value =
+			serde_json::from_slice(&encode_fixture(&request, &BedrockOptions::default()))
+				.expect("developer request is JSON");
+		assert_eq!(body["system"], serde_json::json!([{"text":"System instruction."}]));
+		assert_eq!(
+			body["messages"],
+			serde_json::json!([{
+				"role": "user",
+				"content": [
+					{"text":"Developer instruction."},
+					{"text":"Question."}
+				]
+			}]),
+		);
+	}
+
+	#[test]
 	fn encodes_tools_and_adaptive_thinking_exactly() {
 		let mut request = base_request(vec![text_message(Role::User, "Calculate 2 + 2.")]);
 		request.tools = vec![ToolDefinition {
@@ -2570,6 +2644,18 @@ mod tests {
 		.expect("prefix-bound request is JSON");
 		assert_eq!(bound["toolConfig"]["toolChoice"], serde_json::json!({"auto": {}}));
 		assert_eq!(bound["additionalModelRequestFields"]["thinking"]["type"], "adaptive");
+		assert_eq!(
+			bound["additionalModelRequestFields"]["thinking"]["block_binding"],
+			serde_json::json!({"prefix_mismatch_behavior":"drop_block"}),
+		);
+		assert_eq!(
+			bound["additionalModelRequestFields"]["anthropic_beta"],
+			serde_json::json!(["thinking-binding-controls-2026-08-01"]),
+		);
+		assert_eq!(
+			bound["additionalModelResponseFieldPaths"],
+			serde_json::json!(["/input_transformations"]),
+		);
 
 		request.tool_choice = Setting::Require(ToolChoice::Required);
 		request.reasoning = Setting::Require(ReasoningRequest {
@@ -2587,6 +2673,59 @@ mod tests {
 		.expect("budget request is JSON");
 		assert_eq!(unbound["toolConfig"]["toolChoice"], serde_json::json!({"any": {}}));
 		assert!(unbound.get("additionalModelRequestFields").is_none(), "{unbound}");
+	}
+
+	#[test]
+	fn disabled_tool_choice_omits_live_tools_but_preserves_history_contract() {
+		let mut request = base_request(vec![text_message(Role::User, "Answer without tools.")]);
+		request.tools = vec![ToolDefinition {
+			name:        sf!("lookup"),
+			description: None,
+			input:       ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(
+					serde_json::from_str(r#"{"type":"object","properties":{}}"#).expect("schema"),
+				),
+				strict:     false,
+			},
+		}]
+		.into();
+		request.tool_choice = Setting::Require(ToolChoice::Disabled);
+		let without_history: Value =
+			serde_json::from_slice(&encode_fixture(&request, &BedrockOptions::default()))
+				.expect("disabled tool request is JSON");
+		assert!(without_history.get("toolConfig").is_none());
+
+		let call = ToolCallId::new("prior-call");
+		request.messages = vec![
+			Message {
+				role:    Role::Assistant,
+				content: vec![ContentPart::ToolCall {
+					call:      call.clone(),
+					name:      sf!("lookup"),
+					arguments: OpaqueJson::new(serde_json::json!({})),
+					proof:     None,
+				}]
+				.into(),
+				name:    None,
+			},
+			Message {
+				role:    Role::Tool,
+				content: vec![ContentPart::ToolResult {
+					call,
+					name: Some(sf!("lookup")),
+					content: vec![ToolResultContent::Text(sf!("done"))].into(),
+					is_error: false,
+				}]
+				.into(),
+				name:    None,
+			},
+		]
+		.into();
+		let with_history: Value =
+			serde_json::from_slice(&encode_fixture(&request, &BedrockOptions::default()))
+				.expect("history-bearing disabled tool request is JSON");
+		assert_eq!(with_history["toolConfig"]["tools"][0]["toolSpec"]["name"], "lookup");
+		assert!(with_history["toolConfig"].get("toolChoice").is_none());
 	}
 
 	#[test]
@@ -2683,6 +2822,42 @@ mod tests {
 	}
 
 	#[test]
+	fn prompt_cache_does_not_reach_back_past_a_final_assistant_message() {
+		let mut request = base_request(vec![
+			text_message(Role::System, "stable system"),
+			text_message(Role::User, "cache me"),
+			text_message(Role::Assistant, "final answer"),
+		]);
+		request.cache_retention = Setting::Require(CacheRetention::Short);
+		let body = encode_fixture_with_policy(
+			&request,
+			&BedrockOptions::default(),
+			ThinkingMode::Budget,
+			false,
+			|policy| {
+				policy.cache.prompt_cache_mode = Some(PromptCacheMode::Explicit);
+				policy.cache.maximum_checkpoints = Some(2);
+			},
+		);
+		let body: Value = serde_json::from_slice(&body).expect("cache request is JSON");
+		assert_eq!(
+			body["messages"][0],
+			serde_json::json!({"role":"user","content":[{"text":"cache me"}]}),
+		);
+		assert_eq!(
+			body["messages"][1],
+			serde_json::json!({"role":"assistant","content":[{"text":"final answer"}]}),
+		);
+		assert_eq!(
+			body["system"],
+			serde_json::json!([
+				{"text":"stable system"},
+				{"cachePoint":{"type":"default"}}
+			]),
+		);
+	}
+
+	#[test]
 	fn prompt_cache_maximum_checkpoints_matches_pi_request_shape() {
 		let mut request = base_request(vec![
 			text_message(Role::System, "stable system"),
@@ -2742,7 +2917,11 @@ mod tests {
 				role:    Role::Assistant,
 				content: vec![
 					ContentPart::Reasoning { text: sf!("unsigned reasoning"), proof: None },
-					ContentPart::Reasoning { text: sf!("signed reasoning"), proof: Some(proof) },
+					ContentPart::Reasoning {
+						text:  sf!("signed reasoning"),
+						proof: Some(proof.clone()),
+					},
+					ContentPart::Reasoning { text: Str::default(), proof: Some(proof) },
 				]
 				.into(),
 				name:    None,
@@ -2765,6 +2944,17 @@ mod tests {
 				"reasoningContent": {
 					"reasoningText": {
 						"text": "signed reasoning",
+						"signature": "captured-signature"
+					}
+				}
+			})
+		);
+		assert_eq!(
+			blocks[2],
+			serde_json::json!({
+				"reasoningContent": {
+					"reasoningText": {
+						"text": "",
 						"signature": "captured-signature"
 					}
 				}
@@ -2981,6 +3171,83 @@ mod tests {
 			&events[13],
 			RawEvent::Completion(RawCompletion { reason: FinishReason::ToolCalls, blocks: 3, .. })
 		));
+	}
+
+	#[test]
+	fn sentinel_name_is_suppressed_only_when_this_request_injected_it() {
+		let start = || WireEvent {
+			role:                None,
+			content_block_index: Some(0),
+			start:               Some(WireStart {
+				tool_use: Some(WireToolStart {
+					tool_use_id: sf!("call-1"),
+					name:        sf!(NO_TOOLS_SENTINEL_NAME),
+				}),
+			}),
+			delta:               None,
+			stop_reason:         None,
+			usage:               None,
+			metrics:             None,
+			trace:               None,
+		};
+
+		let mut legitimate = BedrockDecoder::default();
+		let mut events = Vec::new();
+		legitimate
+			.project_event(start(), &mut |event| events.push(event))
+			.expect("legitimate sentinel-named tool projects");
+		assert!(matches!(
+			events.first(),
+			Some(RawEvent::Chat(ChatEvent::ToolCallStarted { name, .. }))
+				if name == NO_TOOLS_SENTINEL_NAME
+		));
+
+		let mut injected = BedrockDecoder { sentinel_injected: true, ..BedrockDecoder::default() };
+		events.clear();
+		injected
+			.project_event(start(), &mut |event| events.push(event))
+			.expect("injected sentinel is ignored");
+		assert!(events.is_empty());
+	}
+
+	#[test]
+	fn unknown_stream_events_are_forward_compatible() {
+		let message = EventStreamMessage {
+			headers: vec![
+				EventStreamHeader {
+					name:  sf!(":message-type"),
+					value: EventStreamHeaderValue::String(sf!("event")),
+				},
+				EventStreamHeader {
+					name:  sf!(":event-type"),
+					value: EventStreamHeaderValue::String(sf!("futureEvent")),
+				},
+			]
+			.into_iter()
+			.collect(),
+			payload: Bytes::from_static(br#"{"future":"shape"}"#),
+		};
+		let mut events = Vec::new();
+		BedrockDecoder::default()
+			.push(Frame::EventStream(Box::new(message)), &mut |event| events.push(event))
+			.expect("unknown AWS events are ignored");
+		assert!(events.is_empty());
+	}
+
+	#[test]
+	fn stream_retry_is_allowed_only_before_canonical_output_commits() {
+		let before = aws_exception_error("throttlingException", sf!("slow down"), Some(429), false);
+		assert!(matches!(before.action, RetryAction::SameRoute { .. }));
+		assert!(!before.committed);
+
+		let timeout =
+			aws_exception_error("modelTimeoutException", sf!("model timed out"), Some(408), false);
+		assert_eq!(timeout.kind, ErrorKind::DeadlineExceeded);
+		assert!(matches!(timeout.action, RetryAction::SameRoute { .. }));
+
+		let after = aws_exception_error("throttlingException", sf!("slow down"), Some(429), true);
+		assert_eq!(after.action, RetryAction::Never);
+		assert!(after.committed);
 	}
 
 	#[test]

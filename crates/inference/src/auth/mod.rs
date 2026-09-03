@@ -41,7 +41,8 @@ pub use aws::{
 	AWS_FILE_SESSION_CREDENTIAL_TTL, AWS_IMDS_REQUEST_TIMEOUT, AWS_REFRESH_SKEW,
 	AWS_SHARED_RESOLVE_TIMEOUT, AwsCredentialEnvironment, AwsCredentialError,
 	AwsCredentialOperation, AwsCredentialOptions, AwsCredentialSource, AwsEnvironmentError, AwsIni,
-	SystemAwsCredentialEnvironment, parse_aws_ini, tokenize_credential_process,
+	AwsRegistryAvailability, SystemAwsCredentialEnvironment, parse_aws_ini,
+	tokenize_credential_process,
 };
 pub use broker::{
 	CredentialBroker, CredentialBrokerEngines, CredentialBrokerError, CredentialEnvironment,

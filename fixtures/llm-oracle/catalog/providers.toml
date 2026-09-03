@@ -911,8 +911,10 @@ compat = { "multiple_system_messages" = false, "max_tokens_field" = "max_tokens"
 
 [providers."bedrock-mantle"]
 transport = "open-ai-responses"
+codec = "bedrock-mantle"
 base_url = "https://bedrock-mantle.{region}.api.aws/openai/v1"
 auth = { type = "bearer", env = ["OMP_AWS_BEARER_TOKEN_BEDROCK", "AWS_BEARER_TOKEN_BEDROCK"] }
+oauth_auth = { type = "aws-sig-v4" }
 discovery = { kind = "open-ai-models", label = "Amazon Bedrock Mantle", authoritative = true }
 facets = ["chat"]
 

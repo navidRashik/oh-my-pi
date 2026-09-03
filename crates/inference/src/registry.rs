@@ -16,7 +16,7 @@ use tracing::Instrument as _;
 
 use crate::{
 	answer::{Answer, AnswerBody, ResponseMeta},
-	auth::{AuthManager, CatalogAuthSpecError},
+	auth::{AuthManager, AwsCredentialError, CatalogAuthSpecError},
 	body::RetryDecision,
 	call::{Call, OperationCall},
 	catalog::{CatalogRevision, OperationKind, ProviderId, RouteDef, RouteId, snapshot::Catalog},
@@ -63,6 +63,19 @@ pub enum RouteUnavailable {
 		#[source]
 		source:    CatalogDiscoveryProjectorError,
 	},
+	/// Local AWS provider availability discovery failed.
+	#[error("AWS route availability discovery failed")]
+	AwsRegistry {
+		/// Catalog route that could not be constructed.
+		route:     RouteId,
+		/// Stable secret-free reason.
+		reason:    ReasonId,
+		/// Operation affected when the failure is narrower than the route.
+		operation: Option<OperationKind>,
+		/// Exact secret-free AWS discovery failure.
+		#[source]
+		source:    AwsCredentialError,
+	},
 	/// The route's catalog authentication specification is invalid.
 	#[error("route authentication specification is invalid")]
 	CatalogAuthSpec {
@@ -102,6 +115,7 @@ impl RouteUnavailable {
 		match self {
 			Self::Static { route, .. }
 			| Self::CatalogDiscoveryProjector { route, .. }
+			| Self::AwsRegistry { route, .. }
 			| Self::CatalogAuthSpec { route, .. }
 			| Self::DiscoveryCodec { route, .. } => route,
 		}
@@ -112,6 +126,7 @@ impl RouteUnavailable {
 		match self {
 			Self::Static { reason, .. }
 			| Self::CatalogDiscoveryProjector { reason, .. }
+			| Self::AwsRegistry { reason, .. }
 			| Self::CatalogAuthSpec { reason, .. }
 			| Self::DiscoveryCodec { reason, .. } => reason,
 		}
@@ -122,6 +137,7 @@ impl RouteUnavailable {
 		match self {
 			Self::Static { operation, .. }
 			| Self::CatalogDiscoveryProjector { operation, .. }
+			| Self::AwsRegistry { operation, .. }
 			| Self::CatalogAuthSpec { operation, .. }
 			| Self::DiscoveryCodec { operation, .. } => *operation,
 		}
@@ -885,6 +901,7 @@ pub(crate) fn route_unavailable_error(
 		RouteUnavailable::CatalogDiscoveryProjector { source, .. } => {
 			error.projector_source(source.clone())
 		},
+		RouteUnavailable::AwsRegistry { source, .. } => error.aws_registry_source(source.clone()),
 		_ => error,
 	}
 }

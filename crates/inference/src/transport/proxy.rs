@@ -1,66 +1,138 @@
-//! URL-based standard proxy environment resolution.
+//! URL-based provider and standard proxy environment resolution.
 
 use std::{env, ffi::OsString, net::IpAddr};
 
+use thiserror::Error;
 use url::Url;
+
+/// Typed failures while resolving environment proxy policy.
+#[derive(Debug, Error)]
+pub enum ProxyEnvironmentError {
+	/// A configured proxy variable was not Unicode.
+	#[error("proxy variable {variable} is not Unicode")]
+	NonUnicode {
+		/// Variable containing non-Unicode bytes.
+		variable: &'static str,
+	},
+	/// A configured proxy variable was not a URL.
+	#[error("proxy variable {variable} is not a valid URL")]
+	InvalidUrl {
+		/// Variable containing the invalid value.
+		variable: &'static str,
+		/// Typed URL parser source. The value itself is intentionally omitted.
+		#[source]
+		source:   url::ParseError,
+	},
+	/// A configured proxy URL had no host.
+	#[error("proxy variable {variable} has no host")]
+	MissingHost {
+		/// Variable containing the hostless URL.
+		variable: &'static str,
+	},
+}
 
 /// Resolves the standard proxy environment for one destination URL.
 pub(crate) fn for_url(url: &Url) -> Option<Url> {
-	for_url_with(url, |name| env::var_os(name))
+	for_url_with(url, None, |name| env::var_os(name))
+		.ok()
+		.flatten()
 }
 
-fn for_url_with(url: &Url, env: impl Fn(&str) -> Option<OsString>) -> Option<Url> {
-	if bypasses_proxy(url, &env) {
-		return None;
+/// Resolves a provider-specific proxy, the process-wide OMP proxy, and then the
+/// standard protocol proxy variables for one destination.
+///
+/// `provider_variable` is the provider's normalized `OMP_PROXY_*` name. The
+/// explicit spelling keeps the environment contract reviewable at each
+/// production composition boundary.
+pub fn for_provider_url(
+	url: &Url,
+	provider_variable: &'static str,
+) -> Result<Option<Url>, ProxyEnvironmentError> {
+	for_url_with(url, Some(provider_variable), |name| env::var_os(name))
+}
+
+fn for_url_with(
+	url: &Url,
+	provider_variable: Option<&'static str>,
+	env: impl Fn(&str) -> Option<OsString>,
+) -> Result<Option<Url>, ProxyEnvironmentError> {
+	if bypasses_proxy(url, &env)? {
+		return Ok(None);
 	}
-	let protocol_names: &[&str] = match url.scheme() {
+	let protocol_names: &[&'static str] = match url.scheme() {
 		"https" | "wss" => &["HTTPS_PROXY", "https_proxy"],
 		"http" | "ws" => &["HTTP_PROXY", "http_proxy"],
-		_ => return None,
+		_ => return Ok(None),
 	};
-	protocol_names
-		.iter()
-		.chain(["ALL_PROXY", "all_proxy"].iter())
-		.find_map(|name| env(name).and_then(parse_proxy))
+	let names = [
+		provider_variable,
+		provider_variable.map(|_| "OMP_PROXY"),
+		Some(protocol_names[0]),
+		Some(protocol_names[1]),
+		Some("ALL_PROXY"),
+		Some("all_proxy"),
+	];
+	for variable in names.into_iter().flatten() {
+		let Some(value) = env(variable) else {
+			continue;
+		};
+		if let Some(proxy) = parse_proxy(value, variable)? {
+			return Ok(Some(proxy));
+		}
+	}
+	Ok(None)
 }
 
-fn parse_proxy(value: OsString) -> Option<Url> {
-	let value = value.to_str()?.trim();
+fn parse_proxy(
+	value: OsString,
+	variable: &'static str,
+) -> Result<Option<Url>, ProxyEnvironmentError> {
+	let value = value
+		.to_str()
+		.ok_or(ProxyEnvironmentError::NonUnicode { variable })?
+		.trim();
 	if value.is_empty() {
-		return None;
+		return Ok(None);
 	}
 	let url = if value.contains("://") {
-		Url::parse(value).ok()?
+		Url::parse(value)
 	} else {
-		Url::parse(&format!("http://{value}")).ok()?
-	};
-	if url.host_str().is_some() {
-		Some(url)
-	} else {
-		None
+		Url::parse(&format!("http://{value}"))
 	}
+	.map_err(|source| ProxyEnvironmentError::InvalidUrl { variable, source })?;
+	if url.host_str().is_none() {
+		return Err(ProxyEnvironmentError::MissingHost { variable });
+	}
+	Ok(Some(url))
 }
 
-fn bypasses_proxy(url: &Url, env: &impl Fn(&str) -> Option<OsString>) -> bool {
+fn bypasses_proxy(
+	url: &Url,
+	env: &impl Fn(&str) -> Option<OsString>,
+) -> Result<bool, ProxyEnvironmentError> {
 	let host = url
 		.host_str()
 		.unwrap_or_default()
 		.trim_matches(|character| matches!(character, '[' | ']'))
 		.to_ascii_lowercase();
 	if is_local_or_metadata(&host) {
-		return true;
+		return Ok(true);
 	}
-	let Some(rules) = env("NO_PROXY").or_else(|| env("no_proxy")) else {
-		return false;
+	let (variable, rules) = if let Some(rules) = env("NO_PROXY") {
+		("NO_PROXY", rules)
+	} else if let Some(rules) = env("no_proxy") {
+		("no_proxy", rules)
+	} else {
+		return Ok(false);
 	};
-	let Some(rules) = rules.to_str() else {
-		return false;
-	};
+	let rules = rules
+		.to_str()
+		.ok_or(ProxyEnvironmentError::NonUnicode { variable })?;
 	let port = url.port_or_known_default();
-	rules
+	Ok(rules
 		.split(|character: char| character == ',' || character.is_ascii_whitespace())
 		.filter(|rule| !rule.is_empty())
-		.any(|rule| no_proxy_matches(rule, &host, port))
+		.any(|rule| no_proxy_matches(rule, &host, port)))
 }
 
 fn no_proxy_matches(rule: &str, host: &str, port: Option<u16>) -> bool {
@@ -139,7 +211,19 @@ mod tests {
 			.iter()
 			.map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
 			.collect::<BTreeMap<_, _>>();
-		for_url_with(&Url::parse(url).unwrap(), |name| values.get(name).cloned())
+		for_url_with(&Url::parse(url).unwrap(), None, |name| values.get(name).cloned())
+			.expect("valid proxy policy")
+	}
+
+	fn resolve_provider(url: &str, values: &[(&str, &str)]) -> Option<Url> {
+		let values = values
+			.iter()
+			.map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
+			.collect::<BTreeMap<_, _>>();
+		for_url_with(&Url::parse(url).unwrap(), Some("OMP_PROXY_OPENAI_CODEX"), |name| {
+			values.get(name).cloned()
+		})
+		.expect("valid proxy policy")
 	}
 
 	#[test]
@@ -168,6 +252,36 @@ mod tests {
 	}
 
 	#[test]
+	fn provider_proxy_precedes_process_and_standard_routes() {
+		assert_eq!(
+			resolve_provider("https://chatgpt.com/live", &[
+				("OMP_PROXY_OPENAI_CODEX", "http://provider:8080"),
+				("OMP_PROXY", "http://process:8080"),
+				("HTTPS_PROXY", "http://standard:8080"),
+			])
+			.expect("provider proxy")
+			.as_str(),
+			"http://provider:8080/"
+		);
+		assert_eq!(
+			resolve_provider("https://chatgpt.com/live", &[
+				("OMP_PROXY", "http://process:8080"),
+				("HTTPS_PROXY", "http://standard:8080"),
+			])
+			.expect("process proxy")
+			.as_str(),
+			"http://process:8080/"
+		);
+		assert!(
+			resolve_provider("https://chatgpt.com/live", &[
+				("OMP_PROXY_OPENAI_CODEX", "http://provider:8080"),
+				("NO_PROXY", "api.example chatgpt.com"),
+			])
+			.is_none()
+		);
+	}
+
+	#[test]
 	fn no_proxy_and_local_destinations_bypass() {
 		assert!(
 			resolve("https://api2.cursor.sh:8443", &[
@@ -177,5 +291,21 @@ mod tests {
 			.is_none()
 		);
 		assert!(resolve("http://127.0.0.1", &[("HTTP_PROXY", "http://proxy:8080")]).is_none());
+		assert!(resolve("http://169.254.169.254", &[("HTTP_PROXY", "http://proxy:8080")]).is_none());
+		assert!(resolve("http://[fd00:ec2::254]", &[("HTTP_PROXY", "http://proxy:8080")]).is_none());
+	}
+
+	#[test]
+	fn invalid_proxy_failures_name_only_the_variable() {
+		let values =
+			BTreeMap::from([("HTTPS_PROXY".to_owned(), OsString::from("http://employee:secret@"))]);
+		let error = for_url_with(&Url::parse("https://chatgpt.com").unwrap(), None, |name| {
+			values.get(name).cloned()
+		})
+		.expect_err("invalid proxy must be typed");
+		let display = error.to_string();
+		assert!(display.contains("HTTPS_PROXY"));
+		assert!(!display.contains("employee"));
+		assert!(!display.contains("secret"));
 	}
 }

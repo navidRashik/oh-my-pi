@@ -7,7 +7,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	env, fmt, io,
+	env, fmt, fs, io,
 	path::{Path, PathBuf},
 	process::Stdio,
 	sync::{
@@ -23,7 +23,7 @@ use futures::{
 	future::{BoxFuture, Shared},
 };
 use http::{HeaderMap, HeaderValue, Method, Request, header::CONTENT_TYPE};
-use omp_core::{ExposeSecret as _, SecretString, Str, hex, parse_rfc3339};
+use omp_core::{ExposeSecret as _, SecretString, Str, hex, parse_rfc3339, sf};
 use omp_oauth::OAuthRequestError;
 use parking_lot::Mutex;
 use ring::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
@@ -62,6 +62,90 @@ pub struct AwsCredentialOptions {
 	pub profile: Option<Str>,
 	/// Explicit region; otherwise environment, shared config, then `us-east-1`.
 	pub region:  Option<Str>,
+}
+
+/// Secret-free result of the AWS registry's local credential-source discovery.
+///
+/// This is availability evidence, not a credential lease. The probe never
+/// retains or exposes bearer values, and never reads web-identity token
+/// contents, container responses, IMDS responses, SSO caches, or
+/// credential-process output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AwsRegistryAvailability {
+	profile:        Str,
+	region:         Str,
+	bearer:         bool,
+	environment:    bool,
+	web_identity:   bool,
+	shared_profile: bool,
+	container:      bool,
+	imds:           bool,
+}
+
+impl AwsRegistryAvailability {
+	/// Returns the effective shared-profile name used by discovery.
+	pub fn profile(&self) -> &str {
+		&self.profile
+	}
+
+	/// Returns the effective region used by Bedrock endpoints and SigV4.
+	pub fn region(&self) -> &str {
+		&self.region
+	}
+
+	/// Reports whether a Bedrock bearer token is configured.
+	pub const fn has_bearer(&self) -> bool {
+		self.bearer
+	}
+
+	/// Reports whether a complete access-key pair is configured in the
+	/// environment.
+	pub const fn has_environment_credentials(&self) -> bool {
+		self.environment
+	}
+
+	/// Reports whether the ambient web-identity pair is configured.
+	pub const fn has_web_identity(&self) -> bool {
+		self.web_identity
+	}
+
+	/// Reports whether the selected shared profile terminates in a source the
+	/// non-interactive resolver can use.
+	pub const fn has_shared_profile(&self) -> bool {
+		self.shared_profile
+	}
+
+	/// Reports whether an ECS/EKS container credential endpoint is configured.
+	pub const fn has_container_credentials(&self) -> bool {
+		self.container
+	}
+
+	/// Reports whether ambient EC2 instance metadata is eligible.
+	pub const fn has_imds(&self) -> bool {
+		self.imds
+	}
+
+	/// Reports whether any SigV4 credential-chain source is locally
+	/// discoverable.
+	pub const fn has_sigv4_source(&self) -> bool {
+		self.environment || self.web_identity || self.shared_profile || self.container || self.imds
+	}
+
+	/// Reports whether the Amazon Bedrock routes are eligible for construction.
+	pub const fn bedrock_eligible(&self) -> bool {
+		self.bearer || self.has_sigv4_source()
+	}
+
+	/// Reports whether the Bedrock Mantle route is eligible for construction.
+	pub const fn mantle_eligible(&self) -> bool {
+		self.bearer || self.has_sigv4_source()
+	}
+
+	/// Adds an invocation-scoped bearer override without retaining its value.
+	pub const fn with_bearer_override(mut self) -> Self {
+		self.bearer = true;
+		self
+	}
 }
 
 /// Exact environment ingress used by the AWS credential chain.
@@ -325,8 +409,9 @@ type SharedResolution = Shared<BoxFuture<'static, Result<CacheEntry, AwsCredenti
 
 #[derive(Default)]
 struct ResolverState {
-	cache:   BTreeMap<CacheKey, CacheEntry>,
-	flights: BTreeMap<CacheKey, SharedResolution>,
+	cache:        BTreeMap<CacheKey, CacheEntry>,
+	availability: BTreeMap<CacheKey, AwsRegistryAvailability>,
+	flights:      BTreeMap<CacheKey, SharedResolution>,
 }
 
 static SYSTEM_STATE: LazyLock<Arc<Mutex<ResolverState>>> =
@@ -380,15 +465,47 @@ impl AwsCredentialSource {
 		self.resolve_for_need(need, false).await
 	}
 
+	/// Resolves the effective non-secret region through the same environment
+	/// and shared-profile precedence used by credential acquisition.
+	pub async fn effective_region(&self) -> Result<Str, AwsCredentialError> {
+		Ok(self.resolve_scope(&self.options).await?.region)
+	}
+
+	/// Discovers the local AWS sources that make Bedrock routes eligible.
+	///
+	/// Discovery is filesystem-local and side-effect-free: it examines source
+	/// configuration but never executes a credential process or calls STS,
+	/// container endpoints, or IMDS. Results share the resolver's exact
+	/// profile/region cache scope.
+	pub async fn registry_availability(
+		&self,
+	) -> Result<AwsRegistryAvailability, AwsCredentialError> {
+		let key = self.resolve_scope(&self.options).await?;
+		if let Some(availability) = self.state.lock().availability.get(&key).cloned() {
+			return Ok(availability);
+		}
+		let availability = self.discover_registry_availability(&key).await?;
+		self
+			.state
+			.lock()
+			.availability
+			.insert(key, availability.clone());
+		Ok(availability)
+	}
+
 	/// Clears every cached scope. In-flight work remains shared and bounded.
 	pub fn clear_cache(&self) {
-		self.state.lock().cache.clear();
+		let mut state = self.state.lock();
+		state.cache.clear();
+		state.availability.clear();
 	}
 
 	/// Invalidates the exact effective profile/region scope.
 	pub async fn invalidate(&self, options: AwsCredentialOptions) -> Result<(), AwsCredentialError> {
 		let key = self.resolve_scope(&options).await?;
-		self.state.lock().cache.remove(&key);
+		let mut state = self.state.lock();
+		state.cache.remove(&key);
+		state.availability.remove(&key);
 		Ok(())
 	}
 
@@ -519,6 +636,96 @@ impl AwsCredentialSource {
 			.and_then(|section| section.get("region"))
 			.filter(|region| !region.is_empty())
 			.cloned())
+	}
+
+	async fn discover_registry_availability(
+		&self,
+		key: &CacheKey,
+	) -> Result<AwsRegistryAvailability, AwsCredentialError> {
+		let bearer = self.env_secret("OMP_AWS_BEARER_TOKEN_BEDROCK")?.is_some()
+			|| self.env_secret("AWS_BEARER_TOKEN_BEDROCK")?.is_some();
+		let environment = self.environment_source_configured()?;
+		let web_identity = self.web_identity_source_configured()?;
+		let container = self.container_source_configured()?;
+		let metadata_enabled = self.metadata_enabled()?;
+		let imds = metadata_enabled
+			&& (self
+				.env_text("AWS_EC2_METADATA_SERVICE_ENDPOINT")?
+				.is_some()
+				|| is_ec2_host());
+		let shared_profile = match self
+			.profile_source_configured(key, environment, container, metadata_enabled)
+			.await
+		{
+			Ok(configured) => configured,
+			Err(_) if bearer || environment || web_identity || container || imds => false,
+			Err(source) => return Err(source),
+		};
+		Ok(AwsRegistryAvailability {
+			profile: key.profile.clone(),
+			region: key.region.clone(),
+			bearer,
+			environment,
+			web_identity,
+			shared_profile,
+			container,
+			imds,
+		})
+	}
+
+	async fn profile_source_configured(
+		&self,
+		key: &CacheKey,
+		environment: bool,
+		container: bool,
+		metadata_enabled: bool,
+	) -> Result<bool, AwsCredentialError> {
+		let credentials = match self.credentials_path()? {
+			Some(path) => read_ini_file(&path, AwsCredentialOperation::CredentialsFile).await?,
+			None => None,
+		};
+		let config = if key.load_shared_config {
+			match self.config_path()? {
+				Some(path) => read_ini_file(&path, AwsCredentialOperation::ConfigFile).await?,
+				None => None,
+			}
+		} else {
+			None
+		};
+		profile_has_credential_source(
+			&key.profile,
+			credentials.as_ref(),
+			config.as_ref(),
+			environment,
+			container,
+			metadata_enabled,
+			BTreeSet::new(),
+		)
+	}
+
+	fn environment_source_configured(&self) -> Result<bool, AwsCredentialError> {
+		Ok(self.env_secret("AWS_ACCESS_KEY_ID")?.is_some()
+			&& self.env_secret("AWS_SECRET_ACCESS_KEY")?.is_some())
+	}
+
+	fn web_identity_source_configured(&self) -> Result<bool, AwsCredentialError> {
+		Ok(self.env_text("AWS_WEB_IDENTITY_TOKEN_FILE")?.is_some()
+			&& self.env_text("AWS_ROLE_ARN")?.is_some())
+	}
+
+	fn container_source_configured(&self) -> Result<bool, AwsCredentialError> {
+		Ok(self
+			.env_text("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")?
+			.is_some()
+			|| self
+				.env_text("AWS_CONTAINER_CREDENTIALS_FULL_URI")?
+				.is_some())
+	}
+
+	fn metadata_enabled(&self) -> Result<bool, AwsCredentialError> {
+		Ok(!self
+			.env_text("AWS_EC2_METADATA_DISABLED")?
+			.is_some_and(|value| value.eq_ignore_ascii_case("true")))
 	}
 
 	async fn resolve_fresh(&self, key: &CacheKey) -> Result<ResolvedCredential, AwsCredentialError> {
@@ -1348,6 +1555,132 @@ impl AwsCredentialSource {
 	}
 }
 
+fn profile_has_credential_source(
+	profile: &str,
+	credentials: Option<&AwsIni>,
+	config: Option<&AwsIni>,
+	environment: bool,
+	container: bool,
+	metadata_enabled: bool,
+	mut seen: BTreeSet<Str>,
+) -> Result<bool, AwsCredentialError> {
+	if !seen.insert(Str::new(profile)) {
+		return Err(AwsCredentialError::ProfileCycle { profile: Str::new(profile) });
+	}
+	let mut merged = config
+		.and_then(|ini| ini.get(profile))
+		.cloned()
+		.unwrap_or_default();
+	if let Some(values) = credentials.and_then(|ini| ini.get(profile)) {
+		merged.extend(values.clone());
+	}
+	if let Some(_role_arn) = merged.get("role_arn").filter(|value| !value.is_empty()) {
+		if merged
+			.get("web_identity_token_file")
+			.is_some_and(|value| !value.is_empty())
+		{
+			return Ok(true);
+		}
+		if merged
+			.get("mfa_serial")
+			.is_some_and(|value| !value.is_empty())
+		{
+			return Ok(false);
+		}
+		if let Some(source) = merged
+			.get("credential_source")
+			.filter(|value| !value.is_empty())
+		{
+			return match source.as_str() {
+				"Environment" => Ok(environment),
+				"EcsContainer" => Ok(container),
+				"Ec2InstanceMetadata" => Ok(metadata_enabled),
+				_ => {
+					Err(AwsCredentialError::UnsupportedCredentialSource { profile: Str::new(profile) })
+				},
+			};
+		}
+		if let Some(source_profile) = merged
+			.get("source_profile")
+			.filter(|value| !value.is_empty())
+		{
+			return profile_has_credential_source(
+				source_profile,
+				credentials,
+				config,
+				environment,
+				container,
+				metadata_enabled,
+				seen,
+			);
+		}
+		return Ok(false);
+	}
+	if merged
+		.get("aws_access_key_id")
+		.is_some_and(|value| !value.is_empty())
+		&& merged
+			.get("aws_secret_access_key")
+			.is_some_and(|value| !value.is_empty())
+	{
+		return Ok(true);
+	}
+	if merged
+		.get("credential_process")
+		.is_some_and(|value| !value.is_empty())
+	{
+		return Ok(true);
+	}
+	if !merged
+		.get("sso_account_id")
+		.is_some_and(|value| !value.is_empty())
+		|| !merged
+			.get("sso_role_name")
+			.is_some_and(|value| !value.is_empty())
+	{
+		return Ok(false);
+	}
+	if merged
+		.get("sso_start_url")
+		.is_some_and(|value| !value.is_empty())
+		&& merged
+			.get("sso_region")
+			.is_some_and(|value| !value.is_empty())
+	{
+		return Ok(true);
+	}
+	let Some(session) = merged
+		.get("sso_session")
+		.filter(|value| !value.is_empty())
+		.and_then(|name| config.and_then(|ini| ini.get(&sf!("sso-session:{name}"))))
+	else {
+		return Ok(false);
+	};
+	Ok(session
+		.get("sso_start_url")
+		.is_some_and(|value| !value.is_empty())
+		&& session
+			.get("sso_region")
+			.is_some_and(|value| !value.is_empty()))
+}
+
+fn is_ec2_host() -> bool {
+	const CHECKS: [(&str, fn(&str) -> bool); 5] = [
+		("/sys/hypervisor/uuid", |value| value.starts_with("ec2")),
+		("/sys/devices/virtual/dmi/id/product_uuid", |value| value.starts_with("ec2")),
+		("/sys/devices/virtual/dmi/id/board_asset_tag", |value| {
+			value.starts_with("ec2") || value.starts_with("i-")
+		}),
+		("/sys/devices/virtual/dmi/id/sys_vendor", |value| value.contains("amazon ec2")),
+		("/sys/devices/virtual/dmi/id/bios_vendor", |value| value.contains("amazon ec2")),
+	];
+	CHECKS.iter().any(|(path, matches)| {
+		fs::read_to_string(path)
+			.ok()
+			.is_some_and(|value| matches(value.trim().to_ascii_lowercase().as_str()))
+	})
+}
+
 impl fmt::Debug for AwsCredentialSource {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
@@ -1707,7 +2040,7 @@ mod tests {
 	use futures::{FutureExt as _, future::BoxFuture};
 	use http::HeaderMap;
 	use omp_catalog::AuthSpecId;
-	use omp_core::{SecretString, Str};
+	use omp_core::{SecretString, Str, sf};
 	use parking_lot::Mutex;
 
 	use super::{
@@ -1933,6 +2266,136 @@ mod tests {
 		assert_eq!(http.calls.load(Ordering::Relaxed), 0);
 		assert!(expiration >= before + Duration::from_secs(4 * 60 + 59));
 		assert!(expiration <= SystemTime::now() + Duration::from_secs(5 * 60));
+	}
+
+	#[tokio::test]
+	async fn effective_region_uses_the_credential_chain_precedence() {
+		let resolver = AwsCredentialSource::new(
+			AwsCredentialOptions {
+				profile: Some(Str::new("team")),
+				region:  Some(Str::new("eu-west-2")),
+			},
+			Arc::new(FakeEnvironment::default().with("AWS_REGION", "us-east-2")),
+			Arc::new(ScriptedHttp::new([])),
+		);
+
+		assert_eq!(resolver.effective_region().await.expect("explicit region"), sf!("eu-west-2"),);
+	}
+
+	#[tokio::test]
+	async fn registry_availability_classifies_every_ambient_source_without_network() {
+		let environment = FakeEnvironment::default()
+			.with("AWS_ACCESS_KEY_ID", "AKIAENV")
+			.with("AWS_SECRET_ACCESS_KEY", "environment-secret")
+			.with("AWS_WEB_IDENTITY_TOKEN_FILE", "/run/secrets/aws-token")
+			.with("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test")
+			.with("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials")
+			.with("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://127.0.0.1:1338")
+			.with("AWS_REGION", "eu-central-1")
+			.with("OMP_AWS_BEARER_TOKEN_BEDROCK", "TOP-SECRET-BEARER");
+		let resolver = AwsCredentialSource::new(
+			AwsCredentialOptions::default(),
+			Arc::new(environment),
+			Arc::new(ScriptedHttp::new([])),
+		);
+
+		let availability = resolver
+			.registry_availability()
+			.await
+			.expect("local discovery");
+
+		assert_eq!(availability.region(), "eu-central-1");
+		assert!(availability.has_bearer());
+		assert!(availability.has_environment_credentials());
+		assert!(availability.has_web_identity());
+		assert!(availability.has_container_credentials());
+		assert!(availability.has_imds());
+		assert!(availability.bedrock_eligible());
+		assert!(availability.mantle_eligible());
+		assert!(!format!("{availability:?}").contains("TOP-SECRET"));
+	}
+
+	#[tokio::test]
+	async fn registry_availability_rejects_partial_pairs_and_disabled_imds() {
+		let resolver = AwsCredentialSource::new(
+			AwsCredentialOptions::default(),
+			Arc::new(
+				FakeEnvironment::default()
+					.with("AWS_ACCESS_KEY_ID", "missing-secret")
+					.with("AWS_WEB_IDENTITY_TOKEN_FILE", "/run/secrets/missing-role")
+					.with("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://127.0.0.1:1338")
+					.with("AWS_EC2_METADATA_DISABLED", "TRUE"),
+			),
+			Arc::new(ScriptedHttp::new([])),
+		);
+
+		let availability = resolver
+			.registry_availability()
+			.await
+			.expect("local discovery");
+
+		assert!(!availability.has_environment_credentials());
+		assert!(!availability.has_web_identity());
+		assert!(!availability.has_imds());
+		assert!(!availability.has_sigv4_source());
+		assert!(!availability.bedrock_eligible());
+		assert!(!availability.mantle_eligible());
+	}
+
+	#[tokio::test]
+	async fn registry_profile_discovery_is_cached_and_exactly_invalidated() {
+		let directory = tempfile::tempdir().expect("temporary directory");
+		let aws = directory.path().join(".aws");
+		std::fs::create_dir(&aws).expect("create AWS directory");
+		let credentials = aws.join("credentials");
+		std::fs::write(
+			&credentials,
+			"[base]\naws_access_key_id=AKIAPROFILE\naws_secret_access_key=profile-secret\n",
+		)
+		.expect("write credentials");
+		std::fs::write(
+			aws.join("config"),
+			"[profile team]\nregion=eu-west-2\nrole_arn=arn:aws:iam::123456789012:role/team\\
+			 nsource_profile=base\n",
+		)
+		.expect("write config");
+		let options = AwsCredentialOptions { profile: Some(sf!("team")), region: None };
+		let resolver = AwsCredentialSource::new(
+			options.clone(),
+			Arc::new(
+				FakeEnvironment::default().with("HOME", directory.path().to_str().expect("utf-8 path")),
+			),
+			Arc::new(ScriptedHttp::new([])),
+		);
+
+		let initial = resolver
+			.registry_availability()
+			.await
+			.expect("initial discovery");
+		assert_eq!(initial.profile(), "team");
+		assert_eq!(initial.region(), "eu-west-2");
+		assert!(initial.has_shared_profile());
+
+		std::fs::write(&credentials, "[base]\n").expect("remove profile credentials");
+		assert!(
+			resolver
+				.registry_availability()
+				.await
+				.expect("cached discovery")
+				.has_shared_profile()
+		);
+
+		resolver
+			.invalidate(options)
+			.await
+			.expect("invalidate scope");
+		assert!(
+			!resolver
+				.registry_availability()
+				.await
+				.expect("refreshed discovery")
+				.has_shared_profile()
+		);
 	}
 
 	#[tokio::test]

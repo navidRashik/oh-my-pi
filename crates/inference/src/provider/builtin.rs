@@ -29,9 +29,10 @@ use crate::{
 		AccountPool, AccountSelection, AccountSelectionRequest, RateAvailability, RotationPolicy,
 	},
 	auth::{
-		AuthManager, AuthScheme, CredentialApplyError, CredentialBroker, CredentialError,
-		CredentialKind, CredentialLease, CredentialNeed, CredentialShaperRegistry, CredentialSource,
-		OAuthHttpClient, OAuthHttpRequest, ProviderShaper, spec::AuthSpec,
+		AuthManager, AuthScheme, AwsCredentialError, AwsRegistryAvailability, CredentialApplyError,
+		CredentialBroker, CredentialError, CredentialKind, CredentialLease, CredentialNeed,
+		CredentialShaperRegistry, CredentialSource, OAuthHttpClient, OAuthHttpRequest,
+		ProviderShaper, spec::AuthSpec,
 	},
 	body::BodySource,
 	call::{
@@ -46,6 +47,7 @@ use crate::{
 		RealtimeWireCodecState, RequestHeader, TransportAttempt, TransportRequest,
 		anthropic::AnthropicCodec,
 		bedrock::{BedrockConverseCodec, BedrockGuardrail, BedrockOptions, guardrail_arn_region},
+		bedrock_mantle::{BedrockMantleCodec, expand_endpoint as expand_mantle_endpoint},
 		cursor::CursorCodec,
 		devin::DevinCodec,
 		discovery::{
@@ -218,6 +220,20 @@ pub struct AuthApplicationConfig {
 	pub signing_regions: Arc<BTreeMap<omp_catalog::RouteId, Str>>,
 }
 
+impl AuthApplicationConfig {
+	/// Binds one resolved AWS region to every catalog route whose endpoint is
+	/// explicitly regional.
+	pub fn for_catalog(catalog: &Catalog, region: Str) -> Self {
+		let signing_regions = catalog
+			.routes()
+			.iter()
+			.filter(|route| route.endpoint.base_url.contains("{region}"))
+			.map(|route| (route.id.clone(), region.clone()))
+			.collect();
+		Self { signing_regions: Arc::new(signing_regions) }
+	}
+}
+
 type WireService = BoxCloneSyncService<TransportRequest, HandshakenResponse, Error>;
 
 #[derive(Clone)]
@@ -335,6 +351,7 @@ pub struct ProductionDependencies {
 	local_routes:         Arc<BTreeMap<RouteId, LocalRouteBackend>>,
 	discovery_projectors: Arc<BTreeMap<RouteId, Arc<dyn DiscoveryProjector>>>,
 	local_unavailable:    Arc<BTreeMap<RouteId, ReasonId>>,
+	aws_registry:         Option<Result<AwsRegistryAvailability, AwsCredentialError>>,
 }
 
 impl ProductionDependencies {
@@ -384,6 +401,7 @@ impl ProductionDependencies {
 			discovery_projectors,
 			local_routes: Arc::new(BTreeMap::new()),
 			local_unavailable: Arc::new(BTreeMap::new()),
+			aws_registry: None,
 		}
 	}
 
@@ -398,6 +416,18 @@ impl ProductionDependencies {
 	/// Installs application-composed provider console usage backends.
 	pub fn with_usage_manager(mut self, manager: ConsoleUsageManager) -> Self {
 		self.usage_manager = Some(manager);
+		self
+	}
+
+	/// Installs secret-free AWS source discovery used to gate AWS routes.
+	///
+	/// A failed probe is retained as typed construction evidence rather than
+	/// silently treating the route as credential-free or leaking a source value.
+	pub fn with_aws_registry_availability(
+		mut self,
+		availability: Result<AwsRegistryAvailability, AwsCredentialError>,
+	) -> Self {
+		self.aws_registry = Some(availability);
 		self
 	}
 
@@ -455,12 +485,43 @@ impl ProductionRouteComposer {
 	}
 }
 
+fn catalog_auth_for_route(
+	route: &RouteDef,
+	auth: &omp_catalog::provider::AuthSpec,
+) -> omp_catalog::provider::AuthSpec {
+	let mut auth = auth.clone();
+	if route.codec.as_str() == "bedrock-mantle"
+		&& let Some(signing) = auth.signing.as_mut()
+	{
+		signing.service = sf!("bedrock-mantle");
+	}
+	auth
+}
+
 impl RouteComposer for ProductionRouteComposer {
 	fn compose(
 		&self,
 		catalog: &Catalog,
 		route: &RouteDef,
 	) -> Result<RouteProviderService, RouteUnavailable> {
+		if route_uses_aws_sigv4(catalog, route)
+			&& let Some(availability) = &self.dependencies.aws_registry
+		{
+			match availability {
+				Ok(availability) if !aws_route_eligible(route, availability) => {
+					return Err(unavailable(route, "aws-credential-source-unavailable"));
+				},
+				Err(source) => {
+					return Err(RouteUnavailable::AwsRegistry {
+						route:     route.id.clone(),
+						reason:    ReasonId(sf!("aws-registry-discovery-failed")),
+						operation: None,
+						source:    source.clone(),
+					});
+				},
+				Ok(_) => {},
+			}
+		}
 		let bedrock_guardrail = configured_bedrock_guardrail(&self.dependencies.settings, route);
 		let bedrock_ambient_region = self
 			.dependencies
@@ -585,18 +646,21 @@ impl RouteComposer for ProductionRouteComposer {
 					crate::codec::anthropic::endpoint_region(route.endpoint.base_url.as_str())
 						.map_or_else(|| sf!("us-east-1"), Str::new)
 				})
-			});
-		let runtime_auth =
-			AuthSpec::from_catalog(auth, oauth, signing_region.clone()).map_err(|source| {
-				RouteUnavailable::CatalogAuthSpec {
-					route: route.id.clone(),
-					reason: ReasonId(sf!("catalog-auth-spec-invalid")),
-					operation: None,
-					source,
-				}
+			})
+			.or_else(|| (route.codec.as_str() == "bedrock-mantle").then(|| sf!("us-east-1")));
+		let route_auth = catalog_auth_for_route(route, auth);
+		let runtime_auth = AuthSpec::from_catalog(&route_auth, oauth, signing_region.clone())
+			.map_err(|source| RouteUnavailable::CatalogAuthSpec {
+				route: route.id.clone(),
+				reason: ReasonId(sf!("catalog-auth-spec-invalid")),
+				operation: None,
+				source,
 			})?;
 		let mut auth_specs = vec![(route.auth.clone(), runtime_auth)];
-		if matches!(route.codec.as_str(), "anthropic" | "bedrock-converse" | "search-perplexity") {
+		if matches!(
+			route.codec.as_str(),
+			"anthropic" | "bedrock-converse" | "bedrock-mantle" | "search-perplexity"
+		) {
 			let provider = catalog
 				.provider(&route.provider)
 				.ok_or_else(|| unavailable(route, "catalog-provider-missing"))?;
@@ -616,20 +680,20 @@ impl RouteComposer for ProductionRouteComposer {
 						matches!(auth.kind, AuthSpecKind::Bearer | AuthSpecKind::OptionalBearer)
 					},
 					"search-perplexity" => auth.kind == AuthSpecKind::Oauth,
+					"bedrock-mantle" => auth.kind == AuthSpecKind::AwsSigv4,
 					_ => false,
 				};
 				if !accepted {
 					continue;
 				}
 				let oauth = auth.oauth.as_ref().and_then(|id| catalog.oauth_spec(id));
-				let runtime =
-					AuthSpec::from_catalog(auth, oauth, signing_region.clone()).map_err(|source| {
-						RouteUnavailable::CatalogAuthSpec {
-							route: route.id.clone(),
-							reason: ReasonId(sf!("catalog-auth-spec-invalid")),
-							operation: None,
-							source,
-						}
+				let route_auth = catalog_auth_for_route(route, auth);
+				let runtime = AuthSpec::from_catalog(&route_auth, oauth, signing_region.clone())
+					.map_err(|source| RouteUnavailable::CatalogAuthSpec {
+						route: route.id.clone(),
+						reason: ReasonId(sf!("catalog-auth-spec-invalid")),
+						operation: None,
+						source,
 					})?;
 				if matches!(route.codec.as_str(), "bedrock-converse" | "search-perplexity") {
 					auth_specs.insert(0, (auth_id.clone(), runtime));
@@ -653,6 +717,17 @@ impl RouteComposer for ProductionRouteComposer {
 			authenticated,
 			required: credential_required,
 		};
+		let regional_route = if route.codec.as_str() == "bedrock-mantle" {
+			let region = signing_region
+				.as_ref()
+				.expect("Mantle signing region always has a default");
+			Some(
+				mantle_regional_route(route, region)
+					.map_err(|_| unavailable(route, "bedrock-mantle-endpoint-invalid"))?,
+			)
+		} else {
+			None
+		};
 		let encoder = RouteEncoder {
 			route: route.clone(),
 			auth_schemes: auth_specs
@@ -675,6 +750,7 @@ impl RouteComposer for ProductionRouteComposer {
 				.unwrap_or_default(),
 			codec,
 			azure_endpoint: self.dependencies.azure_endpoint.clone(),
+			regional_route,
 			transport_timeout: self
 				.dependencies
 				.transport_timeout
@@ -719,6 +795,24 @@ struct CodecBinding {
 	embedding:                 Option<EmbeddingRoutePolicy>,
 	openai_embedding_override: bool,
 }
+fn route_uses_aws_sigv4(catalog: &Catalog, route: &RouteDef) -> bool {
+	catalog.provider(&route.provider).is_some_and(|provider| {
+		provider.auth.iter().any(|auth| {
+			catalog
+				.auth_spec(auth)
+				.is_some_and(|auth| auth.kind == AuthSpecKind::AwsSigv4)
+		})
+	})
+}
+
+fn aws_route_eligible(route: &RouteDef, availability: &AwsRegistryAvailability) -> bool {
+	if route.codec.as_str() == "bedrock-mantle" {
+		availability.mantle_eligible()
+	} else {
+		availability.bedrock_eligible()
+	}
+}
+
 fn configured_bedrock_guardrail<'a>(
 	settings: &'a InferenceSettings,
 	route: &RouteDef,
@@ -924,6 +1018,15 @@ fn codec_binding(
 				..OpenAiResponsesOptions::default()
 			})),
 			operation_bits(&[OperationKind::Chat, OperationKind::GenerateImage]),
+			None,
+			false,
+		),
+		("bedrock-mantle", CodecProfile::Standard) => (
+			Arc::new(BedrockMantleCodec::new(OpenAiResponsesOptions {
+				stateful: stateful_responses,
+				..OpenAiResponsesOptions::default()
+			})),
+			operation_bits(&[OperationKind::Chat]),
 			None,
 			false,
 		),
@@ -1187,6 +1290,7 @@ struct RouteEncoder {
 	headers:           Box<[RequestHeader]>,
 	codec:             Arc<dyn Codec>,
 	azure_endpoint:    Option<AzureEndpointConfig>,
+	regional_route:    Option<RouteDef>,
 	transport_timeout: Duration,
 }
 
@@ -1303,6 +1407,30 @@ fn append_endpoint_api_version(
 	Ok(())
 }
 
+fn mantle_regional_route(
+	route: &RouteDef,
+	region: &Str,
+) -> Result<RouteDef, crate::codec::bedrock_mantle::BedrockMantleEndpointError> {
+	let base_url = expand_mantle_endpoint(route.endpoint.base_url.as_str(), region.as_str())?;
+	let parsed = Url::parse(base_url.as_str())
+		.map_err(crate::codec::bedrock_mantle::BedrockMantleEndpointError::Url)?;
+	let mut effective_route = route.clone();
+	effective_route.endpoint.base_url = base_url;
+	effective_route.endpoint.region = Some(region.clone());
+	effective_route.trust_domain.origin = Str::new(parsed.origin().ascii_serialization());
+	Ok(effective_route)
+}
+
+fn mantle_effective_target(
+	route: &RouteDef,
+	target: Option<&omp_catalog::WireTarget>,
+) -> Option<omp_catalog::WireTarget> {
+	target.cloned().map(|mut target| {
+		target.endpoint = route.endpoint.clone();
+		target
+	})
+}
+
 fn azure_effective_route(
 	route: &RouteDef,
 	target: Option<&omp_catalog::WireTarget>,
@@ -1417,6 +1545,8 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			(Some(route), target)
 		} else if let Some((route, target)) = azure {
 			(Some(route), Some(target))
+		} else if let Some(route) = &self.regional_route {
+			(Some(route.clone()), mantle_effective_target(route, plan.wire_target()))
 		} else {
 			(None, None)
 		};
@@ -2427,6 +2557,41 @@ mod tests {
 	}
 
 	#[test]
+	fn aws_registry_gates_only_routes_backed_by_sigv4_provider_auth() {
+		let catalog = Catalog::embedded();
+		for provider in ["amazon-bedrock", "bedrock-mantle"] {
+			let route = catalog
+				.routes()
+				.iter()
+				.find(|route| route.provider.as_str() == provider)
+				.unwrap_or_else(|| panic!("{provider} route"));
+			assert!(route_uses_aws_sigv4(catalog, route));
+		}
+		let openai = catalog
+			.routes()
+			.iter()
+			.find(|route| route.provider.as_str() == "openai")
+			.expect("OpenAI route");
+		assert!(!route_uses_aws_sigv4(catalog, openai));
+	}
+
+	#[test]
+	fn aws_registry_unavailability_preserves_typed_secret_free_source() {
+		let unavailable = RouteUnavailable::AwsRegistry {
+			route:     RouteId::from("bedrock-mantle/primary"),
+			reason:    ReasonId(sf!("aws-registry-discovery-failed")),
+			operation: None,
+			source:    AwsCredentialError::Unavailable,
+		};
+		let source = std::error::Error::source(&unavailable).expect("typed source");
+		assert!(source.downcast_ref::<AwsCredentialError>().is_some());
+		let planning = crate::registry::route_unavailable_error(&unavailable, OperationKind::Chat);
+		let source = std::error::Error::source(&planning).expect("planning error typed source");
+		assert!(source.downcast_ref::<AwsCredentialError>().is_some());
+		assert!(!format!("{planning:?}").contains("credential value"));
+	}
+
+	#[test]
 	fn bundled_openai_and_openrouter_discovery_projectors_construct() {
 		let catalog = Catalog::embedded();
 		for provider in ["openai", "openrouter"] {
@@ -2938,6 +3103,111 @@ mod tests {
 			"https://example.azure.com/openai/responses?trace=1&api-version=2024-10-21",
 		);
 	}
+
+	#[test]
+	fn mantle_region_expands_the_route_and_preserves_the_wire_model() {
+		let catalog = Catalog::embedded();
+		let model = catalog
+			.model(omp_catalog::ModelKey::from_ref("bedrock-mantle/openai.gpt-5.6-sol"))
+			.expect("Mantle model");
+		let route = catalog
+			.route(omp_catalog::RouteId::from_ref("bedrock-mantle/primary"))
+			.expect("Mantle route");
+		let provider = catalog.provider(&route.provider).expect("Mantle provider");
+		let sigv4 = provider
+			.auth
+			.iter()
+			.filter_map(|id| catalog.auth_spec(id))
+			.find(|auth| auth.kind == AuthSpecKind::AwsSigv4)
+			.expect("Mantle SigV4 alternative");
+		assert_eq!(
+			catalog_auth_for_route(route, sigv4)
+				.signing
+				.expect("Mantle signing contract")
+				.service
+				.as_str(),
+			"bedrock-mantle",
+		);
+		let wire_model = model
+			.wire_ids
+			.iter()
+			.find(|(route_id, _)| route_id == &route.id)
+			.map(|(_, model)| model.clone())
+			.expect("Mantle wire model");
+		let target = WireTarget {
+			route: route.id.clone(),
+			codec: route.codec.clone(),
+			endpoint: route.endpoint.clone(),
+			wire_model,
+		};
+		let effective =
+			mantle_regional_route(route, &sf!("eu-west-2")).expect("valid regional route");
+		let target =
+			mantle_effective_target(&effective, Some(&target)).expect("model target remains present");
+
+		assert_eq!(
+			effective.endpoint.base_url.as_str(),
+			"https://bedrock-mantle.eu-west-2.api.aws/openai/v1",
+		);
+		assert_eq!(effective.endpoint.region.as_deref(), Some("eu-west-2"));
+		assert_eq!(
+			effective.trust_domain.origin.as_str(),
+			"https://bedrock-mantle.eu-west-2.api.aws",
+		);
+		assert_eq!(target.endpoint, effective.endpoint);
+		assert_eq!(target.wire_model.as_str(), "openai.gpt-5.6-sol");
+	}
+
+	#[test]
+	fn mantle_sigv4_signs_the_final_responses_request_with_its_service_scope() {
+		let catalog = Catalog::embedded();
+		let route = catalog
+			.route(omp_catalog::RouteId::from_ref("bedrock-mantle/primary"))
+			.expect("Mantle route");
+		let provider = catalog.provider(&route.provider).expect("Mantle provider");
+		let catalog_auth = provider
+			.auth
+			.iter()
+			.filter_map(|id| catalog.auth_spec(id))
+			.find(|auth| auth.kind == AuthSpecKind::AwsSigv4)
+			.expect("Mantle SigV4 alternative");
+		let catalog_auth = catalog_auth_for_route(route, catalog_auth);
+		let runtime_auth = AuthSpec::from_catalog(&catalog_auth, None, Some(sf!("us-west-2")))
+			.expect("Mantle runtime auth");
+		let lease = CredentialLease::aws_sigv4(
+			LeaseMeta {
+				account:    AccountId::new("aws"),
+				principal:  PrincipalId::new("bedrock-mantle"),
+				generation: 1,
+				expires_at: None,
+			},
+			SecretString::from("AKIDEXAMPLE"),
+			SecretString::from("secret"),
+			Some(SecretString::from("session")),
+		);
+		let credentials = lease
+			.prepare(&runtime_auth, SystemTime::UNIX_EPOCH)
+			.expect("prepare Mantle credentials");
+		let mut request = Request::builder()
+			.method("POST")
+			.uri("https://bedrock-mantle.us-west-2.api.aws/openai/v1/responses")
+			.body(Bytes::from_static(br#"{"model":"openai.gpt-5.6-sol"}"#))
+			.expect("Mantle request");
+
+		credentials
+			.finalize_buffered(&mut request)
+			.expect("sign Mantle request");
+
+		let authorization = request
+			.headers()
+			.get(AUTHORIZATION)
+			.expect("authorization")
+			.to_str()
+			.expect("ASCII authorization");
+		assert!(authorization.contains("/us-west-2/bedrock-mantle/aws4_request"));
+		assert_eq!(request.headers()["x-amz-security-token"], "session");
+	}
+
 	#[test]
 	fn static_and_runtime_bedrock_routes_inherit_provider_guardrails() {
 		let catalog = Catalog::embedded();
@@ -3076,6 +3346,7 @@ mod tests {
 				headers: Box::new([]),
 				codec,
 				azure_endpoint: None,
+				regional_route: None,
 				transport_timeout: Duration::from_secs(30),
 			},
 			call,

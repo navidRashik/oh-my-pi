@@ -3143,19 +3143,25 @@ fn compile_providers(
 	let mut provider_policies = BTreeMap::new();
 	for (provider_key, source) in providers {
 		let provider_id = ProviderId::new(provider_key.clone());
-		let auth = compile_auth(&source.auth, oauth_ids)?;
+		let auth = compile_auth(&source.auth, oauth_ids, None)?;
 		let auth_id = auth.id.clone();
 		auth_by_id.entry(auth_id.clone()).or_insert(auth);
 		let mut provider_auth_ids = Vec::with_capacity(3);
+		let signing_service = (source
+			.codec
+			.as_ref()
+			.is_some_and(|codec| codec.as_str() == "bedrock-mantle")
+			&& matches!(source.oauth_auth.as_ref(), Some(SourceAuth::AwsSigV4)))
+		.then_some("bedrock-mantle");
 		let oauth_auth = source
 			.oauth_auth
 			.as_ref()
-			.map(|auth| compile_auth(auth, oauth_ids))
+			.map(|auth| compile_auth(auth, oauth_ids, signing_service))
 			.transpose()?;
 		let login_auth = if let Some(flow) = source.oauth_flow.as_ref()
 			&& !matches!(&source.auth, SourceAuth::Oauth { flow: request_flow } if request_flow == flow)
 		{
-			Some(compile_auth(&SourceAuth::Oauth { flow: flow.clone() }, oauth_ids)?)
+			Some(compile_auth(&SourceAuth::Oauth { flow: flow.clone() }, oauth_ids, None)?)
 		} else {
 			None
 		};
@@ -5532,8 +5538,12 @@ impl Default for SourceCost {
 fn compile_auth(
 	source: &SourceAuth,
 	oauth_ids: &BTreeMap<Str, OAuthSpecId>,
+	signing_service: Option<&str>,
 ) -> Result<AuthSpec, CompileError> {
-	let canonical = serde_json::to_vec(source)?;
+	let canonical = match signing_service {
+		Some(service) => serde_json::to_vec(&(source, service))?,
+		None => serde_json::to_vec(source)?,
+	};
 	let id = AuthSpecId::new(content_id("auth", &canonical));
 	let mut credential_sources = Vec::new();
 	let (kind, header_name, query_parameter, prefix, sealed_body, account_scope, oauth, signing) =
@@ -5644,7 +5654,10 @@ fn compile_auth(
 					None,
 					AccountScope::Region,
 					None,
-					Some(SigV4Spec { service: sf!("bedrock"), region: RegionSource::RouteEndpoint }),
+					Some(SigV4Spec {
+						service: signing_service.map_or_else(|| sf!("bedrock"), Str::new),
+						region:  RegionSource::RouteEndpoint,
+					}),
 				)
 			},
 			SourceAuth::GoogleAdc { api_key_env, project_env, location_env, credentials_env } => {
@@ -6621,6 +6634,40 @@ facets = ["chat"]
 			sf!("OMP_AWS_BEARER_TOKEN_BEDROCK"),
 			sf!("AWS_BEARER_TOKEN_BEDROCK"),
 		]);
+
+		let mantle = provider_auth("bedrock-mantle");
+		let mantle_bearer = mantle
+			.iter()
+			.find(|auth| auth.kind == AuthSpecKind::Bearer)
+			.and_then(|auth| auth.credential_sources.first())
+			.and_then(|source| match source {
+				CredentialSourceSpec::Environment { ordered_names } => Some(ordered_names),
+				_ => None,
+			})
+			.expect("Bedrock Mantle bearer source");
+		assert_eq!(mantle_bearer.as_ref(), &[
+			sf!("OMP_AWS_BEARER_TOKEN_BEDROCK"),
+			sf!("AWS_BEARER_TOKEN_BEDROCK"),
+		]);
+		let mantle_sigv4 = mantle
+			.iter()
+			.find(|auth| auth.kind == AuthSpecKind::AwsSigv4)
+			.and_then(|auth| auth.signing.as_ref())
+			.expect("Bedrock Mantle SigV4 fallback");
+		assert_eq!(mantle_sigv4.service.as_str(), "bedrock-mantle");
+		assert!(matches!(mantle_sigv4.region, RegionSource::RouteEndpoint));
+
+		let mantle_route = compiled
+			.routes
+			.iter()
+			.find(|route| route.id.as_str() == "bedrock-mantle/primary")
+			.expect("Bedrock Mantle primary route");
+		assert_eq!(mantle_route.codec.as_str(), "bedrock-mantle");
+		assert_eq!(mantle_route.codec_profile, CodecProfile::Standard);
+		assert_eq!(
+			mantle_route.endpoint.base_url.as_str(),
+			"https://bedrock-mantle.{region}.api.aws/openai/v1",
+		);
 	}
 
 	#[test]

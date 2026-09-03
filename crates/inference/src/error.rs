@@ -11,6 +11,7 @@ use omp_core::Str;
 
 use crate::{
 	answer::{AnswerKind, SearchFailureKind, SearchProviderFailure},
+	auth::AwsCredentialError,
 	catalog::{OperationKind, ProviderId, RouteId},
 	id::RequestId,
 	operation::{MediaOperationError, discovery::CatalogDiscoveryProjectorError},
@@ -480,10 +481,11 @@ impl ErrorDetail {
 /// remains cheap to return.
 #[derive(Clone)]
 struct ErrorEvidence {
-	receipt:          ExecutionReceipt,
-	detail:           Option<ErrorDetail>,
-	media_source:     Option<MediaOperationError>,
-	projector_source: Option<CatalogDiscoveryProjectorError>,
+	receipt:             ExecutionReceipt,
+	detail:              Option<ErrorDetail>,
+	media_source:        Option<MediaOperationError>,
+	projector_source:    Option<CatalogDiscoveryProjectorError>,
+	aws_registry_source: Option<AwsCredentialError>,
 }
 
 /// Concrete, cloneable, secret-free inference error.
@@ -574,6 +576,7 @@ impl Error {
 				detail: None,
 				media_source: None,
 				projector_source: None,
+				aws_registry_source: None,
 			}),
 		}
 	}
@@ -674,6 +677,12 @@ impl Error {
 		self
 	}
 
+	/// Attaches the typed AWS registry availability failure.
+	pub(crate) fn aws_registry_source(mut self, source: AwsCredentialError) -> Self {
+		self.evidence.aws_registry_source = Some(source);
+		self
+	}
+
 	/// Constructs a terminal planning error with typed evidence.
 	pub fn planning(kind: ErrorKind, detail: ErrorDetail, receipt: ExecutionReceipt) -> Self {
 		Self::new(kind, ErrorPhase::Planning, RetryAction::Never, receipt).detail(detail)
@@ -715,6 +724,9 @@ impl Display for Error {
 impl error::Error for Error {
 	fn source(&self) -> Option<&(dyn error::Error + 'static)> {
 		if let Some(source) = self.evidence.projector_source.as_ref() {
+			return Some(source);
+		}
+		if let Some(source) = self.evidence.aws_registry_source.as_ref() {
 			return Some(source);
 		}
 		self
