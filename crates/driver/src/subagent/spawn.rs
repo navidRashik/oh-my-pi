@@ -381,6 +381,12 @@ pub enum SpawnError {
 	/// The standard jobs component is absent.
 	#[error("parent session has no jobs component")]
 	MissingJobs,
+	/// The child controller disappeared while its host was rebinding transport.
+	#[error("child session `{id}` is no longer live")]
+	MissingLiveEndpoint {
+		/// Stable child session identity.
+		id: Str,
+	},
 	/// The selected agent is disabled by child policy.
 	#[error("subagent `{agent}` is disabled by policy")]
 	DisabledAgent {
@@ -671,6 +677,7 @@ struct PreparedChild {
 	cancel:       BackgroundToolCancellation,
 	context:      Str,
 	child:        ChildRequest,
+	parent:       Str,
 	id:           Str,
 	agent:        Str,
 	session_path: PathBuf,
@@ -809,6 +816,7 @@ fn prepare_child(
 		cancel: request.cancel,
 		context: Str::new(request.context),
 		child: request.child,
+		parent: Str::new(request.owner),
 		id,
 		agent,
 		session_path,
@@ -858,6 +866,7 @@ async fn run_child(prepared: PreparedChild) -> Result<ChildExecution, SpawnError
 				.name
 				.clone()
 				.or_else(|| Some(prepared.id.clone())),
+			parent_session: Some(prepared.parent.clone()),
 			model_override: true,
 			output_schema: prepared.child.output_schema.clone(),
 			schema_mode: prepared.child.schema_mode,
@@ -1664,10 +1673,13 @@ mod tests {
 		let (up, _) = flume::unbounded();
 		let register = |id: &'static str| {
 			registry.register(Str::new_static(id), crate::sessions::KernelHandle {
-				id:       crate::sessions::SessionId::new(Str::new_static(id)),
-				name:     Str::new_static(id),
-				up:       up.clone(),
-				snapshot: Arc::new(parking_lot::RwLock::new(session.dom().snapshot())),
+				id:        crate::sessions::SessionId::new(Str::new_static(id)),
+				name:      Str::new_static(id),
+				up:        up.clone(),
+				snapshot:  Arc::new(parking_lot::RwLock::new(session.dom().snapshot())),
+				topology:  omp_agent::SessionTopology::main(Str::new_static(id)),
+				relay:     crate::sessions::IrcRelayPolicy::default(),
+				autoreply: None,
 			});
 		};
 		register("kept");

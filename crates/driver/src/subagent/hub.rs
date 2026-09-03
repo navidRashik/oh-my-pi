@@ -10,10 +10,10 @@ use std::{
 };
 
 use omp_agent::{
-	CallControl, EnvEvent, JobBoard, JobSettlement, Received, SessionAuthority, SessionEndpoint,
-	SessionTool, SessionToolCx, SessionToolFuture, Up,
+	AutoreplyRequest, CallControl, EnvEvent, JobBoard, JobSettlement, Received, SessionAuthority,
+	SessionEndpoint, SessionRole, SessionTool, SessionToolCx, SessionToolFuture, Up,
 };
-use omp_core::{EnvPath, Str, sf};
+use omp_core::{EnvPath, Str, Ulid, sf};
 use omp_dom::{Handle, KnownTag, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_env::{EnvClient, ProcessAttachmentEvent};
 use omp_journal::data::{
@@ -61,7 +61,18 @@ impl SessionHub {
 		message: Str,
 		reply_to: Option<Str>,
 	) -> Result<Response, omp_agent::SessionToolError> {
-		send_to(authority, from, to, message, reply_to)
+		send_to(authority, from, to, message, reply_to, false)
+	}
+
+	/// Sends one peer message whose recipient owes a threaded reply.
+	pub fn send_expecting_reply(
+		authority: &dyn SessionAuthority,
+		from: &str,
+		to: &str,
+		message: Str,
+		reply_to: Option<Str>,
+	) -> Result<Response, omp_agent::SessionToolError> {
+		send_to(authority, from, to, message, reply_to, true)
 	}
 
 	/// Reads or drains the caller's journal-backed steering inbox.
@@ -126,9 +137,7 @@ impl SessionTool for HubSessionTool {
 						Err(error) => Err(fault_text(error)),
 					}
 				},
-				HubOp::Send => {
-					send(cx.authority, self.caller_id.as_str(), &params).map_err(fault_text)
-				},
+				HubOp::Send => send(cx.authority, self.caller_id.as_str(), &params).map_err(fault_text),
 				HubOp::Inbox => inbox(cx.session, params.peek).map_err(fault_text),
 				HubOp::Wait => wait(cx.session, cx.jobs, cx.control, &self.env, &params)
 					.await
@@ -202,7 +211,7 @@ fn send(
 		.ok_or_else(|| omp_agent::SessionToolError::Rejected {
 			message: Str::new_static("hub send requires `message`"),
 		})?;
-	send_to(authority, caller_id, target, message, params.reply_to.clone())
+	send_to(authority, caller_id, target, message, params.reply_to.clone(), params.await_reply)
 }
 
 fn send_to(
@@ -211,29 +220,35 @@ fn send_to(
 	target: &str,
 	message: Str,
 	reply_to: Option<Str>,
+	expects_reply: bool,
 ) -> Result<Response, omp_agent::SessionToolError> {
-	let from = authority.lookup(caller_id).ok_or_else(|| {
-		omp_agent::SessionToolError::Rejected {
+	let from = authority
+		.lookup(caller_id)
+		.ok_or_else(|| omp_agent::SessionToolError::Rejected {
 			message: Str::new_static("calling session is not live"),
-		}
-	})?;
+		})?;
 	let delivered = if target == "all" {
-		authority
-			.list()
+		let endpoints = authority.list();
+		let suppress_relay = endpoints
+			.iter()
+			.any(|endpoint| endpoint.topology.role == SessionRole::Main);
+		endpoints
 			.into_iter()
 			.filter(|endpoint| {
-				deliver_peer(
+				deliver_request(
+					authority,
 					endpoint,
 					&from,
 					message.clone(),
 					reply_to.clone(),
-					unix_timestamp_ms(),
+					expects_reply,
+					suppress_relay,
 				)
 			})
 			.count()
 	} else {
 		usize::from(authority.lookup(target).is_some_and(|endpoint| {
-			deliver_peer(&endpoint, &from, message, reply_to, unix_timestamp_ms())
+			deliver_request(authority, &endpoint, &from, message, reply_to, expects_reply, false)
 		}))
 	};
 	if delivered == 0 {
@@ -247,31 +262,89 @@ fn send_to(
 	})
 }
 
-fn deliver_peer(
+fn deliver_request(
+	authority: &dyn SessionAuthority,
+	target: &SessionEndpoint,
+	from: &SessionEndpoint,
+	body: Str,
+	reply_to: Option<Str>,
+	expects_reply: bool,
+	suppress_relay: bool,
+) -> bool {
+	let request = expects_reply.then(|| AutoreplyRequest {
+		message_id: Str::new(Ulid::generate().to_string()),
+		from_id:    from.id.clone(),
+		from:       from.name.clone(),
+		to_id:      target.id.clone(),
+		to:         target.name.clone(),
+		body:       body.clone(),
+		reply_to:   reply_to.clone(),
+	});
+	if !deliver_authenticated_peer(
+		authority,
+		target,
+		from,
+		body,
+		reply_to,
+		unix_timestamp_ms(),
+		suppress_relay,
+	) {
+		return false;
+	}
+	if let (Some(request), Some(producer)) = (request, target.autoreply.as_ref()) {
+		let _ = producer.start(request);
+	}
+	true
+}
+
+pub(crate) fn deliver_authenticated_peer(
+	authority: &dyn SessionAuthority,
 	target: &SessionEndpoint,
 	from: &SessionEndpoint,
 	body: Str,
 	reply_to: Option<Str>,
 	timestamp_ms: u64,
+	suppress_relay: bool,
 ) -> bool {
-	let payload = IrcTraffic {
+	let incoming = IrcTraffic {
 		direction: IrcDirection::Incoming,
 		from: Some(from.name.clone()),
 		to: Some(target.name.clone()),
 		body: body.clone(),
-		reply_to,
+		reply_to: reply_to.clone(),
 		pool: None,
 		mode: None,
 		timestamp_ms,
 	};
-	// The mailbox is FIFO per sender. The display-only observation therefore
-	// reaches the controller before the ordinary peer body, while `Up::Peer`
-	// remains the sole model-delivery path.
-	target
+	// The mailbox is FIFO per sender. The typed observation reaches the
+	// recipient before the ordinary model input; the main relay below is
+	// display-only and never receives `Up::Peer`.
+	if target
 		.up
-		.send(Up::Env(EnvEvent::IrcTraffic { payload: Arc::new(payload) }))
-		.is_ok()
-		&& target.up.send(Up::Peer(body)).is_ok()
+		.send(Up::Env(EnvEvent::IrcTraffic { payload: Arc::new(incoming) }))
+		.is_err()
+		|| target.up.send(Up::Peer(body.clone())).is_err()
+	{
+		return false;
+	}
+	if !suppress_relay && let Some(main) = authority.relay_target(from, target) {
+		let relay = IrcTraffic {
+			direction: IrcDirection::Relay,
+			from: Some(from.name.clone()),
+			to: Some(target.name.clone()),
+			body,
+			reply_to,
+			pool: None,
+			mode: None,
+			timestamp_ms,
+		};
+		// Observation failure is deliberately isolated from successful peer
+		// delivery. A disconnected main never makes child traffic fail.
+		let _ = main
+			.up
+			.send(Up::Env(EnvEvent::IrcTraffic { payload: Arc::new(relay) }));
+	}
+	true
 }
 
 fn unix_timestamp_ms() -> u64 {

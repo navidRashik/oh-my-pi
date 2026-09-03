@@ -71,6 +71,8 @@ pub struct Skill {
 	/// Loaded and readable but omitted from the `<skills>` listing
 	/// (frontmatter `hide` / `disable-model-invocation`).
 	pub hidden:      bool,
+	/// Skill instructions after frontmatter, retained for `/skill:<name>`.
+	pub body:        Str,
 }
 
 /// Non-fatal discovery diagnostic.
@@ -228,6 +230,45 @@ impl ActiveSkills {
 				serde_json::json!({ "name": skill.name.as_str(), "description": skill.description.as_str() })
 			})
 			.collect()
+	}
+
+	/// Builds the exact model-facing prompt for `/skill:<name> [args]`.
+	///
+	/// The canonical declaration path is retained as the source identity and
+	/// the skill directory is embedded so relative assets resolve correctly.
+	#[must_use]
+	pub fn prompt(&self, name: &str, args: &[Str]) -> Option<omp_journal::data::SkillPrompt> {
+		let skill = self.get(name)?;
+		let joined = args.join(" ");
+		let args = joined.trim();
+		let body = skill.body.trim();
+		let mut prompt = String::new();
+		use std::fmt::Write as _;
+		let _ = write!(
+			prompt,
+			"[IMPORTANT: User invoked the \"{}\" skill; follow its instructions. Full skill \
+			 below.]\n\n{}\n\n---\n\n[Skill directory: {}]\nResolve relative paths in this skill \
+			 (e.g. `scripts/foo.js`, `templates/config.yaml`) against this absolute directory; read \
+			 referenced assets and templates; run scripts with the terminal tool when skill \
+			 instructions call for it.",
+			skill.name,
+			body,
+			skill.base_dir.display(),
+		);
+		if !args.is_empty() {
+			let _ = write!(prompt, "\nUser: {args}");
+		}
+		Some(omp_journal::data::SkillPrompt {
+			name:        skill.name.clone(),
+			args:        (!args.is_empty()).then(|| Str::new(args)),
+			path:        Str::new(skill.path.to_string_lossy()),
+			prompt_body: Str::new(prompt.trim()),
+			line_count:  if body.is_empty() {
+				0
+			} else {
+				body.lines().count() as u64
+			},
+		})
 	}
 
 	/// The `skill://` resolver over this snapshot, installed through
@@ -504,6 +545,7 @@ fn load_skill(
 		.parent()
 		.map(Path::to_path_buf)
 		.unwrap_or_else(|| source.root.clone());
+	let body = super::rules::split_frontmatter(&text).1.trim();
 	Some(Skill {
 		name: Str::new(name),
 		description,
@@ -512,6 +554,7 @@ fn load_skill(
 		provider: source.provider.clone(),
 		level: source.level,
 		hidden: header.hide || header.disable_model_invocation,
+		body: Str::new(body),
 	})
 }
 
@@ -872,6 +915,35 @@ mod tests {
 		assert_eq!(active.get("review").unwrap().level, SkillLevel::Project);
 		assert_eq!(active.warnings.len(), 1, "{:?}", active.warnings);
 		assert!(active.warnings[0].message.contains("name collision"));
+	}
+
+	#[test]
+	fn skill_command_prompt_preserves_source_args_and_exact_model_body() {
+		let tree = tempfile::tempdir().unwrap();
+		let root = tree.path().join("skills");
+		let path =
+			write_skill(&root, "review", "description: review code", "First line.\nSecond line.");
+		let active =
+			discover(&[source(&root, "native", SkillLevel::Project)], &SkillPolicy::default());
+		let prompt = active
+			.prompt("review", &[Str::new_static("src/lib.rs"), Str::new_static("carefully")])
+			.expect("skill prompt");
+		assert_eq!(prompt.name, "review");
+		assert_eq!(prompt.path.as_str(), fs::canonicalize(path).unwrap().to_string_lossy().as_ref());
+		assert_eq!(prompt.args.as_deref(), Some("src/lib.rs carefully"));
+		assert_eq!(prompt.line_count, 2);
+		assert_eq!(
+			prompt.prompt_body,
+			format!(
+				"[IMPORTANT: User invoked the \"review\" skill; follow its instructions. Full skill \
+				 below.]\n\nFirst line.\nSecond line.\n\n---\n\n[Skill directory: {}]\nResolve \
+				 relative paths in this skill (e.g. `scripts/foo.js`, `templates/config.yaml`) \
+				 against this absolute directory; read referenced assets and templates; run scripts \
+				 with the terminal tool when skill instructions call for it.\nUser: src/lib.rs \
+				 carefully",
+				fs::canonicalize(root.join("review")).unwrap().display()
+			)
+		);
 	}
 
 	#[test]

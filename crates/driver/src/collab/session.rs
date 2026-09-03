@@ -134,6 +134,8 @@ struct Request {
 pub struct CollabCommandHandle {
 	commands:         flume::Sender<Request>,
 	presence:         watch::Receiver<Option<PresenceFacts>>,
+	state:            watch::Receiver<Option<SessionStateUpdate>>,
+	host_state:       watch::Sender<SessionStateUpdate>,
 	replica:          watch::Receiver<Option<Snapshot>>,
 	replica_events:   flume::Receiver<Event>,
 	remote_mutations: flume::Receiver<AuthorizedMutation>,
@@ -167,6 +169,34 @@ impl CollabCommandHandle {
 	#[must_use]
 	pub fn subscribe_presence(&self) -> watch::Receiver<Option<PresenceFacts>> {
 		self.presence.clone()
+	}
+
+	/// Returns the latest authoritative session state received from the host.
+	#[must_use]
+	pub fn state(&self) -> Option<SessionStateUpdate> {
+		self.state.borrow().clone()
+	}
+
+	/// Subscribes to authoritative session-state changes.
+	#[must_use]
+	pub fn subscribe_state(&self) -> watch::Receiver<Option<SessionStateUpdate>> {
+		self.state.clone()
+	}
+
+	/// Replaces the host's locally projected session state.
+	///
+	/// Presence membership is owned by the relay task and is merged into this
+	/// projection before it is published locally or sent to guests.
+	pub fn publish_state(&self, state: SessionStateUpdate) {
+		if *self.host_state.borrow() != state {
+			self.host_state.send_replace(state);
+		}
+	}
+
+	/// Returns the host's latest locally projected session state.
+	#[must_use]
+	pub fn published_state(&self) -> SessionStateUpdate {
+		self.host_state.borrow().clone()
 	}
 
 	/// Returns the latest complete guest replica snapshot.
@@ -228,6 +258,8 @@ impl ActiveSession {
 pub struct CollabSessionAuthority {
 	commands:         flume::Receiver<Request>,
 	presence:         watch::Sender<Option<PresenceFacts>>,
+	state:            watch::Sender<Option<SessionStateUpdate>>,
+	host_state:       watch::Receiver<SessionStateUpdate>,
 	replica:          watch::Sender<Option<Snapshot>>,
 	replica_events:   flume::Sender<Event>,
 	remote_mutations: flume::Sender<AuthorizedMutation>,
@@ -239,14 +271,26 @@ impl CollabSessionAuthority {
 	pub fn new() -> (Self, CollabCommandHandle) {
 		let (commands, requests) = flume::bounded(16);
 		let (presence, observed) = watch::channel(None);
+		let (state, state_observed) = watch::channel(None);
+		let (host_state, host_state_observed) = watch::channel(SessionStateUpdate::default());
 		let (replica, replica_observed) = watch::channel(None);
 		let (replica_events, observed_events) = flume::unbounded();
 		let (remote_mutations, observed_mutations) = flume::unbounded();
 		(
-			Self { commands: requests, presence, replica, replica_events, remote_mutations },
+			Self {
+				commands: requests,
+				presence,
+				state,
+				host_state: host_state_observed,
+				replica,
+				replica_events,
+				remote_mutations,
+			},
 			CollabCommandHandle {
 				commands,
 				presence: observed,
+				state: state_observed,
+				host_state,
 				replica: replica_observed,
 				replica_events: observed_events,
 				remote_mutations: observed_mutations,
@@ -263,11 +307,14 @@ impl CollabSessionAuthority {
 						previous.close().await;
 					}
 					self.replica.send_replace(None);
+					self.state.send_replace(None);
 					match start_host(
 						relay,
 						snapshot,
 						events,
 						self.presence.clone(),
+						self.state.clone(),
+						self.host_state.clone(),
 						self.remote_mutations.clone(),
 					)
 					.await
@@ -277,7 +324,11 @@ impl CollabSessionAuthority {
 							active = Some(session);
 							Ok(result)
 						},
-						Err(error) => Err(error),
+						Err(error) => {
+							self.presence.send_replace(None);
+							self.state.send_replace(None);
+							Err(error)
+						},
 					}
 				},
 				CollabOwnerCommand::Join { link, display_name } => {
@@ -285,10 +336,12 @@ impl CollabSessionAuthority {
 						previous.close().await;
 					}
 					self.replica.send_replace(None);
+					self.state.send_replace(None);
 					match start_guest(
 						link,
 						display_name,
 						self.presence.clone(),
+						self.state.clone(),
 						self.replica.clone(),
 						self.replica_events.clone(),
 					)
@@ -299,7 +352,11 @@ impl CollabSessionAuthority {
 							active = Some(session);
 							Ok(result)
 						},
-						Err(error) => Err(error),
+						Err(error) => {
+							self.presence.send_replace(None);
+							self.state.send_replace(None);
+							Err(error)
+						},
 					}
 				},
 				CollabOwnerCommand::Prompt { text, images } => {
@@ -328,6 +385,7 @@ impl CollabSessionAuthority {
 					Some(session) => {
 						session.close().await;
 						self.presence.send_replace(None);
+						self.state.send_replace(None);
 						self.replica.send_replace(None);
 						Ok(disconnected_result())
 					},
@@ -393,6 +451,8 @@ async fn start_host(
 	snapshot: Snapshot,
 	events: flume::Receiver<Event>,
 	presence_tx: watch::Sender<Option<PresenceFacts>>,
+	state_tx: watch::Sender<Option<SessionStateUpdate>>,
+	mut host_state: watch::Receiver<SessionStateUpdate>,
 	remote_mutations: flume::Sender<AuthorizedMutation>,
 ) -> Result<ActiveSession, CollabCommandFault> {
 	let room = HostedRoom::generate(relay_endpoint)?;
@@ -402,6 +462,7 @@ async fn start_host(
 	presence_tx.send_replace(Some(PresenceFacts::host(ConnectionState::Connecting, 0)));
 	relay.connect().await?;
 	presence_tx.send_replace(Some(PresenceFacts::host(ConnectionState::Connected, 0)));
+	state_tx.send_replace(Some(session_state(&BTreeMap::new(), &host_state.borrow())));
 	let cancel = CancellationToken::new();
 	let task_cancel = cancel.clone();
 	let editor_link = Some(Str::new(room.full.compact()));
@@ -415,11 +476,13 @@ async fn start_host(
 			enum Wake {
 				Cancel,
 				Event(Result<Event, flume::RecvError>),
+				State(Result<(), watch::error::RecvError>),
 				Inbound(Result<Option<RelayInbound>, omp_collab::relay::RelayError>),
 			}
 			let wake = tokio::select! {
 				() = task_cancel.cancelled() => Wake::Cancel,
 				event = events.recv_async() => Wake::Event(event),
+				state = host_state.changed() => Wake::State(state),
 				inbound = relay.receive() => Wake::Inbound(inbound),
 			};
 			match wake {
@@ -438,14 +501,26 @@ async fn start_host(
 					}
 				},
 				Wake::Event(Err(_)) => break,
+				Wake::State(Ok(())) => {
+					sequence = sequence.saturating_add(1);
+					let state = session_state(&peers, &host_state.borrow());
+					state_tx.send_replace(Some(state.clone()));
+					let frame = state_frame(sequence, state);
+					if relay.send(RelayRoute { peer_id: 0 }, &frame).await.is_err() {
+						break;
+					}
+				},
+				Wake::State(Err(_)) => break,
 				Wake::Inbound(Ok(Some(RelayInbound::PeerJoined(_)))) => {},
 				Wake::Inbound(Ok(Some(RelayInbound::PeerLeft(left)))) => {
 					peers.remove(&left.peer_id);
 					presence_tx
 						.send_replace(Some(PresenceFacts::host(ConnectionState::Connected, peers.len())));
 					sequence = sequence.saturating_add(1);
-					let state = state_frame(sequence, &peers);
-					let _ = relay.send(RelayRoute { peer_id: 0 }, &state).await;
+					let state = session_state(&peers, &host_state.borrow());
+					state_tx.send_replace(Some(state.clone()));
+					let frame = state_frame(sequence, state);
+					let _ = relay.send(RelayRoute { peer_id: 0 }, &frame).await;
 				},
 				Wake::Inbound(Ok(Some(RelayInbound::Frame(routed)))) => {
 					let peer_id = routed.route.peer_id;
@@ -475,7 +550,7 @@ async fn start_host(
 								sequence,
 								read_only,
 								u32::try_from(chunk_count).unwrap_or(u32::MAX),
-								&peers,
+								session_state(&peers, &host_state.borrow()),
 							);
 							if relay.send(RelayRoute { peer_id }, &welcome).await.is_err() {
 								continue;
@@ -493,8 +568,10 @@ async fn start_host(
 								}
 							}
 							sequence = sequence.saturating_add(1);
-							let state = state_frame(sequence, &peers);
-							let _ = relay.send(RelayRoute { peer_id: 0 }, &state).await;
+							let state = session_state(&peers, &host_state.borrow());
+							state_tx.send_replace(Some(state.clone()));
+							let frame = state_frame(sequence, state);
+							let _ = relay.send(RelayRoute { peer_id: 0 }, &frame).await;
 						},
 						Some(payload) => {
 							let Some(peer) = peers.get(&peer_id) else {
@@ -532,6 +609,7 @@ async fn start_host(
 			}
 		}
 		presence_tx.send_replace(Some(PresenceFacts::host(ConnectionState::Disconnected, 0)));
+		state_tx.send_replace(None);
 		let _ = relay.close().await;
 	});
 	Ok(ActiveSession { cancel, task, presence, outbound: None, editor_link, viewer_link })
@@ -541,6 +619,7 @@ async fn start_guest(
 	link: CollabLink,
 	display_name: Str,
 	presence_tx: watch::Sender<Option<PresenceFacts>>,
+	state_tx: watch::Sender<Option<SessionStateUpdate>>,
 	replica_tx: watch::Sender<Option<Snapshot>>,
 	replica_events: flume::Sender<Event>,
 ) -> Result<ActiveSession, CollabCommandFault> {
@@ -610,12 +689,14 @@ async fn start_guest(
 					match routed.frame.payload {
 						Some(collab_frame::Payload::Welcome(welcome)) => {
 							snapshot_records.clear();
+							let participant_count = welcome
+								.initial_state
+								.as_ref()
+								.map_or(1, |state| state.participants.len().max(1));
+							state_tx.send_replace(welcome.initial_state.clone());
 							presence_tx.send_replace(Some(PresenceFacts::guest(
 								ConnectionState::Connecting,
-								welcome
-									.initial_state
-									.as_ref()
-									.map_or(1, |state| state.participants.len().max(1)),
+								participant_count,
 								welcome.read_only,
 							)));
 						},
@@ -679,9 +760,11 @@ async fn start_guest(
 							}
 						},
 						Some(collab_frame::Payload::State(state)) => {
+							let participant_count = state.participants.len().max(1);
+							state_tx.send_replace(Some(state));
 							presence_tx.send_replace(Some(PresenceFacts::guest(
 								ConnectionState::Connected,
-								state.participants.len().max(1),
+								participant_count,
 								read_only,
 							)));
 						},
@@ -720,6 +803,7 @@ async fn start_guest(
 			1,
 			read_only,
 		)));
+		state_tx.send_replace(None);
 		let _ = relay.close().await;
 	});
 	match tokio::time::timeout(INITIAL_HANDSHAKE_TIMEOUT, ready_rx.recv_async()).await {
@@ -785,28 +869,36 @@ fn welcome_frame(
 	sequence: u64,
 	read_only: bool,
 	total_entry_count: u32,
-	peers: &BTreeMap<u32, AuthenticatedPeer>,
+	state: SessionStateUpdate,
 ) -> CollabFrame {
 	Handshake::welcome(sequence, Welcome {
 		protocol_revision: PROTOCOL_REVISION,
-		header: Some(SessionHeader::default()),
-		initial_state: Some(session_state(peers)),
+		header: Some(SessionHeader {
+			session_id: state.session_name.clone(),
+			title: state.session_name.clone(),
+			host_cwd: state.host_cwd.clone(),
+			..SessionHeader::default()
+		}),
+		initial_state: Some(state),
 		initial_agents: Some(RegistrySnapshot::default()),
 		total_entry_count,
 		read_only,
 	})
 }
 
-fn state_frame(sequence: u64, peers: &BTreeMap<u32, AuthenticatedPeer>) -> CollabFrame {
+fn state_frame(sequence: u64, state: SessionStateUpdate) -> CollabFrame {
 	CollabFrame {
 		protocol_revision: PROTOCOL_REVISION,
 		sequence,
-		payload: Some(collab_frame::Payload::State(session_state(peers))),
+		payload: Some(collab_frame::Payload::State(state)),
 		..CollabFrame::default()
 	}
 }
 
-fn session_state(peers: &BTreeMap<u32, AuthenticatedPeer>) -> SessionStateUpdate {
+fn session_state(
+	peers: &BTreeMap<u32, AuthenticatedPeer>,
+	base: &SessionStateUpdate,
+) -> SessionStateUpdate {
 	let mut participants = Vec::with_capacity(peers.len() + 1);
 	participants.push(Participant {
 		display_name: "Host".to_owned(),
@@ -820,7 +912,7 @@ fn session_state(peers: &BTreeMap<u32, AuthenticatedPeer>) -> SessionStateUpdate
 		read_only: peer.read_only(),
 		peer_id,
 	}));
-	SessionStateUpdate { participants, ..SessionStateUpdate::default() }
+	SessionStateUpdate { participants, ..base.clone() }
 }
 
 fn snapshot_chunks(bytes: &[u8]) -> Vec<Bytes> {

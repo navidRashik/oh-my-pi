@@ -1,7 +1,5 @@
 //! Native structural search and rewrite renderers.
 
-use std::collections::HashSet;
-
 use omp_core::{Str, sf};
 use omp_tool::{CallOutcome, ToolIdentity, render::RenderFold};
 
@@ -156,16 +154,17 @@ fn render_ast_edit_live(state: &AstEditState) -> El {
 }
 
 fn render_ast_grep_payload(payload: &AstGrepPayload) -> El {
-	let file_count = payload
-		.matches
-		.iter()
-		.map(|matched| matched.path.as_str())
-		.collect::<HashSet<_>>()
-		.len();
 	view! {
 		<col gap=0>
 			<row gap=1>
-				<text bold fg=accent>{sf!("{} matches · {file_count} files", payload.total)}</text>
+				<text bold fg=accent>
+					{sf!(
+						"{} matches · {} files · {} searched",
+						payload.total,
+						payload.files_with_matches,
+						payload.files_searched
+					)}
+				</text>
 			</row>
 			<col gap=0 max-rows={AST_PREVIEW_ROWS} overflow="matches">
 				for (index, matched) in payload.matches.iter().enumerate() {
@@ -183,6 +182,25 @@ fn render_ast_grep_payload(payload: &AstGrepPayload) -> El {
 			}
 			for advisory in &payload.advisories {
 				<callout kind="warn">{&advisory.path}{": "}{&advisory.message}</callout>
+			}
+			if payload.advisories_total > payload.advisories.len() {
+				<callout kind="warn">
+					{sf!(
+						"{} additional advisories omitted",
+						payload.advisories_total - payload.advisories.len()
+					)}
+				</callout>
+			}
+			for error in &payload.parse_errors {
+				<callout kind="warn">{error}</callout>
+			}
+			if payload.parse_errors_total > payload.parse_errors.len() {
+				<callout kind="warn">
+					{sf!(
+						"{} additional parse issues omitted",
+						payload.parse_errors_total - payload.parse_errors.len()
+					)}
+				</callout>
 			}
 		</col>
 	}
@@ -262,7 +280,7 @@ pub(crate) fn gallery_fixtures(
 			streaming_args: r#"{"pat":"console.$METHOD($AR"#,
 			args:           r#"{"pat":"console.$METHOD($ARG)","path":"packages/tui/src/**/*.ts"}"#,
 			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"matches":[{"path":"packages/tui/src/runtime/logger.ts","line":38,"column":2,"end_line":38,"end_column":48,"text":"console.warn(\"slow render\", durationMs)","bindings":"$ARG=durationMs, $METHOD=warn"},{"path":"packages/tui/src/runtime/session.ts","line":91,"column":3,"end_line":91,"end_column":37,"text":"console.error(\"session failed\", error)","bindings":"$ARG=error, $METHOD=error"},{"path":"packages/tui/src/views/DebugPanel.ts","line":24,"column":4,"end_line":24,"end_column":35,"text":"console.log(\"state\", nextState)","bindings":"$ARG=nextState, $METHOD=log"}],"advisories":[],"total":3,"next_skip":null}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"matches":[{"path":"packages/tui/src/runtime/logger.ts","line":38,"column":2,"end_line":38,"end_column":48,"text":"console.warn(\"slow render\", durationMs)","bindings":"$ARG=durationMs, $METHOD=warn"},{"path":"packages/tui/src/runtime/session.ts","line":91,"column":3,"end_line":91,"end_column":37,"text":"console.error(\"session failed\", error)","bindings":"$ARG=error, $METHOD=error"},{"path":"packages/tui/src/views/DebugPanel.ts","line":24,"column":4,"end_line":24,"end_column":35,"text":"console.log(\"state\", nextState)","bindings":"$ARG=nextState, $METHOD=log"}],"advisories":[],"advisories_total":0,"parse_errors":[],"parse_errors_total":0,"total":3,"files_with_matches":3,"files_searched":17,"skip":0,"limit":50,"limit_reached":false,"next_skip":null}}"#,
 			error_outcome: br#"{"kind":"faulted","value":{"message":"pattern parse error: expected a complete call expression after `console.`"}}"#,
 		},
 		RendererGalleryFixture {
@@ -320,7 +338,7 @@ mod tests {
 	#[test]
 	fn ast_grep_multiline_match_preserves_body_cursor_advisory_and_escaping() {
 		let payload: AstGrepPayload = serde_json::from_str(
-			r#"{"matches":[{"path":"src/<tree>.rs","line":7,"column":1,"end_line":9,"end_column":2,"text":"if (ready) {\n  run(<node> & value);\n}","bindings":"$A=<node>&"}],"advisories":[{"path":"src/<bad>.rs","message":"cannot parse <syntax> & input"}],"total":19,"next_skip":12}"#,
+			r#"{"matches":[{"path":"src/<tree>.rs","line":7,"column":1,"end_line":9,"end_column":2,"text":"if (ready) {\n  run(<node> & value);\n}","bindings":"$A=<node>&"}],"advisories":[{"path":"src/<bad>.rs","message":"cannot parse <syntax> & input"}],"advisories_total":1,"parse_errors":[],"parse_errors_total":0,"total":19,"files_with_matches":4,"files_searched":12,"skip":11,"limit":1,"limit_reached":true,"next_skip":12}"#,
 		)
 		.unwrap();
 		let view = render_ast_grep_payload(&payload).to_tml();

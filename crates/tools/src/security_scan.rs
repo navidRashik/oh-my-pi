@@ -6,12 +6,13 @@ use async_stream::stream;
 use futures::Stream;
 use omp_core::{Str, sf};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DocEffects, Effects, Ev, IncomingParams,
-	ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DocEffects, Effects, Ev, ExecEffects,
+	IncomingParams, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 /// Security scan operation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -35,6 +36,20 @@ pub enum Action {
 	CloudStatus,
 	/// Import cloud findings.
 	CloudPull,
+	/// Import a SARIF 2.1.0 document into the project store.
+	ImportSarif,
+	/// Export a stored scan as SARIF 2.1.0.
+	ExportSarif,
+	/// Export a complete redacted scan bundle.
+	Export,
+	/// Compare finding lineage between two scans.
+	Lineage,
+	/// Create an isolated remediation worktree.
+	RemediationCreate,
+	/// Inspect a remediation worktree.
+	RemediationStatus,
+	/// Remove a remediation worktree.
+	RemediationCleanup,
 }
 
 /// Repository slice selected for a scan.
@@ -97,7 +112,7 @@ pub enum AllHistory {
 	All,
 }
 
-/// Full `security_scan@1` operation schema.
+/// Full `security_scan@2` operation schema.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
@@ -167,6 +182,24 @@ pub struct Params {
 	/// Cloud lookback in days, or `all`.
 	#[serde(default)]
 	pub lookback_days:          Option<LookbackDays>,
+	/// Workspace-relative SARIF input path.
+	#[serde(default)]
+	pub input_path:             Option<Str>,
+	/// Workspace-relative export path.
+	#[serde(default)]
+	pub output_path:            Option<Str>,
+	/// Earlier scan in a lineage comparison.
+	#[serde(default)]
+	pub before_scan_id:         Option<Str>,
+	/// Later scan in a lineage comparison.
+	#[serde(default)]
+	pub after_scan_id:          Option<Str>,
+	/// Findings assigned to a remediation workspace.
+	#[serde(default)]
+	pub finding_ids:            Option<Vec<Str>>,
+	/// Remediation workspace identifier.
+	#[serde(default)]
+	pub remediation_id:         Option<Str>,
 }
 
 /// Durable security operation result.
@@ -200,12 +233,25 @@ pub enum Fault {
 	/// Workspace security state could not be read or persisted.
 	#[error("security scan storage failed")]
 	Storage,
+	/// SARIF input is invalid or unsafe.
+	#[error("invalid or unsafe SARIF input")]
+	InvalidSarif,
+	/// The selected cloud credential is unavailable or does not match.
+	#[error("security scan authentication failed")]
+	Authentication,
+	/// The cloud service rejected or returned an invalid response.
+	#[error("security scan cloud request failed")]
+	Cloud,
 }
 
 /// Environment-owned security scan authority.
 pub trait SecurityScanControl: Clone + Send + Sync + 'static {
 	/// Executes one validated operation.
-	fn execute(&self, params: Params) -> impl Future<Output = Result<Payload, Fault>> + Send + '_;
+	fn execute(
+		&self,
+		params: Params,
+		cancellation: CancellationToken,
+	) -> impl Future<Output = Result<Payload, Fault>> + Send + '_;
 }
 
 /// Frozen security device binding.
@@ -214,14 +260,15 @@ pub struct SecurityScan<C> {
 	spec:    ToolSpec,
 }
 
-/// Returns the host-free `security_scan@1` device specification.
+/// Returns the host-free `security_scan@2` device specification.
 pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("security_scan"),
-		rev:             Rev { family: Str::default(), n: 1 },
+		rev:             Rev { family: Str::default(), n: 2 },
 		description:     sf!(
-			"Plan, run, inspect, cancel, and validate repository security scans; cloud operations \
-			 are available only when configured."
+			"Plan, run, inspect, cancel, validate, import, export, compare, and remediate repository \
+			 security scans. Cloud operations use one pinned credential and preserve redacted \
+			 lineage."
 		),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {
@@ -233,7 +280,7 @@ pub fn spec() -> ToolSpec {
 				read:        true,
 				write_globs: [sf!("**")].into_iter().collect::<Arc<[_]>>(),
 			}),
-			exec:      None,
+			exec:      Some(ExecEffects { commands: Arc::from([sf!("git")]), network: true }),
 			inference: None,
 			desktop:   None,
 			subagents: 0,
@@ -275,10 +322,22 @@ impl<C: SecurityScanControl> Tool for SecurityScan<C> {
 				yield commit_event(error);
 				return;
 			}
-			yield Ev::Done(ToolTerminal::Done {
-				result: self.control.execute(params).await,
-				useless: false,
-			});
+			let cancellation = CancellationToken::new();
+			let execution = self.control.execute(params, cancellation.clone());
+			tokio::pin!(execution);
+			tokio::select! {
+				result = &mut execution => {
+					yield Ev::Done(ToolTerminal::Done { result, useless: false });
+				},
+				interrupt = incoming.next_interrupt() => {
+					cancellation.cancel();
+					if let Ok(interrupt) = interrupt {
+						yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason });
+					} else {
+						yield Ev::Aborted(Abort::InputDropped);
+					}
+				},
+			}
 		}
 	}
 
@@ -340,6 +399,7 @@ mod tests {
 		fn execute(
 			&self,
 			params: Params,
+			_: CancellationToken,
 		) -> impl Future<Output = Result<Payload, Fault>> + Send + '_ {
 			self.0.lock().expect("recording").replace(params.action);
 			future::ready(Ok(Payload {
@@ -351,8 +411,10 @@ mod tests {
 	}
 
 	#[test]
-	fn schema_contains_the_complete_pi_operation_surface() {
-		let schema: Value = serde_json::from_slice(&spec().schema).expect("security schema");
+	fn schema_contains_complete_security_operation_surface() {
+		let spec = spec();
+		assert_eq!(spec.rev.n, 2);
+		let schema: Value = serde_json::from_slice(&spec.schema).expect("security schema");
 		assert_eq!(schema["additionalProperties"], false);
 		assert_eq!(schema["required"], serde_json::json!(["i", "action"]));
 		assert_eq!(
@@ -364,24 +426,30 @@ mod tests {
 				.collect::<std::collections::BTreeSet<_>>(),
 			[
 				"action",
+				"after_scan_id",
 				"archive_existing",
 				"base_revision",
+				"before_scan_id",
 				"cloud_configuration_id",
 				"credential_id",
 				"environment_id",
 				"exclude_paths",
 				"finding_id",
+				"finding_ids",
 				"head_revision",
 				"i",
 				"include_paths",
+				"input_path",
 				"knowledge_base_paths",
 				"lookback_days",
 				"notrunc",
 				"operation_id",
+				"output_path",
 				"output_root",
 				"plan_id",
 				"repository_id",
 				"repository_url",
+				"remediation_id",
 				"scan_id",
 				"target_kind",
 				"validation_evidence",
@@ -402,6 +470,13 @@ mod tests {
 			"cloud_start",
 			"cloud_status",
 			"cloud_pull",
+			"import_sarif",
+			"export_sarif",
+			"export",
+			"lineage",
+			"remediation_create",
+			"remediation_status",
+			"remediation_cleanup",
 		] {
 			assert!(serde_json::from_value::<Action>(serde_json::json!(action)).is_ok());
 		}

@@ -159,6 +159,8 @@ pub struct KernelOptions {
 	pub model_override:     bool,
 	/// Stable prompt projection overrides.
 	pub prompt:             PromptOverrides,
+	/// Skill discovery snapshot shared with an interactive command host.
+	pub discovered_skills:  Option<Arc<crate::discovery::skills::ActiveSkills>>,
 	/// Invocation extension policy.
 	pub extensions:         LaunchExtensionPolicy,
 	/// Optional provider routing constraint.
@@ -169,6 +171,8 @@ pub struct KernelOptions {
 	pub sessions:           Option<Arc<crate::sessions::SessionRegistry>>,
 	/// Human-readable routing name for this kernel.
 	pub session_name:       Option<Str>,
+	/// Authenticated parent session id or routing name for a child kernel.
+	pub parent_session:     Option<Str>,
 	/// Explicit restricted registry for specialized child compositions.
 	pub tool_registry:      Option<Arc<Registry>>,
 	/// Child-specific structured output schema installed on `yield@2`.
@@ -183,18 +187,23 @@ pub struct KernelOptions {
 	pub provider_session:   Option<Str>,
 }
 
-/// Removes a no-session journal regardless of which presentation adapter or
-/// error path drops the composed kernel.
+/// Removes a no-session journal and its private blob/local/temp namespace
+/// regardless of which presentation adapter or error path drops the composed
+/// kernel.
 pub struct EphemeralJournal {
-	path: PathBuf,
+	root: PathBuf,
 }
 
 impl Drop for EphemeralJournal {
 	fn drop(&mut self) {
-		if let Err(error) = fs::remove_file(&self.path)
+		if let Err(error) = fs::remove_dir_all(&self.root)
 			&& error.kind() != std::io::ErrorKind::NotFound
 		{
-			tracing::warn!(journal = %self.path.display(), %error, "ephemeral journal cleanup failed");
+			tracing::warn!(
+				session_root = %self.root.display(),
+				%error,
+				"ephemeral session cleanup failed"
+			);
 		}
 	}
 }
@@ -366,6 +375,81 @@ impl EnvToolExecutor {
 	}
 }
 
+const OUTCOME_REPLICATION_ATTEMPTS: usize = 3;
+
+#[derive(Debug, thiserror::Error)]
+enum OutcomeReplicationError {
+	#[error(transparent)]
+	Client(#[from] omp_env::ClientError),
+	#[error(transparent)]
+	Store(#[from] omp_journal::blob::Error),
+	#[error("environment outcome retrieval was interrupted")]
+	Interrupted,
+	#[error("environment outcome identity changed during replication")]
+	IdentityChanged,
+}
+
+fn resumable_blob_error(error: &omp_env::ClientError) -> bool {
+	matches!(
+		error,
+		omp_env::ClientError::TransportClosed
+			| omp_env::ClientError::StreamLost(_)
+			| omp_env::ClientError::IncompleteBlob
+	)
+}
+
+async fn replicate_outcome_blob(
+	client: &omp_env::EnvClient,
+	session_store: &omp_journal::blob::BlobStore,
+	invocation_id: &str,
+	expected_hash: Hash32,
+	expected_size: u64,
+	max_bytes: u64,
+	cancel: &tokio_util::sync::CancellationToken,
+) -> Result<omp_journal::blob::BlobRef, OutcomeReplicationError> {
+	let mut stage = session_store.begin_put()?;
+	let mut transfer = omp_env::ResumableBlobTransfer::new(expected_hash, expected_size, max_bytes)?;
+
+	for attempt in 0..OUTCOME_REPLICATION_ATTEMPTS {
+		let download = match client
+			.blob_get_for_invocation(invocation_id, transfer.request())
+			.await
+		{
+			Ok(download) => download,
+			Err(source)
+				if resumable_blob_error(&source) && attempt + 1 < OUTCOME_REPLICATION_ATTEMPTS =>
+			{
+				continue;
+			},
+			Err(source) => return Err(source.into()),
+		};
+		let received = tokio::select! {
+			biased;
+			() = cancel.cancelled() => return Err(OutcomeReplicationError::Interrupted),
+			received = transfer.receive(download, &mut stage) => received,
+		};
+		match received {
+			Ok(Some(_)) => break,
+			Ok(None) => {},
+			Err(source)
+				if resumable_blob_error(&source) && attempt + 1 < OUTCOME_REPLICATION_ATTEMPTS =>
+			{
+				continue;
+			},
+			Err(source) => return Err(source.into()),
+		}
+	}
+
+	if !transfer.is_complete() {
+		return Err(omp_env::ClientError::IncompleteBlob.into());
+	}
+	let reference = stage.finish()?;
+	if reference.hash != expected_hash || reference.size != expected_size {
+		return Err(OutcomeReplicationError::IdentityChanged);
+	}
+	Ok(reference)
+}
+
 /// The prompt an admission query becomes (pi `formatApprovalPrompt`): the
 /// exact command for `bash`, else the tool name and its committed arguments.
 fn admission_spec(
@@ -501,6 +585,16 @@ impl ExternalToolExecutor for EnvToolExecutor {
 		let approvals = self.approvals.clone();
 		let outcome_store = self.outcome_store.clone();
 		Box::pin(async_stream::stream! {
+			let client = match client.with_principal(request.session_id.clone(), "kernel") {
+				Ok(client) => client,
+				Err(source) => {
+					tracing::warn!(%source, call_id = %request.call_id, "environment tool principal is invalid");
+					yield ExternalDispatchEvent::Aborted(Abort::Interrupted {
+						reason: Str::new_static("environment tool principal is invalid"),
+					});
+					return;
+				},
+			};
 			let opened = client.invoke(omp_env::frame::InvokeTool {
 				invocation_id: request.call_id.to_string(),
 				name: request.identity.name.to_string(),
@@ -676,63 +770,26 @@ impl ExternalToolExecutor for EnvToolExecutor {
 							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
 							return;
 						}
-						let mut stage = match outcome_store.begin_put() {
-							Ok(stage) => stage,
-							Err(source) => {
-								tracing::warn!(%source, call_id = %request.call_id, "session outcome artifact staging failed");
-								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
-								return;
-							},
-						};
-						let download = match client
-							.blob_get(omp_env::blob_frame::GetRequest {
-								hash: details.hash.clone(),
-								offset: 0,
-								length: 0,
-							})
-							.await
+						let source_artifact = match replicate_outcome_blob(
+							&client,
+							&outcome_store,
+							request.call_id.as_str(),
+							expected_hash,
+							details.size,
+							max_bytes,
+							&request.cancellation,
+						)
+						.await
 						{
-							Ok(download) => download,
-							Err(source) => {
-								tracing::warn!(%source, call_id = %request.call_id, "environment outcome blob download failed");
-								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
-								return;
-							},
-						};
-						let transfer = tokio::select! {
-							biased;
-							() = request.cancellation.cancelled() => {
+							Ok(source_artifact) => source_artifact,
+							Err(OutcomeReplicationError::Interrupted) => {
 								yield ExternalDispatchEvent::Aborted(Abort::Interrupted {
 									reason: Str::new_static("environment outcome retrieval interrupted"),
 								});
 								return;
 							},
-							transfer = download.write_verified(
-								expected_hash,
-								details.size,
-								max_bytes,
-								&mut stage,
-							) => transfer,
-						};
-						if let Err(source) = transfer {
-							tracing::warn!(%source, call_id = %request.call_id, "environment outcome blob verification failed");
-							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
-							return;
-						}
-						let source_artifact = match stage.finish() {
-							Ok(source_artifact)
-								if source_artifact.hash == expected_hash
-									&& source_artifact.size == details.size =>
-							{
-								source_artifact
-							},
-							Ok(_) => {
-								tracing::warn!(call_id = %request.call_id, "session outcome artifact identity changed during adoption");
-								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
-								return;
-							},
 							Err(source) => {
-								tracing::warn!(%source, call_id = %request.call_id, "session outcome artifact adoption failed");
+								tracing::warn!(%source, call_id = %request.call_id, "environment outcome replication failed");
 								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
 								return;
 							},
@@ -1184,6 +1241,21 @@ impl ComposedInference {
 		}
 	}
 
+	/// Resolves the production target for a side-channel request without
+	/// losing an explicit provider constraint from the ordinary turn.
+	pub(crate) fn side_channel_target(&self) -> Option<Target> {
+		let Self::Production(inference) = self else {
+			return None;
+		};
+		let model = omp_catalog::ModelKey::from(inference.selected_model().as_str());
+		Some(match &inference.meta.target {
+			Target::Provider { provider, .. } => {
+				Target::Provider { provider: provider.clone(), model }
+			},
+			_ => Target::Model(model),
+		})
+	}
+
 	/// Borrows the production authentication and usage stack; `None` behind
 	/// a remote gateway, whose credentials live on the gateway host.
 	#[must_use]
@@ -1311,7 +1383,10 @@ pub async fn compose_kernel(
 		.clone()
 		.unwrap_or_else(|| Arc::new(crate::sessions::SessionRegistry::new()));
 	let disabled_extensions = crate::discovery::CL_DISABLED_EXTENSIONS.get(&ctx);
-	let skills = Arc::new(crate::discovery::skills::ActiveSkills::discover(&ctx, &project_root)?);
+	let skills = match &options.discovered_skills {
+		Some(skills) => Arc::clone(skills),
+		None => Arc::new(crate::discovery::skills::ActiveSkills::discover(&ctx, &project_root)?),
+	};
 	let (context_files, rules) = discover_prompt_material(&project_root, &options.prompt)?;
 	let facts = {
 		let buckets = rules.prompt_facts(crate::discovery::rules::MAIN_AGENT);
@@ -1528,9 +1603,12 @@ pub async fn compose_kernel(
 		production.meta.debug_session = debug_session;
 		production.client.set_call_meta(production.meta.clone());
 	}
-	let ephemeral_journal = options
-		.ephemeral
-		.then(|| EphemeralJournal { path: journal_path.clone() });
+	let ephemeral_journal = options.ephemeral.then(|| EphemeralJournal {
+		root: journal_path
+			.parent()
+			.expect("ephemeral journals always have a private parent")
+			.to_path_buf(),
+	});
 	let mut session = if journal_path.exists() {
 		Session::open(&journal_path, component_registry)?
 	} else {
@@ -1557,7 +1635,10 @@ pub async fn compose_kernel(
 	}
 
 	let prompt = CanonicalPromptSource;
-	let spill = omp_journal::blob::BlobStore::open(data_dir.join("artifacts"))?;
+	// Tool output, provider media, user attachments, and compaction summaries
+	// share the project/session CAS. Every durable byte is therefore rooted by
+	// the journals that reference it and cannot leak across project namespaces.
+	let spill = session.blobs().clone();
 	// The environment applies `sv_interrupt_grace` between TERM and KILL; the
 	// dispatcher grants that courtesy plus one second for the unit's verdict
 	// to travel back before it forces the call closed as effects-unknown.
@@ -1605,6 +1686,9 @@ pub async fn compose_kernel(
 	};
 	let kernel = Kernel::new(inference, registry, policy, prompt)
 		.with_director_registry(director_registry)
+		.with_file_mention_source(super::file_mentions::EnvFileMentionSource::new(
+			hub_environment.clone(),
+		))
 		.with_route_facts(route_facts)
 		.with_runtime_flags(runtime_flags)
 		.with_con_context(Arc::clone(&ctx))
@@ -1636,11 +1720,36 @@ pub async fn compose_kernel(
 		.and_then(|name| name.to_str())
 		.map_or_else(|| Str::new(Ulid::generate().to_string()), Str::new);
 	let name = options.session_name.clone().unwrap_or_else(|| id.clone());
+	let topology = match options.parent_session.as_deref() {
+		Some(parent) => {
+			let parent = omp_agent::SessionAuthority::lookup(live_sessions.as_ref(), parent)
+				.ok_or_else(|| HeadlessError::ParentSessionUnavailable { parent: Str::new(parent) })?;
+			omp_agent::SessionTopology::child(parent.id, parent.topology.main_id)
+		},
+		None => omp_agent::SessionTopology::main(id.clone()),
+	};
+	let relay_ctx = Arc::clone(&ctx);
+	let relay = crate::sessions::IrcRelayPolicy::new(move || {
+		crate::subagent::settings::CL_IRC_RELAY_TO_MAIN.get(&relay_ctx)
+	});
+	let up = kernel.mailbox();
+	let autoreply = crate::subagent::autoreply::producer(
+		kernel.inference(),
+		&live_sessions,
+		up.clone(),
+		kernel.turn_activity(),
+		kernel.session_cancellation(),
+		kernel.reply_obligations(),
+		session.blobs().clone(),
+	);
 	live_sessions.register(name.clone(), crate::sessions::KernelHandle {
-		id:       crate::sessions::SessionId::new(id),
-		name:     name.clone(),
-		up:       kernel.mailbox(),
+		id: crate::sessions::SessionId::new(id),
+		name: name.clone(),
+		up,
 		snapshot: Arc::new(RwLock::new(session.dom().snapshot())),
+		topology,
+		relay,
+		autoreply,
 	});
 	if tools_enabled {
 		// ADR 0013: `subagent.cfg` and `<agent>.cfg` resolve through the same
@@ -1678,18 +1787,18 @@ pub async fn compose_kernel(
 #[derive(Clone)]
 pub struct SessionHome {
 	/// Directory holding this project's `.oms` journals.
-	pub sessions_dir: PathBuf,
+	pub sessions_dir:  PathBuf,
 	/// Canonical project root recorded in prompt facts.
-	pub project_root: PathBuf,
+	pub project_root:  PathBuf,
 	/// Resolved model key recorded in prompt facts.
-	pub model:        Str,
+	pub model:         Str,
 	/// Invocation prompt projection overrides.
-	pub prompt:       PromptOverrides,
+	pub prompt:        PromptOverrides,
 	/// Discovered prompt material (skills, context files, rules) projected
 	/// into every session's prompt facts.
-	pub facts:        crate::discovery::PromptFacts,
+	pub facts:         crate::discovery::PromptFacts,
 	/// Process-local live-session routing authority.
-	pub live:         Arc<crate::sessions::SessionRegistry>,
+	pub live:          Arc<crate::sessions::SessionRegistry>,
 	/// Whether the session's production composition exposes the tool surface.
 	pub tools_enabled: bool,
 	/// The kernel's upward mailbox, shared by every session it drives.
@@ -1786,13 +1895,31 @@ impl SessionHome {
 		Ok(session)
 	}
 
-	/// Copies `source` to a fresh journal and opens the copy: the whole
-	/// branch tree travels with the fork (the journal is the tree).
+	/// Copies `source` and its session-local files to a fresh journal and opens
+	/// the copy: the whole branch tree travels with the fork.
 	pub fn fork(&self, source: &Path) -> Result<Session, HeadlessError> {
 		let source = resolve_session_path(&self.sessions_dir, source);
 		let path = self.fresh_path();
-		fs::copy(source, &path)?;
-		self.open(&path)
+		copy_private_file(&source, &path)?;
+		if let (Some(source_local), Some(destination_local)) =
+			(session_local_tree(&source), session_local_tree(&path))
+			&& source_local.is_dir()
+			&& let Err(error) = copy_private_tree(&source_local, &destination_local)
+		{
+			let _ = fs::remove_file(&path);
+			let _ = fs::remove_dir_all(&destination_local);
+			return Err(error.into());
+		}
+		match self.open(&path) {
+			Ok(session) => Ok(session),
+			Err(error) => {
+				let _ = fs::remove_file(&path);
+				if let Some(local) = session_local_tree(&path) {
+					let _ = fs::remove_dir_all(local);
+				}
+				Err(error)
+			},
+		}
 	}
 
 	/// Registers (or re-registers) `session` under its journal stem.
@@ -1802,13 +1929,30 @@ impl SessionHome {
 			.file_stem()
 			.and_then(|name| name.to_str())
 			.map_or_else(|| Str::new(Ulid::generate().to_string()), Str::new);
+		let prior = self
+			.live
+			.list()
+			.into_iter()
+			.find(|live| live.up.same_channel(&self.up));
+		let autoreply = prior.as_ref().and_then(|live| live.autoreply.clone());
+		if let Some(producer) = &autoreply {
+			producer.rebind(session.blobs().clone());
+		}
+		let topology = prior.as_ref().map_or_else(
+			|| omp_agent::SessionTopology::main(id.clone()),
+			|live| live.topology.rebind(id.clone()),
+		);
+		let relay = prior.map_or_else(crate::sessions::IrcRelayPolicy::default, |live| live.relay);
 		self
 			.live
 			.register(id.clone(), crate::sessions::KernelHandle {
-				id:       crate::sessions::SessionId::new(id.clone()),
-				name:     id,
-				up:       self.up.clone(),
+				id: crate::sessions::SessionId::new(id.clone()),
+				name: id,
+				up: self.up.clone(),
 				snapshot: Arc::new(RwLock::new(session.dom().snapshot())),
+				topology,
+				relay,
+				autoreply,
 			});
 	}
 
@@ -2075,7 +2219,16 @@ fn select_journal_path(
 	if let Some(source) = fork {
 		let source = resolve_session_path(sessions_dir, source);
 		let destination = sessions_dir.join(format!("{}.oms", Ulid::generate()));
-		fs::copy(source, &destination)?;
+		copy_private_file(&source, &destination)?;
+		if let (Some(source_local), Some(destination_local)) =
+			(session_local_tree(&source), session_local_tree(&destination))
+			&& source_local.is_dir()
+			&& let Err(error) = copy_private_tree(&source_local, &destination_local)
+		{
+			let _ = fs::remove_file(&destination);
+			let _ = fs::remove_dir_all(&destination_local);
+			return Err(error.into());
+		}
 		return Ok(destination);
 	}
 	if continue_session {
@@ -2088,12 +2241,53 @@ fn select_journal_path(
 			return Ok(path);
 		}
 	}
-	let name = format!("{}.oms", Ulid::generate());
-	Ok(if ephemeral {
-		std::env::temp_dir().join(name)
-	} else {
-		sessions_dir.join(name)
-	})
+	if !ephemeral {
+		return Ok(sessions_dir.join(format!("{}.oms", Ulid::generate())));
+	}
+	loop {
+		let root = std::env::temp_dir().join(format!("omp-session-{}", Ulid::generate()));
+		match fs::create_dir(&root) {
+			Ok(()) => return Ok(root.join("session.oms")),
+			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+			Err(error) => return Err(error.into()),
+		}
+	}
+}
+
+fn session_local_tree(journal: &Path) -> Option<PathBuf> {
+	let stem = journal.file_stem().filter(|stem| !stem.is_empty())?;
+	Some(journal.with_file_name(stem))
+}
+
+fn copy_private_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+	let result = (|| {
+		let mut source = fs::File::open(source)?;
+		let mut destination = fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(destination)?;
+		std::io::copy(&mut source, &mut destination)?;
+		destination.sync_all()
+	})();
+	if result.is_err() {
+		let _ = fs::remove_file(destination);
+	}
+	result
+}
+
+fn copy_private_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+	fs::create_dir_all(destination)?;
+	for entry in fs::read_dir(source)? {
+		let entry = entry?;
+		let file_type = entry.file_type()?;
+		let target = destination.join(entry.file_name());
+		if file_type.is_dir() {
+			copy_private_tree(&entry.path(), &target)?;
+		} else if file_type.is_file() {
+			fs::copy(entry.path(), target)?;
+		}
+	}
+	Ok(())
 }
 
 /// The discovered prompt material [`install_prompt_facts`] journaled on
@@ -2254,10 +2448,122 @@ mod tests {
 	use super::{
 		EphemeralJournal, HeadlessError, KernelOptions, PromptOverrides, apply_model_override,
 		convar_reasoning, install_prompt_facts, install_yield_contract, remember_terminal_session,
-		route_facts, select_journal_path, validate_tool_names,
+		replicate_outcome_blob, route_facts, select_journal_path, session_local_tree,
+		validate_tool_names,
 	};
 
 	const GPT5: &str = "openai/gpt-5";
+
+	#[tokio::test]
+	async fn remote_outcome_replication_resumes_with_stable_session_provenance() {
+		let (client, transport) = omp_env::EnvClient::in_process(0);
+		let client = client
+			.with_principal("session-a", "kernel")
+			.expect("valid principal");
+		let bytes = b"detached outcome crossing hosts";
+		let size = u64::try_from(bytes.len()).expect("fixture size fits u64");
+		let digest = omp_core::Hash32::sum(bytes);
+		let scratch = tempfile::tempdir().expect("temporary CAS");
+		let store = omp_journal::blob::BlobStore::open(scratch.path()).expect("open session CAS");
+		let cancel = tokio_util::sync::CancellationToken::new();
+		let replication = tokio::spawn({
+			let client = client.clone();
+			let store = store.clone();
+			let cancel = cancel.clone();
+			async move {
+				replicate_outcome_blob(&client, &store, "call-a", digest, size, 1024, &cancel).await
+			}
+		});
+
+		let first = transport.recv().await.expect("first blob range");
+		let first_request = match first.body {
+			Some(omp_env::frame::client_frame::Body::BlobGet(request)) => request,
+			_ => panic!("expected first blob get"),
+		};
+		assert_eq!(first_request.offset, 0);
+		assert_eq!(
+			first.scope.as_ref().map(|scope| (
+				scope.session_id.as_str(),
+				scope.agent_id.as_str(),
+				scope.invocation_id.as_str(),
+			)),
+			Some(("session-a", "kernel", "call-a"))
+		);
+		let split = 9;
+		transport
+			.send(omp_env::frame::ServerFrame {
+				request_id: first.request_id,
+				body: Some(omp_env::frame::server_frame::Body::BlobChunk(omp_env::blob_frame::Chunk {
+					data: bytes::Bytes::copy_from_slice(&bytes[..split]),
+					hash: bytes::Bytes::copy_from_slice(digest.as_bytes()),
+					size: Some(size),
+				})),
+				..Default::default()
+			})
+			.await
+			.expect("first blob chunk");
+		transport
+			.send(omp_env::frame::ServerFrame {
+				request_id: first.request_id,
+				body: Some(omp_env::frame::server_frame::Body::EventStreamError(
+					omp_env::frame::EventStreamError {
+						stream: omp_env::frame::EventStreamKind::Unspecified as i32,
+						failure: omp_env::frame::EventStreamFailure::Closed as i32,
+						message: "remote blob stream interrupted".into(),
+						..Default::default()
+					},
+				)),
+				..Default::default()
+			})
+			.await
+			.expect("interrupt first range");
+
+		let resumed = loop {
+			let frame = transport.recv().await.expect("resumed blob range");
+			if matches!(&frame.body, Some(omp_env::frame::client_frame::Body::BlobGet(_))) {
+				break frame;
+			}
+		};
+		let resumed_request = match resumed.body {
+			Some(omp_env::frame::client_frame::Body::BlobGet(request)) => request,
+			_ => unreachable!("filtered to blob get"),
+		};
+		assert_eq!(resumed_request.offset, u64::try_from(split).expect("split fits u64"));
+		assert_eq!(resumed.scope, first.scope);
+		transport
+			.send(omp_env::frame::ServerFrame {
+				request_id: resumed.request_id,
+				body: Some(omp_env::frame::server_frame::Body::BlobChunk(omp_env::blob_frame::Chunk {
+					data: bytes::Bytes::copy_from_slice(&bytes[split..]),
+					hash: bytes::Bytes::copy_from_slice(digest.as_bytes()),
+					size: Some(size),
+				})),
+				..Default::default()
+			})
+			.await
+			.expect("resumed blob chunk");
+		transport
+			.send(omp_env::frame::ServerFrame {
+				request_id: resumed.request_id,
+				body: Some(omp_env::frame::server_frame::Body::BlobGetComplete(
+					omp_env::frame::BlobGetComplete {
+						hash: bytes::Bytes::copy_from_slice(digest.as_bytes()),
+						bytes_sent: u64::try_from(bytes.len() - split).expect("remainder fits u64"),
+						..Default::default()
+					},
+				)),
+				..Default::default()
+			})
+			.await
+			.expect("complete resumed range");
+
+		let reference = replication
+			.await
+			.expect("replication task")
+			.expect("replicated outcome");
+		assert_eq!(reference.hash, digest);
+		assert_eq!(store.get(&reference).expect("read local replica").as_ref(), bytes);
+	}
 
 	fn gpt5_policy(catalog: &Catalog) -> &ThinkingPolicy {
 		let spec = catalog
@@ -2459,6 +2765,9 @@ mod tests {
 		let scratch = tempfile::tempdir().expect("tempdir");
 		let source = scratch.path().join("source.oms");
 		std::fs::write(&source, b"authoritative branch").expect("source");
+		std::fs::create_dir_all(scratch.path().join("source/local")).expect("local root");
+		std::fs::write(scratch.path().join("source/local/plan.md"), b"branch-local")
+			.expect("local artifact");
 		let fork = select_journal_path(
 			scratch.path(),
 			None,
@@ -2469,16 +2778,32 @@ mod tests {
 		)
 		.expect("fork");
 		assert_ne!(fork, source);
-		assert_eq!(std::fs::read(fork).expect("fork bytes"), b"authoritative branch");
+		assert_eq!(std::fs::read(&fork).expect("fork bytes"), b"authoritative branch");
+		let fork_local = session_local_tree(&fork).expect("fork local root");
+		assert_eq!(
+			std::fs::read(fork_local.join("local/plan.md")).expect("fork local artifact"),
+			b"branch-local"
+		);
 	}
 
 	#[test]
-	fn ephemeral_cleanup_runs_when_the_owner_drops() {
+	fn ephemeral_cleanup_removes_the_private_journal_and_blob_namespace() {
 		let scratch = tempfile::tempdir().expect("tempdir");
-		let path = scratch.path().join("ephemeral.oms");
+		let path =
+			select_journal_path(scratch.path(), None, None, false, true, None).expect("private path");
+		let root = path.parent().expect("private root").to_path_buf();
+		let cleanup = EphemeralJournal { root: root.clone() };
+		assert!(root.is_dir(), "selector atomically reserves the owned directory");
+		assert_ne!(root, scratch.path());
+		std::fs::create_dir_all(root.join("blobs/aa/bb")).expect("blob directories");
+		std::fs::create_dir_all(root.join("local")).expect("local directory");
 		std::fs::write(&path, b"private transcript").expect("journal");
-		drop(EphemeralJournal { path: path.clone() });
-		assert!(!path.exists());
+		std::fs::write(root.join("blobs/aa/bb/content"), b"private media").expect("media");
+		std::fs::write(root.join("local/paste.md"), b"private local artifact").expect("local");
+
+		drop(cleanup);
+
+		assert!(!root.exists(), "the no-session namespace must not leak");
 	}
 
 	#[test]
@@ -2519,6 +2844,8 @@ mod tests {
 		assert_eq!(facts["append_prompt"], "append");
 		assert_eq!(facts["include_model"], false);
 		assert_eq!(facts["null_prompt"], true);
+		assert_eq!(facts["device_guidance"], omp_tools::device::PROMPT_GUIDANCE);
+		assert_eq!(facts["auto_qa_guidance"], omp_tools::device::AUTO_QA_PROMPT_GUIDANCE,);
 	}
 
 	#[test]

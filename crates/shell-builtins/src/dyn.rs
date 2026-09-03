@@ -29,9 +29,9 @@
 //!   dropped and it binds to the next positional exactly like a bare literal.
 //!
 //! Required properties are validated after every source has been applied, so
-//! `dyn report_issue "$session" "$device" --rev 1 --verdict '{"summary":"result contradicted docs"}'`
-//! and `dyn report_issue "$session" "$device" 1 --verdict @verdict.json` bind
-//! identically.
+//! `dyn report_issue "$session" "$device" --rev 1 --verdict '{"summary":"result
+//! contradicted docs"}'` and `dyn report_issue "$session" "$device" 1 --verdict
+//! @verdict.json` bind identically.
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
@@ -1305,7 +1305,14 @@ mod tests {
 	fn autoqa_prompt_invocation_binds() {
 		let parsed = parse(
 			&report_issue_schema(),
-			&["sess-1", "read", "--rev", "1", "--verdict", r#"{"summary":"mismatch","observed":"x","expected":"y"}"#],
+			&[
+				"sess-1",
+				"read",
+				"--rev",
+				"1",
+				"--verdict",
+				r#"{"summary":"mismatch","observed":"x","expected":"y"}"#,
+			],
 			"",
 		)
 		.expect("AutoQA-shaped command binds");
@@ -1530,7 +1537,7 @@ mod tests {
 			root.path().join("verdict.json"),
 			r#"{"summary":"mismatch","observed":"bad"}"#,
 		)
-			.expect("write verdict");
+		.expect("write verdict");
 		std::fs::write(
 			root.path().join("args.json"),
 			r#"{"session_id":"file-session","device":"read","rev":"1","verdict":{"summary":"mismatch"}}"#,

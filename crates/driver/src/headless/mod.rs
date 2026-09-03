@@ -1,6 +1,7 @@
 //! Journal-first non-interactive session assembly shared by app modes.
 
 pub mod ask;
+mod file_mentions;
 pub mod gateway;
 pub mod kernel;
 
@@ -56,4 +57,10 @@ pub enum HeadlessError {
 	/// Continue mode found no durable session for the project.
 	#[error("no durable headless session exists for this project")]
 	NoSession,
+	/// A child composition lost its authenticated parent endpoint.
+	#[error("parent session `{parent}` is not live")]
+	ParentSessionUnavailable {
+		/// Stable id or routing name supplied by the spawning host.
+		parent: Str,
+	},
 }

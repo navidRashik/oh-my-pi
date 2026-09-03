@@ -139,13 +139,23 @@ omp_con::var! {
 		flags: archive,
 	};
 	/// pi `bash.patterns` (array, default: []).
-	pub static SV_BASH_PATTERNS = sv_bash_patterns: Vec<Str> {
+	pub static SV_BASH_PATTERNS = sv_bash_patterns: Vec<Kv> {
 		default: Vec::new(),
 		flags: archive,
 	};
 	/// pi `eval.py` (boolean, default: true).
 	pub static SV_EVAL_PY = sv_eval_py: bool {
 		default: true,
+		flags: archive,
+	};
+	/// pi `eval.tools.enabled` (boolean, default: true).
+	pub static SV_EVAL_TOOLS_ENABLED = sv_eval_tools_enabled: bool {
+		default: true,
+		flags: archive,
+	};
+	/// pi `eval.workpool.freshAgents` (boolean, default: false).
+	pub static SV_EVAL_WORKPOOL_FRESH_AGENTS = sv_eval_workpool_fresh_agents: bool {
+		default: false,
 		flags: archive,
 	};
 	/// pi `eval.autoBackground.enabled` (boolean, default: false).
@@ -328,6 +338,8 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("lsp.shared", "sv_lsp_shared"),
 	("bash.patterns", "sv_bash_patterns"),
 	("eval.py", "sv_eval_py"),
+	("eval.tools.enabled", "sv_eval_tools_enabled"),
+	("eval.workpool.freshAgents", "sv_eval_workpool_fresh_agents"),
 	("eval.autoBackground.enabled", "sv_eval_auto_background_enabled"),
 	("eval.autoBackground.thresholdMs", "sv_eval_auto_background_threshold_ms"),
 	("python.kernelMode", "sv_python_kernel_mode"),

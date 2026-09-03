@@ -13,7 +13,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_catalog::snapshot;
+use omp_catalog::{provider::AuthSpecKind, snapshot};
 use omp_core::{Hash32, SecretString, Str, sf};
 use omp_envd::browser_fetch::BrowserFetchAdapter;
 #[cfg(target_os = "macos")]
@@ -29,7 +29,7 @@ use omp_inference::{
 	},
 	auth::{
 		AlibabaTokenPlanLoginEngine, AlibabaTokenPlanShaper, AuthControlHandle, AuthLoginEngine,
-		AuthManager, AuthManagerBuildError, CredentialAcquisitionLoginEngine,
+		AuthManager, AuthManagerBuildError, AwsCredentialSource, CredentialAcquisitionLoginEngine,
 		CredentialAcquisitionLoginEngineError, CredentialAffinityResolver, CredentialBroker,
 		CredentialBrokerEngines, CredentialShaperRegistry, CredentialStore, FileCredentialKeySource,
 		FileKeyError, GithubCopilotShaper, KeyError, KeySource, OAuthCustomDispatcher,
@@ -781,8 +781,23 @@ async fn production_assembly_with_catalog(
 		refresh_coordinator,
 	));
 	let refreshing = Arc::new(RefreshingCredentialSource::new(stored.clone(), refresh.clone()));
+	let aws = AwsCredentialSource::system();
+	let invocation_supplies_aws_bearer = invocation_key.as_ref().is_some_and(|(provider, _)| {
+		catalog.provider(provider).is_some_and(|provider| {
+			provider.auth.iter().any(|auth| {
+				catalog
+					.auth_spec(auth)
+					.is_some_and(|auth| auth.kind == AuthSpecKind::AwsSigv4)
+			})
+		})
+	});
+	let mut aws_availability = aws.registry_availability().await;
+	if invocation_supplies_aws_bearer {
+		aws_availability = aws_availability.map(|availability| availability.with_bearer_override());
+	}
 	let credentials = CredentialBroker::system(&catalog, CredentialBrokerEngines {
 		stored: Some(refreshing),
+		aws: Some(Arc::new(aws)),
 		..CredentialBrokerEngines::default()
 	})
 	.map_err(|_| {
@@ -851,7 +866,10 @@ async fn production_assembly_with_catalog(
 		.register(ProviderShaper::GithubCopilot(GithubCopilotShaper::new(oauth_http)))
 		.expect("GitHub Copilot credential shaper registered once");
 	let sessions = ConversationSessionPlanner::open(&database, catalog.clone())?;
-	let auth_application = AuthApplicationConfig { signing_regions: Arc::new(BTreeMap::new()) };
+	let aws_region = aws_availability
+		.as_ref()
+		.map_or_else(|_| sf!("us-east-1"), |availability| Str::new(availability.region()));
+	let auth_application = AuthApplicationConfig::for_catalog(&catalog, aws_region);
 	let antigravity_fingerprint = AntigravityFingerprint {
 		version: antigravity_version.await,
 		cl:      env_override(ANTIGRAVITY_CL_ENV).unwrap_or_else(|| sf!(DEFAULT_ANTIGRAVITY_CL)),
@@ -879,6 +897,7 @@ async fn production_assembly_with_catalog(
 		Arc::new(credential_shapers),
 	)
 	.with_settings(inference_settings)
+	.with_aws_registry_availability(aws_availability)
 	.with_azure_endpoint(production_azure_endpoint()?);
 	let dependencies = dependencies.with_usage_manager(usage_manager);
 	#[cfg(feature = "local-applefm")]

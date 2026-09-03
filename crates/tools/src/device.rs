@@ -44,8 +44,8 @@ pub const AUTO_QA_PROMPT_GUIDANCE: &str =
 Automated QA reporting is available through the live `report_issue` device. When a tool or device \
 	 result contradicts its documented behavior for the supplied parameters, run `dyn report_issue \
 	 <session-id> <device> <rev> --verdict '<JSON verdict>'` in the shell, using the current exact \
-	 session id and the reported call's canonical device revision. The verdict requires a \
-	 one-line `summary`; it may include `expected`, `observed`, bounded `evidence`, and at most one \
+	 session id and the reported call's canonical device revision. The verdict requires a one-line \
+	 `summary`; it may include `expected`, `observed`, bounded `evidence`, and at most one \
 	 structured `outcome` or `fault`. False positives are acceptable and should be reported rather \
 	 than suppressed. Filing persists a redacted local-only record; external delivery requires a \
 	 separate explicit user consent action.";

@@ -72,6 +72,9 @@ pub enum ReviveError {
 	/// The parent journal could not record the revival.
 	#[error("parent job projection failed")]
 	Session(#[from] SessionError),
+	/// The parent journal path has no stable session identity.
+	#[error("parent session has no stable journal identity")]
+	ParentIdentity,
 	/// Composition inputs were rejected.
 	#[error(transparent)]
 	Spawn(#[from] SpawnError),
@@ -125,6 +128,12 @@ pub fn revive_child(parent: &mut Session, request: ReviveRequest<'_>) -> Result<
 	if omp_con::AI_MODEL.get(&ctx).is_empty() {
 		omp_con::AI_MODEL.set(&ctx, Str::new(request.model))?;
 	}
+	let parent_id = parent
+		.journal_path()
+		.file_stem()
+		.and_then(|value| value.to_str())
+		.map(Str::new)
+		.ok_or(ReviveError::ParentIdentity)?;
 	let cause = parent.head().ok_or(SpawnError::MissingParentHead)?;
 	parent.patch(jobs::set_status(cause, handle, "running"))?;
 	let child = Revived {
@@ -134,6 +143,7 @@ pub fn revive_child(parent: &mut Session, request: ReviveRequest<'_>) -> Result<
 		env: request.env.clone(),
 		ctx,
 		settings,
+		parent: parent_id,
 		id,
 		agent,
 		session_path,
@@ -180,6 +190,7 @@ struct Revived {
 	env:          EnvClient,
 	ctx:          Arc<Ctx>,
 	settings:     TaskSettings,
+	parent:       Str,
 	id:           Str,
 	agent:        Str,
 	session_path: PathBuf,
@@ -274,6 +285,7 @@ async fn drive(
 		sessions_dir: Some(child.sessions_dir.clone()),
 		sessions: Some(Arc::clone(&child.sessions)),
 		session_name: Some(child.id.clone()),
+		parent_session: Some(child.parent.clone()),
 		model_override: true,
 		..KernelOptions::default()
 	};
@@ -284,12 +296,20 @@ async fn drive(
 	// nobody drains it, so the live entry points at this loop's inbox and
 	// every message is forwarded into the kernel while a turn runs.
 	let kernel_up = kernel.mailbox();
+	let composed = child
+		.sessions
+		.lookup(SessionId::from_ref(child.id.as_str()))
+		.ok_or_else(|| SpawnError::MissingLiveEndpoint { id: child.id.clone() })?;
+	let autoreply = composed.autoreply.clone();
 	let (inbox_tx, inbox_rx) = flume::unbounded::<Up>();
 	let live = KernelHandle {
-		id:       SessionId::new(child.id.clone()),
-		name:     child.id.clone(),
-		up:       inbox_tx,
+		id: SessionId::new(child.id.clone()),
+		name: child.id.clone(),
+		up: inbox_tx,
 		snapshot: Arc::new(RwLock::new(session.dom().snapshot())),
+		topology: composed.topology,
+		relay: composed.relay,
+		autoreply,
 	};
 	child.sessions.register(child.id.clone(), live.clone());
 	let idle_ttl = idle_park_delay(child.settings.agent_idle_ttl_ms);
@@ -306,8 +326,9 @@ async fn drive(
 			Some(text) => Idle::Prompt(text, Vec::new()),
 			None => idle(&inbox_rx, &kernel_up, &mut session, &cancel, idle_ttl).await,
 		};
-		let (text, attachments) = match next {
-			Idle::Prompt(text, attachments) => (text, attachments),
+		let (text, attachments, skill) = match next {
+			Idle::Prompt(text, attachments) => (text, attachments, None),
+			Idle::Skill(prompt) => (prompt.prompt_body.clone(), Vec::new(), Some(prompt)),
 			Idle::Park => break,
 			Idle::Cancelled => {
 				run.stop = TurnStop::Cancelled;
@@ -320,7 +341,16 @@ async fn drive(
 			.with_request_budget(child.settings.soft_request_budget)
 			.with_request_budget_notice(child.settings.soft_request_budget_notice);
 		let outcome = {
-			let turn = kernel.run_turn(&mut session, TurnInput { text, attachments }, control);
+			let turn = match skill {
+				Some(prompt) => {
+					futures::future::Either::Left(kernel.run_skill_turn(&mut session, prompt, control))
+				},
+				None => futures::future::Either::Right(kernel.run_turn(
+					&mut session,
+					TurnInput { text, attachments },
+					control,
+				)),
+			};
 			tokio::pin!(turn);
 			loop {
 				tokio::select! {
@@ -348,6 +378,7 @@ async fn drive(
 
 enum Idle {
 	Prompt(Str, Vec<omp_journal::data::Attachment>),
+	Skill(omp_journal::data::SkillPrompt),
 	Park,
 	Cancelled,
 }
@@ -377,6 +408,19 @@ async fn idle(
 						}
 					} else {
 						return Idle::Prompt(text, attachments);
+					}
+				},
+				Ok(Up::SkillPrompt(prompt)) => {
+					if omp_agent::pause_state(session.dom()).active {
+						if let Err(error) = omp_agent::queue_prompt(
+							session,
+							prompt.prompt_body.clone(),
+							&[],
+						) {
+							tracing::warn!(%error, "paused subagent skill prompt could not be queued");
+						}
+					} else {
+						return Idle::Skill(prompt);
 					}
 				},
 				Ok(Up::Peer(text)) => {
@@ -409,7 +453,13 @@ async fn idle(
 				},
 				Ok(Up::Cancel) => return Idle::Cancelled,
 				Ok(Up::Interrupt) => {},
-				Ok(other @ (Up::Approval(_) | Up::Approve { .. } | Up::Env(_))) => {
+				Ok(
+					other @ (Up::SteerAuthored { .. }
+					| Up::Approval(_)
+					| Up::Approve { .. }
+					| Up::Env(_)
+					| Up::Autoreply { .. }),
+				) => {
 					let _ = kernel_up.send(other);
 				},
 				Err(_) => return Idle::Park,

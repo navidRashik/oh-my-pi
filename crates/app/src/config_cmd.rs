@@ -447,6 +447,13 @@ pub fn migrate_settings(data_dir: &Path, project: &Path) -> miette::Result<PathB
 		user_sources.extend(env::split_paths(&overlays));
 	}
 	let user = migrate_toml_sources(&user_sources)?;
+	user
+		.exec(
+			crate::keybindings::DEFAULT_BINDS,
+			Source::Config(Str::new_static(crate::keybindings::DEFAULT_BINDS_NAME)),
+		)
+		.into_diagnostic()?;
+	user.seal_bind_defaults();
 	migrate_keybindings(data_dir, &user)?;
 	let destination = crate::config_path().into_diagnostic()?;
 	persist_cfg(&destination, &user)?;
@@ -454,6 +461,7 @@ pub fn migrate_settings(data_dir: &Path, project: &Path) -> miette::Result<PathB
 	let project_source = project.join(".omp/config.toml");
 	if project_source.is_file() {
 		let scoped = migrate_toml_sources(std::slice::from_ref(&project_source))?;
+		scoped.seal_bind_defaults();
 		persist_cfg(&project.join(".omp/config.cfg"), &scoped)?;
 	}
 	Ok(destination)
@@ -560,8 +568,33 @@ fn migrate_keybindings(data_dir: &Path, ctx: &Ctx) -> miette::Result<()> {
 		let Some(chords) = chords.as_array() else {
 			continue;
 		};
+		remove_bound_command(ctx, command)?;
 		for chord in chords.iter().filter_map(toml::Value::as_str) {
 			ctx.bind(Str::new(chord), Str::new_static(command))
+				.into_diagnostic()?;
+		}
+	}
+	Ok(())
+}
+
+/// Removes one legacy action from every shipped fallback script before its
+/// replacement chords are installed. Other contextual actions sharing a
+/// chord remain in their original order.
+fn remove_bound_command(ctx: &Ctx, command: &str) -> miette::Result<()> {
+	for (chord, script) in ctx.binds() {
+		let kept = script
+			.as_str()
+			.split(';')
+			.map(str::trim)
+			.filter(|statement| *statement != command)
+			.collect::<Vec<_>>();
+		if kept.len() == script.as_str().split(';').count() {
+			continue;
+		}
+		if kept.is_empty() {
+			ctx.unbind(chord.as_str());
+		} else {
+			ctx.bind(chord, Str::new(kept.join("; ")))
 				.into_diagnostic()?;
 		}
 	}

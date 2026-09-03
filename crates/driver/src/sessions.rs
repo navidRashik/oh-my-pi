@@ -7,7 +7,9 @@ use std::{
 	time::UNIX_EPOCH,
 };
 
-use omp_agent::{SessionAuthority, SessionEndpoint, Up};
+use omp_agent::{
+	PeerAutoreply, SessionAuthority, SessionEndpoint, SessionRole, SessionTopology, Up,
+};
 use omp_core::{FastHashMap, Str};
 use omp_dom::{Dom, Op, PropId, Snapshot};
 use parking_lot::RwLock;
@@ -17,17 +19,53 @@ omp_core::string_id!(
 	SessionId
 );
 
+/// Live policy consulted whenever third-party traffic is eligible for relay.
+#[derive(Clone)]
+pub struct IrcRelayPolicy {
+	enabled: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl IrcRelayPolicy {
+	/// Creates a policy backed by the host's current effective configuration.
+	#[must_use]
+	pub fn new(enabled: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+		Self { enabled: Arc::new(enabled) }
+	}
+
+	/// Returns a static policy, primarily for non-interactive compositions.
+	#[must_use]
+	pub fn fixed(enabled: bool) -> Self {
+		Self::new(move || enabled)
+	}
+
+	fn enabled(&self) -> bool {
+		(self.enabled)()
+	}
+}
+
+impl Default for IrcRelayPolicy {
+	fn default() -> Self {
+		Self::fixed(true)
+	}
+}
+
 /// Cloneable endpoint retained by the process composition for one live kernel.
 #[derive(Clone)]
 pub struct KernelHandle {
 	/// Stable session identity.
-	pub id:       SessionId,
+	pub id:        SessionId,
 	/// Display and routing name.
-	pub name:     Str,
+	pub name:      Str,
 	/// The kernel's sole upward mailbox.
-	pub up:       flume::Sender<Up>,
+	pub up:        flume::Sender<Up>,
 	/// Latest detached DOM projection.
-	pub snapshot: Arc<RwLock<Snapshot>>,
+	pub snapshot:  Arc<RwLock<Snapshot>>,
+	/// Authenticated role, parent, and main-session relationship.
+	pub topology:  SessionTopology,
+	/// Current host policy for relaying third-party traffic to this root.
+	pub relay:     IrcRelayPolicy,
+	/// Recipient-owned automatic peer reply actor.
+	pub autoreply: Option<Arc<dyn PeerAutoreply>>,
 }
 
 impl KernelHandle {
@@ -36,12 +74,14 @@ impl KernelHandle {
 		*self.snapshot.write() = session.dom().snapshot();
 	}
 
-	fn endpoint(&self) -> SessionEndpoint {
+	pub(crate) fn endpoint(&self) -> SessionEndpoint {
 		SessionEndpoint {
-			id:       Str::new(self.id.as_str()),
-			name:     self.name.clone(),
-			up:       self.up.clone(),
-			snapshot: Arc::clone(&self.snapshot),
+			id:        Str::new(self.id.as_str()),
+			name:      self.name.clone(),
+			up:        self.up.clone(),
+			snapshot:  Arc::clone(&self.snapshot),
+			topology:  self.topology.clone(),
+			autoreply: self.autoreply.clone(),
 		}
 	}
 }
@@ -70,13 +110,39 @@ impl SessionRegistry {
 
 	/// Registers or replaces one live kernel endpoint.
 	pub fn register(&self, name: Str, mut handle: KernelHandle) -> Option<KernelHandle> {
-		handle.name = name.clone();
+		let autoreply = handle.autoreply.clone();
 		let mut state = self.state.write();
-		if let Some(previous_id) = state.by_name.insert(name, handle.id.clone())
+		let prior_session = state.by_id.values().find_map(|live| {
+			(live.up.same_channel(&handle.up) && live.id != handle.id)
+				.then(|| (live.id.clone(), live.name.clone(), live.topology.role))
+		});
+		let routing_name = prior_session
+			.as_ref()
+			.map_or(name, |(_, prior_name, _)| prior_name.clone());
+		handle.name = routing_name.clone();
+		if handle.topology.role == SessionRole::Main {
+			handle.topology = SessionTopology::main(Str::new(handle.id.as_str()));
+		}
+		if let Some((prior_id, _, prior_role)) = prior_session {
+			for live in state.by_id.values_mut() {
+				if live.topology.parent_id.as_deref() == Some(prior_id.as_str()) {
+					live.topology.parent_id = Some(Str::new(handle.id.as_str()));
+				}
+				if prior_role == SessionRole::Main
+					&& live.topology.main_id.as_str() == prior_id.as_str()
+				{
+					live.topology.main_id = Str::new(handle.id.as_str());
+				}
+			}
+		}
+		let displaced = if let Some(previous_id) =
+			state.by_name.insert(routing_name, handle.id.clone())
 			&& previous_id != handle.id
 		{
-			state.by_id.remove(&previous_id);
-		}
+			state.by_id.remove(&previous_id)
+		} else {
+			None
+		};
 		let id = handle.id.clone();
 		let current_name = handle.name.clone();
 		let previous = state.by_id.insert(id, handle);
@@ -85,6 +151,16 @@ impl SessionRegistry {
 		{
 			state.by_name.remove(&previous.name);
 		}
+		drop(state);
+		for replaced in displaced.iter().chain(previous.iter()) {
+			if let Some(producer) = &replaced.autoreply
+				&& autoreply
+					.as_ref()
+					.is_none_or(|current| !Arc::ptr_eq(current, producer))
+			{
+				producer.cancel();
+			}
+		}
 		previous
 	}
 
@@ -92,7 +168,21 @@ impl SessionRegistry {
 	pub fn remove(&self, id: &SessionId<str>) -> Option<KernelHandle> {
 		let mut state = self.state.write();
 		let handle = state.by_id.remove(id)?;
-		state.by_name.remove(&handle.name);
+		if state.by_name.get(&handle.name) == Some(&handle.id) {
+			state.by_name.remove(&handle.name);
+		}
+		let actor_still_registered = handle.autoreply.as_ref().is_some_and(|removed| {
+			state.by_id.values().any(|live| {
+				live
+					.autoreply
+					.as_ref()
+					.is_some_and(|current| Arc::ptr_eq(current, removed))
+			})
+		});
+		drop(state);
+		if !actor_still_registered && let Some(producer) = &handle.autoreply {
+			producer.cancel();
+		}
 		Some(handle)
 	}
 
@@ -348,6 +438,37 @@ impl SessionAuthority for SessionRegistry {
 			.into_iter()
 			.map(|handle| handle.endpoint())
 			.collect()
+	}
+
+	fn relay_target(&self, from: &SessionEndpoint, to: &SessionEndpoint) -> Option<SessionEndpoint> {
+		let state = self.state.read();
+		let live_from = state
+			.by_id
+			.get(SessionId::from_ref(from.id.as_str()))
+			.filter(|live| {
+				live.name == from.name
+					&& live.up.same_channel(&from.up)
+					&& live.topology == from.topology
+			})?;
+		let live_to = state
+			.by_id
+			.get(SessionId::from_ref(to.id.as_str()))
+			.filter(|live| {
+				live.name == to.name && live.up.same_channel(&to.up) && live.topology == to.topology
+			})?;
+		if live_from.topology.role == SessionRole::Main
+			|| live_to.topology.role == SessionRole::Main
+			|| live_from.topology.main_id != live_to.topology.main_id
+		{
+			return None;
+		}
+		let main = state
+			.by_id
+			.get(SessionId::from_ref(live_from.topology.main_id.as_str()))?;
+		(main.topology.role == SessionRole::Main
+			&& main.topology.main_id.as_str() == main.id.as_str()
+			&& main.relay.enabled())
+		.then(|| main.endpoint())
 	}
 }
 
