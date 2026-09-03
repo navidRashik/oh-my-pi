@@ -365,6 +365,8 @@ fn binds_drive_actions_with_press_release_inversion() {
 	ctx.key("space", true).unwrap();
 	assert!(JUMP.is_active(&ctx));
 	assert_eq!(GRAVITY.get(&ctx), 300, "non-action statements run on press");
+	ctx.key("space", true).unwrap();
+	assert_eq!(JUMP.presses(&ctx), 1, "terminal repeats are not fresh press edges");
 
 	ctx.key("w", true).unwrap();
 	assert_eq!(JUMP.presses(&ctx), 2, "two keys can hold one action");
@@ -382,6 +384,40 @@ fn binds_drive_actions_with_press_release_inversion() {
 	assert!(omp_con::CL_SHOWTHINKING.get(&ctx));
 	ctx.key("h", false).unwrap();
 	assert!(!omp_con::CL_SHOWTHINKING.get(&ctx));
+}
+
+#[test]
+fn ordinary_bind_remaps_apply_without_a_release_capable_terminal() {
+	let ctx = Ctx::new();
+	ctx.run("bind g \"test::gravity 200\"").unwrap();
+	ctx.key("g", true).unwrap();
+	assert_eq!(GRAVITY.get(&ctx), 200);
+	ctx.run("bind g \"test::gravity 350\"").unwrap();
+	ctx.key("g", true).unwrap();
+	assert_eq!(
+		GRAVITY.get(&ctx),
+		350,
+		"ordinary bind presses are not latched when terminals cannot report releases"
+	);
+}
+
+#[test]
+fn held_action_release_survives_live_remap_and_removal() {
+	let ctx = Ctx::new();
+	ctx.run("bind h +test::jump").unwrap();
+	ctx.key("h", true).unwrap();
+	assert!(JUMP.is_active(&ctx));
+
+	ctx.run("bind h \"test::gravity 450\"").unwrap();
+	ctx.key("h", false).unwrap();
+	assert!(!JUMP.is_active(&ctx), "release belongs to the program latched at press");
+	assert_eq!(GRAVITY.get(&ctx), 100, "the replacement waits for the next press");
+
+	ctx.key("h", true).unwrap();
+	assert_eq!(GRAVITY.get(&ctx), 450);
+	ctx.run("unbind h").unwrap();
+	ctx.key("h", false).unwrap();
+	assert_eq!(JUMP.presses(&ctx), 0);
 }
 
 #[test]

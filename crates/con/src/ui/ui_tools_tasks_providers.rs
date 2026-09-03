@@ -4,12 +4,101 @@ use super::*;
 
 pub(super) const ENTRIES: &[UiSpec] = &[
 	ui!(
+		"todo.enabled",
+		"sv_todo_enabled",
+		Tools,
+		"Available Tools",
+		"Todos",
+		"Enable the todo tool for task tracking",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"glob.enabled",
+		"sv_glob_enabled",
+		Tools,
+		"Available Tools",
+		"Glob",
+		"Enable the glob tool for glob-based file lookup",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"grep.enabled",
+		"sv_grep_enabled",
+		Tools,
+		"Available Tools",
+		"Grep",
+		"Enable the grep tool for regex content search",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
 		"astGrep.enabled",
 		"sv_ast_grep_enabled",
 		Tools,
 		"Available Tools",
 		"AST Grep",
 		"Enable the ast_grep tool for structural AST search",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"astEdit.enabled",
+		"sv_ast_edit_enabled",
+		Tools,
+		"Available Tools",
+		"AST Edit",
+		"Enable the ast_edit tool for structural AST rewrites",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"debug.enabled",
+		"sv_debug_enabled",
+		Tools,
+		"Available Tools",
+		"Debug",
+		"Enable the debug tool for DAP-based debugging",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"launch.enabled",
+		"sv_launch_enabled",
+		Tools,
+		"Available Tools",
+		"Launch",
+		"Enable the launch tool for supervising shared long-running project processes",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"speechgen.enabled",
+		"cl_speechgen_enabled",
+		Tools,
+		"Available Tools",
+		"Speech Generation",
+		"Enable the tts tool for on-device (Kokoro) or xAI Grok Voice speech-file synthesis",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"generate_image.enabled",
+		"sv_generate_image_enabled",
+		Tools,
+		"Available Tools",
+		"Generate Image",
+		"Enable the generate_image tool (text-to-image generation and editing). Exposed as an xd:// \
+		 device when tools.xdev is on.",
 		UiWidget::Boolean,
 		None,
 		Identity
@@ -32,12 +121,93 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Identity
 	),
 	ui!(
+		"computer.enabled",
+		"sv_computer_enabled",
+		Tools,
+		"Available Tools",
+		"Computer",
+		"Enable the scriptable host-desktop control tool (screenshots, input, accessibility)",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"checkpoint.enabled",
+		"sv_checkpoint_enabled",
+		Tools,
+		"Available Tools",
+		"Checkpoint/Rewind",
+		"Enable the checkpoint and rewind tools for context checkpointing",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
 		"fetch.enabled",
 		"sv_fetch_enabled",
 		Tools,
 		"Available Tools",
 		"Read URLs",
 		"Allow the read tool to fetch and process URLs",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"vault.enabled",
+		"sv_vault_enabled",
+		Tools,
+		"Available Tools",
+		"Obsidian Vault",
+		"Enable the vault:// internal URL for reading and editing Obsidian vault content via the \
+		 Obsidian CLI. When disabled, vault:// resolution is refused and the vault:// entry is \
+		 omitted from the system prompt.",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"github.enabled",
+		"sv_github_enabled",
+		Tools,
+		"Available Tools",
+		"GitHub CLI",
+		"Enable the github tool (op-based dispatch for repository, issue, pull request, diff, \
+		 search, checkout, push, and Actions watch workflows)",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"web_search.enabled",
+		"ai_web_search_enabled",
+		Tools,
+		"Available Tools",
+		"Web Search",
+		"Enable the web_search tool for live web results",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"security.enabled",
+		"ai_security_enabled",
+		Tools,
+		"Available Tools",
+		"Security",
+		"Enable OMP-native security scan planning, execution, and the read-only security:// \
+		 resource namespace",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"ask.enabled",
+		"cl_ask_enabled",
+		Tools,
+		"Available Tools",
+		"Ask",
+		"Enable the ask tool for interactive user questions",
 		UiWidget::Boolean,
 		None,
 		Identity
@@ -50,6 +220,88 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		"Browser",
 		"Enable the browser tool for scripted Chromium automation (puppeteer)",
 		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"todo.reminders",
+		"sv_todo_reminders",
+		Tools,
+		"Todos",
+		"Todo Reminders",
+		"Remind the agent to complete todos before stopping",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"todo.remindersMax",
+		"sv_todo_reminders_max",
+		Tools,
+		"Todos",
+		"Todo Reminder Limit",
+		"Maximum number of todo reminders before giving up",
+		UiWidget::Submenu(&[
+			UiOption::new("1", "1 reminder", ""),
+			UiOption::new("2", "2 reminders", ""),
+			UiOption::new("3", "3 reminders", ""),
+			UiOption::new("5", "5 reminders", "")
+		]),
+		None,
+		Identity
+	),
+	ui!(
+		"todo.eager",
+		"sv_todo_eager",
+		Tools,
+		"Todos",
+		"Create Todos Automatically",
+		"How strongly to push automatic todo-list creation after the first message",
+		UiWidget::Submenu(&[
+			UiOption::new("default", "Default", "Model decides; no automatic todo list"),
+			UiOption::new(
+				"preferred",
+				"Preferred",
+				"Suggests a todo list on the first message (reminder, not forced)"
+			),
+			UiOption::new("always", "Always", "Forces a comprehensive todo list on the first message")
+		]),
+		None,
+		Identity
+	),
+	ui!(
+		"tasks.todoClearDelay",
+		"sv_tasks_todo_clear_delay",
+		Tools,
+		"Todos",
+		"Todo Auto-Clear Delay",
+		"Delay before completed or abandoned todos are removed from the todo widget",
+		UiWidget::Submenu(&[
+			UiOption::new("0", "Instant", ""),
+			UiOption::new("60", "1 minute", "Default"),
+			UiOption::new("300", "5 minutes", ""),
+			UiOption::new("900", "15 minutes", ""),
+			UiOption::new("1800", "30 minutes", ""),
+			UiOption::new("3600", "1 hour", ""),
+			UiOption::new("-1", "Never", "")
+		]),
+		None,
+		Identity
+	),
+	ui!(
+		"grep.contextBefore",
+		"sv_tools_grep_context_before",
+		Tools,
+		"Grep & Browser",
+		"Grep Context Before",
+		"Lines of context before each grep match",
+		UiWidget::Submenu(&[
+			UiOption::new("0", "0 lines", ""),
+			UiOption::new("1", "1 line", ""),
+			UiOption::new("2", "2 lines", ""),
+			UiOption::new("3", "3 lines", ""),
+			UiOption::new("5", "5 lines", "")
+		]),
 		None,
 		Identity
 	),
@@ -72,6 +324,44 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Identity
 	),
 	ui!(
+		"browser.cdpUrl",
+		"sv_browser_cdp_url",
+		Tools,
+		"Grep & Browser",
+		"Browser CDP URL",
+		"Default HTTP CDP discovery endpoint (for example http://127.0.0.1:9222) to attach to \
+		 instead of launching a browser. Explicit app.cdp_url or app.path on the tool call take \
+		 precedence.",
+		UiWidget::Text { secret: false },
+		None,
+		Identity
+	),
+	ui!(
+		"browser.relay",
+		"sv_browser_relay",
+		Tools,
+		"Grep & Browser",
+		"Browser Relay",
+		"Drive your own Chrome tabs through the omp browser relay. Install the extension once (`omp \
+		 browser-relay install`); the relay server auto-starts when the browser tool needs it. \
+		 Takes precedence over Browser CDP URL; set OMP_BROWSER_RELAY=0 or OMP_BROWSER_RELAY=1 to \
+		 override.",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"browser.relayUrl",
+		"sv_browser_relay_url",
+		Tools,
+		"Grep & Browser",
+		"Browser Relay URL",
+		"omp browser relay endpoint (default http://127.0.0.1:9224).",
+		UiWidget::Text { secret: false },
+		None,
+		Identity
+	),
+	ui!(
 		"browser.headless",
 		"sv_browser_headless",
 		Tools,
@@ -79,6 +369,30 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		"Headless Browser",
 		"Launch browser in headless mode (disable to show browser UI)",
 		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"browser.cmux",
+		"sv_browser_cmux",
+		Tools,
+		"Grep & Browser",
+		"cmux Browser",
+		"Use cmux WKWebView surfaces for browser automation when a cmux socket is available. Set \
+		 OMP_BROWSER_CMUX=0 or OMP_BROWSER_CMUX=1 to override.",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"browser.screenshotDir",
+		"sv_browser_screenshot_dir",
+		Tools,
+		"Grep & Browser",
+		"Screenshot Directory",
+		"Directory to save screenshots. If unset, screenshots go to a temp file. Supports ~. \
+		 Examples: ~/Downloads, ~/Desktop, /sdcard/Download (Android)",
+		UiWidget::Text { secret: false },
 		None,
 		Identity
 	),
@@ -665,6 +979,38 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 			UiOption::new("production", "Production Only", "Force production endpoint only"),
 			UiOption::new("sandbox", "Sandbox Only", "Force sandbox endpoint only")
 		]),
+		None,
+		Identity
+	),
+	ui!(
+		"providers.imageOrder",
+		"ai_providers_image_order",
+		Providers,
+		"Services",
+		"Image Provider Order",
+		"Prioritized providers for image generation; unlisted providers follow the active session \
+		 provider and the built-in order",
+		UiWidget::MultiSelect {
+			options: &[
+				UiOption::new(
+					"openai",
+					"OpenAI",
+					"OPENAI_API_KEY (gpt-image-2) or active GPT model; falls back to a connected Codex \
+					 subscription"
+				),
+				UiOption::new(
+					"openai-codex",
+					"OpenAI Codex (ChatGPT)",
+					"Uses a connected Codex / ChatGPT subscription — no OPENAI_API_KEY needed"
+				),
+				UiOption::new("antigravity", "Antigravity", "Requires google-antigravity OAuth"),
+				UiOption::new("xai", "xAI Grok Imagine", "Requires xAI Grok OAuth or XAI_API_KEY"),
+				UiOption::new("gemini", "Gemini", "Requires GEMINI_API_KEY"),
+				UiOption::new("openrouter", "OpenRouter", "Requires OPENROUTER_API_KEY"),
+				UiOption::new("deepinfra", "DeepInfra", "Requires DEEPINFRA_API_KEY")
+			],
+			ordered: true,
+		},
 		None,
 		Identity
 	),

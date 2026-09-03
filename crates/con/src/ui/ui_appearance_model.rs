@@ -273,6 +273,36 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Identity
 	),
 	ui!(
+		"statusLine.segmentOptions.time.format",
+		"cl_status_line_time_format",
+		Appearance,
+		"Status Line",
+		"Clock Format",
+		"Use the preset clock format, or force a 12-hour or 24-hour local clock",
+		UiWidget::Submenu(&[
+			UiOption::new("preset", "Preset", "Full and Nerd preset default"),
+			UiOption::new("12h", "12-hour", "Show am or pm"),
+			UiOption::new("24h", "24-hour", "Use 0 through 23")
+		]),
+		None,
+		Identity
+	),
+	ui!(
+		"statusLine.segmentOptions.time.showSeconds",
+		"cl_status_line_time_show_seconds",
+		Appearance,
+		"Status Line",
+		"Clock Seconds",
+		"Use the preset choice, always hide seconds, or always show seconds",
+		UiWidget::Submenu(&[
+			UiOption::new("preset", "Preset", "Full hides seconds; Nerd shows them"),
+			UiOption::new("hide", "Hidden", "Update once a minute"),
+			UiOption::new("show", "Shown", "Update once a second")
+		]),
+		None,
+		Identity
+	),
+	ui!(
 		"tui.resizeScrollback",
 		"cl_resize_policy",
 		Appearance,

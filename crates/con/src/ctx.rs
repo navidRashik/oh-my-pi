@@ -236,6 +236,14 @@ struct DynamicVar {
 	state: ItemState,
 }
 
+/// Bind program latched on the physical press edge. A live remap or unbind
+/// applies to the next press without losing the matching release.
+#[derive(Clone)]
+struct PressedBind {
+	script:   Str,
+	releases: Vec<(Str, u32)>,
+}
+
 struct VarRef<'a> {
 	name:      &'a str,
 	ty:        &'static crate::TypeSpec,
@@ -325,6 +333,7 @@ impl CtxBuilder {
 			names:          RwLock::new(FastHashMap::default()),
 			aliases:        RwLock::new(FastHashMap::default()),
 			binds:          RwLock::new(FastHashMap::default()),
+			pressed_binds:  RwLock::new(FastHashMap::default()),
 			bind_baseline:  RwLock::new(None),
 			completers:     RwLock::new(FastHashMap::default()),
 			observers:      RwLock::new(Vec::new()),
@@ -360,6 +369,8 @@ pub struct Ctx {
 	names:                 RwLock<FastHashMap<Str, u32>>,
 	aliases:               RwLock<FastHashMap<Str, Str>>,
 	binds:                 RwLock<FastHashMap<Str, Str>>,
+	/// Programs captured on physical press edges until their release arrives.
+	pressed_binds:         RwLock<FastHashMap<Str, PressedBind>>,
 	/// Bind table as it stood after the default bind cfg ran; `dump` diffs
 	/// against it instead of resetting the whole table.
 	bind_baseline:         RwLock<Option<FastHashMap<Str, Str>>>,
@@ -1412,18 +1423,36 @@ impl Ctx {
 		out
 	}
 
-	/// Feeds a key edge. Press executes the bound script; release executes
-	/// the `-` counterpart of every `+action` statement in it.
+	/// Feeds a physical key edge.
+	///
+	/// A press containing `+action` statements latches the current bind
+	/// program. Repeats run its ordinary statements again but never re-press
+	/// an action; release runs the latched `-action` counterparts even when
+	/// the chord was remapped or unbound while held.
 	pub fn key(&self, key: &str, pressed: bool) -> ConResult<Vec<Output>> {
-		let Some(script) = self.bound(key) else {
+		let chord = crate::normalize_chord(key).map_err(ConError::Chord)?;
+		if !pressed {
+			let Some(held) = self.pressed_binds.write().remove(chord.as_str()) else {
+				return Ok(Vec::new());
+			};
+			let mut output = Vec::with_capacity(held.releases.len());
+			for (release, line) in held.releases {
+				self.run(release.as_str())?;
+				output.push(Output { line });
+			}
+			return Ok(output);
+		}
+
+		let mut held = self.pressed_binds.write();
+		if let Some(prior) = held.get(chord.as_str()).cloned() {
+			drop(held);
+			return self.exec_key_repeat(&prior.script);
+		}
+		let Some(script) = self.bound(chord.as_str()) else {
 			return Ok(Vec::new());
 		};
-		if pressed {
-			return self.exec(script.as_str(), Source::Console);
-		}
-		let stmts = script::parse(&script)?;
-		let mut output = Vec::new();
-		for stmt in &stmts {
+		let mut releases = Vec::new();
+		for stmt in script::parse(&script)? {
 			let Some(name) = stmt.args[0].as_atom() else {
 				continue;
 			};
@@ -1432,7 +1461,30 @@ impl Ctx {
 			};
 			let mut release = StrMut::new("-");
 			release.push_str(base);
-			self.run(release.as_str())?;
+			releases.push((release.freeze(), stmt.line));
+		}
+		if !releases.is_empty() {
+			held.insert(chord, PressedBind { script: script.clone(), releases });
+		}
+		drop(held);
+		self.exec(script.as_str(), Source::Console)
+	}
+
+	/// Replays a held key's non-action statements. Terminal repeat reports are
+	/// presses, not new physical edges, so replaying `+action` would leak its
+	/// press count after the single matching release.
+	fn exec_key_repeat(&self, script: &Str) -> ConResult<Vec<Output>> {
+		let stmts = script::parse(script)?;
+		let origin = Origin::Script(Str::new_static("console"));
+		let mut output = Vec::new();
+		for stmt in &stmts {
+			let Some(name) = stmt.args[0].as_atom() else {
+				continue;
+			};
+			if name.as_str().starts_with('+') {
+				continue;
+			}
+			self.dispatch(stmt, false, &origin)?;
 			output.push(Output { line: stmt.line });
 		}
 		Ok(output)

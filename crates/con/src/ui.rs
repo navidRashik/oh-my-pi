@@ -452,6 +452,7 @@ mod ui_contextual;
 mod ui_files;
 mod ui_interaction;
 mod ui_memory;
+mod ui_shell;
 mod ui_tools_tasks_providers;
 
 /// All curated built-in entries in tab/group/declaration order.
@@ -466,7 +467,7 @@ pub fn builtin_ui_entries() -> impl Iterator<Item = &'static UiSpec> {
 		)
 		.chain(ui_memory::ENTRIES)
 		.chain(ui_files::ENTRIES)
-		.chain(ui_contextual::ENTRIES.iter().filter(|entry| entry.tab == SettingTab::Shell))
+		.chain(ui_shell::ENTRIES)
 		.chain(ui_tools_tasks_providers::ENTRIES)
 }
 

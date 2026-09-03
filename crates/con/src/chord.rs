@@ -26,6 +26,11 @@ pub enum ChordError {
 /// Canonical modifier order for chord spellings.
 const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "super"];
 
+/// Symbols whose printable form already implies Shift. Terminals disagree
+/// about whether the Shift modifier remains set beside the shifted codepoint,
+/// so both reports must name one physical chord (pi `addKeyAliases`).
+const SHIFTED_SYMBOLS: &str = "!@#$%^&*()_+{}|:<>?~";
+
 /// Folds a `bind` chord to its canonical spelling: lowercase, modifiers in
 /// `ctrl+alt+shift+super` order, pi key names (`escape`, `pageup`,
 /// `shift+tab`, `f5`).
@@ -80,6 +85,9 @@ pub fn normalize_chord(chord: &str) -> Result<Str, ChordError> {
 		},
 		other => other,
 	};
+	if key.len() == 1 && SHIFTED_SYMBOLS.contains(key) {
+		present[2] = false;
+	}
 	let mut out = StrMut::with_capacity(chord.len() + 8);
 	for (index, name) in MODIFIERS.iter().enumerate() {
 		if present[index] {
@@ -105,6 +113,8 @@ mod tests {
 		assert_eq!(normalize_chord("backtab").unwrap().as_str(), "shift+tab");
 		assert_eq!(normalize_chord("esc").unwrap().as_str(), "escape");
 		assert_eq!(normalize_chord("ctrl++").unwrap().as_str(), "ctrl++");
+		assert_eq!(normalize_chord("shift+!").unwrap().as_str(), "!");
+		assert_eq!(normalize_chord("ctrl+shift+_").unwrap().as_str(), "ctrl+_");
 	}
 
 	#[test]
