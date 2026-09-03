@@ -11,10 +11,13 @@ use omp_core::{IntoStr, SemVer, Str};
 use thiserror::Error;
 
 use crate::{
-	cascade::{CascadeError, glob_match},
+	cascade::{CascadeError, RevisionConstraint, glob_match, parse_revision_constraint},
 	classify::EffortTier,
 	id::{ClassId, FamilyId, ProviderId},
+	thinking::ThinkingMode,
 };
+
+const REVISION_PLACEHOLDER: &str = "{rev}";
 
 macro_rules! sources {
 	($($name:literal),+ $(,)?) => {
@@ -229,6 +232,132 @@ struct EffortFamily {
 	aliases:  Box<[Str]>,
 }
 
+/// One reviewed provider-scoped sibling family.
+///
+/// A family may contain `{rev}` placeholders. Such a family is instantiated
+/// only from a matching live identifier and only when its revision constraint
+/// accepts the captured revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VariantFamily {
+	/// Provider whose roster carries the siblings.
+	pub(crate) provider: ProviderId,
+	/// Logical identifier emitted after collapse.
+	pub(crate) logical: Str,
+	/// Display name emitted after collapse.
+	pub(crate) name: Str,
+	/// Optional constraint for a revision template.
+	revision: Option<RevisionConstraint>,
+	/// Wire identifiers in default-priority order.
+	pub(crate) members: Box<[Str]>,
+	/// Preferred default member when it is live.
+	pub(crate) default_member: Option<Str>,
+	/// Members that remain aliases but cannot be selected.
+	pub(crate) retired_members: Box<[Str]>,
+	/// Portable effort to wire identifier.
+	pub(crate) routing: BTreeMap<EffortTier, Str>,
+	/// Portable effort to token budget.
+	pub(crate) effort_budgets: BTreeMap<EffortTier, u64>,
+	/// Native thinking control.
+	pub(crate) mode: Option<ThinkingMode>,
+	/// Advertised portable effort ladder.
+	pub(crate) efforts: Box<[EffortTier]>,
+	/// Default portable effort.
+	pub(crate) default_level: Option<EffortTier>,
+	/// Whether callers must choose an effort.
+	pub(crate) requires_effort: Option<bool>,
+	/// Whether off requests require an explicit wire control.
+	pub(crate) suppress_when_off: Option<bool>,
+	/// Whether this rename intentionally exposes no thinking surface.
+	pub(crate) no_thinking: bool,
+	/// Whether non-off routes survive absent discovery members.
+	pub(crate) preserve_absent_effort_routes: bool,
+	/// Selector aliases that are not family members.
+	pub(crate) extra_aliases: Box<[Str]>,
+}
+
+impl VariantFamily {
+	fn instantiate_for(&self, id: &str) -> Option<Self> {
+		if !self.logical.contains(REVISION_PLACEHOLDER) {
+			return self.matches_id(id).then(|| self.clone());
+		}
+		let revision = self
+			.ids_used_for_matching()
+			.find_map(|template| capture_template_revision(template, id))?;
+		let parsed = parse_revision(revision).ok()?;
+		if self
+			.revision
+			.as_ref()
+			.is_some_and(|constraint| !constraint.matches(parsed))
+		{
+			return None;
+		}
+		let fill = |value: &Str| Str::from(value.replace(REVISION_PLACEHOLDER, revision));
+		let mut family = self.clone();
+		family.logical = fill(&self.logical);
+		family.name = fill(&self.name);
+		family.members = self.members.iter().map(&fill).collect();
+		family.default_member = self.default_member.as_ref().map(&fill);
+		family.retired_members = self.retired_members.iter().map(&fill).collect();
+		family.routing = self
+			.routing
+			.iter()
+			.map(|(effort, target)| (*effort, fill(target)))
+			.collect();
+		family.extra_aliases = self.extra_aliases.iter().map(fill).collect();
+		Some(family)
+	}
+
+	fn matches_id(&self, id: &str) -> bool {
+		self
+			.ids_used_for_matching()
+			.any(|candidate| candidate.eq_ignore_ascii_case(id))
+	}
+
+	fn ids_used_for_matching(&self) -> impl Iterator<Item = &str> {
+		std::iter::once(self.logical.as_str())
+			.chain(self.members.iter().map(Str::as_str))
+			.chain(self.extra_aliases.iter().map(Str::as_str))
+	}
+
+	pub(crate) fn preferred_default<'a>(&'a self, present: &BTreeSet<&str>) -> Option<&'a str> {
+		let is_live = |member: &str| {
+			present.iter().any(|candidate| *candidate == member)
+				&& !self
+					.retired_members
+					.iter()
+					.any(|retired| retired.as_str() == member)
+		};
+		if let Some(member) = self.default_member.as_deref()
+			&& is_live(member)
+		{
+			return Some(member);
+		}
+		self
+			.members
+			.iter()
+			.find_map(|member| is_live(member).then_some(member.as_str()))
+	}
+}
+
+fn capture_template_revision<'a>(template: &str, id: &'a str) -> Option<&'a str> {
+	let marker = template.find(REVISION_PLACEHOLDER)?;
+	let prefix = &template[..marker];
+	if id.len() < prefix.len() || !id[..prefix.len()].eq_ignore_ascii_case(prefix) {
+		return None;
+	}
+	let tail = &id[prefix.len()..];
+	let revision_len = tail
+		.bytes()
+		.take_while(|byte| byte.is_ascii_digit() || *byte == b'.')
+		.count();
+	let revision = tail.get(..revision_len)?;
+	if revision.is_empty() || parse_revision(revision).is_err() {
+		return None;
+	}
+	let rendered = template.replace(REVISION_PLACEHOLDER, revision);
+	rendered.eq_ignore_ascii_case(id).then_some(revision)
+}
+
 /// Parsed checked-in identity taxonomy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Taxonomy {
@@ -237,6 +366,7 @@ pub struct Taxonomy {
 	pair_tokens:      Vec<Str>,
 	lanes:            Vec<EffortLaneSuffix>,
 	effort_families:  Vec<EffortFamily>,
+	variant_families: Vec<VariantFamily>,
 	routing_variants: Vec<RoutingVariantSuffix>,
 	discovery:        DiscoveryVocabulary,
 }
@@ -285,6 +415,7 @@ impl Taxonomy {
 		let mut pair_tokens = Vec::new();
 		let mut lanes = Vec::new();
 		let mut effort_families = Vec::new();
+		let mut variant_families = Vec::new();
 		let mut routing_variants = Vec::new();
 		let mut discovery = DiscoveryVocabulary::default();
 		let mut source_names = BTreeSet::new();
@@ -331,7 +462,8 @@ impl Taxonomy {
 							return malformed(file, "collapse");
 						}
 						saw_collapse = true;
-						(collapse, pair_tokens, lanes, routing_variants) = parse_collapse(file, node)?;
+						(collapse, pair_tokens, lanes, routing_variants, variant_families) =
+							parse_collapse(file, node)?;
 						effort_families = parse_effort_families(file, node)?;
 					},
 					"discovery" => {
@@ -354,6 +486,7 @@ impl Taxonomy {
 			pair_tokens,
 			lanes,
 			effort_families,
+			variant_families,
 			routing_variants,
 			discovery,
 		})
@@ -610,6 +743,11 @@ impl Taxonomy {
 				return (Cow::Owned(format!("{base}{}", &model[trimmed.len()..])), rule.effort, false);
 			}
 		}
+		if let Some(family) = self.variant_family(provider, model)
+			&& !family.logical.eq_ignore_ascii_case(model)
+		{
+			return (Cow::Owned(family.logical.to_string()), None, false);
+		}
 		if let Some(family) = self.effort_families.iter().find(|family| {
 			family.provider.eq_ignore_ascii_case(provider)
 				&& family
@@ -622,12 +760,37 @@ impl Taxonomy {
 		(Cow::Borrowed(model), None, false)
 	}
 
+	/// Returns the reviewed variant family matching a logical, member, or alias
+	/// id.
+	pub(crate) fn variant_family(&self, provider: &str, id: &str) -> Option<VariantFamily> {
+		let matching_provider =
+			|family: &&VariantFamily| family.provider.eq_ignore_ascii_case(provider);
+		self
+			.variant_families
+			.iter()
+			.filter(matching_provider)
+			.filter(|family| !family.logical.contains(REVISION_PLACEHOLDER))
+			.find_map(|family| family.instantiate_for(id))
+			.or_else(|| {
+				self
+					.variant_families
+					.iter()
+					.filter(matching_provider)
+					.filter(|family| family.logical.contains(REVISION_PLACEHOLDER))
+					.find_map(|family| family.instantiate_for(id))
+			})
+	}
+
 	/// Whether `provider` declares dynamic effort-sibling families.
 	pub(crate) fn supports_dynamic_effort_siblings(&self, provider: &str) -> bool {
 		self
 			.effort_families
 			.iter()
 			.any(|family| family.provider.eq_ignore_ascii_case(provider) && !family.logical.is_empty())
+			|| self
+				.variant_families
+				.iter()
+				.any(|family| family.provider.eq_ignore_ascii_case(provider))
 	}
 
 	/// Returns the standard-lane id when `model` ends in a declared effort lane.
@@ -941,7 +1104,7 @@ fn parse_collapse(
 	file: &str,
 	node: &KdlNode,
 ) -> Result<
-	(Vec<SuffixDef>, Vec<Str>, Vec<EffortLaneSuffix>, Vec<RoutingVariantSuffix>),
+	(Vec<SuffixDef>, Vec<Str>, Vec<EffortLaneSuffix>, Vec<RoutingVariantSuffix>, Vec<VariantFamily>),
 	CascadeError,
 > {
 	validate_properties(file, node, "collapse", &[])?;
@@ -955,6 +1118,7 @@ fn parse_collapse(
 	let mut pair_tokens = Vec::new();
 	let mut lanes = Vec::new();
 	let mut routing_variants = Vec::new();
+	let mut variant_families = Vec::new();
 	let mut suffixes = BTreeSet::new();
 	for child in children.nodes() {
 		let directive = child.name().value();
@@ -974,7 +1138,7 @@ fn parse_collapse(
 		let allowed = match directive {
 			"effort-suffix" => &["tier", "except-bare-prefix"][..],
 			"effort-lane-suffix" => &["bare-prefix"][..],
-			"variant-family" => &["name"][..],
+			"variant-family" => &["name", "revision"][..],
 			_ => &[][..],
 		};
 		validate_properties(file, child, directive, allowed)?;
@@ -987,7 +1151,11 @@ fn parse_collapse(
 			return malformed(file, directive);
 		}
 		let arguments = positional_strings(child);
-		if matches!(directive, "effort-family" | "variant-family" | "provider-alias") {
+		if directive == "variant-family" {
+			variant_families.push(parse_variant_family(file, child)?);
+			continue;
+		}
+		if matches!(directive, "effort-family" | "provider-alias") {
 			continue;
 		}
 		if directive == "pair-token" {
@@ -1087,8 +1255,210 @@ fn parse_collapse(
 				.map(|value| value.to_ascii_lowercase().to_str()),
 		});
 	}
-	Ok((rules, pair_tokens, lanes, routing_variants))
+	Ok((rules, pair_tokens, lanes, routing_variants, variant_families))
 }
+
+fn parse_variant_family(file: &str, node: &KdlNode) -> Result<VariantFamily, CascadeError> {
+	validate_properties(file, node, "variant-family", &["name", "revision"])?;
+	let arguments = positional_strings(node);
+	let [provider, logical] = arguments.as_slice() else {
+		return malformed(file, "variant-family");
+	};
+	if provider.is_empty() || logical.is_empty() {
+		return malformed(file, "variant-family");
+	}
+	let name =
+		property_string(node, "name").ok_or_else(|| malformed_error(file, "variant-family"))?;
+	let Some(children) = node.children() else {
+		return malformed(file, "variant-family");
+	};
+	let templated = logical.contains(REVISION_PLACEHOLDER);
+	let revision = match node.get("revision") {
+		Some(KdlValue::String(expression)) if templated => Some(
+			parse_revision_constraint(expression)
+				.ok_or_else(|| malformed_error(file, "variant-family"))?,
+		),
+		Some(_) => return malformed(file, "variant-family"),
+		None => None,
+	};
+	let mut family = VariantFamily {
+		provider: ProviderId::new(provider.to_ascii_lowercase()),
+		logical: Str::new(logical),
+		name: Str::new(name),
+		revision,
+		members: Box::default(),
+		default_member: None,
+		retired_members: Box::default(),
+		routing: BTreeMap::new(),
+		effort_budgets: BTreeMap::new(),
+		mode: None,
+		efforts: Box::default(),
+		default_level: None,
+		requires_effort: None,
+		suppress_when_off: None,
+		no_thinking: false,
+		preserve_absent_effort_routes: false,
+		extra_aliases: Box::default(),
+	};
+	let mut members = Vec::new();
+	let mut retired_members = Vec::new();
+	let mut efforts = Vec::new();
+	let mut extra_aliases = Vec::new();
+	for child in children.nodes() {
+		let directive = child.name().value();
+		if child.children().is_some() {
+			return malformed(file, directive);
+		}
+		if matches!(
+			directive,
+			"requires-effort" | "suppress-when-off" | "no-thinking" | "preserve-absent-effort-routes"
+		) {
+			let [entry] = child.entries() else {
+				return malformed(file, directive);
+			};
+			if entry.name().is_some() {
+				return malformed(file, directive);
+			}
+			let KdlValue::Bool(value) = entry.value() else {
+				return malformed(file, directive);
+			};
+			match directive {
+				"requires-effort" => family.requires_effort = Some(*value),
+				"suppress-when-off" => family.suppress_when_off = Some(*value),
+				"no-thinking" => family.no_thinking = *value,
+				"preserve-absent-effort-routes" => {
+					family.preserve_absent_effort_routes = *value;
+				},
+				_ => unreachable!("matched boolean variant-family directive"),
+			}
+			continue;
+		}
+		validate_properties(file, child, directive, &[])?;
+		let values = positional_strings(child);
+		if values.len() != child.entries().len() {
+			return malformed(file, directive);
+		}
+		match directive {
+			"members" => {
+				if values.is_empty() || values.iter().any(String::is_empty) {
+					return malformed(file, directive);
+				}
+				members.extend(values.into_iter().map(Str::new));
+			},
+			"route" => {
+				let [tier, target] = values.as_slice() else {
+					return malformed(file, directive);
+				};
+				if target.is_empty() {
+					return malformed(file, directive);
+				}
+				let tier = parse_effort(tier).map_err(|()| malformed_error(file, directive))?;
+				if family.routing.insert(tier, Str::new(target)).is_some() {
+					return malformed(file, directive);
+				}
+			},
+			"budget" => {
+				let [tier, amount] = values.as_slice() else {
+					return malformed(file, directive);
+				};
+				let tier = parse_effort(tier).map_err(|()| malformed_error(file, directive))?;
+				if tier == EffortTier::Off {
+					return malformed(file, directive);
+				}
+				let amount = amount
+					.parse::<u64>()
+					.map_err(|_| malformed_error(file, directive))?;
+				if amount > 9_007_199_254_740_991 {
+					return malformed(file, directive);
+				}
+				if family.effort_budgets.insert(tier, amount).is_some() {
+					return malformed(file, directive);
+				}
+			},
+			"mode" => {
+				let [mode] = values.as_slice() else {
+					return malformed(file, directive);
+				};
+				if mode.is_empty() || family.mode.is_some() {
+					return malformed(file, directive);
+				}
+				let parsed = mode
+					.parse::<ThinkingMode>()
+					.map_err(|_| malformed_error(file, directive))?;
+				if parsed.into_str() != mode {
+					return malformed(file, directive);
+				}
+				family.mode = Some(parsed);
+			},
+			"efforts" => {
+				if values.is_empty() || !efforts.is_empty() {
+					return malformed(file, directive);
+				}
+				for value in values {
+					let effort = parse_effort(&value).map_err(|()| malformed_error(file, directive))?;
+					if effort == EffortTier::Off {
+						return malformed(file, directive);
+					}
+					efforts.push(effort);
+				}
+			},
+			"default-level" => {
+				let [value] = values.as_slice() else {
+					return malformed(file, directive);
+				};
+				if family.default_level.is_some() {
+					return malformed(file, directive);
+				}
+				let effort = parse_effort(value).map_err(|()| malformed_error(file, directive))?;
+				if effort == EffortTier::Off {
+					return malformed(file, directive);
+				}
+				family.default_level = Some(effort);
+			},
+			"default-member" => {
+				let [value] = values.as_slice() else {
+					return malformed(file, directive);
+				};
+				if value.is_empty() || family.default_member.is_some() {
+					return malformed(file, directive);
+				}
+				family.default_member = Some(Str::new(value));
+			},
+			"retired" => {
+				if values.is_empty() || values.iter().any(String::is_empty) {
+					return malformed(file, directive);
+				}
+				retired_members.extend(values.into_iter().map(Str::new));
+			},
+			"aliases" => {
+				if values.is_empty() || values.iter().any(String::is_empty) {
+					return malformed(file, directive);
+				}
+				extra_aliases.extend(values.into_iter().map(Str::new));
+			},
+			_ => return unexpected(file, directive, "variant-family"),
+		}
+	}
+	if members.is_empty() {
+		return malformed(file, "variant-family");
+	}
+	let placeholder_shape_is_valid = members
+		.iter()
+		.chain(family.routing.values())
+		.chain(retired_members.iter())
+		.chain(extra_aliases.iter())
+		.chain(family.default_member.iter())
+		.all(|id| id.contains(REVISION_PLACEHOLDER) == templated);
+	if !placeholder_shape_is_valid {
+		return malformed(file, "variant-family");
+	}
+	family.members = members.into_boxed_slice();
+	family.retired_members = retired_members.into_boxed_slice();
+	family.efforts = efforts.into_boxed_slice();
+	family.extra_aliases = extra_aliases.into_boxed_slice();
+	Ok(family)
+}
+
 fn parse_effort_families(file: &str, node: &KdlNode) -> Result<Vec<EffortFamily>, CascadeError> {
 	let Some(children) = node.children() else {
 		return malformed(file, "collapse");
@@ -1140,7 +1510,7 @@ fn parse_effort_families(file: &str, node: &KdlNode) -> Result<Vec<EffortFamily>
 					.collect::<Vec<_>>(),
 			)
 		} else {
-			validate_properties(file, child, directive, &["name"])?;
+			validate_properties(file, child, directive, &["name", "revision"])?;
 			let arguments = positional_strings(child);
 			let [provider, logical] = arguments.as_slice() else {
 				return malformed(file, directive);

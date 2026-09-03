@@ -293,10 +293,10 @@ enum RevisionOp {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RevisionConstraint(Vec<(RevisionOp, SemVer)>);
+pub(crate) struct RevisionConstraint(Vec<(RevisionOp, SemVer)>);
 
 impl RevisionConstraint {
-	fn matches(&self, revision: SemVer) -> bool {
+	pub(crate) fn matches(&self, revision: SemVer) -> bool {
 		self.0.iter().all(|&(op, expected)| match op {
 			RevisionOp::GreaterEqual => revision >= expected,
 			RevisionOp::Greater => revision > expected,
@@ -729,7 +729,7 @@ fn required_name<'a>(
 	})
 }
 
-fn parse_revision_constraint(expression: &str) -> Option<RevisionConstraint> {
+pub(crate) fn parse_revision_constraint(expression: &str) -> Option<RevisionConstraint> {
 	let mut terms = Vec::new();
 	for term in expression.split_ascii_whitespace() {
 		let (op, version) = if let Some(version) = term.strip_prefix(">=") {

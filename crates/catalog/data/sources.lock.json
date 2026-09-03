@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_digest": "c73854c442291b71039b8384390bb552cdd5a02d43a98f86b5d131a2217b7425",
+  "source_digest": "f06d428e600cd3ab369471c58608e5eab41cc3f9425f696387f5a5cc4061d896",
   "inputs": [
     {
       "id": "catalog.models.compressed.v1",
@@ -671,20 +671,20 @@
     {
       "id": "compat.cascade.runtime.behavior.v1",
       "path": "crates/catalog/compat/runtime/behavior.kdl",
-      "sha256": "b8d871ac275ab3f6b77c3fc4848eae806785365f12d9d3f196d59d10fedd1e69",
-      "source": "census 2026-08: .omp/local/quirks + frozen oracle"
+      "sha256": "93b97d60cb8f486255d9e38a74cd4a14c40040c154851aca8c13d0954afa4db5",
+      "source": "pi upstream compat rules 2026-09-03"
     },
     {
       "id": "compat.cascade.taxonomy._collapse.v1",
       "path": "crates/catalog/compat/taxonomy/_collapse.kdl",
-      "sha256": "d6e50d2a14acce8a3ae5bc3b1ee842f459093d266e4892e1e2c91bde6fab4d49",
-      "source": "census 2026-08: .omp/local/quirks + frozen oracle"
+      "sha256": "2ca39414ba7c4e2cfbc3ccbf49e86d0c7c886484df1c34b24504b030026375a8",
+      "source": "pi upstream compat rules 2026-09-03"
     },
     {
       "id": "compat.cascade.taxonomy._discovery.v1",
       "path": "crates/catalog/compat/taxonomy/_discovery.kdl",
-      "sha256": "49ba4281e998fb8a102a9dd78405d67022a093ea7957929e3275b0b63b147a61",
-      "source": "census 2026-08: .omp/local/quirks + frozen oracle"
+      "sha256": "6a0cdc96435b128a435a3881c223f99e402804638bb59d83677bba0e69323d27",
+      "source": "pi upstream compat rules 2026-09-03"
     },
     {
       "id": "compat.cascade.taxonomy.ai21.v1",
@@ -743,8 +743,8 @@
     {
       "id": "compat.cascade.taxonomy.glm.v1",
       "path": "crates/catalog/compat/taxonomy/glm.kdl",
-      "sha256": "56342ddac5b98abd354da437a9d9a573def0e01db6cabd76e49c8ecee39fbd58",
-      "source": "census 2026-08: .omp/local/quirks + frozen oracle"
+      "sha256": "ba5c4890ce5513058af746283a6d6cf3974b3f9e3dbb2d09cfe5b24634dbcd90",
+      "source": "pi upstream compat rules 2026-09-03"
     },
     {
       "id": "compat.cascade.taxonomy.gpt-oss.v1",
@@ -761,8 +761,8 @@
     {
       "id": "compat.cascade.taxonomy.meta.v1",
       "path": "crates/catalog/compat/taxonomy/meta.kdl",
-      "sha256": "c49f4b0916064ab66aa41c985d87e2843d10a8d55da219cf7a9a123d4f913f84",
-      "source": "census 2026-08: .omp/local/quirks + frozen oracle"
+      "sha256": "c6931f770846d67749c726ca1f54e1ffc279797cd728c2b7d6e8896fa4efff0a",
+      "source": "pi upstream compat rules 2026-09-03"
     },
     {
       "id": "compat.cascade.taxonomy.mimo.v1",

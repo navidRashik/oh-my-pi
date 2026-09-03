@@ -32,8 +32,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
 	Abort, ArgIssue, ArgIssueKind, ArgPath, ArgSpec, ArgSpecRegistry, ArgSpecRegistryError,
 	CallOutcome, Constraint, DeviceIssue, DevicePath, Effects, ExecutionMode, GrammarSyntax,
-	IncomingParams, JobRef, LiftedCall, Part, Presentation, PromptCaps, RecordedCall,
-	RecordedCallOwned, Rev, Tool, ToolIdentity, ToolPromptExample, ToolSpec,
+	IncomingParams, JobRef, LiftedCall, Part, Presentation, ProjectionAuthorizationError,
+	ProjectionSpan, PromptCaps, RecordedCall, RecordedCallOwned, Rev, Tool, ToolIdentity,
+	ToolPromptExample, ToolSpec, VisibilityReceipt,
 };
 
 /// Catalog capabilities needed for deterministic tool lowering.
@@ -973,11 +974,13 @@ pub struct ProjectedVerdict {
 	///
 	/// Shared ownership avoids copying immutable parts into each projected
 	/// thread item.
-	pub parts:    Arc<[Part]>,
+	pub parts:      Arc<[Part]>,
+	/// Source ranges awaiting the live dispatcher's final visibility receipt.
+	pub visibility: Arc<[ProjectionSpan]>,
 	/// Whether the decoded verdict branch is a fault, argument error, or abort.
-	pub is_error: bool,
+	pub is_error:   bool,
 	/// Durable compaction hint, forced false for argument errors and aborts.
-	pub useless:  bool,
+	pub useless:    bool,
 }
 
 struct ProjectionCache {
@@ -1031,7 +1034,14 @@ impl ProjectionCache {
 	}
 
 	fn insert(&self, device_id: u32, key: &ProjectionKey, value: ProjectedVerdict) {
-		let bytes = projected_part_bytes(&value.parts);
+		let bytes = projected_part_bytes(&value.parts).saturating_add(value.visibility.iter().fold(
+			0,
+			|bytes, span| {
+				bytes
+					.saturating_add(size_of::<ProjectionSpan>())
+					.saturating_add(span.source_key.len())
+			},
+		));
 		if bytes > Self::MAX_PART_BYTES {
 			return;
 		}
@@ -1231,6 +1241,15 @@ pub enum RegistryError {
 		/// Typed update decoder failure.
 		source: serde_json::Error,
 	},
+	/// A document authority rejected the dispatcher's visibility receipt.
+	#[error("tool {name} rejected its model visibility receipt")]
+	ProjectionAuthorization {
+		/// Tool receiving the receipt.
+		name:   Str,
+		/// Typed authority failure.
+		#[source]
+		source: ProjectionAuthorizationError,
+	},
 	/// Selected route cannot honor a constraint whose fallback is `ERROR`.
 	#[error("tool {name}@{rev} requires unsupported constraint: {feature}")]
 	UnsupportedConstraint {
@@ -1253,6 +1272,11 @@ trait ErasedTool: Send + Sync {
 	fn project_cached(&self, key: &ProjectionKey) -> Option<Arc<ProjectedVerdict>>;
 	fn cache_projected(&self, key: &ProjectionKey, projected: ProjectedVerdict);
 	fn warm(&self, requests: &[ProjectionRequest<'_>]) -> ProjectionWarm;
+	fn authorize_visibility(
+		&self,
+		verdict: &[u8],
+		receipt: &VisibilityReceipt,
+	) -> Result<(), RegistryError>;
 	fn invoke_input(
 		&self,
 		invocation_id: &str,
@@ -1282,22 +1306,25 @@ impl HostTool {
 			CallOutcome::Faulted(value) => (value, true, recorded_useless),
 			CallOutcome::ArgsRejected(issue) => {
 				return Ok(ProjectedVerdict {
-					parts:    vec![Part::Text { text: render_arg_issue(&issue) }].into(),
-					is_error: true,
-					useless:  false,
+					parts:      vec![Part::Text { text: render_arg_issue(&issue) }].into(),
+					visibility: Arc::from([]),
+					is_error:   true,
+					useless:    false,
 				});
 			},
 			CallOutcome::Aborted { abort, .. } => {
 				return Ok(ProjectedVerdict {
-					parts:    vec![Part::Text { text: abort.render() }].into(),
-					is_error: true,
-					useless:  false,
+					parts:      vec![Part::Text { text: abort.render() }].into(),
+					visibility: Arc::from([]),
+					is_error:   true,
+					useless:    false,
 				});
 			},
 		};
 		let text = serde_json::to_string(&value).map_err(RegistryError::Serialize)?;
 		Ok(ProjectedVerdict {
 			parts: vec![Part::Text { text: Str::new(text) }].into(),
+			visibility: Arc::from([]),
 			is_error,
 			useless,
 		})
@@ -1350,6 +1377,14 @@ impl ErasedTool for HostTool {
 				Ok(())
 			});
 		ProjectionWarm::ready(result)
+	}
+
+	fn authorize_visibility(
+		&self,
+		_verdict: &[u8],
+		_receipt: &VisibilityReceipt,
+	) -> Result<(), RegistryError> {
+		Ok(())
 	}
 
 	fn invoke_input(
@@ -1425,6 +1460,14 @@ impl ErasedTool for Worker {
 		ProjectionWarm::ready(Err(external_error(&self.spec, "warm")))
 	}
 
+	fn authorize_visibility(
+		&self,
+		_verdict: &[u8],
+		_receipt: &VisibilityReceipt,
+	) -> Result<(), RegistryError> {
+		Ok(())
+	}
+
 	fn invoke_input(
 		&self,
 		_invocation_id: &str,
@@ -1455,25 +1498,35 @@ impl<T: Tool> Registered<T> {
 		let verdict: CallOutcome<T::Payload, T::Fault> = serde_json::from_slice(verdict)
 			.map_err(|_| RegistryError::VerdictShape(self.tool.spec().name.clone()))?;
 		Ok(match &verdict {
-			CallOutcome::Ok(payload) => ProjectedVerdict {
-				parts:    self.tool.prompt(Ok(payload), &caps).into(),
-				is_error: false,
-				useless:  recorded_useless,
+			CallOutcome::Ok(payload) => {
+				let projected = self.tool.projection(Ok(payload), &caps);
+				ProjectedVerdict {
+					parts:      projected.parts.into(),
+					visibility: projected.visibility.into(),
+					is_error:   false,
+					useless:    recorded_useless,
+				}
 			},
-			CallOutcome::Faulted(fault) => ProjectedVerdict {
-				parts:    self.tool.prompt(Err(fault), &caps).into(),
-				is_error: true,
-				useless:  recorded_useless,
+			CallOutcome::Faulted(fault) => {
+				let projected = self.tool.projection(Err(fault), &caps);
+				ProjectedVerdict {
+					parts:      projected.parts.into(),
+					visibility: projected.visibility.into(),
+					is_error:   true,
+					useless:    recorded_useless,
+				}
 			},
 			CallOutcome::ArgsRejected(issue) => ProjectedVerdict {
-				parts:    vec![Part::Text { text: render_arg_issue(issue) }].into(),
-				is_error: true,
-				useless:  false,
+				parts:      vec![Part::Text { text: render_arg_issue(issue) }].into(),
+				visibility: Arc::from([]),
+				is_error:   true,
+				useless:    false,
 			},
 			CallOutcome::Aborted { abort, .. } => ProjectedVerdict {
-				parts:    vec![Part::Text { text: abort.render() }].into(),
-				is_error: true,
-				useless:  false,
+				parts:      vec![Part::Text { text: abort.render() }].into(),
+				visibility: Arc::from([]),
+				is_error:   true,
+				useless:    false,
 			},
 		})
 	}
@@ -1599,6 +1652,27 @@ impl<T: Tool> ErasedTool for Registered<T> {
 				Ok(())
 			});
 		ProjectionWarm::ready(result)
+	}
+
+	fn authorize_visibility(
+		&self,
+		verdict: &[u8],
+		receipt: &VisibilityReceipt,
+	) -> Result<(), RegistryError> {
+		let verdict: CallOutcome<T::Payload, T::Fault> = serde_json::from_slice(verdict)
+			.map_err(|_| RegistryError::VerdictShape(self.tool.spec().name.clone()))?;
+		let view = match &verdict {
+			CallOutcome::Ok(payload) => Ok(payload),
+			CallOutcome::Faulted(fault) => Err(fault),
+			CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => return Ok(()),
+		};
+		self
+			.tool
+			.authorize_visibility(view, receipt)
+			.map_err(|source| RegistryError::ProjectionAuthorization {
+				name: self.tool.spec().name.clone(),
+				source,
+			})
 	}
 
 	fn invoke_input(
@@ -2851,6 +2925,19 @@ impl Registry {
 			.ok_or_else(|| RegistryError::ProjectionCacheMiss(identity.clone()))
 	}
 
+	/// Returns the live dispatcher's final source visibility receipt to the
+	/// exact registered tool revision.
+	pub fn authorize_visibility(
+		&self,
+		identity: &ToolIdentity,
+		verdict: &[u8],
+		receipt: &VisibilityReceipt,
+	) -> Result<(), RegistryError> {
+		self
+			.projection_tool(identity)?
+			.authorize_visibility(verdict, receipt)
+	}
+
 	/// Projects one exact serialized update through its registered typed tool.
 	pub fn invoke_input(
 		&self,
@@ -3583,9 +3670,10 @@ mod tests {
 			ProjectionKey::new(&identity(1), b"{\"kind\":\"ok\"}", &caps(), [2; 32].into());
 		assert!(cache.get(0, &key).is_none());
 		cache.insert(0, &key, ProjectedVerdict {
-			parts:    Arc::<[Part]>::from([]),
-			is_error: false,
-			useless:  false,
+			parts:      Arc::<[Part]>::from([]),
+			visibility: Arc::from([]),
+			is_error:   false,
+			useless:    false,
 		});
 		let hit = cache.get(0, &key).expect("matching key hits");
 		assert!(Arc::ptr_eq(&hit, &cache.get(0, &key).expect("second matching key hits")));
@@ -3732,8 +3820,12 @@ mod tests {
 			&caps(),
 			remote.projection_hash(),
 		);
-		let projected =
-			ProjectedVerdict { parts: Arc::<[Part]>::from([]), is_error: false, useless: false };
+		let projected = ProjectedVerdict {
+			parts:      Arc::<[Part]>::from([]),
+			visibility: Arc::from([]),
+			is_error:   false,
+			useless:    false,
+		};
 		remote
 			.cache_projected(&projection_key, projected.clone())
 			.expect("remote projection can be supplied externally");

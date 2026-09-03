@@ -27,7 +27,7 @@ use crate::{
 	cascade::{AxisMap, CascadeError, CompatCascade, ResolveTarget},
 	classify::{
 		ClassificationInput, ClassificationPhase, EffortTier, ModelClassification, classify,
-		strip_effort_lane, supports_dynamic_effort_siblings,
+		strip_effort_lane, supports_dynamic_effort_siblings, variant_family,
 	},
 	discover::DiscoveryDefaults,
 	id::{
@@ -3594,7 +3594,7 @@ fn compile_models(
 				(model.clone(), classified)
 			})
 			.collect();
-		let collapsible = collapsible_groups(&identities);
+		let collapsible = collapsible_groups(provider.as_str(), &identities);
 		let mut logical: BTreeMap<Str, Vec<(Str, SourceModelRecord, ModelClassification)>> =
 			BTreeMap::new();
 		for (wire, row) in rows {
@@ -3613,6 +3613,7 @@ fn compile_models(
 		}
 		for (logical_id, members) in logical {
 			let first = &members[0];
+			let reviewed_family = variant_family(provider.as_str(), logical_id.as_str());
 			let mut merged_row = first.1.clone();
 			for (_, row, _) in members.iter().skip(1) {
 				for input in &row.input {
@@ -3632,10 +3633,10 @@ fn compile_models(
 				});
 			merged_row.reasoning = merged_row.reasoning || tier_reasoning;
 			let class = first.2.class.clone();
-			let display_name = first
-				.1
-				.name
-				.clone()
+			let display_name = reviewed_family
+				.as_ref()
+				.map(|family| family.name.clone())
+				.or_else(|| first.1.name.clone())
 				.map(|name| {
 					if provider == "cursor"
 						&& logical_id.as_str().starts_with("cursor-grok-")
@@ -3675,12 +3676,29 @@ fn compile_models(
 			}
 			routes.sort();
 			routes.dedup();
-			if members.len() > 1 {
+			if members.len() > 1 && reviewed_family.is_none() {
 				for route in &routes {
 					wire_ids.push((route.clone(), WireModelId::new(logical_id.clone())));
 				}
 			}
-			wire_ids.sort();
+			let present = members
+				.iter()
+				.map(|(wire, ..)| wire.as_str())
+				.collect::<BTreeSet<_>>();
+			let preferred_wire = reviewed_family
+				.as_ref()
+				.and_then(|family| family.preferred_default(&present));
+			wire_ids.sort_by(|left, right| {
+				left
+					.0
+					.cmp(&right.0)
+					.then_with(|| {
+						let left_preferred = preferred_wire == Some(left.1.as_str());
+						let right_preferred = preferred_wire == Some(right.1.as_str());
+						right_preferred.cmp(&left_preferred)
+					})
+					.then_with(|| left.1.cmp(&right.1))
+			});
 			wire_ids.dedup();
 			let capability_override = exact_capability_override(&provider, &logical_id);
 			let resolved = cascade.resolve(&ResolveTarget {
@@ -3800,7 +3818,12 @@ fn compile_models(
 				});
 			}
 			let (thinking, mut thinking_routing) = if capabilities.chat.is_some() {
-				compile_thinking(provider.as_str(), &members, thinking_profile)?
+				compile_thinking(
+					provider.as_str(),
+					&members,
+					thinking_profile,
+					reviewed_family.as_ref(),
+				)?
 			} else {
 				(None, ThinkingRouting::default())
 			};
@@ -3838,6 +3861,24 @@ fn compile_models(
 						target:     key.clone(),
 						rationale:  classified.evidence.rationale.clone(),
 						provenance: classified.evidence.provenance.clone(),
+					});
+				}
+			}
+			if let Some(family) = &reviewed_family {
+				for alias in family
+					.members
+					.iter()
+					.chain(family.retired_members.iter())
+					.chain(family.extra_aliases.iter())
+				{
+					if alias.as_str() == logical_id.as_str() {
+						continue;
+					}
+					aliases.push(CatalogAlias {
+						alias:      Str::from(format!("{provider}/{alias}")),
+						target:     key.clone(),
+						rationale:  sf!("reviewed provider variant belongs to one logical model"),
+						provenance: sf!("compat/taxonomy/_collapse.kdl"),
 					});
 				}
 			}
@@ -4065,10 +4106,17 @@ fn retarget_collapsed_model_reference(
 	}
 }
 
-fn collapsible_groups(classified: &BTreeMap<Str, ModelClassification>) -> BTreeSet<Str> {
+fn collapsible_groups(
+	provider: &str,
+	classified: &BTreeMap<Str, ModelClassification>,
+) -> BTreeSet<Str> {
 	let raw: BTreeSet<&str> = classified.keys().map(Str::as_str).collect();
 	let mut tiers: BTreeMap<&str, Vec<EffortTier>> = BTreeMap::new();
-	let mut result = BTreeSet::new();
+	let mut result = classified
+		.keys()
+		.filter_map(|wire| variant_family(provider, wire.as_str()))
+		.map(|family| family.logical)
+		.collect::<BTreeSet<_>>();
 	for value in classified.values() {
 		if value.thinking_variant && raw.contains(value.logical_model.as_str()) {
 			result.insert(value.logical_model.clone());
@@ -4511,6 +4559,7 @@ fn compile_thinking(
 	provider: &str,
 	members: &[(Str, SourceModelRecord, ModelClassification)],
 	profile: Option<ThinkingPolicy>,
+	reviewed_family: Option<&crate::taxonomy::VariantFamily>,
 ) -> Result<(Option<ThinkingPolicy>, ThinkingRouting), CompileError> {
 	let source = members.iter().find_map(|(_, row, _)| row.thinking.as_ref());
 	let mut classified_efforts: SmallVec<ThinkingEffort, 6> = members
@@ -4520,9 +4569,42 @@ fn compile_thinking(
 	classified_efforts.sort();
 	classified_efforts.dedup();
 	let tier_collapsed = classified_efforts.len() >= 2;
-	let synthesize_cursor =
-		supports_dynamic_effort_siblings(provider) && tier_collapsed && source.is_none();
-	let mut profile = if synthesize_cursor {
+	let synthesize_cursor = reviewed_family.is_none()
+		&& supports_dynamic_effort_siblings(provider)
+		&& tier_collapsed
+		&& source.is_none();
+	let reviewed_profile = reviewed_family.and_then(|family| {
+		(!family.no_thinking)
+			.then_some(family.mode)
+			.flatten()
+			.map(|mode| ThinkingPolicy {
+				mode,
+				efforts: family
+					.efforts
+					.iter()
+					.copied()
+					.map(translate_effort)
+					.collect(),
+				default_level: family.default_level.map(translate_effort),
+				effort_budgets: family
+					.effort_budgets
+					.iter()
+					.map(|(effort, budget)| (translate_effort(*effort), *budget))
+					.collect(),
+				effort_map: BTreeMap::new(),
+				prefix_binding: None,
+				supports_display: None,
+				suppress_when_off: family.suppress_when_off,
+				requires_effort: family.requires_effort,
+			})
+	});
+	let mut profile = if reviewed_family.is_some_and(|family| family.no_thinking) {
+		None
+	} else if let Some(profile) = profile {
+		Some(profile)
+	} else if reviewed_profile.is_some() {
+		reviewed_profile
+	} else if synthesize_cursor {
 		let efforts = classified_efforts
 			.iter()
 			.copied()
@@ -4550,8 +4632,7 @@ fn compile_thinking(
 			suppress_when_off: None,
 			requires_effort: (!has_off_route).then_some(true),
 		})
-	} else if profile.is_none()
-		&& let Some(source) = source
+	} else if let Some(source) = source
 		&& !source.efforts.is_empty()
 	{
 		Some(ThinkingPolicy {
@@ -4566,7 +4647,7 @@ fn compile_thinking(
 			requires_effort:   source.requires_effort,
 		})
 	} else {
-		profile
+		None
 	};
 	if supports_dynamic_effort_siblings(provider)
 		&& let Some(profile) = profile.as_mut()
@@ -4599,6 +4680,26 @@ fn compile_thinking(
 				.or_insert_with(|| {
 					WireModelId::new(row.request_model_id.clone().unwrap_or_else(|| wire.clone()))
 				});
+		}
+	}
+	if let Some(family) = reviewed_family
+		&& !family.no_thinking
+	{
+		let present = members
+			.iter()
+			.map(|(wire, ..)| wire.as_str())
+			.collect::<BTreeSet<_>>();
+		for (effort, target) in &family.routing {
+			let target_present = present
+				.iter()
+				.any(|candidate| *candidate == target.as_str());
+			let preserve_absent = *effort != EffortTier::Off && family.preserve_absent_effort_routes;
+			let retired = family.retired_members.contains(target);
+			if (target_present || preserve_absent) && !retired {
+				routing
+					.effort_routing
+					.insert(translate_effort(*effort), WireModelId::new(target.clone()));
+			}
 		}
 	}
 	for (wire, row, classified) in members {
@@ -6023,7 +6124,7 @@ mod tests {
 				)
 			})
 			.collect::<BTreeMap<_, _>>();
-		assert!(collapsible_groups(&classifications("cursor", &rows)).contains("review"));
+		assert!(collapsible_groups("cursor", &classifications("cursor", &rows)).contains("review"));
 
 		let duplicate = ["low", "xhigh", "extra-high"]
 			.into_iter()
@@ -6034,7 +6135,10 @@ mod tests {
 				)
 			})
 			.collect::<BTreeMap<_, _>>();
-		assert!(!collapsible_groups(&classifications("cursor", &duplicate)).contains("duplicate"));
+		assert!(
+			!collapsible_groups("cursor", &classifications("cursor", &duplicate))
+				.contains("duplicate")
+		);
 	}
 
 	#[test]
@@ -6058,7 +6162,7 @@ mod tests {
 			(Str::from("review-low"), source_model(serde_json::json!({ "api": "cursor" }))),
 			(Str::from("review-high"), source_model(serde_json::json!({ "api": "cursor" }))),
 		]);
-		assert!(collapsible_groups(&classifications("cursor", &rows)).contains("review"));
+		assert!(collapsible_groups("cursor", &classifications("cursor", &rows)).contains("review"));
 	}
 
 	#[test]
@@ -6162,7 +6266,7 @@ mod tests {
 				observed_at_ms: None,
 			}),
 		)]);
-		assert!(collapsible_groups(&single).is_empty());
+		assert!(collapsible_groups("p", &single).is_empty());
 		let siblings = BTreeMap::from([
 			(
 				sf!("model-low"),
@@ -6183,7 +6287,7 @@ mod tests {
 				}),
 			),
 		]);
-		assert!(collapsible_groups(&siblings).contains("model"));
+		assert!(collapsible_groups("p", &siblings).contains("model"));
 	}
 
 	#[test]

@@ -71,7 +71,9 @@ pub enum ProtocolSchemaError {
 /// Injects the caller-owned fields shared by every model-facing tool schema.
 ///
 /// `i` is always the first required property. `notrunc` is always optional;
-/// omitting it retains central output bounding.
+/// omitting it retains the default central output bound. Setting it requests
+/// complete inline output only up to the runtime's fixed security ceiling;
+/// larger results remain complete in the returned artifact.
 pub fn inject_protocol_schema(schema: &[u8]) -> Result<Bytes, ProtocolSchemaError> {
 	let mut value = serde_json::from_slice(schema)?;
 	inject_protocol_fields(&mut value)?;
@@ -99,7 +101,7 @@ fn inject_protocol_fields(value: &mut serde_json::Value) -> Result<(), ProtocolS
 		"notrunc".to_owned(),
 		serde_json::json!({
 			"type": "boolean",
-			"description": "Return complete output inline without central truncation."
+			"description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."
 		}),
 	);
 	let required = object
@@ -1011,6 +1013,35 @@ pub struct OperationSpec {
 	pub authority:     Authority,
 }
 
+/// Caller-selected inline-output policy.
+///
+/// `Complete` bypasses the ordinary projection limit, but never the fixed host
+/// security ceiling. Results larger than that ceiling remain artifact-backed.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	Hash,
+	PartialEq,
+	Serialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum OutputRequest {
+	/// Apply the runtime's ordinary inline projection limit.
+	#[default]
+	Bounded,
+	/// Prefer complete inline output up to the host security ceiling; a stalled
+	/// consumer still falls back to the complete artifact.
+	Complete,
+}
+
 /// A content-addressed blob reference suitable for durable projection.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BlobRef {
@@ -1020,6 +1051,29 @@ pub struct BlobRef {
 	pub media_type: Str,
 	/// Exact stored byte length.
 	pub byte_len:   u64,
+}
+
+/// Typed receipt for the one output projection applied at a trust boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OutputProjection {
+	/// Caller policy in force when the projection was made.
+	pub request:      OutputRequest,
+	/// Exact bytes observed before projection.
+	pub source_bytes: u64,
+	/// Bytes emitted inline after projection.
+	pub inline_bytes: u64,
+	/// Whether any source byte was omitted from the inline result.
+	pub omitted:      bool,
+	/// Complete retained bytes when an artifact store is available.
+	pub artifact:     Option<BlobRef>,
+}
+
+impl OutputProjection {
+	/// Returns whether all source bytes were emitted inline.
+	#[must_use]
+	pub const fn complete_inline(&self) -> bool {
+		!self.omitted && self.inline_bytes == self.source_bytes
+	}
 }
 
 /// One model-facing tool-result part.
@@ -1043,6 +1097,73 @@ pub enum Part {
 		/// Optional deterministic accessibility/model fallback.
 		alt:  Option<Str>,
 	},
+}
+
+/// One source-backed range in a model-facing projection.
+///
+/// The central dispatcher resolves these candidates against the bytes it
+/// actually retained inline. Tools never guess visibility from a local byte
+/// limit or from a rendered truncation notice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionSpan {
+	/// Index of the projected [`Part`] containing this range.
+	pub part:       usize,
+	/// Inclusive UTF-8 byte offset in the unbounded part.
+	pub start_byte: usize,
+	/// Exclusive UTF-8 byte offset in the unbounded part.
+	pub end_byte:   usize,
+	/// Stable document-authority identity.
+	pub source_key: Str,
+	/// One-based source line represented by the complete range.
+	pub line:       usize,
+}
+
+/// Complete model projection before central output bounding.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PromptProjection {
+	/// Unbounded deterministic model-facing parts.
+	pub parts:      Vec<Part>,
+	/// Source ranges whose visibility requires authority acknowledgement.
+	pub visibility: Vec<ProjectionSpan>,
+}
+
+impl PromptProjection {
+	/// Wraps ordinary tool parts which carry no document visibility.
+	#[must_use]
+	pub const fn new(parts: Vec<Part>) -> Self {
+		Self { parts, visibility: Vec::new() }
+	}
+}
+
+/// One source line proven visible by the central dispatcher.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct VisibleSourceLine {
+	/// Stable document-authority identity.
+	pub source_key: Str,
+	/// One-based source line fully retained inline.
+	pub line:       usize,
+}
+
+/// Typed authorization receipt returned after central projection.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VisibilityReceipt {
+	/// Exact source lines fully visible to the model, sorted and deduplicated.
+	pub lines: Vec<VisibleSourceLine>,
+}
+
+/// Typed failure while returning a visibility receipt to its authority.
+#[derive(Debug, Error)]
+#[error("tool projection visibility authorization failed")]
+pub struct ProjectionAuthorizationError {
+	#[source]
+	source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl ProjectionAuthorizationError {
+	/// Preserves the authority's typed failure across the erased registry seam.
+	pub fn new(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+		Self { source: Box::new(source) }
+	}
 }
 
 /// One model-facing example attached to an exact tool revision.
@@ -1091,6 +1212,32 @@ pub trait Tool: Send + Sync + 'static {
 
 	/// Deterministically projects either durable tool branch for one model.
 	fn prompt(&self, view: Result<&Self::Payload, &Self::Fault>, caps: &PromptCaps) -> Vec<Part>;
+
+	/// Projects model parts together with any source ranges requiring a
+	/// post-bound visibility receipt.
+	///
+	/// Ordinary tools inherit a range-free projection. Source-backed tools
+	/// override this method so rendering and range attribution happen once.
+	fn projection(
+		&self,
+		view: Result<&Self::Payload, &Self::Fault>,
+		caps: &PromptCaps,
+	) -> PromptProjection {
+		PromptProjection::new(self.prompt(view, caps))
+	}
+
+	/// Returns the dispatcher's final visibility receipt to the tool's
+	/// document authority.
+	///
+	/// This runs only for the live call after central bounding, never while
+	/// replaying or re-projecting historical calls.
+	fn authorize_visibility(
+		&self,
+		_view: Result<&Self::Payload, &Self::Fault>,
+		_receipt: &VisibilityReceipt,
+	) -> Result<(), ProjectionAuthorizationError> {
+		Ok(())
+	}
 
 	/// Projects one typed ephemeral update into an optional live invocation
 	/// frame.

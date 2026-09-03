@@ -10,7 +10,7 @@ use strum::IntoStaticStr;
 
 use crate::{
 	id::{ClassId, FamilyId},
-	taxonomy::{Taxonomy, TaxonomyError, taxonomy},
+	taxonomy::{Taxonomy, TaxonomyError, VariantFamily, taxonomy},
 };
 
 /// Source phase allowed to invoke identity classification.
@@ -112,6 +112,11 @@ pub struct ModelClassification {
 pub fn classify(input: ClassificationInput<'_>) -> ModelClassification {
 	classify_with_taxonomy(input, taxonomy())
 }
+/// Returns the reviewed variant family matching a logical, member, or alias id.
+pub(crate) fn variant_family(provider: &str, id: &str) -> Option<VariantFamily> {
+	taxonomy().variant_family(provider, id)
+}
+
 /// Whether a provider declares conservative dynamic effort-sibling grouping.
 pub(crate) fn supports_dynamic_effort_siblings(provider: &str) -> bool {
 	taxonomy().supports_dynamic_effort_siblings(provider)
