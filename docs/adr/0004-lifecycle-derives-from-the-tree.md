@@ -85,7 +85,7 @@ Rules:
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/session/src/rewind.rs`. Rewind lifecycle work, projections, components, and subscriptions derive from the session tree. Global runtime pause is likewise materialized as `<meta><pause>` by `crates/agent/src/pause.rs`; replay and session switches select that element rather than restoring a controller flag.
+**Implemented.** Primary implementation: `crates/session/src/rewind.rs`. Rewind lifecycle work, projections, components, and subscriptions derive from the session tree. Global runtime pause is likewise materialized as `<meta><pause>` by `crates/agent/src/pause.rs`; replay and session switches select that element rather than restoring a controller flag. Blob collection scans every committed branch of every project session, so rewindable media survives until explicit journal pruning, a session switch keeps both journals' roots, and deleting one session cannot evict blobs still retained by another.
 
 ## References
 

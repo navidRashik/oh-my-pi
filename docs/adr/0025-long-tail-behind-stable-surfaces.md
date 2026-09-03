@@ -74,10 +74,18 @@ surface.** Neither MUST change the permanent roster after discovery.
 ## Status in omp
 
 **Partial.** Primary implementation: `crates/shell-builtins/src/dyn.rs`. `dyn` lists, documents,
-validates, and calls long-tail devices. The `tts@4` device in
-`crates/envd/src/{media_devices,media_tts}.rs` is mounted only through this surface and performs
-real local/xAI/DeepInfra synthesis with typed progress, cancellation, timeout, artifact retention,
-and atomic workspace output. Gap: Eval binding and terminal graphics passthrough remain unproved.
+validates, and calls long-tail devices. The `image_gen@4` device in
+`crates/envd/src/media_devices.rs` is mounted only through this surface and implements pi's
+structured generation/edit schema, configured/active/automatic provider ordering, bounded image
+inputs and outputs, typed provider-attempt updates and faults, cancellation, a three-minute
+deadline, content-addressed retention, and optional atomic workspace output. The `tts@4` device in
+`crates/envd/src/{media_devices,media_tts}.rs` likewise performs real local/xAI/DeepInfra synthesis
+with typed progress, cancellation, timeout, artifact retention, and atomic workspace output.
+The `security_scan@2` device in `crates/tools/src/security_scan.rs` and
+`crates/envd/src/security_scan{.rs,/}` provides durable local and cloud scan lineage, exact
+credential selection, recursive public-export redaction, validated evidence, bounded cloud
+responses, cancellable operations, SARIF interchange, and isolated remediation worktrees through
+the generated `dyn` schema. Gap: Eval binding and terminal graphics passthrough remain unproved.
 
 ## References
 

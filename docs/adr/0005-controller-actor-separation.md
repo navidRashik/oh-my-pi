@@ -56,7 +56,7 @@ Controller and actor are completely separate.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/chat/src/host.rs`. The chat actor consumes `Session::subscribe()` and returns commands without holding controller authority. `crates/app/src/chat_control.rs` transports pause/resume commands while the controller and kernel derive the gate exclusively from the session DOM.
+**Implemented.** Primary implementation: `crates/chat/src/host.rs`. The chat actor consumes `Session::subscribe()` and returns commands without holding controller authority. `crates/app/src/chat_control.rs` transports pause/resume commands while the controller and kernel derive the gate exclusively from the session DOM. The stdio actor in `crates/app/src/rpc_mode.rs` projects the same snapshot/patch stream into pi-compatible message, tool, turn, and subagent events; private DOM snapshots and patches never cross the public RPC boundary.
 
 ## References
 

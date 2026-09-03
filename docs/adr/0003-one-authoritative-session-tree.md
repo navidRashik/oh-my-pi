@@ -108,7 +108,11 @@ Rules:
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/session/src/fold.rs`. Live writes and replay use the same journal-to-DOM fold; replay and Appendix A laws passed P2.
+**Implemented.** Primary implementation: `crates/session/src/fold.rs`. Live writes and replay use the same journal-to-DOM fold; replay and Appendix A laws passed P2. `crates/journal/src/gc.rs` derives attachment, assistant-media, compaction, and tool-artifact blob roots from every committed branch before the project/session CAS can evict bytes; abandoned roots are released only when journal GC first prunes that history.
+
+Work-pool presentation is likewise replay-derived: `omp_journal::data::WorkpoolObservation`
+converts the producer-authenticated transition into the same typed IRC notice folded by
+`omp_agent::append_irc_traffic`; the process-local producer registry never owns durable history.
 
 ## References
 
