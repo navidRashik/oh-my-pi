@@ -2300,13 +2300,13 @@ mod tests {
 		);
 		let fenced = rendered(source.as_str(), 80, &theme);
 		assert_eq!(style_containing(&fenced, "pub").foreground_color(), palette.accent);
-		assert_eq!(style_containing(&fenced, "hi").foreground_color(), palette.ok);
+		assert_eq!(style_containing(&fenced, "hi").foreground_color(), palette.code_border);
 		assert_eq!(style_containing(&fenced, "second").foreground_color(), palette.muted);
 
 		let listed = Str::new("- ```rust\n  let value = \"ok\";\n  ```");
 		let nested = rendered(listed.as_str(), 80, &theme);
 		assert_eq!(style_containing(&nested, "let").foreground_color(), palette.accent);
-		assert_eq!(style_containing(&nested, "ok").foreground_color(), palette.ok);
+		assert_eq!(style_containing(&nested, "ok").foreground_color(), palette.code_border);
 
 		let unknown = Str::new("```not-a-language\nanswer = 42\n```");
 		let fallback = rendered(unknown.as_str(), 80, &theme);

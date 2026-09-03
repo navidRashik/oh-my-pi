@@ -2256,7 +2256,12 @@ fn encode_blank_row(output: &mut String, width: u16) {
 	}
 }
 
-fn emit_cell_style(output: &mut String, style: Style, active_style: &mut Style, hyperlinks: bool) {
+pub(crate) fn emit_cell_style(
+	output: &mut String,
+	style: Style,
+	active_style: &mut Style,
+	hyperlinks: bool,
+) {
 	let link_changed = hyperlinks && active_style.link != style.link;
 	if link_changed && active_style.link.is_some() {
 		output.push_str(esc!(osc, "8;;", st));
@@ -2271,7 +2276,11 @@ fn emit_cell_style(output: &mut String, style: Style, active_style: &mut Style, 
 	*active_style = style;
 }
 
-fn close_active_link(output: &mut String, active_style: &mut Style, hyperlinks: bool) {
+pub(crate) fn close_active_link(
+	output: &mut String,
+	active_style: &mut Style,
+	hyperlinks: bool,
+) {
 	if hyperlinks && active_style.link.is_some() {
 		output.push_str(esc!(osc, "8;;", st));
 	}

@@ -169,7 +169,7 @@ impl Card for AskCard {
 			<box border=round bc=border bg=panel bleed title_pad=3 pad="0 1">
 				<row kind=title gap=1>
 					if answered { <i:success fg=ok/> }
-					<text>{"Ask"}</text><text fg=output>{count}</text>
+					<text fg=accent>{"Ask"}</text><text fg=muted>{count}</text>
 				</row>
 				<col>{question_rows}</col>
 			</box>

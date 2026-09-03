@@ -104,8 +104,8 @@ fn render_resolution(view: &CardView<'_>, action: Action, _ui: &UiContext) -> Co
 			dom! {
 				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Resolve"}</text><text>{":"}</text>
 					<text fg=output wrap=pre>{format!(" {}", action.name())}</text><text>{" "}</text>
-					<text fg={if action == Action::Apply { "ok" } else { "warn" }}>{action.badge()}</text>
-					if let Some(reason) = reason { <text fg=output>{sf!(" {reason}")}</text> }
+					<text fg={if action == Action::Apply { "ok" } else { "warn" }} wrap=pre>{action.badge()}</text>
+					if let Some(reason) = reason { <text fg=output wrap=pre>{sf!(" {reason}")}</text> }
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}

@@ -86,7 +86,7 @@ impl Card for InspectImageCard {
 				CardStatus::Done => {
 					<box border=round pad-x=1 title_pad=3 bc=border>
 						<row kind=title gap=0><i:inspect-image fg=accent/><text>{" "}</text><text fg=accent>{"Inspect"}</text><text>{":"}</text>
-							<text fg=output wrap=pre>{format!(" {path}")}</text><text fg=muted>{if meta.is_empty() { String::new() } else { format!(" · {meta}") }}</text>
+							<text fg=output wrap=pre>{format!(" {path}")}</text><text fg=muted wrap=pre>{if meta.is_empty() { String::new() } else { format!(" · {meta}") }}</text><text>{" "}</text>
 						</row>
 						<col gap=1>
 							if !question.is_empty() { <row gap=1><text fg=muted>{"Question:"}</text><text fg=accent wrap=word>{question}</text></row> }
@@ -111,7 +111,7 @@ impl Card for InspectImageCard {
 				},
 				CardStatus::Failed => {
 					<box border=round pad-x=1 title_pad=3 bc=err>
-						<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Inspect"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {path}")}</text></row>
+						<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Inspect"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {path}")}</text><text>{" "}</text></row>
 						if !question.is_empty() { <row gap=1><text fg=muted>{"Question:"}</text><text fg=accent wrap=word>{question}</text></row> }
 						<text pad-x=2 fg=err>{fault}</text>
 					</box>

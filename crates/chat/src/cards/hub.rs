@@ -133,8 +133,8 @@ fn render_process(
 	dom! {
 		<col>
 			<row gap=0>
-				{icon}<text>{" "}</text><text fg=accent>{format!("Launch {op}")}</text><text>{": "}</text><text fg=output>{name}</text>
-				if view.status != CardStatus::Failed { if let Some(command) = command { <text fg=muted>{format!(" {command}")}</text> } }
+				{icon}<text>{" "}</text><text fg=accent>{format!("Launch {op}")}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {name}")}</text>
+				if view.status != CardStatus::Failed { if let Some(command) = command { <text fg=muted wrap=pre>{format!(" {command}")}</text> } }
 				if let Some(detail) = detail { <text fg=muted>{detail}</text> }
 				if let Some(pid) = pid { <text fg=muted>{"· pid"}</text><text fg=muted>{sf!("{pid}")}</text> }
 				if let Some(wall_ms) = wall_ms { <text fg=muted>{"· up"}</text><time ms={wall_ms}/> }
@@ -167,8 +167,8 @@ fn render_logs(view: &CardView<'_>, args: Option<&Value>, _ui: &UiContext) -> Co
 				.and_then(Value::as_bool)
 				.unwrap_or(false);
 			dom! {
-				<row gap=0><spinner kind=status/><text>{" "}</text><text fg=accent>{"Launch logs"}</text><text>{": "}</text><text fg=output>{name}</text>
-					if follow { <text fg=muted>{"follow"}</text> }
+				<row gap=0><spinner kind=status/><text>{" "}</text><text fg=accent>{"Launch logs"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {name}")}</text>
+					if follow { <text fg=muted wrap=pre>{" follow"}</text> }
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}
@@ -177,9 +177,10 @@ fn render_logs(view: &CardView<'_>, args: Option<&Value>, _ui: &UiContext) -> Co
 		CardStatus::Done => {
 			dom! {
 				<box border=round bc=muted title_pad=3 pad="0 1">
-					<row kind=title gap=0><i:launch fg=accent/><text>{" "}</text><text fg=accent>{"Launch logs"}</text><text>{": "}</text>
-						<text fg=output>{name}</text>
-						if let Some(detail) = detail { <text fg=ok>{format!(" {detail}")}</text> }
+					<row kind=title gap=0><i:launch fg=accent/><text>{" "}</text><text fg=accent>{"Launch logs"}</text><text>{":"}</text>
+						<text fg=output wrap=pre>{format!(" {name}")}</text>
+						if let Some(detail) = detail { <text fg=ok wrap=pre>{format!(" {detail}")}</text> }
+						<text>{" "}</text>
 					</row>
 					<hr title="Output" title_pad=3 bc=muted/>
 					if let Some(text) = text { <pre fg=output>{text}</pre> }
@@ -191,7 +192,7 @@ fn render_logs(view: &CardView<'_>, args: Option<&Value>, _ui: &UiContext) -> Co
 			let fault = diag_text(view.diag).unwrap_or_else(|| Str::new_static("operation failed"));
 			dom! {
 				<box border=round bc=err title_pad=3 pad="0 1">
-					<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Launch logs"}</text><text>{": "}</text><text fg=output>{name}</text></row>
+					<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Launch logs"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {name}")}</text><text>{" "}</text></row>
 					<hr title="Output" title_pad=3 bc=err/><pre fg=err>{fault}</pre>
 				</box>
 			}

@@ -163,7 +163,7 @@ fn render_retain(view: &CardView<'_>) -> Component {
 				if let Some(badge) = elapsed_badge(view) { {badge} }
 			</row>
 			for item in &items {
-				<row gap=1 pad-x=2><i:enabled fg=ok/><text fg=output>{field(item, "content").unwrap_or_default()}</text></row>
+				<row gap=1 pad-x=2><i:enabled fg=output/><text fg=output>{field(item, "content").unwrap_or_default()}</text></row>
 			}
 		</col>
 	}

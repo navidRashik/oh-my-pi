@@ -42,6 +42,7 @@ impl Card for WebSearchCard {
 				<box border=round bc=err bg=error_surface bleed title_pad=3 pad="0 1">
 					<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Web Search"}</text>
 						if let Some(provider) = provider { <text>{":"}</text><text fg=output wrap=pre>{format!(" {provider}")}</text> }
+						<text>{" "}</text>
 					</row>
 					<text fg=err>{format!("Error: {error}")}</text>
 				</box>
@@ -167,7 +168,7 @@ impl Card for WebSearchCard {
 		dom! {
 			<box border=round bc=muted bg=panel bleed title_pad=3 pad="0 1">
 				<row kind=title gap=0><i:web-search fg=accent/><text>{" "}</text><text fg=accent>{"Web Search"}</text><text>{":"}</text>
-					<text fg=output wrap=pre>{format!(" {provider}")}</text><text fg=muted wrap=pre>{format!(" {source_count}")}</text>
+					<text fg=output wrap=pre>{format!(" {provider}")}</text><text fg=muted wrap=pre>{format!(" {source_count}")}</text><text>{" "}</text>
 				</row>
 				<col>
 					<row gap=0><text fg=output>{"Query:"}</text><text wrap=pre>{format!(" {query}")}</text></row>

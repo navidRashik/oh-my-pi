@@ -231,18 +231,18 @@ impl Component for Hr {
 					.x
 					.saturating_add(rect.width.saturating_sub(1).saturating_sub(total)),
 			);
-			let label_style =
-				if self.props.has_foreground() { style } else { Style::new().bg(style.background_color()) };
+			let gap_style = Style::new().bg(style.background_color());
+			let label_style = if self.props.has_foreground() { style } else { gap_style };
 			let mut end = x;
 			if left_pad {
-				end = pc.frame.put(end, rect.y, " ", style);
+				end = pc.frame.put(end, rect.y, " ", gap_style);
 			}
 			end = pc.frame.put(end, rect.y, label.text, label_style);
 			if label.ellipsis {
 				end = pc.frame.put(end, rect.y, "…", label_style);
 			}
 			if right_pad {
-				pc.frame.put(end, rect.y, " ", style);
+				pc.frame.put(end, rect.y, " ", gap_style);
 			}
 		}
 	}
@@ -403,7 +403,7 @@ mod tests {
 			Rect::new(0, 0, 12, 1),
 		);
 		assert_eq!(frame_row_text(&frame, 0), "── Output ──");
-		assert_eq!(frame.cell(3, 0).style, Style::new().fg(ctx.theme.fg).bold());
+		assert_eq!(frame.cell(3, 0).style, Style::new());
 	}
 
 	#[test]

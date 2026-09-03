@@ -50,9 +50,9 @@ fn render_live(view: &CardView<'_>) -> Component {
 			<i:pending fg=output/><text>{" "}</text>
 			<text fg=accent>{"Goal"}</text><text>{":"}</text>
 			<text fg=output wrap=pre>{format!(" {verb}")}</text>
-			if let Some(objective) = objective { <text fg=output>{sf!(" \"{objective}\"")}</text> }
+			if let Some(objective) = objective { <text fg=output wrap=pre>{sf!(" \"{objective}\"")}</text> }
 			if let Some(budget) = budget {
-				<text>{sf!(" · budget {budget}")}</text>
+				<text wrap=pre>{sf!(" · budget {budget}")}</text>
 			}
 			if let Some(badge) = elapsed_badge(view) { {badge} }
 		</row>
@@ -100,7 +100,8 @@ fn render_done(view: &CardView<'_>) -> Component {
 		<box border=round bc=border bg=panel bleed title_pad=3 pad="0 1">
 			<row kind=title gap=0><i:goal-tool fg=accent/><text>{" "}</text><text fg=accent>{"Goal"}</text><text>{":"}</text>
 				<text fg=output wrap=pre>{format!(" {verb}")}</text>
-				if let Some(state) = state { <text fg=accent>{sf!(" ⟨{state}⟩")}</text> }
+				if let Some(state) = state { <text fg=accent wrap=pre>{sf!(" ⟨{state}⟩")}</text> }
+				<text>{" "}</text>
 			</row>
 			if let Some(objective) = objective { <text fg=output>{sf!("\"{objective}\"")}</text> }
 			if let Some(detail) = detail { <text fg=muted>{detail}</text> }
@@ -122,7 +123,7 @@ fn render_failed(view: &CardView<'_>) -> Component {
 	let verb = if op == "create" { "set" } else { op };
 	dom! {
 		<box border=round bc=err bg=error_surface bleed title_pad=3 pad="0 1">
-			<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Goal"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {verb}")}</text></row>
+			<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Goal"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {verb}")}</text><text>{" "}</text></row>
 			<text fg=err pad-x=2>{fault}</text>
 		</box>
 	}

@@ -637,8 +637,35 @@ impl Component for Pre {
 				put_clipped(pc.frame, x, y, content_x, &prefix, gutter_style);
 			}
 			if self.highlighted_for.is_some() {
+				let inline_number = line
+					.bytes()
+					.position(|byte| !byte.is_ascii_whitespace() && !byte.is_ascii_digit())
+					.and_then(|first| {
+						let prefix = &line[..first];
+						(prefix.bytes().any(|byte| byte.is_ascii_digit())).then_some(first)
+					})
+					.unwrap_or(0);
 				let mut run_x = content_x;
+				if inline_number > 0 {
+					run_x = put_clipped(
+						pc.frame,
+						run_x,
+						y,
+						right,
+						&line[..inline_number],
+						style.fg(pc.ctx.theme.muted),
+					);
+				}
+				let mut skip = inline_number;
 				for (run_style, text) in self.highlighted.row_runs(row as u16) {
+					let text = if skip >= text.len() {
+						skip -= text.len();
+						continue;
+					} else {
+						let text = &text[skip..];
+						skip = 0;
+						text
+					};
 					run_x = put_clipped(pc.frame, run_x, y, right, text, style.inherit(run_style));
 				}
 			} else {

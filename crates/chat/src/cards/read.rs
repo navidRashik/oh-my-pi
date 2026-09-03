@@ -29,7 +29,7 @@ impl Card for ReadCard {
 			.unwrap_or_default();
 		match view.status {
 			CardStatus::StreamingArgs | CardStatus::InProgress => dom! {
-				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Read"}</text><text>{": "}</text><text fg=output>{target}</text>
+				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Read"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {target}")}</text>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}

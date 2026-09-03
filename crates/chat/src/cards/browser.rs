@@ -106,25 +106,21 @@ impl Card for BrowserCard {
 				.map(str::to_owned)
 		});
 		let live = matches!(view.status, CardStatus::StreamingArgs | CardStatus::InProgress);
-		let state = match view.status {
-			CardStatus::StreamingArgs | CardStatus::InProgress => format!("running tab \"{name}\""),
-			CardStatus::Done => format!("{} tab \"{name}\"", icon(ui, "done")),
-			CardStatus::Failed => format!("{} tab \"{name}\"", icon(ui, "error")),
-		};
 		dom! {
 			<box border=round bc={if view.status == CardStatus::Failed { "err" } else if live { "accent" } else { "muted" }} bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }} bleed pad-x=1 title_pad=3>
 				<row kind=title gap=1>
-					if live { <spinner kind=status/> }
-					<text fg={if view.status == CardStatus::Failed { "err" } else { "output" }}>{state}</text>
-					if !url.is_empty() { <text fg=muted>{"·"}</text><text fg=muted>{url}</text> }
-					if !kind.is_empty() { <text fg=muted>{"·"}</text><text fg=muted>{kind}</text> }
+					if live { <spinner kind=status/><text fg=output>{"running"}</text><text>{format!("tab \"{name}\"")}</text> }
+					else if view.status == CardStatus::Done { <text fg=ok>{icon(ui, "done")}</text><text>{format!("tab \"{name}\"")}</text> }
+					else { <text fg=err>{icon(ui, "error")}</text><text>{format!("tab \"{name}\"")}</text> }
+					if !url.is_empty() { <text>{"·"}</text><text fg=muted>{url}</text> }
+					if !kind.is_empty() { <text>{"·"}</text><text fg=muted>{kind}</text> }
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 				if !code.is_empty() { <pre path="cell.js">{code}</pre> }
 				if matches!(view.status, CardStatus::Done | CardStatus::Failed) {
 					<hr title="Output" title_pad=3 bc={if view.status == CardStatus::Failed { "err" } else { "muted" }}/>
 					if let Some(fault) = fault {
-						<pre fg=err>{fault}</pre>
+						<pre fg=output>{fault}</pre>
 					} else {
 						for displayed in displayed { <pre fg=ok>{displayed}</pre> }
 						if let Some(returned) = returned { <pre fg=output>{returned}</pre> }

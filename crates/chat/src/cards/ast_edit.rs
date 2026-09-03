@@ -84,7 +84,7 @@ impl Card for AstEditCard {
 					<box border=round bc=border bg=panel bleed pad-x=1 title_pad=3>
 						<row kind=title gap=0><i:success fg=ok/><text>{" "}</text><text fg=accent>{"AST Edit"}</text><text>{":"}</text>
 							<text fg=output wrap=pre>{format!(" {pattern}")}</text><text>{" "}</text><text fg=warn>{format!("⟨{proposal}⟩")}</text>
-							<text fg=muted wrap=pre>{format!(" {summary}")}</text>
+							<text fg=muted grow truncate>{format!(" {summary}")}</text><text>{" "}</text>
 						</row>
 						<col>
 							for (index, file) in files.iter().enumerate() {

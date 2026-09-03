@@ -43,7 +43,7 @@ impl Card for DebugCard {
 		}
 		let Some(result) = typed_result::<omp_tools::debug::Payload>(view) else {
 			return dom! {
-				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Debug"}</text><text>{": "}</text><text fg=output>{action}</text>
+				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Debug"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {action}")}</text>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>
 			}

@@ -2778,7 +2778,7 @@ mod tests {
 				.cell(string_column, string_row as u16)
 				.style
 				.foreground_color(),
-			ui.ctx.theme.ok,
+			ui.ctx.theme.code_border,
 		);
 	}
 	/// A theme swap through [`Ui::set_context`] must reach output cached

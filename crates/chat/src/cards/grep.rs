@@ -69,7 +69,7 @@ fn render_done(
 	dom! {
 		<col pad-x=1 w="100%">
 			<row gap=1>
-				<i:search/><text>{"Grep:"}</text><text fg=output>{query}</text>
+				<i:search fg=default/><text>{"Grep:"}</text><text fg=output>{query}</text>
 				<text fg=muted>{format!("{match_count} matches · {file_count} files · in")}</text>
 				if let Some(path) = path { <text fg=muted href={super::file_link(path)}>{path}</text> }
 			</row>
@@ -83,17 +83,17 @@ fn render_done(
 						for (file_index, matches_shown) in files_shown.iter().enumerate() {
 							if let Some(file) = group.files.get(file_index) {
 								if group_index + 1 == plan.len() && hidden == 0 {
-									<text pad-x=3>{sf!("## {}", file.name)}</text>
+									<text pad-x=3 fg=muted href={super::file_link(&format!("{}/{}", group.dir, file.name))}>{sf!("## {}", file.name)}</text>
 								} else {
-									<text>{sf!("{}  ## {}", icon(ui, "tree-vertical"), file.name)}</text>
+									<text fg=muted href={super::file_link(&format!("{}/{}", group.dir, file.name))}>{sf!("{}  ## {}", icon(ui, "tree-vertical"), file.name)}</text>
 								}
 								for row in file.matches.iter().take(*matches_shown) {
 									if group_index + 1 == plan.len() && hidden == 0 {
-										<text fg=muted pad_x={3_u16.saturating_add(line_padding(file, row))} w="100%">
+										<text fg=output href={super::file_link(&format!("{}/{}", group.dir, file.name))} pad_x={3_u16.saturating_add(line_padding(file, row))} w="100%">
 											{sf!("*{}│{}", row.line, row.text)}
 										</text>
 									} else {
-										<text fg=muted w="100%">{match_line(file, row, icon(ui, "tree-vertical"))}</text>
+										<text fg=output href={super::file_link(&format!("{}/{}", group.dir, file.name))} w="100%">{match_line(file, row, icon(ui, "tree-vertical"))}</text>
 									}
 								}
 							}
@@ -101,7 +101,7 @@ fn render_done(
 					}
 				}
 				if hidden > 0 {
-					<row gap=1><i:tree-last/><text fg=muted>{"…"}</text><text fg=muted>{&hidden}</text><text fg=muted>{if hidden == 1 { "more match" } else { "more matches" }}</text></row>
+					<row gap=1><i:tree-last fg=muted/><text fg=output>{"…"}</text><text fg=muted>{&hidden}</text><text fg=muted>{if hidden == 1 { "more match" } else { "more matches" }}</text></row>
 				}
 			</col>
 		</col>

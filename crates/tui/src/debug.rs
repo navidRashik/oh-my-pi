@@ -165,12 +165,12 @@ pub fn frame_ansi(frame: &Frame) -> String {
 			let cell = frame.cell(x, row);
 			match cell.content() {
 				CellContent::Blank => {
-					set_ansi_style(&mut output, &mut active, cell.style().without_link());
+					set_ansi_style(&mut output, &mut active, cell.style());
 					output.push(' ');
 					x += 1;
 				},
 				CellContent::Grapheme { text, width } => {
-					set_ansi_style(&mut output, &mut active, cell.style().without_link());
+					set_ansi_style(&mut output, &mut active, cell.style());
 					output.push_str(text);
 					x = x.saturating_add((*width).max(1));
 				},
@@ -184,6 +184,7 @@ pub fn frame_ansi(frame: &Frame) -> String {
 				CellContent::Continuation => x += 1,
 			}
 		}
+		renderer::close_active_link(&mut output, &mut active, true);
 	}
 	renderer::emit_style(&mut output, Style::default());
 	output
@@ -191,10 +192,7 @@ pub fn frame_ansi(frame: &Frame) -> String {
 
 /// Switches the active SGR state when the next cell's style differs.
 fn set_ansi_style(output: &mut String, active: &mut Style, style: Style) {
-	if style != *active {
-		renderer::emit_style(output, style);
-		*active = style;
-	}
+	renderer::emit_cell_style(output, style, active, true);
 }
 
 /// Rasterizes one painted terminal frame to a native PNG.

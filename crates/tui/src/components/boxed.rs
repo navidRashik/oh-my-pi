@@ -166,6 +166,8 @@ impl Component for Boxed {
 				let clip = pc.clip;
 				pc.clip = rect.y.saturating_add(1).min(clip);
 				self.children[0].paint(pc);
+				let gap = Style::new().bg(self.props.style(&pc.ctx.theme).background_color());
+				pc.frame.put(end, rect.y, " ", gap);
 				pc.clip = clip;
 			}
 		}

@@ -60,7 +60,7 @@ fn render_streaming(path: &str, content: &str, expanded: bool, _ui: &UiContext) 
 	dom! {
 		<box border=round bc=border bg=panel bleed title_pad=3>
 			<row kind=title gap=0><text fg=accent>{"Write"}</text><text>{":"}</text><text>{" "}</text>
-				<icon name={path_language_icon(path)} fg=output/><text>{" "}</text><text fg=accent href={href} wrap=pre>{path}</text>
+				<icon name={path_language_icon(path)} fg=output/><text>{" "}</text><text fg=accent href={href} wrap=pre>{path}</text><text>{" "}</text>
 			</row>
 			if !body.is_empty() { <pre pad-x=1 path={path}>{body}</pre> }
 			<row pad-x=1 gap=1>
@@ -90,6 +90,7 @@ fn render_progress(
 				<text fg=accent>{"Write"}</text><text>{":"}</text><text>{" "}</text>
 				<icon name={path_language_icon(path)} fg=output/><text>{" "}</text><text fg=accent href={href} wrap=pre>{path}</text>
 				if let Some(badge) = elapsed_badge(view) { {badge} }
+				<text>{" "}</text>
 			</row>
 			if expanded {
 				<pre pad-x=1 path={path}>{full}</pre>
@@ -120,7 +121,7 @@ fn render_done(
 		<box border=round bc=border bg=panel bleed title_pad=3>
 			<row kind=title gap=0><i:write fg=accent/><text>{" "}</text><text fg=accent>{"Write"}</text><text>{":"}</text><text>{" "}</text>
 				<icon name={path_language_icon(path)} fg=output/><text>{" "}</text><text fg=accent href={href} wrap=pre>{path}</text>
-				<text fg=muted>{sf!(" · {line_count} lines")}</text>
+				<text fg=muted wrap=pre>{sf!(" · {line_count} lines")}</text><text>{" "}</text>
 			</row>
 			if expanded {
 				<pre pad-x=1 path={path}>{full}</pre>
@@ -143,7 +144,7 @@ fn render_failed(view: &CardView<'_>, path: &str, _ui: &UiContext) -> Component 
 	dom! {
 		<box border=round bc=err bg=error_surface bleed title_pad=3>
 			<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Write"}</text><text>{":"}</text><text>{" "}</text>
-				<icon name={path_language_icon(path)} fg=output/><text>{" "}</text><text fg=accent href={href} wrap=pre>{path}</text>
+				<icon name={path_language_icon(path)} fg=output/><text>{" "}</text><text fg=accent href={href} wrap=pre>{path}</text><text>{" "}</text>
 			</row>
 			<text pad-x=3 fg=err wrap=word>{fault}</text>
 		</box>

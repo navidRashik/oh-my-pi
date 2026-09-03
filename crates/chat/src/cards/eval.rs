@@ -76,12 +76,7 @@ impl Card for EvalCard {
 			}
 			output.push_str(&fault);
 		}
-		let duration = status.map(|status| format!("· ({}ms)", status.duration_ms));
-		let state = match (view.status, failed) {
-			(CardStatus::StreamingArgs | CardStatus::InProgress, _) => "running",
-			(_, true) => icon(ui, "error"),
-			(_, false) => icon(ui, "done"),
-		};
+		let duration = status.map(|status| format!("({}ms)", status.duration_ms));
 		let tree = payload
 			.as_ref()
 			.filter(|_| !failed)
@@ -92,12 +87,11 @@ impl Card for EvalCard {
 				<box border=round bc={if failed { "err" } else if live { "accent" } else { "muted" }} bg={if failed { "error_surface" } else { "panel" }} bleed pad-x=1 title_pad=3>
 					<row kind=title gap=1>
 						<i:python fg=python/>
-						if live { <spinner kind=status/> }
-						if failed { <text fg=err>{state}</text> }
-						else if live { <text>{state}</text> }
-						else { <text fg=ok>{state}</text> }
+						if live { <spinner kind=status/><text fg=output>{"running"}</text> }
+						else if failed { <i:error fg=err/> }
+						else { <text fg=ok>{"•"}</text> }
 						if !title.is_empty() { <text>{title}</text> }
-						if let Some(duration) = duration { <text fg=muted>{duration}</text> }
+						if let Some(duration) = duration { <text>{"·"}</text><text fg=muted>{duration}</text> }
 						if let Some(badge) = elapsed_badge(view) { {badge} }
 					</row>
 					if !code.is_empty() {

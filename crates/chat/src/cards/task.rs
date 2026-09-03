@@ -102,7 +102,7 @@ impl Card for TaskCard {
 	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 		let _fault = view.fault::<omp_tools::task::Fault>();
 		match view.status {
-			CardStatus::StreamingArgs | CardStatus::InProgress => render_live(view),
+			CardStatus::StreamingArgs | CardStatus::InProgress => render_live(view, ui),
 			CardStatus::Done | CardStatus::Failed => render_settled(view, expanded, ui),
 		}
 	}
@@ -112,18 +112,16 @@ impl Card for TaskCard {
 /// `renderCall`): `Task: <agent>` for the flat form, the context and
 /// assignment markdown, then a divider and one `• name: brief ⟨agent⟩` row
 /// per dispatched agent.
-fn render_live(view: &CardView<'_>) -> Component {
+fn render_live(view: &CardView<'_>, ui: &UiContext) -> Component {
 	let args = CallArgs::read(view);
+	let title = args
+		.agent
+		.as_deref()
+		.map_or_else(|| Str::new_static("Task"), |agent| sf!("Task: {agent}"));
 	let sections = args.sections();
 	let rows = call_rows(&args);
 	dom! {
-		<box border=round bc=border bg=panel bleed title_pad=3 pad="0 1">
-			<row kind=title gap=0>
-				<i:task fg=accent/><text>{" "}</text><text fg=accent>{"Task"}</text>
-				if let Some(agent) = args.agent.as_deref() { <text>{":"}</text><text fg=output wrap=pre>{format!(" {agent}")}</text> }
-				if args.isolated { <text fg=muted>{"isolated"}</text> }
-				if let Some(badge) = elapsed_badge(view) { {badge} }
-			</row>
+		<box border=round bc=border bg=panel bleed title={format!("{} {title}", ui.charset.icon_named("task").unwrap_or_default())} title_pad=3 pad="0 1">
 			{sections}
 			if !rows.is_empty() {
 				<hr/>

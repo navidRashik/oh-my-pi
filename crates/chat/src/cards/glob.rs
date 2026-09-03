@@ -73,7 +73,7 @@ fn render_done(view: &CardView<'_>, query: &str, expanded: bool) -> Component {
 	dom! {
 		<col pad-x=1>
 			<row gap=1>
-				<i:search/><text>{"Glob:"}</text><text fg=output>{query}</text>
+				<i:search fg=default/><text>{"Glob:"}</text><text fg=output>{query}</text>
 				<text fg=muted>{sf!("{count} files · in {scope}")}</text>
 			</row>
 			<col>
@@ -84,7 +84,7 @@ fn render_done(view: &CardView<'_>, query: &str, expanded: bool) -> Component {
 					</row>
 				}
 				if hidden > 0 {
-					<row gap=1><i:tree-last/><text fg=muted>{more}</text></row>
+					<row gap=1><i:tree-last fg=muted/><text fg=muted>{more}</text></row>
 				}
 			</col>
 		</col>

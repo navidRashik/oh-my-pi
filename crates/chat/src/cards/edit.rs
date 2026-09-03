@@ -123,6 +123,7 @@ fn render_section(
 					<text fg=muted>{"/"}</text><text fg=err>{sf!("-{removed}")}</text><text fg=muted>{"⟩"}</text>
 				}
 				if let Some(badge) = elapsed_badge(view) { {badge} }
+				<text>{" "}</text>
 			</row>
 			if let Some(fault) = fault {
 				<text fg=err wrap=word>{fault}</text>
@@ -151,7 +152,7 @@ fn render_delete(view: &CardView<'_>, path: &str, _ui: &UiContext) -> Component 
 		return dom! {
 			<box border=round bc=err bg=error_surface bleed title_pad=3>
 				<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Delete"}</text><text>{":"}</text><text>{" "}</text>
-					<icon name={path_language_icon(path)} fg=output/><text>{" "}</text><text fg=accent href={href}>{path}</text>
+					<icon name={path_language_icon(path)} fg=output/><text>{" "}</text><text fg=accent href={href}>{path}</text><text>{" "}</text>
 				</row>
 				<text fg=err wrap=word>{fault}</text>
 			</box>
@@ -180,7 +181,7 @@ fn render_move(view: &CardView<'_>, source: &str, destination: &str, _ui: &UiCon
 				<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Edit"}</text><text>{":"}</text><text>{" "}</text>
 					<icon name={path_language_icon(source)} fg=output/><text>{" "}</text>
 					<text fg=accent href={file_link(source)} wrap=pre>{source}</text><text fg=muted wrap=pre>{" → "}</text>
-					<text fg=accent href={file_link(destination)} wrap=pre>{destination}</text>
+					<text fg=accent href={file_link(destination)} wrap=pre>{destination}</text><text>{" "}</text>
 				</row>
 				<text fg=err wrap=word>{fault}</text>
 			</box>

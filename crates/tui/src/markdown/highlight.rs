@@ -422,14 +422,14 @@ mod tests {
 		let mut rendered = RichText::default();
 		assert!(render(nix, "nix", 1, &styles, &mut rendered));
 		assert_eq!(color_containing(&rendered, "let"), palette.accent);
-		assert_eq!(color_containing(&rendered, "hello"), palette.ok);
+		assert_eq!(color_containing(&rendered, "hello"), palette.code_border);
 		assert_eq!(color_containing(&rendered, "greeting"), palette.muted);
 
 		let mermaid = "graph TD\n  A[\"Start\"] --> B\n  %% note";
 		rendered.clear();
 		assert!(render(mermaid, "mermaid", 3, &styles, &mut rendered));
 		assert_eq!(color_containing(&rendered, "graph"), palette.accent);
-		assert_eq!(color_containing(&rendered, "Start"), palette.ok);
+		assert_eq!(color_containing(&rendered, "Start"), palette.code_border);
 		assert_eq!(color_containing(&rendered, "-->"), palette.accent);
 		assert_eq!(color_containing(&rendered, "note"), palette.muted);
 	}

@@ -83,10 +83,10 @@ impl Card for LspCard {
 					<row gap=0>
 						<i:pending fg=output/><text>{" "}</text><text fg=accent>{"LSP"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {action}")}</text>
 						if !path.is_empty() {
-							<text fg=output>{if let Some(line) = line { format!(" {path}:{line}") } else { format!(" {path}") }}</text>
+							<text fg=output wrap=pre>{if let Some(line) = line { format!(" {path}:{line}") } else { format!(" {path}") }}</text>
 						}
 						if !symbol.is_empty() {
-							<text fg=output>{format!(" ({symbol})")}</text>
+							<text fg=output wrap=pre>{format!(" ({symbol})")}</text>
 						}
 						if let Some(badge) = elapsed_badge(view) { {badge} }
 					</row>

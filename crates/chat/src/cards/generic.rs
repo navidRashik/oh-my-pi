@@ -58,7 +58,9 @@ impl GenericCard {
 						<row><i:space/></row>
 					}
 				} else if let Some(detail) = detail {
-					<row pad-x=2 gap=1 fg=muted bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }}><text>{"└─"}</text><text>{detail}</text></row>
+					<row pad-x=2 gap=1 bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }}>
+						<text fg=muted>{"└─"}</text><text fg=muted>{detail}</text>
+					</row>
 				}
 				if let Some(result) = result { <pre pad-x=1 fg=output bg={if view.status == CardStatus::Failed { "error_surface" } else { "panel" }}>{result}</pre> }
 				if expanded { {images} }
