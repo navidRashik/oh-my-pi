@@ -84,6 +84,9 @@ impl Session {
 			let raw = serde_json::value::to_raw_value(&payload.attachments)?;
 			node = node.with_prop(PropId::Data, Value::Json(raw));
 		}
+		if let Some(author) = payload.author {
+			node = node.with_prop(PropId::Author, Value::Str(author));
+		}
 		self.insert_last(entry, turn, node)?;
 		Ok(())
 	}

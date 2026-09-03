@@ -1,17 +1,19 @@
 use std::{
+	fmt::Write as _,
 	path::Path,
 	time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
 use flume::Receiver;
-use omp_core::{FastHashMap, Str};
+use omp_core::{FastHashMap, Str, StrMut};
 use omp_dom::{Dom, Event, Handle, Op, PropKey, Sid, Snapshot, Tag, Txn, Value};
 use omp_journal::{
 	Entry, EntryDraft, EntryId, Journal, JournalError, Kind, KindName,
 	blob::{BlobRef, BlobStore},
 	data::{
-		Attachment, Compaction, Genesis, MsgAssistantEnd, MsgAssistantStart, MsgUser, Patch, Stream,
-		StreamOp, ToolCall, ToolResult, ToolUpdate, TurnReceipt, TurnStart,
+		Attachment, Compaction, FileMentions, Genesis, MsgAssistantEnd, MsgAssistantStart, MsgUser,
+		Patch, SkillPrompt, Stream, StreamOp, ToolCall, ToolResult, ToolUpdate, TurnReceipt,
+		TurnStart,
 	},
 };
 use omp_tool::{Abort, CallOutcome, Part as ToolPart};
@@ -538,10 +540,87 @@ impl Session {
 		text: impl Into<Str>,
 		attachments: Vec<Attachment>,
 	) -> Result<EntryId, SessionError> {
+		self.commit_user(text.into(), attachments, None)
+	}
+
+	/// Appends one host-authenticated remote user message to the active turn.
+	///
+	/// The author is committed in the same `msg.user@1` entry as its ordinary
+	/// model-facing text and ordered attachments. The entry ULID is the
+	/// authoritative accepted-at timestamp, so attribution never needs a
+	/// follow-up patch and replay cannot separate it from the prompt.
+	pub fn user_authored(
+		&mut self,
+		text: impl Into<Str>,
+		attachments: Vec<Attachment>,
+		author: impl Into<Str>,
+	) -> Result<EntryId, SessionError> {
+		self.commit_user(text.into(), attachments, Some(author.into()))
+	}
+
+	fn commit_user(
+		&mut self,
+		text: Str,
+		attachments: Vec<Attachment>,
+		author: Option<Str>,
+	) -> Result<EntryId, SessionError> {
 		let by = self.turn_cause()?;
-		self.commit(KindName::MsgUser, Some(by), None, None, &MsgUser {
-			text: text.into(),
-			attachments,
+		self.commit(KindName::MsgUser, Some(by), None, None, &MsgUser { text, attachments, author })
+	}
+
+	/// Appends a user-invoked skill prompt to the active turn.
+	///
+	/// The typed payload remains in the patch for replay and actors. Its
+	/// `prompt_body` is also the `<user>` content, so the ordinary user-message
+	/// projection sends it to inference without a parallel skill state path.
+	pub fn skill_prompt(&mut self, prompt: SkillPrompt) -> Result<EntryId, SessionError> {
+		let turn = self.current_turn_handle()?;
+		let cause = self.turn_cause()?;
+		let data = serde_json::value::to_raw_value(&prompt)?;
+		self.patch(Txn {
+			cause,
+			label: Some(Str::new_static("skill.prompt")),
+			ops: vec![Op::Ins {
+				parent: turn,
+				after:  self.dom.children(turn).last().copied(),
+				node:   omp_dom::NodeSpec::new(omp_dom::KnownTag::User)
+					.with_prop(PropKey::Custom(Str::new_static("skill_prompt")), Value::Bool(true))
+					.with_prop(omp_dom::PropId::Data, Value::Json(data))
+					.with_content(prompt.prompt_body),
+			}],
+		})
+	}
+
+	/// Appends one typed auto-read file-mention group to the active turn.
+	///
+	/// The payload remains the replay and presentation contract. The duplicate
+	/// `<file>` body is a lossless fallback for actors that do not understand
+	/// [`crate::FILE_MENTION_PROP`].
+	pub fn file_mentions(&mut self, payload: FileMentions) -> Result<EntryId, SessionError> {
+		let turn = self.current_turn_handle()?;
+		let cause = self.turn_cause()?;
+		let data = serde_json::value::to_raw_value(&payload)?;
+		let mut body = StrMut::new("");
+		for (index, file) in payload.files.iter().enumerate() {
+			if index > 0 {
+				body.push('\n');
+			}
+			let _ = write!(body, "<file path=\"{}\">\n{}\n</file>", file.path, file.content);
+		}
+		self.patch(Txn {
+			cause,
+			label: Some(Str::new_static("file.mention")),
+			ops: vec![Op::Ins {
+				parent: turn,
+				after:  self.dom.children(turn).last().copied(),
+				node:   omp_dom::NodeSpec::new(omp_dom::KnownTag::User)
+					.with_prop(
+						PropKey::Custom(Str::new_static(crate::FILE_MENTION_PROP)),
+						Value::Bool(true),
+					)
+					.with_prop(omp_dom::PropId::Data, Value::Json(data))
+					.with_content(body.freeze()),
+			}],
 		})
 	}
 

@@ -2,6 +2,7 @@
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
+	fmt::Write as _,
 	str,
 	str::FromStr,
 };
@@ -9,7 +10,10 @@ use std::{
 use bytes::Bytes;
 use omp_core::{Str, encoding::hex};
 use omp_dom::{Dom, Handle, KnownTag, Node, PropId, PropKey, Tag, Value};
-use omp_journal::{EntryId, data::Attachment};
+use omp_journal::{
+	EntryId,
+	data::{Attachment, FileMentions, MentionedFile, MentionedFileState},
+};
 use omp_proto::{
 	inference::v1 as inference,
 	thread::v1::{self as thread, Item, item, part},
@@ -32,6 +36,10 @@ pub const ASSISTANT_CONTENT_TAG: &str = "assistant-content";
 /// Provider content-array index shared by assistant content and artifact
 /// children.
 pub const PROVIDER_BLOCK_INDEX_PROP: &str = "index";
+
+/// Prop marking a `<user>` turn child that carries a typed auto-read
+/// [`omp_journal::data::FileMentions`] payload.
+pub const FILE_MENTION_PROP: &str = "file_mention";
 
 /// Prop marking a `<user>` turn child that arrived as steering at a safe
 /// point (pi `steering: true`).
@@ -382,7 +390,13 @@ fn project_window(dom: &Dom, window: Window, items: &mut Vec<Item>) {
 				continue;
 			}
 			match &node.tag {
-				Tag::Known(KnownTag::User) => project_message(node, thread::Role::User, items),
+				Tag::Known(KnownTag::User) => {
+					if let Some(mentions) = file_mentions(node) {
+						project_file_mentions(&mentions, items);
+					} else {
+						project_message(node, thread::Role::User, items);
+					}
+				},
 				Tag::Known(KnownTag::Developer) => {
 					project_message(node, thread::Role::System, items);
 				},
@@ -479,6 +493,69 @@ fn project_local_tool(dom: &Dom, handle: Handle, name: &str, node: &Node, items:
 		_ => {},
 	}
 	items.push(message_item(thread::Role::User, &text, None, false));
+}
+
+/// Decodes a typed auto-read file-mention payload from its journal-derived
+/// `<user>` element.
+#[must_use]
+pub fn file_mentions(node: &Node) -> Option<FileMentions> {
+	if node.tag != Tag::Known(KnownTag::User)
+		|| node.prop(&PropKey::Custom(Str::new_static(FILE_MENTION_PROP))) != Some(&Value::Bool(true))
+	{
+		return None;
+	}
+	let Value::Json(data) = node.prop(&PropId::Data.into())? else {
+		return None;
+	};
+	serde_json::from_str(data.get()).ok()
+}
+
+fn append_mentioned_file(out: &mut String, file: &MentionedFile) {
+	if !out.is_empty() {
+		out.push('\n');
+	}
+	let _ = write!(out, "<file path=\"{}\">\n{}\n</file>", file.path, file.content);
+}
+
+fn project_file_mentions(payload: &FileMentions, items: &mut Vec<Item>) {
+	let mut text = String::new();
+	let mut image_text = String::new();
+	let mut images = Vec::new();
+	for file in &payload.files {
+		if let MentionedFileState::Image { attachment } = &file.state {
+			append_mentioned_file(&mut image_text, file);
+			images.push(attachment);
+		} else {
+			append_mentioned_file(&mut text, file);
+		}
+	}
+	if !text.is_empty() {
+		items.push(message_item(thread::Role::System, &text, None, false));
+	}
+	if image_text.is_empty() {
+		return;
+	}
+	let mut parts = Vec::with_capacity(images.len() + 1);
+	parts.push(thread::Part { kind: Some(part::Kind::Text(image_text)) });
+	parts.extend(images.into_iter().map(|attachment| thread::Part {
+		kind: Some(part::Kind::Blob(thread::Blob {
+			hash: attachment.blob.hash.as_bytes().to_vec().into(),
+			mime: attachment.mime.as_str().to_owned(),
+			size: attachment.blob.size,
+			..Default::default()
+		})),
+	}));
+	items.push(Item {
+		seq:           0,
+		created_at_ms: 0,
+		kind:          Some(item::Kind::Message(thread::Message {
+			role: thread::Role::User as i32,
+			parts,
+			synthetic: Some(false),
+			..Default::default()
+		})),
+		props:         None,
+	});
 }
 
 fn is_steering(node: &Node) -> bool {

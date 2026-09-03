@@ -1162,3 +1162,103 @@ fn user_attachment_projects_a_media_part_with_its_mime() {
 	let restored = Session::open(&path, ComponentRegistry::default()).expect("session restores");
 	assert_eq!(media(&restored), live);
 }
+
+#[test]
+fn file_mentions_split_text_and_images_without_losing_order_on_replay() {
+	use omp_journal::data::{FileMentions, MentionedFile, MentionedFileState};
+	use omp_proto::thread::v1::Role;
+	use omp_session::file_mentions;
+
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let path = directory.path().join("file-mentions.oms");
+	let png = b"\x89PNG\r\n\x1a\nmention";
+	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
+	let attachment = session
+		.store_attachment("image/png", png)
+		.expect("image stores");
+	session.begin_turn().expect("turn starts");
+	session
+		.user("inspect @a.txt and @b.png", Vec::new())
+		.expect("user appends");
+	session
+		.file_mentions(FileMentions {
+			files: vec![
+				MentionedFile {
+					path:    Str::new_static("a.txt"),
+					content: Str::new_static("alpha"),
+					state:   MentionedFileState::Lines { line_count: Some(1) },
+				},
+				MentionedFile {
+					path:    Str::new_static("b.png"),
+					content: Str::default(),
+					state:   MentionedFileState::Image { attachment: attachment.clone() },
+				},
+				MentionedFile {
+					path:    Str::new_static("c.bin"),
+					content: Str::default(),
+					state:   MentionedFileState::SkippedBinary { byte_size: Some(64) },
+				},
+			],
+		})
+		.expect("mentions append");
+
+	let mention_node = session
+		.dom()
+		.children(
+			*session
+				.dom()
+				.children(session.dom().body())
+				.last()
+				.expect("turn"),
+		)
+		.iter()
+		.filter_map(|handle| session.dom().get(*handle))
+		.find(|node| file_mentions(node).is_some())
+		.expect("typed mention node");
+	assert_eq!(
+		file_mentions(mention_node)
+			.expect("payload decodes")
+			.files
+			.iter()
+			.map(|file| file.path.as_str())
+			.collect::<Vec<_>>(),
+		["a.txt", "b.png", "c.bin"]
+	);
+
+	let live = project_thread(session.dom());
+	assert_eq!(live.len(), 3, "authored user, text mentions, image mentions");
+	let messages = live
+		.iter()
+		.map(|item| match item.kind.as_ref().expect("item kind") {
+			item::Kind::Message(message) => message,
+			other => panic!("expected message, got {other:?}"),
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(
+		messages
+			.iter()
+			.map(|message| message.role)
+			.collect::<Vec<_>>(),
+		[Role::User as i32, Role::System as i32, Role::User as i32]
+	);
+	let system_text = messages[1].parts[0].kind.as_ref().expect("system text");
+	assert_eq!(
+		system_text,
+		&part::Kind::Text(
+			"<file path=\"a.txt\">\nalpha\n</file>\n<file path=\"c.bin\">\n\n</file>".to_owned()
+		)
+	);
+	assert_eq!(
+		messages[2].parts[0].kind.as_ref(),
+		Some(&part::Kind::Text("<file path=\"b.png\">\n\n</file>".to_owned()))
+	);
+	let Some(part::Kind::Blob(blob)) = messages[2].parts[1].kind.as_ref() else {
+		panic!("image mention blob");
+	};
+	assert_eq!(blob.mime, "image/png");
+	assert_eq!(blob.hash.as_ref(), attachment.blob.hash.as_bytes());
+
+	drop(session);
+	let restored = Session::open(&path, ComponentRegistry::default()).expect("session restores");
+	assert_eq!(project_thread(restored.dom()), live);
+}
