@@ -61,9 +61,12 @@ pub enum SigV4Error {
 	/// Neither the URI nor request headers identify a host.
 	#[error("SigV4 request has no host")]
 	MissingHost,
-	/// A request header cannot be represented canonically.
-	#[error("SigV4 request contains an invalid header")]
-	InvalidHeader,
+	/// A request header value cannot be represented canonically.
+	#[error("SigV4 request contains a non-canonical header value")]
+	InvalidHeaderValue,
+	/// A query component is not valid `decodeURIComponent` input.
+	#[error("SigV4 request query contains invalid percent-encoded UTF-8")]
+	InvalidQueryEncoding,
 	/// The catalog signing specification is structurally incomplete.
 	#[error("SigV4 signing specification is incomplete")]
 	InvalidSpec,
@@ -84,30 +87,36 @@ pub(crate) fn sign_request(
 	}
 	let (amz_date, short_date) = aws_dates(signed_at)?;
 	let host = request
-		.headers()
-		.get(HOST)
-		.cloned()
-		.or_else(|| {
-			request
-				.uri()
-				.authority()
-				.and_then(|authority| HeaderValue::from_str(authority.as_str()).ok())
+		.uri()
+		.authority()
+		.map(|authority| {
+			HeaderValue::from_str(authority.as_str()).map_err(|_| SigV4Error::InvalidHeaderValue)
 		})
+		.transpose()?
+		.or_else(|| request.headers().get(HOST).cloned())
 		.ok_or(SigV4Error::MissingHost)?;
 	request.headers_mut().insert(HOST, host);
 	request.headers_mut().insert(
 		HeaderName::from_static("x-amz-date"),
-		HeaderValue::from_str(&amz_date).map_err(|_| SigV4Error::InvalidHeader)?,
+		HeaderValue::from_str(&amz_date).map_err(|_| SigV4Error::InvalidHeaderValue)?,
 	);
 	let payload_hash = Sha256::digest(request.body());
 	let payload_hash = hex::encode(&payload_hash).into_string();
+	request.headers_mut().insert(
+		HeaderName::from_static("x-amz-content-sha256"),
+		HeaderValue::from_str(&payload_hash).map_err(|_| SigV4Error::InvalidHeaderValue)?,
+	);
 	if let Some(token) = &credential.session_token {
-		let mut value =
-			HeaderValue::from_str(token.expose_secret()).map_err(|_| SigV4Error::InvalidHeader)?;
+		let mut value = HeaderValue::from_str(token.expose_secret())
+			.map_err(|_| SigV4Error::InvalidHeaderValue)?;
 		value.set_sensitive(true);
 		request
 			.headers_mut()
 			.insert(HeaderName::from_static("x-amz-security-token"), value);
+	} else {
+		request
+			.headers_mut()
+			.remove(HeaderName::from_static("x-amz-security-token"));
 	}
 
 	let (canonical_hash, signed_headers) = canonical_request(request, &payload_hash, spec)?;
@@ -117,14 +126,12 @@ pub(crate) fn sign_request(
 		hex::encode(&canonical_hash).into_string()
 	);
 
-	let mut initial =
-		Zeroizing::new(Vec::with_capacity(4 + credential.secret_access_key.expose_secret().len()));
-	initial.extend_from_slice(b"AWS4");
-	initial.extend_from_slice(credential.secret_access_key.expose_secret().as_bytes());
-	let date_key = Zeroizing::new(hmac_sha256(&initial, short_date.as_bytes()));
-	let region_key = Zeroizing::new(hmac_sha256(&date_key[..], spec.region.as_bytes()));
-	let service_key = Zeroizing::new(hmac_sha256(&region_key[..], spec.service.as_bytes()));
-	let signing_key = Zeroizing::new(hmac_sha256(&service_key[..], b"aws4_request"));
+	let signing_key = derive_signing_key(
+		credential.secret_access_key.expose_secret(),
+		&short_date,
+		spec.region.as_str(),
+		spec.service.as_str(),
+	);
 	let mut signature = Zeroizing::new(hmac_sha256(&signing_key[..], string_to_sign.as_bytes()));
 	let signature_hex = hex::encode(&signature[..]).into_string();
 
@@ -144,7 +151,7 @@ pub(crate) fn sign_request(
 	authorization.extend_from_slice(b", Signature=");
 	authorization.extend_from_slice(signature_hex.as_bytes());
 	let mut value =
-		HeaderValue::from_bytes(&authorization).map_err(|_| SigV4Error::InvalidHeader)?;
+		HeaderValue::from_bytes(&authorization).map_err(|_| SigV4Error::InvalidHeaderValue)?;
 	value.set_sensitive(true);
 	request.headers_mut().insert(AUTHORIZATION, value);
 	signature.zeroize();
@@ -160,10 +167,11 @@ fn canonical_request(
 	for (name, value) in request.headers() {
 		let name = name.as_str();
 		if default_unsigned_header(name)
-			|| spec
-				.unsigned_headers
-				.iter()
-				.any(|excluded| excluded == name)
+			|| (!signer_owned_header(name)
+				&& spec
+					.unsigned_headers
+					.iter()
+					.any(|excluded| excluded == name))
 		{
 			continue;
 		}
@@ -173,10 +181,10 @@ fn canonical_request(
 	let mut canonical = Zeroizing::new(Vec::new());
 	canonical.extend_from_slice(request.method().as_str().as_bytes());
 	canonical.push(b'\n');
-	let canonical_uri = canonical_uri(request.uri().path(), spec.service.as_str());
+	let canonical_uri = canonical_path(request.uri().path());
 	canonical.extend_from_slice(canonical_uri.as_bytes());
 	canonical.push(b'\n');
-	let canonical_query = canonical_query(request.uri().query().unwrap_or_default());
+	let canonical_query = canonical_query(request.uri().query().unwrap_or_default())?;
 	canonical.extend_from_slice(canonical_query.as_bytes());
 	canonical.push(b'\n');
 	for (name, values) in headers {
@@ -186,7 +194,7 @@ fn canonical_request(
 			if index != 0 {
 				canonical.push(b',');
 			}
-			let value = value.to_str().map_err(|_| SigV4Error::InvalidHeader)?;
+			let value = value.to_str().map_err(|_| SigV4Error::InvalidHeaderValue)?;
 			append_normalized_header(&mut canonical, value);
 		}
 		canonical.push(b'\n');
@@ -199,105 +207,76 @@ fn canonical_request(
 	Ok((hash.into(), signed_headers))
 }
 
-fn canonical_uri(path: &str, service: &str) -> String {
-	let normalized = if service == "s3" {
-		path.to_owned()
-	} else {
-		normalize_path(path)
-	};
-	encode_path(&normalized, service != "s3")
-}
-
-fn normalize_path(path: &str) -> String {
-	let trailing_slash = path.ends_with('/');
-	let mut segments = Vec::new();
-	for segment in path.split('/') {
-		match segment {
-			"" | "." => {},
-			".." => {
-				segments.pop();
-			},
-			value => segments.push(value),
+fn canonical_path(path: &str) -> String {
+	let mut output = String::with_capacity(path.len());
+	for byte in path.bytes() {
+		if byte == b'/' {
+			output.push('/');
+		} else {
+			append_uri_byte(&mut output, byte);
 		}
-	}
-	let mut output = String::from("/");
-	output.push_str(&segments.join("/"));
-	if trailing_slash && output.len() > 1 {
-		output.push('/');
 	}
 	output
 }
 
-fn encode_path(path: &str, double_encode_percent: bool) -> String {
-	let bytes = path.as_bytes();
-	let mut output = String::with_capacity(bytes.len());
-	let mut index = 0;
-	while index < bytes.len() {
-		let byte = bytes[index];
-		if byte == b'/' {
-			output.push('/');
-		} else if byte == b'%'
-			&& index + 2 < bytes.len()
-			&& hex_value(bytes[index + 1]).is_some()
-			&& hex_value(bytes[index + 2]).is_some()
-		{
-			output.push_str(if double_encode_percent { "%25" } else { "%" });
-			output.push(hex_digit(hex_value(bytes[index + 1]).expect("checked")));
-			output.push(hex_digit(hex_value(bytes[index + 2]).expect("checked")));
-			index += 2;
-		} else {
-			append_uri_byte(&mut output, byte);
-		}
-		index += 1;
-	}
-	if output.is_empty() {
-		"/".to_owned()
-	} else {
-		output
-	}
-}
-
-fn canonical_query(query: &str) -> String {
+fn canonical_query(query: &str) -> Result<String, SigV4Error> {
 	if query.is_empty() {
-		return String::new();
+		return Ok(String::new());
 	}
 	let mut parameters = query
 		.split('&')
+		.filter(|parameter| !parameter.is_empty())
 		.map(|parameter| {
 			let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
-			(encode_query_component(name), encode_query_component(value))
+			Ok((decode_query_component(name)?, decode_query_component(value)?))
 		})
-		.collect::<Vec<_>>();
-	parameters.sort_unstable();
+		.collect::<Result<Vec<_>, SigV4Error>>()?;
+	parameters.sort_by(|(left_name, left_value), (right_name, right_value)| {
+		left_name
+			.encode_utf16()
+			.cmp(right_name.encode_utf16())
+			.then_with(|| left_value.encode_utf16().cmp(right_value.encode_utf16()))
+	});
 	let mut output = String::new();
 	for (index, (name, value)) in parameters.into_iter().enumerate() {
 		if index != 0 {
 			output.push('&');
 		}
-		output.push_str(&name);
+		append_query_component(&mut output, &name);
 		output.push('=');
-		output.push_str(&value);
+		append_query_component(&mut output, &value);
 	}
-	output
+	Ok(output)
 }
 
-fn encode_query_component(value: &str) -> String {
+fn decode_query_component(value: &str) -> Result<String, SigV4Error> {
 	let bytes = value.as_bytes();
-	let mut output = String::with_capacity(bytes.len());
+	let mut decoded = Vec::with_capacity(bytes.len());
 	let mut index = 0;
 	while index < bytes.len() {
-		if bytes[index] == b'%'
-			&& index + 2 < bytes.len()
-			&& let (Some(high), Some(low)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-		{
-			append_uri_byte(&mut output, high * 16 + low);
+		if bytes[index] == b'%' {
+			let high = bytes
+				.get(index + 1)
+				.and_then(|&byte| hex_value(byte))
+				.ok_or(SigV4Error::InvalidQueryEncoding)?;
+			let low = bytes
+				.get(index + 2)
+				.and_then(|&byte| hex_value(byte))
+				.ok_or(SigV4Error::InvalidQueryEncoding)?;
+			decoded.push(high * 16 + low);
 			index += 3;
 		} else {
-			append_uri_byte(&mut output, bytes[index]);
+			decoded.push(bytes[index]);
 			index += 1;
 		}
 	}
-	output
+	String::from_utf8(decoded).map_err(|_| SigV4Error::InvalidQueryEncoding)
+}
+
+fn append_query_component(output: &mut String, value: &str) {
+	for byte in value.bytes() {
+		append_uri_byte(output, byte);
+	}
 }
 
 fn append_uri_byte(output: &mut String, byte: u8) {
@@ -326,15 +305,32 @@ const fn hex_digit(value: u8) -> char {
 	}
 }
 
-const fn default_unsigned_header(name: &str) -> bool {
+fn default_unsigned_header(name: &str) -> bool {
 	matches!(
 		name.as_bytes(),
 		b"authorization"
+			| b"cache-control"
 			| b"connection"
 			| b"expect"
+			| b"from"
+			| b"keep-alive"
+			| b"max-forwards"
+			| b"pragma"
+			| b"referer"
+			| b"te"
+			| b"trailer"
 			| b"transfer-encoding"
+			| b"upgrade"
 			| b"user-agent"
 			| b"x-amzn-trace-id"
+	) || name.starts_with("proxy-")
+		|| name.starts_with("sec-")
+}
+
+const fn signer_owned_header(name: &str) -> bool {
+	matches!(
+		name.as_bytes(),
+		b"host" | b"x-amz-content-sha256" | b"x-amz-date" | b"x-amz-security-token"
 	)
 }
 
@@ -353,6 +349,21 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 		.as_ref()
 		.try_into()
 		.expect("SHA-256 HMAC is 32 bytes")
+}
+
+fn derive_signing_key(
+	secret_access_key: &str,
+	short_date: &str,
+	region: &str,
+	service: &str,
+) -> Zeroizing<[u8; 32]> {
+	let mut initial = Zeroizing::new(Vec::with_capacity(4 + secret_access_key.len()));
+	initial.extend_from_slice(b"AWS4");
+	initial.extend_from_slice(secret_access_key.as_bytes());
+	let date_key = Zeroizing::new(hmac_sha256(&initial, short_date.as_bytes()));
+	let region_key = Zeroizing::new(hmac_sha256(&date_key[..], region.as_bytes()));
+	let service_key = Zeroizing::new(hmac_sha256(&region_key[..], service.as_bytes()));
+	Zeroizing::new(hmac_sha256(&service_key[..], b"aws4_request"))
 }
 
 fn aws_dates(time: SystemTime) -> Result<(String, String), SigV4Error> {
@@ -391,68 +402,300 @@ mod tests {
 
 	use super::*;
 
+	const ACCESS_KEY: &str = "AKIDEXAMPLE";
+	const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+	const VECTOR_SECONDS: u64 = 1_440_938_160;
+
+	fn credential(session_token: Option<&str>) -> AwsCredential {
+		AwsCredential::new(
+			SecretString::from(ACCESS_KEY.to_owned()),
+			SecretString::from(SECRET_KEY.to_owned()),
+			session_token.map(|token| SecretString::from(token.to_owned())),
+		)
+	}
+
+	fn spec(unsigned_headers: Vec<omp_core::Str>) -> SigV4Spec {
+		SigV4Spec {
+			service: "service".into(),
+			region: "us-east-1".into(),
+			unsigned_headers,
+		}
+	}
+
 	#[test]
-	fn bedrock_golden_signs_the_final_request_and_redacts_material() {
-		let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
-		let session = "session-token";
-		let credential = AwsCredential::new(
-			SecretString::from("AKIDEXAMPLE".to_owned()),
-			SecretString::from(secret.to_owned()),
-			Some(SecretString::from(session.to_owned())),
+	fn dates_and_derived_signing_key_match_aws_vectors() {
+		assert_eq!(
+			aws_dates(UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS)).expect("valid date"),
+			("20150830T123600Z".to_owned(), "20150830".to_owned())
 		);
-		let spec = SigV4Spec {
-			service:          "bedrock".into(),
-			region:           "us-east-1".into(),
-			unsigned_headers: Vec::new(),
-		};
+		let key = derive_signing_key(SECRET_KEY, "20150830", "us-east-1", "iam");
+		assert_eq!(
+			hex::encode(&key[..]).into_string(),
+			"c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
+		);
+	}
+
+	#[test]
+	fn get_with_empty_body_matches_smithy_reference_bytes() {
+		let mut request = Request::builder()
+			.method("GET")
+			.uri("https://example.amazonaws.com/")
+			.body(Bytes::new())
+			.expect("request");
+		sign_request(&credential(None), &spec(Vec::new()), UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS), &mut request)
+			.expect("signature");
+
+		assert_eq!(request.headers()[HOST], "example.amazonaws.com");
+		assert_eq!(request.headers()["x-amz-date"], "20150830T123600Z");
+		assert_eq!(
+			request.headers()["x-amz-content-sha256"],
+			"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+		);
+		assert_eq!(
+			request.headers()[AUTHORIZATION],
+			"AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
+			 SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+			 Signature=726c5c4879a6b4ccbbd3b24edbd6b8826d34f87450fbbf4e85546fc7ba9c1642"
+		);
+
+		let first = request.headers()[AUTHORIZATION].clone();
+		sign_request(&credential(None), &spec(Vec::new()), UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS), &mut request)
+			.expect("repeat signature");
+		assert_eq!(request.headers()[AUTHORIZATION], first);
+	}
+
+	#[test]
+	fn post_with_json_body_matches_smithy_reference_bytes() {
 		let mut request = Request::builder()
 			.method("POST")
-			.uri("https://bedrock-runtime.us-east-1.amazonaws.com/model/test/invoke?x=1")
+			.uri("https://example.amazonaws.com/")
 			.header("content-type", "application/json")
-			.body(Bytes::from_static(b"{}"))
+			.body(Bytes::from_static(br#"{"hello":"world"}"#))
+			.expect("request");
+		sign_request(&credential(None), &spec(Vec::new()), UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS), &mut request)
+			.expect("signature");
+
+		assert_eq!(
+			request.headers()["x-amz-content-sha256"],
+			"93a23971a914e5eacbf0a8d25154cda309c3c1c72fbb9914d47c60f3cb681588"
+		);
+		assert_eq!(
+			request.headers()[AUTHORIZATION],
+			"AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
+			 SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, \
+			 Signature=e9744044f72be2a6e5082cdcebb673e0a1daf890c82cc130d46abd3769ca15e0"
+		);
+	}
+
+	#[test]
+	fn session_token_is_signer_owned_signed_and_redacted() {
+		let session = "AQoDYXdzEJr...";
+		let credential = credential(Some(session));
+		let mut request = Request::builder()
+			.method("GET")
+			.uri("https://example.amazonaws.com/")
+			.header(HOST, "caller.example")
+			.header(AUTHORIZATION, "Bearer caller-secret")
+			.header("x-amz-date", "19990101T000000Z")
+			.header("x-amz-content-sha256", "caller-hash")
+			.header("x-amz-security-token", "caller-token")
+			.body(Bytes::new())
 			.expect("request");
 		sign_request(
 			&credential,
-			&spec,
-			UNIX_EPOCH + Duration::from_secs(1_704_164_645),
+			&spec(vec![
+				"host".into(),
+				"x-amz-date".into(),
+				"x-amz-content-sha256".into(),
+				"x-amz-security-token".into(),
+			]),
+			UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS),
 			&mut request,
 		)
 		.expect("signature");
-		assert_eq!(request.headers()["x-amz-date"], "20240102T030405Z");
-		assert_eq!(request.headers()["x-amz-security-token"], session);
+
+		assert_eq!(request.headers()[HOST], "example.amazonaws.com");
+		assert_eq!(request.headers()["x-amz-date"], "20150830T123600Z");
 		assert_eq!(
-			request.headers()[AUTHORIZATION],
-			"AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240102/us-east-1/bedrock/aws4_request, \
-			 SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, \
-			 Signature=b3d1eb71036f1bc84ecc771586e0218c87cd321b6b484b244702cb01fc3914a0"
+			request.headers()["x-amz-content-sha256"],
+			"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+		);
+		assert_eq!(request.headers()["x-amz-security-token"], session);
+		assert!(
+			request.headers()[AUTHORIZATION]
+				.to_str()
+				.expect("authorization")
+				.contains(
+					"SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+				)
 		);
 		let debug = format!("{credential:?} {request:?}");
-		assert!(!debug.contains(secret));
+		assert!(!debug.contains(SECRET_KEY));
 		assert!(!debug.contains(session));
+		assert!(!debug.contains("caller-secret"));
+		assert!(!debug.contains("caller-token"));
 	}
 
 	#[test]
-	fn canonical_query_uses_aws_rfc3986_encoding_and_encoded_pair_order() {
+	fn absent_session_token_removes_a_caller_supplied_token() {
+		let mut request = Request::builder()
+			.method("GET")
+			.uri("https://example.amazonaws.com/")
+			.header("x-amz-security-token", "caller-token")
+			.body(Bytes::new())
+			.expect("request");
+		sign_request(&credential(None), &spec(Vec::new()), UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS), &mut request)
+			.expect("signature");
+		assert!(!request.headers().contains_key("x-amz-security-token"));
+		assert!(
+			!request.headers()[AUTHORIZATION]
+				.to_str()
+				.expect("authorization")
+				.contains("x-amz-security-token")
+		);
+	}
+
+	#[test]
+	fn canonical_query_decodes_sorts_and_reencodes_like_javascript() {
 		assert_eq!(
-			canonical_query("z=last&a=+&a=/&empty&colon=:&lower=%2f&upper=%2F&a="),
+			canonical_query("z=last&a=+&a=/&empty&colon=:&lower=%2f&upper=%2F&a=")
+				.expect("canonical query"),
 			"a=&a=%2B&a=%2F&colon=%3A&empty=&lower=%2F&upper=%2F&z=last"
 		);
+		assert_eq!(
+			canonical_query("%EE%80%80=b&%F0%90%80%80=a").expect("Unicode query"),
+			"%F0%90%80%80=a&%EE%80%80=b"
+		);
+		assert_eq!(canonical_query("a=1&&b=2&").expect("empty pairs"), "a=1&b=2");
+		assert_eq!(
+			canonical_query("bad=%ZZ"),
+			Err(SigV4Error::InvalidQueryEncoding)
+		);
+		assert_eq!(
+			canonical_query("bad=%E0%A4%A"),
+			Err(SigV4Error::InvalidQueryEncoding)
+		);
 	}
 
 	#[test]
-	fn canonical_path_normalizes_service_paths_without_confusing_encoded_slashes() {
+	fn canonical_path_preserves_segments_and_double_encodes_percent() {
 		assert_eq!(
-			canonical_uri("/a//b/./c/../d:+/%2f/%2F", "execute-api"),
-			"/a/b/d%3A%2B/%252F/%252F"
+			canonical_path("/a//b/./c/../d:+/%2f/%2F"),
+			"/a//b/./c/../d%3A%2B/%252f/%252F"
 		);
-		assert_eq!(canonical_uri("/a//b/./c/../d:+/%2f/%2F", "s3"), "/a//b/./c/../d%3A%2B/%2F/%2F");
+		assert_eq!(canonical_path("/model/a:b.c/converse-stream"), "/model/a%3Ab.c/converse-stream");
+	}
+
+	#[test]
+	fn standard_transport_and_proxy_headers_are_never_signed() {
+		for name in [
+			"authorization",
+			"cache-control",
+			"connection",
+			"expect",
+			"from",
+			"keep-alive",
+			"max-forwards",
+			"pragma",
+			"referer",
+			"te",
+			"trailer",
+			"transfer-encoding",
+			"upgrade",
+			"user-agent",
+			"x-amzn-trace-id",
+			"proxy-authorization",
+			"sec-fetch-mode",
+		] {
+			assert!(default_unsigned_header(name), "{name}");
+		}
+		assert!(!default_unsigned_header("content-type"));
+	}
+
+	#[test]
+	fn canonical_headers_collapse_whitespace_and_exclude_unsigned_values() {
+		let mut baseline = Request::builder()
+			.method("GET")
+			.uri("https://example.amazonaws.com/")
+			.header("x-custom", "one two")
+			.header("x-ignored", "baseline")
+			.body(Bytes::new())
+			.expect("request");
+		let mut noisy = Request::builder()
+			.method("GET")
+			.uri("https://example.amazonaws.com/")
+			.header("x-custom", "one \t  two")
+			.header("x-ignored", "changed")
+			.header("cache-control", "no-cache")
+			.header("user-agent", "caller")
+			.header("proxy-authorization", "secret")
+			.header("sec-fetch-mode", "cors")
+			.body(Bytes::new())
+			.expect("request");
+		let spec = spec(vec!["x-ignored".into()]);
+		sign_request(
+			&credential(None),
+			&spec,
+			UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS),
+			&mut baseline,
+		)
+		.expect("baseline signature");
+		sign_request(
+			&credential(None),
+			&spec,
+			UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS),
+			&mut noisy,
+		)
+		.expect("noisy signature");
+		assert_eq!(baseline.headers()[AUTHORIZATION], noisy.headers()[AUTHORIZATION]);
+		assert!(
+			baseline.headers()[AUTHORIZATION]
+				.to_str()
+				.expect("authorization")
+				.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-custom")
+		);
+	}
+
+	#[test]
+	fn malformed_input_errors_are_typed_and_do_not_expose_values() {
+		let mut missing_host = Request::builder()
+			.method("GET")
+			.uri("/")
+			.body(Bytes::new())
+			.expect("request");
+		assert_eq!(
+			sign_request(
+				&credential(None),
+				&spec(Vec::new()),
+				UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS),
+				&mut missing_host
+			),
+			Err(SigV4Error::MissingHost)
+		);
+
+		let secret_value = "secret\nheader";
+		let bad_credential = credential(Some(secret_value));
+		let mut invalid_header = Request::builder()
+			.method("GET")
+			.uri("https://example.amazonaws.com/")
+			.body(Bytes::new())
+			.expect("request");
+		let error = sign_request(
+			&bad_credential,
+			&spec(Vec::new()),
+			UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS),
+			&mut invalid_header,
+		)
+		.expect_err("invalid token");
+		assert_eq!(error, SigV4Error::InvalidHeaderValue);
+		assert!(!format!("{error:?} {error}").contains(secret_value));
 	}
 
 	#[test]
 	fn aws_published_iam_canonical_components_are_stable() {
-		assert_eq!(canonical_uri("/", "iam"), "/");
+		assert_eq!(canonical_path("/"), "/");
 		assert_eq!(
-			canonical_query("Version=2010-05-08&Action=ListUsers"),
+			canonical_query("Version=2010-05-08&Action=ListUsers").expect("canonical query"),
 			"Action=ListUsers&Version=2010-05-08"
 		);
 	}

@@ -37,6 +37,8 @@ pub mod router;
 pub mod search_settings;
 pub mod session;
 pub mod settings;
+/// Backend-neutral local and hosted speech synthesis convars.
+pub mod speech_settings;
 pub mod staging;
 pub mod transport;
 

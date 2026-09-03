@@ -38,6 +38,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{
+	account::{RetryAfterInput, parse_retry_after},
 	body::{
 		AttemptBodyEvidence, AttemptEvidenceHandle, BodyFactoryHandle, BodyOpenError, BodyReader,
 		BodySource, ByteStream, byte_stream,
@@ -1212,7 +1213,8 @@ fn header_str<'h>(headers: &'h HeaderMap, name: &HeaderName) -> Option<&'h str> 
 }
 
 fn retry_after_hint(headers: &HeaderMap) -> Option<time::Duration> {
-	let now = time::SystemTime::now()
+	let now = time::SystemTime::now();
+	let now_epoch = now
 		.duration_since(time::SystemTime::UNIX_EPOCH)
 		.unwrap_or_default()
 		.as_secs_f64();
@@ -1228,33 +1230,41 @@ fn retry_after_hint(headers: &HeaderMap) -> Option<time::Duration> {
 		let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
 			continue;
 		};
-		let seconds = if name == "retry-after-ms" {
-			value
-				.trim()
-				.parse::<f64>()
+		let duration = if name == "retry-after" {
+			parse_retry_after(RetryAfterInput::Header(value), now)
 				.ok()
-				.map(|milliseconds| milliseconds / 1_000.0)
-		} else if let Some(milliseconds) = value.trim().strip_suffix("ms") {
-			milliseconds
-				.trim()
-				.parse::<f64>()
-				.ok()
-				.map(|milliseconds| milliseconds / 1_000.0)
-		} else if let Some(seconds) = value.trim().strip_suffix('s') {
-			seconds.trim().parse::<f64>().ok()
+				.map(|parsed| parsed.until.duration_since(now).unwrap_or_default())
 		} else {
-			value.trim().parse::<f64>().ok().map(|value| {
-				if value >= 1_000_000_000.0 {
-					(value - now).max(0.0)
-				} else {
-					value
-				}
-			})
+			let seconds = if name == "retry-after-ms" {
+				value
+					.trim()
+					.parse::<f64>()
+					.ok()
+					.map(|milliseconds| milliseconds / 1_000.0)
+			} else if let Some(milliseconds) = value.trim().strip_suffix("ms") {
+				milliseconds
+					.trim()
+					.parse::<f64>()
+					.ok()
+					.map(|milliseconds| milliseconds / 1_000.0)
+			} else if let Some(seconds) = value.trim().strip_suffix('s') {
+				seconds.trim().parse::<f64>().ok()
+			} else {
+				value.trim().parse::<f64>().ok().map(|value| {
+					if value >= 1_000_000_000.0 {
+						(value - now_epoch).max(0.0)
+					} else {
+						value
+					}
+				})
+			};
+			seconds
+				.filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+				.map(time::Duration::from_secs_f64)
 		};
-		let Some(seconds) = seconds.filter(|seconds| seconds.is_finite() && *seconds >= 0.0) else {
+		let Some(duration) = duration else {
 			continue;
 		};
-		let duration = time::Duration::from_secs_f64(seconds);
 		maximum = Some(maximum.map_or(duration, |current: time::Duration| current.max(duration)));
 	}
 	maximum
@@ -1266,8 +1276,9 @@ fn classify_http_error_with_hint(
 	retry_hint: Option<time::Duration>,
 ) -> Error {
 	let (code, message) = provider_error_facts(body);
-	let account_exhausted =
-		account_cap_exhausted(status, code.as_deref(), message.as_deref(), retry_hint);
+	let account_exhausted = google_rpc_account_cap(body)
+		.unwrap_or_else(|| account_cap_exhausted(status, code.as_deref(), message.as_deref()));
+	let concurrent_shedding = status != 402 && concurrent_cap(code.as_deref(), message.as_deref());
 	let classified_rejection =
 		classify_provider_rejection(Some(status), message.as_deref(), None, None);
 	let transient_generation_fault = status == 400
@@ -1281,6 +1292,10 @@ fn classify_http_error_with_hint(
 			ErrorKind::RateLimited
 		};
 		(kind, RetryAction::RotateAccount)
+	} else if concurrent_shedding {
+		(ErrorKind::RateLimited, RetryAction::SameRoute {
+			after: retry_hint.unwrap_or_else(|| time::Duration::from_secs(5)),
+		})
 	} else if let Some(kind) = classified_rejection {
 		(kind, RetryAction::Never)
 	} else if transient_generation_fault {
@@ -1343,6 +1358,32 @@ static SUBSCRIPTION_CAP_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
 static PER_INTERVAL_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
 	regex::Regex::new(r"(?i)\bper\s+(?:second|minute)\b").expect("per-interval pattern compiles")
 });
+/// Simplified Chinese account-quota exhaustion. The `使用` anchor keeps
+/// rate/concurrency limits out of the persistent-account lane.
+static CN_QUOTA_EXHAUSTED_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+	regex::Regex::new(
+		r"使用.{0,30}?上限|(?:额度|配额)已?(?:用|耗)(?:完|尽)|限额.{0,30}重置|余额不足",
+	)
+	.expect("Chinese quota pattern compiles")
+});
+static CN_TRANSIENT_CAP_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+	regex::Regex::new(
+		r"速率.{0,30}上限|频率.{0,30}上限|每分钟.{0,30}上限|并发.{0,30}上限|使用.{0,30}(?:速率|频率|每分钟|并发).{0,30}上限",
+	)
+	.expect("Chinese transient-cap pattern compiles")
+});
+/// DashScope/Bailian documents this otherwise quota-worded response as a
+/// minute-window token throttle.
+static DASHSCOPE_TOKEN_LIMIT_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+	regex::Regex::new(
+		r"(?i)\byou exceeded your current quota, please check your plan and billing details\b",
+	)
+	.expect("DashScope token-limit message pattern compiles")
+});
+static DASHSCOPE_TOKEN_LIMIT_DOC: LazyLock<regex::Regex> = LazyLock::new(|| {
+	regex::Regex::new(r"(?i)error-code[^()\s]*#token-limit")
+		.expect("DashScope token-limit documentation pattern compiles")
+});
 /// Pi `CONCURRENT_LIMIT_PATTERN`: a concurrency cap is shed-and-backoff on a
 /// 429 but an exhausted billing cap on a 402.
 static CONCURRENT_LIMIT_TEXT: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -1376,15 +1417,85 @@ static INFORMATIVE_TEXT: LazyLock<regex::Regex> =
 /// account-local cap a sibling credential could satisfy. Per-interval
 /// throttles, capacity shedding, and informative non-quota bodies stay on the
 /// same credential; a bare status rotates conservatively because the server
-/// gave nothing else to go on — except a bare 429 with a provider retry hint,
-/// which is the one extra fact pi's classifier never sees and names a
-/// transient wait, not an exhausted account.
-fn account_cap_exhausted(
-	status: u16,
-	code: Option<&str>,
-	message: Option<&str>,
-	retry_hint: Option<time::Duration>,
-) -> bool {
+/// gave nothing else to go on. A retry hint controls when an attempted route
+/// may run again; it does not turn an opaque account failure into evidence
+/// that the current credential remains usable.
+fn google_rpc_account_cap(body: &[u8]) -> Option<bool> {
+	const ERROR_INFO: &str = "type.googleapis.com/google.rpc.ErrorInfo";
+	const RETRY_INFO: &str = "type.googleapis.com/google.rpc.RetryInfo";
+	const LONG_RATE_LIMIT_SECONDS: f64 = 5.0 * 60.0;
+
+	let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+	let error = value.get("error")?;
+	if error
+		.get("status")?
+		.as_str()?
+		.trim()
+		.eq_ignore_ascii_case("RESOURCE_EXHAUSTED")
+	{
+		let details = error.get("details")?.as_array()?;
+		let reason = details.iter().find_map(|detail| {
+			(detail.get("@type")?.as_str()? == ERROR_INFO)
+				.then(|| detail.get("reason")?.as_str())
+				.flatten()
+		})?;
+		let reason = reason.trim();
+		if reason.eq_ignore_ascii_case("QUOTA_EXHAUSTED")
+			|| reason.eq_ignore_ascii_case("INSUFFICIENT_G1_CREDITS_BALANCE")
+		{
+			return Some(true);
+		}
+		if reason.eq_ignore_ascii_case("RATE_LIMIT_EXCEEDED") {
+			if error
+				.get("message")
+				.and_then(serde_json::Value::as_str)
+				.is_some_and(|message| {
+					contains_ascii_case_insensitive(
+						message.as_bytes(),
+						b"exhausted your capacity on this model",
+					)
+				}) {
+				return Some(true);
+			}
+			let retry_seconds = details.iter().find_map(|detail| {
+				if detail.get("@type")?.as_str()? != RETRY_INFO {
+					return None;
+				}
+				detail
+					.get("retryDelay")?
+					.as_str()?
+					.trim()
+					.strip_suffix('s')?
+					.parse::<f64>()
+					.ok()
+			});
+			return Some(
+				retry_seconds
+					.is_some_and(|seconds| seconds.is_finite() && seconds >= LONG_RATE_LIMIT_SECONDS),
+			);
+		}
+	}
+	None
+}
+
+fn concurrent_cap(code: Option<&str>, message: Option<&str>) -> bool {
+	code
+		.into_iter()
+		.chain(message)
+		.any(|evidence| CONCURRENT_LIMIT_TEXT.is_match(evidence))
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+	needle.is_empty()
+		|| haystack.windows(needle.len()).any(|window| {
+			window
+				.iter()
+				.zip(needle)
+				.all(|(left, right)| left.eq_ignore_ascii_case(right))
+		})
+}
+
+fn account_cap_exhausted(status: u16, code: Option<&str>, message: Option<&str>) -> bool {
 	if !matches!(status, 402 | 429) {
 		return false;
 	}
@@ -1393,8 +1504,19 @@ fn account_cap_exhausted(
 		.chain(message)
 		.collect::<Vec<_>>()
 		.join(" ");
+	if DASHSCOPE_TOKEN_LIMIT_DOC.is_match(&evidence)
+		&& DASHSCOPE_TOKEN_LIMIT_TEXT.is_match(&evidence)
+	{
+		return false;
+	}
+	if CN_TRANSIENT_CAP_TEXT.is_match(&evidence) {
+		return false;
+	}
+	if CN_QUOTA_EXHAUSTED_TEXT.is_match(&evidence) {
+		return true;
+	}
 	if !INFORMATIVE_TEXT.is_match(&STATUS_FRAMING_TEXT.replace_all(&evidence, "")) {
-		return status == 402 || retry_hint.is_none();
+		return true;
 	}
 	if USAGE_LIMIT_TEXT.is_match(&evidence)
 		|| (SUBSCRIPTION_CAP_TEXT.is_match(&evidence) && !PER_INTERVAL_TEXT.is_match(&evidence))
@@ -2268,11 +2390,11 @@ mod tests {
 			assert_eq!(classify_http_error(status, body).action, action, "status {status} {body:?}");
 		}
 
-		// A bare 429 with a provider retry hint is a wait, not an exhausted
-		// account.
+		// A retry hint does not make an opaque 429 informative: rotate the
+		// credential, while retaining the hint as transport evidence.
 		assert_eq!(
 			classify_http_error_with_hint(429, b"{}", Some(time::Duration::from_secs(2))).action,
-			RetryAction::SameRoute { after: time::Duration::from_secs(2) },
+			RetryAction::RotateAccount,
 		);
 	}
 
@@ -2284,9 +2406,53 @@ mod tests {
 		headers.insert("x-ratelimit-reset", HeaderValue::from_static("1500ms"));
 		assert_eq!(retry_after_hint(&headers), Some(time::Duration::from_secs(2)));
 		assert_eq!(
-			classify_http_error_with_hint(429, b"{}", retry_after_hint(&headers)).action,
+			classify_http_error_with_hint(
+				429,
+				br#"{"error":{"message":"Too many requests"}}"#,
+				retry_after_hint(&headers),
+			)
+			.action,
 			RetryAction::SameRoute { after: time::Duration::from_secs(2) },
 		);
+	}
+
+	#[test]
+	fn retry_after_accepts_an_imf_fixdate() {
+		let mut headers = HeaderMap::new();
+		headers.insert("retry-after", HeaderValue::from_static("Wed, 21 Oct 2099 07:28:00 GMT"));
+		assert!(retry_after_hint(&headers).is_some_and(|delay| delay > time::Duration::ZERO));
+	}
+
+	#[test]
+	fn provider_quota_dialects_choose_rotation_or_transient_backoff() {
+		let structured_quota = br#"{"error":{"code":429,"message":"No capacity","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"21600s"}]}}"#;
+		assert_eq!(classify_http_error(429, structured_quota).action, RetryAction::RotateAccount,);
+
+		let structured_throttle = br#"{"error":{"code":429,"message":"Too many requests","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"30s"}]}}"#;
+		assert!(matches!(
+			classify_http_error(429, structured_throttle).action,
+			RetryAction::SameRoute { .. }
+		));
+
+		let chinese_quota =
+			r#"{"error":{"message":"已达到 5 小时的使用上限。您的限额将在稍后重置"}}"#.as_bytes();
+		assert_eq!(classify_http_error(429, chinese_quota).action, RetryAction::RotateAccount,);
+		let chinese_throttle =
+			r#"{"error":{"message":"每分钟请求数已达上限，请稍后重试"}}"#.as_bytes();
+		assert!(matches!(
+			classify_http_error(429, chinese_throttle).action,
+			RetryAction::SameRoute { .. }
+		));
+
+		let dashscope_throttle = br#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details. https://help.aliyun.com/error-code#token-limit"}}"#;
+		assert!(matches!(
+			classify_http_error(429, dashscope_throttle).action,
+			RetryAction::SameRoute { .. }
+		));
+		let concurrent = br#"{"error":{"message":"Too many concurrent requests"}}"#;
+		assert_eq!(classify_http_error(403, concurrent).action, RetryAction::SameRoute {
+			after: time::Duration::from_secs(5),
+		},);
 	}
 
 	#[test]

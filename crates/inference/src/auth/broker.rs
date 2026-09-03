@@ -6,9 +6,12 @@ use futures::future::{Either, FutureExt as _};
 use omp_catalog::{AuthSpecId, Catalog, provider::AuthSpecKind};
 use omp_core::{SecretString, Str, sf};
 
-use super::lease::{
-	AuthRejection, CredentialError, CredentialFuture, CredentialKind, CredentialLease,
-	CredentialNeed, CredentialSource, LeaseMeta, credential_ready,
+use super::{
+	aws::AwsCredentialSource,
+	lease::{
+		AuthRejection, CredentialError, CredentialFuture, CredentialKind, CredentialLease,
+		CredentialNeed, CredentialSource, LeaseMeta, credential_ready,
+	},
 };
 use crate::{AccountId, PrincipalId};
 
@@ -202,11 +205,16 @@ impl CredentialBroker {
 		Ok(Self { plans: Arc::new(plans), environment, engines, invocation: None })
 	}
 
-	/// Uses the process environment without upstream aliases or fallbacks.
+	/// Uses the process environment without upstream aliases and installs the
+	/// complete process-wide AWS credential chain when no injected engine was
+	/// supplied.
 	pub fn system(
 		catalog: &Catalog,
-		engines: CredentialBrokerEngines,
+		mut engines: CredentialBrokerEngines,
 	) -> Result<Self, CredentialBrokerError> {
+		if engines.aws.is_none() {
+			engines.aws = Some(Arc::new(AwsCredentialSource::system()));
+		}
 		Self::from_catalog(catalog, Arc::new(SystemCredentialEnvironment), engines)
 	}
 
@@ -245,9 +253,10 @@ impl CredentialBroker {
 
 	/// Refreshes the renewable engine for an exact account/spec selection.
 	///
-	/// Stored OAuth is authoritative when installed. Environment, invocation,
-	/// ADC, AWS, and session engines are never considered and no ordinary
-	/// source fallback occurs.
+	/// Stored OAuth is authoritative when installed. An AWS-only plan refreshes
+	/// its chain in place so rejected or expiring role credentials are
+	/// re-resolved. Environment, invocation, ADC, and session sources remain
+	/// nonrenewable, and no ordinary source fallback occurs.
 	pub fn refresh_account(
 		&self,
 		need: CredentialNeed,
@@ -255,7 +264,7 @@ impl CredentialBroker {
 		let Some(plan) = self.plans.get(&need.spec) else {
 			return credential_ready(Err(CredentialError::InvalidSource));
 		};
-		let Some(selected) = [EngineKind::Stored, EngineKind::OAuth]
+		let Some(selected) = [EngineKind::Stored, EngineKind::OAuth, EngineKind::Aws]
 			.into_iter()
 			.find(|kind| {
 				self.engine(*kind).is_some()
@@ -292,8 +301,9 @@ impl CredentialBroker {
 		};
 		let engine = match tag {
 			STORED_TAG => EngineKind::Stored,
+			AWS_TAG => EngineKind::Aws,
 			OAUTH_TAG => EngineKind::OAuth,
-			ENVIRONMENT_TAG | INVOCATION_TAG | ADC_TAG | AWS_TAG | SESSION_TAG => {
+			ENVIRONMENT_TAG | INVOCATION_TAG | ADC_TAG | SESSION_TAG => {
 				return credential_ready(Err(CredentialError::Unavailable));
 			},
 			_ => return credential_ready(Err(CredentialError::InvalidSource)),

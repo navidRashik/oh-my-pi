@@ -339,6 +339,7 @@ omp_con::var! {
 	/// pi `mnemopi.embeddingApiKey` (string, default: undefined).
 	pub static AI_MNEMOPI_EMBEDDING_API_KEY = ai_mnemopi_embedding_api_key: Str {
 		default: Str::new_static(""),
+		flags: archive,
 	};
 	/// pi `mnemopi.llmMode` (enum, default: "smol").
 	pub static AI_MNEMOPI_LLM_MODE = ai_mnemopi_llm_mode: Str {
@@ -353,6 +354,7 @@ omp_con::var! {
 	/// pi `mnemopi.llmApiKey` (string, default: undefined).
 	pub static AI_MNEMOPI_LLM_API_KEY = ai_mnemopi_llm_api_key: Str {
 		default: Str::new_static(""),
+		flags: archive,
 	};
 	/// pi `mnemopi.llmModel` (string, default: undefined).
 	pub static AI_MNEMOPI_LLM_MODEL = ai_mnemopi_llm_model: Str {
@@ -397,6 +399,7 @@ omp_con::var! {
 	/// pi `hindsight.apiToken` (string, default: undefined).
 	pub static AI_HINDSIGHT_API_TOKEN = ai_hindsight_api_token: Str {
 		default: Str::new_static(""),
+		flags: archive,
 	};
 	/// pi `hindsight.bankId` (string, default: undefined).
 	pub static AI_HINDSIGHT_BANK_ID = ai_hindsight_bank_id: Str {

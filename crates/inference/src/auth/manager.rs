@@ -12,6 +12,7 @@ use std::{
 
 use flume::Sender;
 use futures::future::{BoxFuture, Either, FutureExt as _};
+use http::HeaderValue;
 use omp_catalog::{
 	AuthSpecId, Catalog, ProviderId,
 	provider::{AuthSpecKind, OAuthExchangeKind, OAuthFlowSpec},
@@ -1309,6 +1310,84 @@ pub enum AuthManagerBuildError {
 	UnknownAuthSpec(AuthSpecId),
 }
 
+/// Opaque Codex OAuth generation leased for one realtime live connection.
+///
+/// The bearer remains private to inference. Callers can only request a
+/// sensitive `Authorization` header and inspect non-secret account identity.
+#[derive(Clone)]
+pub struct CodexLiveCredential {
+	lease:      CredentialLease,
+	account_id: Option<Str>,
+}
+
+impl CodexLiveCredential {
+	/// Builds the sensitive bearer header consumed by Codex signaling and
+	/// sideband handshakes.
+	pub fn authorization_header(&self) -> Result<HeaderValue, CodexLiveCredentialError> {
+		let token = self
+			.lease
+			.scalar_secret()
+			.ok_or(CodexLiveCredentialError::WrongCredentialKind)?;
+		let mut bearer =
+			Zeroizing::new(String::with_capacity("Bearer ".len() + token.expose_secret().len()));
+		bearer.push_str("Bearer ");
+		bearer.push_str(token.expose_secret());
+		let mut value = HeaderValue::from_str(&bearer)
+			.map_err(|source| CodexLiveCredentialError::InvalidAuthorization { source })?;
+		value.set_sensitive(true);
+		Ok(value)
+	}
+
+	/// Provider-issued ChatGPT account identity recovered from the OAuth JWT.
+	#[must_use]
+	pub const fn account_id(&self) -> Option<&Str> {
+		self.account_id.as_ref()
+	}
+}
+
+impl fmt::Debug for CodexLiveCredential {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("CodexLiveCredential")
+			.field("account", &self.lease.meta().account)
+			.field("generation", &self.lease.meta().generation)
+			.field("account_id", &self.account_id)
+			.field("authorization", &"[REDACTED]")
+			.finish()
+	}
+}
+
+/// Failure to lease or represent the shared Codex OAuth generation.
+#[derive(Debug, thiserror::Error)]
+pub enum CodexLiveCredentialError {
+	/// The compiled Codex provider is absent.
+	#[error("the openai-codex provider is unavailable")]
+	ProviderUnavailable,
+	/// The compiled provider has no authentication specification.
+	#[error("the openai-codex provider has no authentication specification")]
+	AuthSpecUnavailable,
+	/// No enabled Codex account is available.
+	#[error("no enabled Codex OAuth account is available")]
+	AccountUnavailable,
+	/// Credential acquisition failed.
+	#[error(transparent)]
+	Credential {
+		/// Typed credential source failure.
+		#[from]
+		source: CredentialError,
+	},
+	/// The selected credential was not a bearer generation.
+	#[error("the selected Codex credential is not an OAuth bearer")]
+	WrongCredentialKind,
+	/// Bearer bytes could not be represented as an HTTP header.
+	#[error("the Codex OAuth bearer is not a valid HTTP authorization value")]
+	InvalidAuthorization {
+		/// Typed HTTP header source.
+		#[source]
+		source: http::header::InvalidHeaderValue,
+	},
+}
+
 /// Direct, route-independent authentication and account-management service.
 #[derive(Clone)]
 struct AuthSessionControl {
@@ -1481,6 +1560,85 @@ impl AuthManager {
 	/// execution.
 	pub const fn credential_broker(&self) -> &CredentialBroker {
 		&self.broker
+	}
+
+	/// Leases the same renewable Codex OAuth generation used by normal
+	/// inference routes for one realtime live connection.
+	pub async fn lease_codex_live(&self) -> Result<CodexLiveCredential, CodexLiveCredentialError> {
+		self.codex_live_credential(None).await
+	}
+
+	/// Forces the exact renewable source behind `rejected` to issue a fresh
+	/// generation for a retried live signaling request.
+	pub async fn refresh_codex_live(
+		&self,
+		rejected: &CodexLiveCredential,
+	) -> Result<CodexLiveCredential, CodexLiveCredentialError> {
+		self.codex_live_credential(Some(&rejected.lease)).await
+	}
+
+	async fn codex_live_credential(
+		&self,
+		rejected: Option<&CredentialLease>,
+	) -> Result<CodexLiveCredential, CodexLiveCredentialError> {
+		let provider_id = ProviderId::from("openai-codex");
+		let provider = self
+			.catalog
+			.provider(&provider_id)
+			.ok_or(CodexLiveCredentialError::ProviderUnavailable)?;
+		let spec = provider
+			.auth
+			.first()
+			.cloned()
+			.ok_or(CodexLiveCredentialError::AuthSpecUnavailable)?;
+		let account = self
+			.accounts
+			.accounts()
+			.into_iter()
+			.find(|record| record.enabled && record.provider == provider_id)
+			.ok_or(CodexLiveCredentialError::AccountUnavailable)?;
+		let need = CredentialNeed {
+			spec,
+			account: Some(account.account),
+			principal: Some(account.principal),
+			valid_after: SystemTime::now() + time::Duration::from_secs(30),
+		};
+		let lease = if let Some(rejected) = rejected {
+			self.broker.refresh_lease(rejected, need).await?
+		} else {
+			self.broker.lease(need).await?
+		};
+		if lease.kind() != super::CredentialKind::Bearer {
+			return Err(CodexLiveCredentialError::WrongCredentialKind);
+		}
+		let token = lease
+			.scalar_secret()
+			.ok_or(CodexLiveCredentialError::WrongCredentialKind)?;
+		let (account_id, _) =
+			crate::operation::usage::openai_codex::parse_codex_jwt_identity(token.expose_secret());
+		Ok(CodexLiveCredential { lease, account_id })
+	}
+
+	/// Rejects one live OAuth generation through the canonical refresh and
+	/// account-rotation authority.
+	pub async fn reject_codex_live(
+		&self,
+		credential: &CodexLiveCredential,
+		status: u16,
+	) -> Result<(), CredentialError> {
+		self
+			.broker
+			.reject(&credential.lease, AuthRejection {
+				kind:        if status == 401 {
+					super::AuthRejectionKind::Invalid
+				} else {
+					super::AuthRejectionKind::Unauthorized
+				},
+				status:      Some(status),
+				code:        None,
+				refreshable: status == 401,
+			})
+			.await
 	}
 
 	async fn login(&self, request: LoginRequest) -> Result<AuthAnswer, Error> {

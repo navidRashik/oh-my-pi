@@ -68,16 +68,21 @@ pub struct EventStreamMessage {
 }
 
 impl EventStreamMessage {
-	/// Returns the first header with the exact requested name.
+	/// Returns the last header with the exact requested name.
+	///
+	/// AWS headers are normally unique. Choosing the last duplicate preserves
+	/// the overwrite semantics of a decoded header map without discarding wire
+	/// order.
 	pub fn header(&self, name: &str) -> Option<&EventStreamHeaderValue> {
 		self
 			.headers
 			.iter()
+			.rev()
 			.find(|header| header.name.as_str() == name)
 			.map(|header| &header.value)
 	}
 
-	/// Returns the first exact-name string header.
+	/// Returns the last exact-name string header.
 	pub fn string_header(&self, name: &str) -> Option<&str> {
 		self.header(name).and_then(EventStreamHeaderValue::as_str)
 	}

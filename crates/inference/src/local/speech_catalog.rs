@@ -13,6 +13,7 @@ use super::{
 	},
 	runtime::{LocalCancellation, LocalResult},
 };
+pub use crate::speech_settings::KokoroVoice;
 
 /// Stable setting key for the selected speech-to-text preset.
 pub const STT_MODEL_SETTING: &str = "stt.modelName";
@@ -65,49 +66,6 @@ pub enum SttPreset {
 	Turbo,
 	/// NVIDIA Parakeet TDT 0.6B v3 preset.
 	Parakeet,
-}
-
-/// Stable curated Kokoro voice id.
-#[derive(
-	Clone,
-	Copy,
-	Debug,
-	Deserialize,
-	Display,
-	EnumString,
-	Eq,
-	Hash,
-	IntoStaticStr,
-	PartialEq,
-	Serialize,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
-pub enum KokoroVoice {
-	/// Heart, American female.
-	AfHeart,
-	/// Bella, American female.
-	AfBella,
-	/// Nicole, American female.
-	AfNicole,
-	/// Aoede, American female.
-	AfAoede,
-	/// Kore, American female.
-	AfKore,
-	/// Sarah, American female.
-	AfSarah,
-	/// Michael, American male.
-	AmMichael,
-	/// Fenrir, American male.
-	AmFenrir,
-	/// Puck, American male.
-	AmPuck,
-	/// Emma, British female.
-	BfEmma,
-	/// George, British male.
-	BmGeorge,
-	/// Fable, British male.
-	BmFable,
 }
 
 /// Stable realtime voice id.

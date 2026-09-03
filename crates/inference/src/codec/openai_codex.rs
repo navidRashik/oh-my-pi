@@ -26,7 +26,8 @@ use crate::{
 	transport::Frame,
 };
 
-const CODEX_CLIENT_VERSION: &str = "0.144.1";
+/// Codex Desktop protocol version shared by chat, discovery, and live voice.
+pub const CODEX_CLIENT_VERSION: &str = "0.144.1";
 const CODEX_ORIGINATOR: &str = "omp";
 const CODEX_DISCOVERY_SOURCE: &str = "openai_codex_models";
 const CODEX_RESIDENCY_HEADER: &str = "x-openai-internal-codex-residency";

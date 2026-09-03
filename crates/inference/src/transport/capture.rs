@@ -203,10 +203,10 @@ fn redact_payload(payload: &str, redactor: &mut SecretRedactor) -> String {
 		let (line, newline) = segment
 			.strip_suffix('\n')
 			.map_or((segment, ""), |line| (line, "\n"));
-		let Some(json) = line.strip_prefix("data: ") else {
-			output.push_str(line);
-			output.push_str(newline);
-			continue;
+		let (prefix, json) = if let Some(json) = line.strip_prefix("data:") {
+			(Some("data: "), json.trim_start())
+		} else {
+			(None, line.trim())
 		};
 		let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json) else {
 			output.push_str(line);
@@ -214,7 +214,9 @@ fn redact_payload(payload: &str, redactor: &mut SecretRedactor) -> String {
 			continue;
 		};
 		redact_json(&mut value);
-		output.push_str("data: ");
+		if let Some(prefix) = prefix {
+			output.push_str(prefix);
+		}
 		output
 			.push_str(&serde_json::to_string(&value).unwrap_or_else(|_| "\"[REDACTED]\"".to_owned()));
 		output.push_str(newline);
@@ -231,10 +233,19 @@ fn redact_json(value: &mut serde_json::Value) {
 		},
 		serde_json::Value::Object(object) => {
 			for (key, value) in object {
-				let key = key.to_ascii_lowercase();
-				if ["token", "secret", "password", "credential", "authorization", "cookie", "api_key"]
-					.iter()
-					.any(|sensitive| key.contains(sensitive))
+				if [
+					b"token".as_slice(),
+					b"secret".as_slice(),
+					b"password".as_slice(),
+					b"credential".as_slice(),
+					b"authorization".as_slice(),
+					b"cookie".as_slice(),
+					b"api_key".as_slice(),
+					b"api-key".as_slice(),
+					b"apikey".as_slice(),
+				]
+				.iter()
+				.any(|sensitive| contains_ascii_case_insensitive(key.as_bytes(), sensitive))
 				{
 					*value = serde_json::Value::String("[REDACTED]".to_owned());
 				} else {
@@ -244,6 +255,16 @@ fn redact_json(value: &mut serde_json::Value) {
 		},
 		_ => {},
 	}
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+	needle.is_empty()
+		|| haystack.windows(needle.len()).any(|window| {
+			window
+				.iter()
+				.zip(needle)
+				.all(|(left, right)| left.eq_ignore_ascii_case(right))
+		})
 }
 
 #[cfg(test)]
@@ -266,5 +287,18 @@ mod tests {
 		let delivered = alpha.try_recv().expect("matching session delivery");
 		assert!(!delivered.payload.contains("sk-or-v1-secretsecretsecret"));
 		assert!(alpha.try_recv().is_err(), "foreign session is never delivered");
+	}
+
+	#[test]
+	fn every_json_capture_shape_redacts_separator_variants_and_key_spellings() {
+		let capture = RawProviderCapture::new(4, 1_024, 1);
+		for payload in [
+			r#"data:{"api-key":"opaque-a","nested":{"Authorization":"opaque-b"}}"#,
+			r#"{"api_key":"opaque-c","credential":"opaque-d"}"#,
+		] {
+			let frame = capture.capture(None, "sse", payload);
+			assert!(!frame.payload.contains("opaque-"));
+			assert!(frame.payload.contains("[REDACTED]"));
+		}
 	}
 }

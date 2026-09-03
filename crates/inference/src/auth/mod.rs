@@ -5,6 +5,7 @@ pub mod adc;
 pub mod alibaba_token_plan;
 pub mod apply;
 pub mod attribution;
+pub mod aws;
 pub mod broker;
 pub mod command;
 pub mod crypto;
@@ -36,6 +37,12 @@ pub use attribution::{
 	APP_HEADER, AttributionError, ClientUsageIdentity, HOSTNAME_HEADER, INSTALL_ID_HEADER,
 	UsageAttribution, resolve_app_name, resolve_forwarded_attribution,
 };
+pub use aws::{
+	AWS_FILE_SESSION_CREDENTIAL_TTL, AWS_IMDS_REQUEST_TIMEOUT, AWS_REFRESH_SKEW,
+	AWS_SHARED_RESOLVE_TIMEOUT, AwsCredentialEnvironment, AwsCredentialError,
+	AwsCredentialOperation, AwsCredentialOptions, AwsCredentialSource, AwsEnvironmentError, AwsIni,
+	SystemAwsCredentialEnvironment, parse_aws_ini, tokenize_credential_process,
+};
 pub use broker::{
 	CredentialBroker, CredentialBrokerEngines, CredentialBrokerError, CredentialEnvironment,
 	SystemCredentialEnvironment,
@@ -66,10 +73,10 @@ pub use login::{
 };
 pub use manager::{
 	AuthControlHandle, AuthLoginEngine, AuthManager, AuthManagerBuildError, AuthRefreshEngine,
-	CredentialAcquisitionLoginEngine, CredentialAcquisitionLoginEngineError,
-	CredentialAffinityError, CredentialAffinityResolver, CredentialControlWrite, OAuthControlImport,
-	OAuthLoginEngine, OAuthLoginEngineError, RefreshingCredentialSource, SecretLoginEngine,
-	SecretLoginEngineError, StoredOAuthRefreshEngine,
+	CodexLiveCredential, CodexLiveCredentialError, CredentialAcquisitionLoginEngine,
+	CredentialAcquisitionLoginEngineError, CredentialAffinityError, CredentialAffinityResolver,
+	CredentialControlWrite, OAuthControlImport, OAuthLoginEngine, OAuthLoginEngineError,
+	RefreshingCredentialSource, SecretLoginEngine, SecretLoginEngineError, StoredOAuthRefreshEngine,
 };
 pub use oauth::{
 	DevicePending, OAuthClock, OAuthCredentialManagerError, OAuthCustomDispatchError,
