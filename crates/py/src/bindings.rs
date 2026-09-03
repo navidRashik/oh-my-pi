@@ -1205,7 +1205,15 @@ fn client_error(py: Python<'_>, error: ClientError) -> PyErr {
 		ClientError::TransportClosed | ClientError::Transport(_) => {
 			environment_exception(py, "Disconnected", &error.to_string())
 		},
-		ClientError::InvalidEnvPath(_) => environment_exception(py, "Invalid", &error.to_string()),
+		ClientError::InvalidEnvPath(_)
+		| ClientError::InvalidBlobDigest { .. }
+		| ClientError::BlobTooLarge { .. }
+		| ClientError::BlobResumeOffsetMismatch { .. }
+		| ClientError::InvalidBlobMetadata
+		| ClientError::BlobDigestMismatch
+		| ClientError::BlobSizeMismatch { .. } => {
+			environment_exception(py, "Invalid", &error.to_string())
+		},
 		ClientError::InvalidInvocationPrincipal => environment_exception(
 			py,
 			"Invalid",
@@ -1213,9 +1221,11 @@ fn client_error(py: Python<'_>, error: ClientError) -> PyErr {
 		),
 		ClientError::ScopedOperationDenied => environment_exception(py, "Denied", &error.to_string()),
 		ClientError::StreamLost(_) => environment_exception(py, "StreamLost", &error.to_string()),
+		ClientError::IncompleteBlob => environment_exception(py, "Disconnected", &error.to_string()),
 		ClientError::TransportBusy
 		| ClientError::RequestIdExhausted
-		| ClientError::UnexpectedResponse { .. } => environment_exception(py, "Io", &error.to_string()),
+		| ClientError::UnexpectedResponse { .. }
+		| ClientError::BlobWrite { .. } => environment_exception(py, "Io", &error.to_string()),
 	}
 }
 
@@ -3269,9 +3279,10 @@ macro_rules! backend_methods {
 					.ok_or_else(|| PyTypeError::new_err("script is required"))?
 					.extract::<String>()?;
 				let mut run = block_on_data(self.client.exec(env_pb::ExecRequest {
-					session: session.into(),
-					source:  Some(env_pb::Script { text: script, props: Default::default() }),
-					props:   Default::default(),
+					session:        session.into(),
+					source:         Some(env_pb::Script { text: script, props: Default::default() }),
+					output_request: env_pb::OutputRequest::Unspecified as i32,
+					props:          Default::default(),
 				}))
 				.map_err(|error| client_error(py, error))?;
 				let started = block_on_data(run.next_event())
