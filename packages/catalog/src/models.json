@@ -29,6 +29,11 @@
 					"xhigh"
 				]
 			},
+			"identity": {
+				"class": "glm"
+			},
+			"requiresGlyphTokenization": false,
+			"supportsComputerUse": false,
 			"compat": {
 				"supportsDeveloperRole": false,
 				"supportsStrictMode": false,
@@ -81,15 +86,6 @@
 				"reasoningDeltasMayBeCumulative": false,
 				"emptyLengthFinishIsContextError": false,
 				"usesOpenAIToolCallIdLimit": false,
-				"streamIdleTimeoutMs": 0
-			},
-			"identity": {
-				"class": "glm"
-			},
-			"requiresGlyphTokenization": false,
-			"supportsComputerUse": false,
-			"compatConfig": {
-				"includeEncryptedReasoning": false,
 				"streamIdleTimeoutMs": 0
 			}
 		},
@@ -114,13 +110,21 @@
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
-					"minimal",
-					"low",
-					"medium",
 					"high",
+					"xhigh",
 					"max"
-				]
+				],
+				"defaultLevel": "high",
+				"effortMap": {
+					"xhigh": "max"
+				}
 			},
+			"identity": {
+				"class": "glm",
+				"revision": "5.2.0"
+			},
+			"requiresGlyphTokenization": false,
+			"supportsComputerUse": false,
 			"compat": {
 				"supportsDeveloperRole": false,
 				"supportsStrictMode": false,
@@ -133,7 +137,9 @@
 				"supportsAllTurnsReasoningContext": false,
 				"requiresReasoningOffJuiceInstruction": false,
 				"stripImageInput": false,
-				"reasoningEffortMap": {},
+				"reasoningEffortMap": {
+					"xhigh": "max"
+				},
 				"supportsReasoningParams": true,
 				"supportsSamplingParams": true,
 				"supportsPenaltyAndStopParams": true,
@@ -173,16 +179,6 @@
 				"reasoningDeltasMayBeCumulative": false,
 				"emptyLengthFinishIsContextError": false,
 				"usesOpenAIToolCallIdLimit": false,
-				"streamIdleTimeoutMs": 0
-			},
-			"identity": {
-				"class": "glm",
-				"revision": "5.2.0"
-			},
-			"requiresGlyphTokenization": false,
-			"supportsComputerUse": false,
-			"compatConfig": {
-				"includeEncryptedReasoning": false,
 				"streamIdleTimeoutMs": 0
 			}
 		},
@@ -208,12 +204,24 @@
 				"mode": "effort",
 				"efforts": [
 					"low",
+					"medium",
 					"high",
+					"xhigh",
 					"max"
 				],
 				"defaultLevel": "max",
+				"effortMap": {
+					"medium": "high",
+					"xhigh": "max"
+				},
 				"requiresEffort": true
 			},
+			"identity": {
+				"class": "glm",
+				"revision": "5.3.0"
+			},
+			"requiresGlyphTokenization": false,
+			"supportsComputerUse": false,
 			"compat": {
 				"supportsDeveloperRole": false,
 				"supportsStrictMode": false,
@@ -226,7 +234,10 @@
 				"supportsAllTurnsReasoningContext": false,
 				"requiresReasoningOffJuiceInstruction": false,
 				"stripImageInput": false,
-				"reasoningEffortMap": {},
+				"reasoningEffortMap": {
+					"medium": "high",
+					"xhigh": "max"
+				},
 				"supportsReasoningParams": true,
 				"supportsSamplingParams": true,
 				"supportsPenaltyAndStopParams": true,
@@ -266,16 +277,6 @@
 				"reasoningDeltasMayBeCumulative": false,
 				"emptyLengthFinishIsContextError": false,
 				"usesOpenAIToolCallIdLimit": false,
-				"streamIdleTimeoutMs": 0
-			},
-			"identity": {
-				"class": "glm",
-				"revision": "5.3.0"
-			},
-			"requiresGlyphTokenization": false,
-			"supportsComputerUse": false,
-			"compatConfig": {
-				"includeEncryptedReasoning": false,
 				"streamIdleTimeoutMs": 0
 			}
 		}
