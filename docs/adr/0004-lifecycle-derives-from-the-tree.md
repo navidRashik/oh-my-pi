@@ -85,7 +85,7 @@ Rules:
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/session/src/rewind.rs`. Rewind lifecycle work, projections, components, and subscriptions derive from the session tree.
+**Implemented.** Primary implementation: `crates/session/src/rewind.rs`. Rewind lifecycle work, projections, components, and subscriptions derive from the session tree. Global runtime pause is likewise materialized as `<meta><pause>` by `crates/agent/src/pause.rs`; replay and session switches select that element rather than restoring a controller flag.
 
 ## References
 

@@ -73,7 +73,11 @@ surface.** Neither MUST change the permanent roster after discovery.
 
 ## Status in omp
 
-**Partial.** Primary implementation: `crates/shell-builtins/src/dyn.rs`. `dyn` lists, documents, validates, and calls long-tail devices. Gap: Eval binding and terminal graphics passthrough remain unproved.
+**Partial.** Primary implementation: `crates/shell-builtins/src/dyn.rs`. `dyn` lists, documents,
+validates, and calls long-tail devices. The `tts@4` device in
+`crates/envd/src/{media_devices,media_tts}.rs` is mounted only through this surface and performs
+real local/xAI/DeepInfra synthesis with typed progress, cancellation, timeout, artifact retention,
+and atomic workspace output. Gap: Eval binding and terminal graphics passthrough remain unproved.
 
 ## References
 

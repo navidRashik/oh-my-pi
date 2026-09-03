@@ -39,10 +39,18 @@ needed data, and which repair belongs in the harness.
 
 ## Status in omp
 
-**Partial.** Primary implementation: `crates/tools/src/device.rs`. AutoQA prompt guidance exposes `report_issue` through the mounted device surface. Gap: report-store misattribution filtering is not proved.
+**Partial.** Primary implementation: `crates/envd/src/report_issue.rs`, mounted through
+`crates/envd/src/tools.rs` and documented by `crates/tools/src/device.rs`. `report_issue@1` records
+an exact session, device path, canonical revision, and bounded structured verdict in the redacted
+local issue store; typed results state that delivery requires a separate user-owned consent action.
+The consent-fenced delivery worker is `crates/driver/src/telemetry_upload.rs`. Gap: report-store
+misattribution filtering is not proved.
 
 ## References
 
 - The Harness Playbook, "The tool surface" — "AutoQA: give agents a bug-report path"
 - 0025 (`dyn` devices), 0026 (versioned identities), 0024
 - `crates/tools/src/device.rs`
+- `crates/envd/src/report_issue.rs`
+- `crates/cache/src/telemetry_cache.rs`
+- `crates/driver/src/telemetry_upload.rs`

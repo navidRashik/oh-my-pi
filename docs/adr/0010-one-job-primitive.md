@@ -50,7 +50,7 @@ features independently or lack them.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/agent/src/jobs.rs`. The kernel job board and session `<meta><jobs>` component own detached tools and subagents.
+**Implemented.** Primary implementation: `crates/agent/src/jobs.rs`. The kernel job board and session `<meta><jobs>` component own detached tools and subagents. A durable call-entry link lets `JobBoard` adopt a terminal tool artifact after restart when `tool.result@1` committed but `jobs.settle` did not; otherwise the missing execution unit is orphan-settled, and the atomic async-result marker prevents duplicate delivery. `crates/agent/src/dispatch.rs` holds new tool, subagent, and job admission at the journal-derived global pause gate while existing units may settle.
 
 ## References
 

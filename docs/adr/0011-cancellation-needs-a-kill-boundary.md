@@ -64,6 +64,8 @@ which `crates/driver/src/headless/kernel.rs` forwards to envd where `ExecHost` a
 unit's own verdict, then forcibly terminates and journals `Abort::EffectsUnknown` — never a missing
 `tool.result@1`. A cancelled turn is recorded in the tree (`msg.assistant.end@1 cancelled` when an
 assistant is open, then `<notice kind=warn>`), so the chat host derives "turn over" from the DOM.
+The pause hold in `crates/agent/src/loop.rs` continues servicing interrupt, session cancellation,
+rewind lifecycle, and job settlement instead of becoming an uncancellable wait.
 Proof: `crates/agent/tests/dispatch.rs::interrupt_kills_a_running_shell_tool_and_settles_aborted`,
 `crates/agent/tests/cancel.rs`, `crates/e2e/tests/p7_tui.rs` (real PTY ctrl+c over a `sleep 30`).
 
