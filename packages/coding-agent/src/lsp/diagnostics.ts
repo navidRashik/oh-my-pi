@@ -342,6 +342,10 @@ export async function waitForDiagnostics(
 			!supportsDocumentDiagnostics(client) &&
 			client.diagnostics.get(uri) === undefined
 		) {
+			// Restore the publish so later queries still snapshot it as a fallback;
+			// otherwise the fix survives only one refresh. Kept unversioned so a
+			// genuine fresh publish still supersedes it via the paths above.
+			client.diagnostics.set(uri, { diagnostics: fallbackDiagnostics, version: null });
 			return fallbackDiagnostics;
 		}
 		return [];

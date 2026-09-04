@@ -1790,6 +1790,18 @@ describe("lsp regressions", () => {
 			const fakeServer = installFakeLsp((message, server) => {
 				if (message.method === "initialize") {
 					server.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+					// Resolve project load immediately so the test does not pay the 15s
+					// PROJECT_LOAD_TIMEOUT_MS fallback on the first query.
+					server.send({
+						jsonrpc: "2.0",
+						method: "$/progress",
+						params: { token: "workspace", value: { kind: "begin" } },
+					});
+					server.send({
+						jsonrpc: "2.0",
+						method: "$/progress",
+						params: { token: "workspace", value: { kind: "end" } },
+					});
 				} else if (message.method === "textDocument/didOpen") {
 					server.send({
 						jsonrpc: "2.0",
@@ -1814,20 +1826,25 @@ describe("lsp regressions", () => {
 
 			const tool = new LspTool(makeLspSession(tempDir.path()));
 			// First query opens the file; the didOpen publish is surfaced directly.
-			const first = await tool.execute("push-1", { action: "diagnostics", file: targetFile, timeout: 20 });
+			const first = await tool.execute("push-1", { action: "diagnostics", file: targetFile, timeout: 15 });
 			expect(textResult(first)).toContain("unknown type name 'UnknownType'");
 			// Second query: the file is already open, so `refreshFile` sends
 			// didChange/didSave and the server never re-publishes. The last published
 			// diagnostic must still surface instead of collapsing to a false "OK".
-			const second = await tool.execute("push-2", { action: "diagnostics", file: targetFile, timeout: 20 });
+			const second = await tool.execute("push-2", { action: "diagnostics", file: targetFile, timeout: 15 });
 			expect(textResult(second)).not.toBe("OK");
 			expect(textResult(second)).toContain("unknown type name 'UnknownType'");
+			// Third query: the re-surfaced publish must have been re-cached, so a
+			// still-silent server keeps returning it instead of decaying to "OK".
+			const third = await tool.execute("push-3", { action: "diagnostics", file: targetFile, timeout: 15 });
+			expect(textResult(third)).not.toBe("OK");
+			expect(textResult(third)).toContain("unknown type name 'UnknownType'");
 			expect(fakeServer.received.map(m => m.method)).not.toContain("textDocument/diagnostic");
 		} finally {
 			await lspClient.shutdownAll();
 			tempDir.removeSync();
 		}
-	}, 30_000);
+	}, 45_000);
 
 	it("does not reuse stale file diagnostics after another URI publishes", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-stale-diags-");
