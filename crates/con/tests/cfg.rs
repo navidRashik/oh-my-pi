@@ -10,13 +10,13 @@ use omp_session::{
 struct Loader;
 
 impl omp_con::CfgLoader for Loader {
-	fn load(&self, name: &str) -> Option<Str> {
-		match name {
+	fn load(&self, name: &str) -> omp_con::ConResult<Option<Str>> {
+		Ok(match name {
 			"config.cfg" => Some(Str::new_static("ai_fastmode 1")),
 			"subagent.cfg" => Some(Str::new_static("ai_fastmode 0")),
 			"sonic.cfg" => Some(Str::new_static("ai_thinking low")),
 			_ => None,
-		}
+		})
 	}
 }
 
@@ -53,7 +53,7 @@ fn subagent_cfg_seeds_child_without_touching_parent() {
 	for (name, value) in parent.seed_child().into_values() {
 		child.set(name.as_str(), value, Origin::Session).unwrap();
 	}
-	let outcome = child.exec_configs(&Loader, Some("sonic"));
+	let outcome = child.exec_configs(&Loader, Some("sonic")).unwrap();
 	assert_eq!(outcome.failed, 0);
 	assert_eq!(child.get("ai_fastmode"), Some(Value::Bool(false)));
 	assert_eq!(child.get("ai_thinking"), Some(Value::Str(Str::new_static("low"))));
@@ -85,17 +85,17 @@ fn config_cfg_dump_reloads_identically() {
 struct StaleLoader;
 
 impl omp_con::CfgLoader for StaleLoader {
-	fn load(&self, name: &str) -> Option<Str> {
-		(name == "config.cfg").then(|| {
+	fn load(&self, name: &str) -> omp_con::ConResult<Option<Str>> {
+		Ok((name == "config.cfg").then(|| {
 			Str::new_static("ai_fastmode 1\nai_retired_from_an_older_build medium\ncl_theme cyanotype")
-		})
+		}))
 	}
 }
 
 #[test]
 fn stale_config_cfg_lines_are_skipped_not_fatal() {
 	let ctx = Ctx::new();
-	let outcome = ctx.exec_configs(&StaleLoader, None);
+	let outcome = ctx.exec_configs(&StaleLoader, None).unwrap();
 	assert_eq!(outcome.failed, 1);
 	assert_eq!(outcome.ran, 2);
 	assert_eq!(ctx.get("ai_fastmode"), Some(Value::Bool(true)));

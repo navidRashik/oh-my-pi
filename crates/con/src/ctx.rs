@@ -16,8 +16,8 @@ use parking_lot::RwLock;
 use strum::Display;
 
 use crate::{
-	Arg, ConError, ConResult, LayerId, Origin, ParseError, RegItem, Role, Seed, SetReport,
-	Statement, Value, ValueKind, VarFlags, VarSpec,
+	Arg, ConError, ConResult, DumpOptions, LayerId, Origin, ParseError, RegItem, Role, Seed,
+	SetReport, Statement, Value, ValueKind, VarFlags, VarSpec,
 	layers::Layers,
 	script::{self, CoerceIssue},
 };
@@ -97,14 +97,17 @@ pub struct Output {
 /// Loads cfg script text by name.
 pub trait CfgLoader: Send + Sync {
 	/// Returns cfg text, or `None` when the file is absent.
-	fn load(&self, name: &str) -> Option<Str>;
+	///
+	/// Filesystem and schema failures remain typed instead of being
+	/// indistinguishable from an absent optional cfg.
+	fn load(&self, name: &str) -> ConResult<Option<Str>>;
 }
 
 impl<F> CfgLoader for F
 where
-	F: Fn(&str) -> Option<Str> + Send + Sync,
+	F: Fn(&str) -> ConResult<Option<Str>> + Send + Sync,
 {
-	fn load(&self, name: &str) -> Option<Str> {
+	fn load(&self, name: &str) -> ConResult<Option<Str>> {
 		self(name)
 	}
 }
@@ -143,7 +146,7 @@ impl std::ops::AddAssign for ExecOutcome {
 /// Reply sink: receives all console output.
 pub type SinkFn = dyn Fn(Severity, &str) + Send + Sync;
 /// Config source resolver for `exec`: name → script text.
-pub type LoaderFn = dyn Fn(&str) -> Option<Str> + Send + Sync;
+pub type LoaderFn = dyn Fn(&str) -> ConResult<Option<Str>> + Send + Sync;
 /// Config writer for `writecfg`: `(name, contents)`.
 pub type SaverFn = dyn Fn(&str, &str) -> ConResult<()> + Send + Sync;
 /// Value observer, called after each committed non-no-op variable change.
@@ -287,7 +290,10 @@ impl CtxBuilder {
 
 	/// Installs the `exec` config loader.
 	#[must_use]
-	pub fn loader(mut self, loader: impl Fn(&str) -> Option<Str> + Send + Sync + 'static) -> Self {
+	pub fn loader(
+		mut self,
+		loader: impl Fn(&str) -> ConResult<Option<Str>> + Send + Sync + 'static,
+	) -> Self {
 		self.loader = Some(Box::new(loader));
 		self
 	}
@@ -845,6 +851,14 @@ impl Ctx {
 			.into_iter()
 	}
 
+	pub(crate) fn has_archive_write(&self, name: &str) -> bool {
+		self.layers.read().archive.contains_key(name)
+	}
+
+	pub(crate) fn has_session_write(&self, name: &str) -> bool {
+		self.layers.read().session.contains_key(name)
+	}
+
 	fn refresh(&self, name: &str, source: SetSource) {
 		let var = self
 			.var(name)
@@ -1021,31 +1035,35 @@ impl Ctx {
 	/// leniently, so a stale or unknown name is reported through the sink and
 	/// skipped instead of aborting startup. The aggregate outcome counts the
 	/// skipped statements.
-	pub fn exec_configs(&self, loader: &dyn CfgLoader, agent: Option<&str>) -> ExecOutcome {
+	pub fn exec_configs(
+		&self,
+		loader: &dyn CfgLoader,
+		agent: Option<&str>,
+	) -> ConResult<ExecOutcome> {
 		let mut total = ExecOutcome::default();
-		if let Some(src) = loader.load("config.cfg") {
+		if let Some(src) = loader.load("config.cfg")? {
 			total += self.run_lenient(&src, Source::Config(Str::new_static("config.cfg")));
 		}
 		if let Some(agent) = agent {
-			total += self.exec_spawn_configs(loader, agent);
+			total += self.exec_spawn_configs(loader, agent)?;
 		}
-		total
+		Ok(total)
 	}
 
 	/// Runs the spawn-time cfgs only — `subagent.cfg`, then `<agent>.cfg` —
 	/// on a child already seeded from its parent (ADR 0013 order). The main
 	/// session's `config.cfg` is not re-read.
-	pub fn exec_spawn_configs(&self, loader: &dyn CfgLoader, agent: &str) -> ExecOutcome {
+	pub fn exec_spawn_configs(&self, loader: &dyn CfgLoader, agent: &str) -> ConResult<ExecOutcome> {
 		let mut total = ExecOutcome::default();
-		if let Some(src) = loader.load("subagent.cfg") {
+		if let Some(src) = loader.load("subagent.cfg")? {
 			total += self.run_lenient(&src, Source::Subagent);
 		}
 		let mut name = StrMut::new(agent);
 		name.push_str(".cfg");
-		if let Some(src) = loader.load(name.as_str()) {
+		if let Some(src) = loader.load(name.as_str())? {
 			total += self.run_lenient(&src, Source::Agent(agent.to_str()));
 		}
-		total
+		Ok(total)
 	}
 
 	fn run_lenient(&self, src: &Str, source: Source) -> ExecOutcome {
@@ -1063,9 +1081,14 @@ impl Ctx {
 		self.exec(script.as_str(), Source::Session).map(|_| ())
 	}
 
-	/// Writes the current replayable archive diff through `saver`.
-	pub fn write_cfg(&self, saver: &dyn CfgSaver, name: &str) -> ConResult<()> {
-		let contents = self.dump();
+	/// Writes the current replayable archive diff through the installed saver.
+	pub fn write_cfg(&self, name: &str) -> ConResult<()> {
+		let saver = self.saver.as_deref().ok_or(ConError::NoSaver)?;
+		let contents = self.dump_with_options(DumpOptions {
+			include_archived_defaults: true,
+			include_session_defaults: true,
+			..DumpOptions::default()
+		});
 		saver.save(name, contents.as_str())
 	}
 
@@ -1082,10 +1105,18 @@ impl Ctx {
 				);
 				continue;
 			};
-			let Some(src) = loader(name.as_str()) else {
-				total.failed += 1;
-				self.reply_fmt(Severity::Error, format_args!("config `{name}` not found"));
-				continue;
+			let src = match loader(name.as_str()) {
+				Ok(Some(src)) => src,
+				Ok(None) => {
+					total.failed += 1;
+					self.reply_fmt(Severity::Error, format_args!("config `{name}` not found"));
+					continue;
+				},
+				Err(error) => {
+					total.failed += 1;
+					self.reply_fmt(Severity::Error, format_args!("{error}"));
+					continue;
+				},
 			};
 			match self.with_depth(&name, |ctx| ctx.eval(&src, true, &Origin::Script(name.clone()))) {
 				Ok(outcome) => {
@@ -1300,16 +1331,12 @@ impl Ctx {
 			.loader
 			.as_deref()
 			.ok_or_else(|| ConError::NoLoader { name: name.clone() })?;
-		let src = loader(name.as_str()).ok_or_else(|| ConError::MissingCfg { name: name.clone() })?;
+		let src =
+			loader(name.as_str())?.ok_or_else(|| ConError::MissingCfg { name: name.clone() })?;
 		self.with_depth(name, |ctx| {
 			ctx.eval(&src, true, &Origin::Script(name.clone()))
 				.map(|_| ())
 		})
-	}
-
-	pub(crate) fn save_cfg(&self, name: &str, contents: &str) -> ConResult<()> {
-		let saver = self.saver.as_deref().ok_or(ConError::NoSaver)?;
-		saver(name, contents)
 	}
 
 	// ── aliases ─────────────────────────────────────────────────────────

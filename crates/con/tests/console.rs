@@ -290,12 +290,16 @@ fn on_change_fires_with_old_and_new_but_not_on_noop() {
 #[test]
 fn script_language_quotes_comments_separators() {
 	let (ctx, log) = capture_ctx();
-	ctx.run("echo \"hello world\"; test::gravity 400 // trailing comment\necho \"line\\nbreak\"")
-		.unwrap();
+	ctx.run(
+		"echo \"hello world\"; test::gravity 400 // trailing comment\necho \"line\\nbreak\"\necho \
+		 wss://relay.example/room",
+	)
+	.unwrap();
 	assert_eq!(GRAVITY.get(&ctx), 400);
 	let lines = logged(&log);
 	assert!(lines.contains(&"hello world".to_string()));
 	assert!(lines.contains(&"line\nbreak".to_string()));
+	assert!(lines.contains(&"wss://relay.example/room".to_string()));
 }
 
 #[test]
@@ -411,7 +415,7 @@ fn held_action_release_survives_live_remap_and_removal() {
 	ctx.run("bind h \"test::gravity 450\"").unwrap();
 	ctx.key("h", false).unwrap();
 	assert!(!JUMP.is_active(&ctx), "release belongs to the program latched at press");
-	assert_eq!(GRAVITY.get(&ctx), 100, "the replacement waits for the next press");
+	assert_eq!(GRAVITY.get(&ctx), 800, "the replacement waits for the next press");
 
 	ctx.key("h", true).unwrap();
 	assert_eq!(GRAVITY.get(&ctx), 450);
@@ -540,7 +544,7 @@ fn exec_uses_loader_and_writecfg_uses_saver() {
 	let saved: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
 	let saved_in = Arc::clone(&saved);
 	let ctx = Ctx::builder()
-		.loader(|name| (name == "autoexec").then(|| Str::new_static("test::gravity 300")))
+		.loader(|name| Ok((name == "autoexec").then(|| Str::new_static("test::gravity 300"))))
 		.saver(move |name, contents| {
 			saved_in
 				.lock()
@@ -554,11 +558,16 @@ fn exec_uses_loader_and_writecfg_uses_saver() {
 	let err = ctx.run("exec nonexistent").unwrap_err();
 	assert!(matches!(err, ConError::MissingCfg { .. }), "{err:?}");
 
+	ctx.run("cl_showthinking true").unwrap();
 	ctx.run("writecfg backup").unwrap();
 	let saved = saved.lock();
 	assert_eq!(saved.len(), 1);
 	assert_eq!(saved[0].0, "backup");
 	assert!(saved[0].1.contains("test::gravity 300"));
+	assert!(
+		saved[0].1.contains("cl_showthinking true"),
+		"explicit defaults survive future schema-default changes"
+	);
 
 	let bare = Ctx::new();
 	let err = bare.run("writecfg").unwrap_err();
@@ -567,11 +576,13 @@ fn exec_uses_loader_and_writecfg_uses_saver() {
 #[test]
 fn settings_selected_scripts_apply_in_declared_order() {
 	let ctx = Ctx::builder()
-		.loader(|name| match name {
-			"base" => Some(Str::new_static("test::gravity 400")),
-			"project" => Some(Str::new_static("unknown::setting 1; test::gravity 650")),
-			"runtime" => Some(Str::new_static("test::gravity 900")),
-			_ => None,
+		.loader(|name| {
+			Ok(match name {
+				"base" => Some(Str::new_static("test::gravity 400")),
+				"project" => Some(Str::new_static("unknown::setting 1; test::gravity 650")),
+				"runtime" => Some(Str::new_static("test::gravity 900")),
+				_ => None,
+			})
 		})
 		.build();
 

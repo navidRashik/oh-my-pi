@@ -1,6 +1,9 @@
 //! Console error taxonomy.
 
+use std::{io, path::PathBuf};
+
 use omp_core::Str;
+use strum::Display;
 
 use crate::{ChordError, Role, ValueKind};
 
@@ -50,8 +53,47 @@ pub enum ParseError {
 	},
 }
 
+/// Filesystem operation which failed for a cfg file.
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
+#[strum(serialize_all = "lowercase")]
+pub enum ConfigOperation {
+	/// Open or read existing configuration.
+	Read,
+	/// Create a configuration directory.
+	Create,
+	/// Acquire the cross-process update lock.
+	Lock,
+	/// Write and synchronize a replacement.
+	Write,
+	/// Atomically publish a replacement.
+	Replace,
+	/// Synchronize the containing directory.
+	Sync,
+}
+
+/// A cfg filesystem failure with its operation and path preserved.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to {operation} config `{path}`")]
+pub struct ConfigIoError {
+	/// Operation which failed.
+	pub operation: ConfigOperation,
+	/// Exact logical or physical path operated on.
+	pub path:      PathBuf,
+	/// Original filesystem error.
+	#[source]
+	pub source:    io::Error,
+}
+
+impl ConfigIoError {
+	/// Creates an attributed filesystem failure.
+	#[must_use]
+	pub fn new(operation: ConfigOperation, path: PathBuf, source: io::Error) -> Self {
+		Self { operation, path, source }
+	}
+}
+
 /// Any console-facing failure: dispatch, permission, typing, or parsing.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ConError {
 	/// Name resolves to no var, command, action, or alias.
 	#[error("unknown console name `{name}`")]
@@ -139,6 +181,49 @@ pub enum ConError {
 	MissingCfg {
 		/// Requested config name.
 		name: Str,
+	},
+	/// A cfg name could escape the selected profile root.
+	#[error("invalid config name `{name}`")]
+	InvalidCfgName {
+		/// Rejected cfg name.
+		name: Str,
+	},
+	/// A generated cfg header carries a malformed schema revision.
+	#[error("config `{path}` has an invalid generated schema header")]
+	InvalidCfgSchema {
+		/// File carrying the malformed header.
+		path: PathBuf,
+	},
+	/// A generated cfg was written by a newer unsupported schema.
+	#[error(
+		"config `{path}` uses schema {found}, but this build supports at most schema {supported}"
+	)]
+	UnsupportedCfgSchema {
+		/// File carrying the future schema.
+		path:      PathBuf,
+		/// Schema found in its generated header.
+		found:     u32,
+		/// Newest schema this build can migrate.
+		supported: u32,
+	},
+	/// The cfg changed after this context loaded it, so saving would discard a
+	/// concurrent update.
+	#[error("config `{path}` changed concurrently; reload it before saving")]
+	ConfigChanged {
+		/// Config whose observed baseline no longer matches.
+		path: PathBuf,
+	},
+	/// A cfg filesystem operation failed.
+	#[error(transparent)]
+	ConfigIo(#[from] ConfigIoError),
+	/// A cfg script failed syntax validation.
+	#[error("failed to parse config `{path}`")]
+	ConfigParse {
+		/// File containing the malformed script.
+		path:   PathBuf,
+		/// Typed parser failure.
+		#[source]
+		source: ParseError,
 	},
 	/// Name registered twice (item or alias colliding with an item).
 	#[error("`{name}` is already registered")]

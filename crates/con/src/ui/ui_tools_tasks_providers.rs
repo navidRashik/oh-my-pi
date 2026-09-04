@@ -397,6 +397,39 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Identity
 	),
 	ui!(
+		"computer.display",
+		"sv_computer_display",
+		Tools,
+		"Computer",
+		"Computer Display",
+		"Composite all displays or select a native display id",
+		UiWidget::Text { secret: false },
+		None,
+		Identity
+	),
+	ui!(
+		"computer.maxWidth",
+		"sv_computer_max_width",
+		Tools,
+		"Computer",
+		"Computer Screenshot Width",
+		"Maximum composite screenshot width in pixels",
+		UiWidget::ConfigOnly,
+		None,
+		Identity
+	),
+	ui!(
+		"computer.maxHeight",
+		"sv_computer_max_height",
+		Tools,
+		"Computer",
+		"Computer Screenshot Height",
+		"Maximum composite screenshot height in pixels",
+		UiWidget::ConfigOnly,
+		None,
+		Identity
+	),
+	ui!(
 		"tools.artifactSpillThreshold",
 		"sv_tools_output_spill_bytes",
 		Tools,
@@ -421,12 +454,107 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Kibibytes
 	),
 	ui!(
+		"tools.artifactTailBytes",
+		"sv_tools_artifact_tail_bytes",
+		Tools,
+		"Output Limits",
+		"Artifact Tail Size (KB)",
+		"Amount of tail content kept inline when output spills to artifact",
+		UiWidget::Submenu(&[
+			UiOption::new("1", "1 KB", "~250 tokens"),
+			UiOption::new("2.5", "2.5 KB", "~625 tokens"),
+			UiOption::new("5", "5 KB", "~1.25K tokens"),
+			UiOption::new("10", "10 KB", "~2.5K tokens"),
+			UiOption::new("20", "20 KB", "Default; ~5K tokens"),
+			UiOption::new("50", "50 KB", "~12.5K tokens"),
+			UiOption::new("100", "100 KB", "~25K tokens"),
+			UiOption::new("200", "200 KB", "~50K tokens")
+		]),
+		None,
+		Kibibytes
+	),
+	ui!(
+		"tools.artifactHeadBytes",
+		"sv_tools_artifact_head_bytes",
+		Tools,
+		"Output Limits",
+		"Artifact Head Size (KB)",
+		"Amount of head content kept inline alongside the tail when output spills to artifact \
+		 (middle elision). 0 disables — keep tail only.",
+		UiWidget::Submenu(&[
+			UiOption::new("0", "0 KB", "Disabled; tail-only truncation"),
+			UiOption::new("1", "1 KB", "~250 tokens"),
+			UiOption::new("2.5", "2.5 KB", "~625 tokens"),
+			UiOption::new("5", "5 KB", "~1.25K tokens"),
+			UiOption::new("10", "10 KB", "~2.5K tokens"),
+			UiOption::new("20", "20 KB", "Default; ~5K tokens"),
+			UiOption::new("50", "50 KB", "~12.5K tokens"),
+			UiOption::new("100", "100 KB", "~25K tokens"),
+			UiOption::new("200", "200 KB", "~50K tokens")
+		]),
+		None,
+		Kibibytes
+	),
+	ui!(
+		"tools.outputMaxColumns",
+		"sv_tools_output_max_columns",
+		Tools,
+		"Output Limits",
+		"Output Column Cap",
+		"Per-line byte cap for streaming tool outputs (bash, python, js eval) and `read`. Lines \
+		 wider than this are ellipsis-truncated; remaining bytes up to the next newline are \
+		 dropped. 0 disables.",
+		UiWidget::Submenu(&[
+			UiOption::new("0", "Off", "No per-line cap"),
+			UiOption::new("256", "256", "Tight"),
+			UiOption::new("512", "512", ""),
+			UiOption::new("768", "768", "Default"),
+			UiOption::new("1024", "1024", ""),
+			UiOption::new("2048", "2048", ""),
+			UiOption::new("4096", "4096", "Loose")
+		]),
+		None,
+		Identity
+	),
+	ui!(
+		"tools.artifactTailLines",
+		"sv_tools_artifact_tail_lines",
+		Tools,
+		"Output Limits",
+		"Artifact Tail Lines",
+		"Maximum lines of tail content kept inline when output spills to artifact",
+		UiWidget::Submenu(&[
+			UiOption::new("50", "50 lines", "~250 tokens"),
+			UiOption::new("100", "100 lines", "~500 tokens"),
+			UiOption::new("250", "250 lines", "~1.25K tokens"),
+			UiOption::new("500", "500 lines", "Default; ~2.5K tokens"),
+			UiOption::new("1000", "1000 lines", "~5K tokens"),
+			UiOption::new("2000", "2000 lines", "~10K tokens"),
+			UiOption::new("5000", "5000 lines", "~25K tokens")
+		]),
+		None,
+		Identity
+	),
+	ui!(
 		"tools.intentTracing",
 		"sv_tools_intent_tracing",
 		Tools,
 		"Execution",
 		"Intent Tracing",
 		"Ask the agent to describe the intent of each tool call before executing it",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"tools.abortOnFabricatedResult",
+		"sv_tools_abort_on_fabricated_result",
+		Tools,
+		"Execution",
+		"Abort On Fabricated Tool Result",
+		"With in-band tool calls, stop the model immediately when it starts hallucinating a tool \
+		 result mid-turn. Disable to let the model finish generating and discard the fabricated \
+		 continuation instead.",
 		UiWidget::Boolean,
 		None,
 		Identity
@@ -482,6 +610,24 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Identity
 	),
 	ui!(
+		"irc.timeoutMs",
+		"sv_irc_timeout",
+		Tools,
+		"Execution",
+		"IRC Timeout",
+		"Default timeout for hub message waits (and send await:true) in milliseconds; 0 disables \
+		 the timeout",
+		UiWidget::Submenu(&[
+			UiOption::new("0", "Disabled", ""),
+			UiOption::new("30000", "30 seconds", ""),
+			UiOption::new("60000", "1 minute", ""),
+			UiOption::new("120000", "2 minutes", ""),
+			UiOption::new("300000", "5 minutes", "")
+		]),
+		None,
+		MillisecondsDuration
+	),
+	ui!(
 		"mcp.enableProjectConfig",
 		"sv_mcp_enable_project_config",
 		Tools,
@@ -489,6 +635,40 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		"MCP Project Config",
 		"Load .mcp.json/mcp.json from project root",
 		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"mcp.renderMarkdownResults",
+		"sv_mcp_render_markdown_results",
+		Tools,
+		"Discovery & MCP",
+		"MCP Markdown Results",
+		"Render non-JSON MCP text results as Markdown in the transcript",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"mcp.notifications",
+		"sv_mcp_notifications",
+		Tools,
+		"Discovery & MCP",
+		"MCP Update Injection",
+		"Inject MCP resource updates into the agent conversation",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"mcp.notificationDebounceMs",
+		"sv_mcp_notification_debounce_ms",
+		Tools,
+		"Discovery & MCP",
+		"MCP Notification Debounce",
+		"Debounce window in milliseconds for MCP resource updates before injecting them into the \
+		 conversation",
+		UiWidget::ConfigOnly,
 		None,
 		Identity
 	),
@@ -1011,6 +1191,19 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 			],
 			ordered: true,
 		},
+		None,
+		Identity
+	),
+	ui!(
+		"live.voice",
+		"cl_live_voice",
+		Providers,
+		"Services",
+		"Live Voice",
+		"Voice used by Codex-backed realtime voice sessions",
+		UiWidget::Enum(&[
+			"arbor", "breeze", "cove", "ember", "juniper", "maple", "sol", "spruce", "vale"
+		]),
 		None,
 		Identity
 	),

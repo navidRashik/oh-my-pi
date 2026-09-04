@@ -34,8 +34,7 @@ pub enum ResizePolicy {
 
 crate::con_enum!(ResizePolicy);
 
-/// Whether image attachments reach the model (pi `/vision`,
-/// `inspect_image.mode`).
+/// Whether image attachments and `Read.question` media reach the model.
 #[derive(
 	Clone,
 	Copy,
@@ -378,8 +377,7 @@ crate::cmd! {
 	/// Writes the persistence script through the installed saver.
 	writecfg(?cfg: Str) = |ctx, args| {
 		let name = args.opt::<Str>(0)?.unwrap_or_else(|| Str::new_static("config"));
-		let script = ctx.dump();
-		ctx.save_cfg(name.as_str(), script.as_str())
+		ctx.write_cfg(name.as_str())
 	};
 }
 

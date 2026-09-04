@@ -71,8 +71,8 @@ pub use ctx::{
 	Args, CfgLoader, CfgSaver, Ctx, CtxBuilder, DynamicCmdHandler, DynamicCmdSpec, DynamicVarSpec,
 	ExecOutcome, LoaderFn, ObserverFn, Output, SaverFn, SetSource, Severity, SinkFn, Source,
 };
-pub use dump::DumpOptions;
-pub use error::{ConError, ConResult, ParseError};
+pub use dump::{CFG_HEADER_PREFIX, CFG_SCHEMA_VERSION, DumpOptions};
+pub use error::{ConError, ConResult, ConfigIoError, ConfigOperation, ParseError};
 pub use handle::{Action, CVar};
 pub use layers::{LayerId, Origin, Seed, SetReport};
 pub use repl::{Patch, Replica, Role};

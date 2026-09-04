@@ -5,7 +5,7 @@
 //! data format:
 //!
 //! - Statements are separated by newlines or `;`.
-//! - `//` starts a comment (outside quotes).
+//! - `//` starts a comment at an argument boundary (outside quotes).
 //! - `"..."` quotes an atom; escapes: `\"` `\\` `\n` `\t`; literal newlines are
 //!   permitted inside quotes.
 //! - `[a b c]` is a list literal, `{key value ...}` a kv block; both may span
@@ -227,10 +227,7 @@ impl Lexer<'_> {
 	fn word(&mut self) -> Str {
 		let start = self.pos;
 		while let Some(ch) = self.peek() {
-			if ch.is_whitespace()
-				|| matches!(ch, ';' | '"' | '[' | ']' | '{' | '}')
-				|| self.text[self.pos..].starts_with("//")
-			{
+			if ch.is_whitespace() || matches!(ch, ';' | '"' | '[' | ']' | '{' | '}') {
 				break;
 			}
 			self.bump();
