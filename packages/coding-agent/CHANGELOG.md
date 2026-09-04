@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved Codex thread and window identity when resuming a session, retaining provider affinity and prompt-cache reuse ([#10799](https://github.com/can1357/oh-my-pi/issues/10799)).
+
 ## [18.1.10] - 2026-09-04
 
 ### Changed
