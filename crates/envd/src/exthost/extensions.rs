@@ -21,6 +21,7 @@ use omp_dom::{Node, Op, Txn};
 use omp_ext::config::{SettingSchema, SettingType, extension_setting_convar_name};
 use omp_journal::{Entry, Kind};
 use omp_session::{Component, Draft, SessionError};
+use parking_lot::RwLock;
 use serde_json::{Map, Value as JsonValue, json};
 use thiserror::Error;
 
@@ -226,11 +227,39 @@ fn convar_value(schema: &SettingSchema, value: &JsonValue) -> Option<ConValue> {
 }
 
 #[derive(Clone)]
-struct PyCallback {
+pub(crate) struct PyCallbackRoute {
+	target: Arc<RwLock<PyCallbackTarget>>,
+}
+
+#[derive(Clone)]
+struct PyCallbackTarget {
 	control:   ControlHandle,
 	authority: ControlInvocationAuthority,
-	callable:  Str,
-	timeout:   Duration,
+}
+
+impl PyCallbackRoute {
+	pub(crate) fn new(control: ControlHandle, authority: ControlInvocationAuthority) -> Self {
+		Self { target: Arc::new(RwLock::new(PyCallbackTarget { control, authority })) }
+	}
+
+	pub(crate) fn replace(
+		&self,
+		control: ControlHandle,
+		authority: ControlInvocationAuthority,
+	) {
+		*self.target.write() = PyCallbackTarget { control, authority };
+	}
+
+	fn current(&self) -> PyCallbackTarget {
+		self.target.read().clone()
+	}
+}
+
+#[derive(Clone)]
+struct PyCallback {
+	route:    PyCallbackRoute,
+	callable: Str,
+	timeout:  Duration,
 }
 
 impl PyCallback {
@@ -238,15 +267,17 @@ impl PyCallback {
 		&self,
 		operation: &'static str,
 		mut arguments: Map<String, JsonValue>,
-	) -> ControlDispatch {
+	) -> (ControlHandle, ControlDispatch) {
 		arguments.insert("callable".into(), JsonValue::String(self.callable.to_string()));
-		ControlDispatch {
+		let target = self.route.current();
+		let dispatch = ControlDispatch {
 			operation: Str::new_static(operation),
 			arguments,
-			authority: self.authority.clone(),
+			authority: target.authority,
 			policy: CallbackConcurrency::Serialized,
 			deadline: EventDeadline { at: Instant::now() + self.timeout },
-		}
+		};
+		(target.control, dispatch)
 	}
 
 	async fn call_async(
@@ -254,10 +285,8 @@ impl PyCallback {
 		operation: &'static str,
 		arguments: Map<String, JsonValue>,
 	) -> Result<JsonValue, PyExtensionError> {
-		Ok(self
-			.control
-			.dispatch(self.dispatch(operation, arguments))
-			.await?)
+		let (control, dispatch) = self.dispatch(operation, arguments);
+		Ok(control.dispatch(dispatch).await?)
 	}
 
 	fn call_sync(
@@ -267,8 +296,7 @@ impl PyCallback {
 	) -> Result<JsonValue, PyExtensionError> {
 		let runtime =
 			tokio::runtime::Handle::try_current().map_err(|_| PyExtensionError::NoRuntime)?;
-		let control = self.control.clone();
-		let dispatch = self.dispatch(operation, arguments);
+		let (control, dispatch) = self.dispatch(operation, arguments);
 		let (tx, rx) = flume::bounded(1);
 		std::thread::spawn(move || {
 			let _ = tx.send(runtime.block_on(control.dispatch(dispatch)));
@@ -302,11 +330,28 @@ impl PyDirector {
 		binds: Vec<(Str, BindValue)>,
 		timeout: Option<Duration>,
 	) -> Self {
+		Self::with_route(
+			id,
+			callable,
+			PyCallbackRoute::new(control, authority),
+			claims,
+			binds,
+			timeout,
+		)
+	}
+
+	fn with_route(
+		id: Str,
+		callable: Str,
+		route: PyCallbackRoute,
+		claims: Vec<Slot>,
+		binds: Vec<(Str, BindValue)>,
+		timeout: Option<Duration>,
+	) -> Self {
 		Self {
 			id,
 			callback: PyCallback {
-				control,
-				authority,
+				route,
 				callable,
 				timeout: timeout.unwrap_or(DEFAULT_EXTENSION_HOOK_TIMEOUT),
 			},
@@ -336,8 +381,7 @@ impl PyDirector {
 		Some(Self {
 			id,
 			callback: PyCallback {
-				control: self.callback.control.clone(),
-				authority: self.callback.authority.clone(),
+				route: self.callback.route.clone(),
 				callable,
 				timeout: self.callback.timeout,
 			},
@@ -485,11 +529,26 @@ impl PyComponent {
 		interested: Vec<Kind>,
 		timeout: Option<Duration>,
 	) -> Self {
+		Self::with_route(
+			id,
+			callable,
+			PyCallbackRoute::new(control, authority),
+			interested,
+			timeout,
+		)
+	}
+
+	fn with_route(
+		id: Str,
+		callable: Str,
+		route: PyCallbackRoute,
+		interested: Vec<Kind>,
+		timeout: Option<Duration>,
+	) -> Self {
 		Self {
 			id,
 			callback: PyCallback {
-				control,
-				authority,
+				route,
 				callable,
 				timeout: timeout.unwrap_or(DEFAULT_EXTENSION_HOOK_TIMEOUT),
 			},
@@ -550,12 +609,11 @@ impl LiveComponent for PyComponent {
 /// The returned components are the live invocation handles. Register clones in
 /// `ExtensionRegistrar` consume no replay entries; callers invoke
 /// [`PyComponent::reduce_live`] at the journal append boundary.
-pub fn register_python_extensions(
+pub(crate) fn register_python_extensions(
 	registrar: &mut ExtensionRegistrar,
 	directors: &[JsonValue],
 	components: &[JsonValue],
-	control: ControlHandle,
-	authority: ControlInvocationAuthority,
+	route: PyCallbackRoute,
 	timeout: Option<Duration>,
 ) -> Result<Vec<PyComponent>, PyExtensionError> {
 	for row in directors {
@@ -585,11 +643,10 @@ pub fn register_python_extensions(
 					.ok_or(PyExtensionError::InvalidResult)
 			})
 			.collect::<Result<Vec<_>, _>>()?;
-		registrar.director(Box::new(PyDirector::new(
+		registrar.director(Box::new(PyDirector::with_route(
 			id,
 			callable,
-			control.clone(),
-			authority.clone(),
+			route.clone(),
 			claims,
 			binds,
 			timeout,
@@ -621,7 +678,7 @@ pub fn register_python_extensions(
 			})
 			.collect::<Result<Vec<_>, _>>()?;
 		let component =
-			PyComponent::new(id, callable, control.clone(), authority.clone(), interested, timeout);
+			PyComponent::with_route(id, callable, route.clone(), interested, timeout);
 		registrar.component(Box::new(component.clone()));
 		live.push(component);
 	}

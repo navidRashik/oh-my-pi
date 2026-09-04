@@ -299,6 +299,7 @@ mod tests {
 				args:              Vec::new(),
 				env:               BTreeMap::new(),
 				env_policy:        None,
+				env_literal_keys:  BTreeSet::new(),
 				cwd:               None,
 				url:               Some(Str::from(url)),
 				headers:           BTreeMap::new(),

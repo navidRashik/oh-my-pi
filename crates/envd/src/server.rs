@@ -8,7 +8,7 @@ use std::{
 	pin, process, str, sync,
 	sync::{
 		Arc, Weak,
-		atomic::{AtomicU8, AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 	},
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -827,15 +827,97 @@ impl PreludeInvoker for PreludeBridgeInvoker {
 	}
 }
 
+struct LateDiagnosticsBatcher {
+	pending:   parking_lot::Mutex<Vec<omp_session::late_diagnostics::LateDiagnosticsFile>>,
+	scheduled: AtomicBool,
+	active:    AtomicBool,
+	sender:    KernelSender,
+}
+
+impl LateDiagnosticsBatcher {
+	fn reset(&self) {
+		self.pending.lock().clear();
+	}
+
+	fn push(self: &Arc<Self>, diagnostics: omp_session::late_diagnostics::LateDiagnostics) {
+		if !self.active.load(Ordering::Acquire) {
+			return;
+		}
+		let mut pending = self.pending.lock();
+		for file in diagnostics.files {
+			if let Some(existing) = pending.iter_mut().find(|known| known.path == file.path) {
+				existing.messages.extend(file.messages);
+				existing.recount();
+			} else {
+				pending.push(file);
+			}
+		}
+		drop(pending);
+		if !self.scheduled.swap(true, Ordering::AcqRel) {
+			let batcher = Arc::clone(self);
+			tokio::spawn(async move { batcher.flush().await });
+		}
+	}
+
+	async fn flush(self: Arc<Self>) {
+		loop {
+			tokio::time::sleep(Duration::from_millis(25)).await;
+			let files = {
+				let mut pending = self.pending.lock();
+				if !self.active.load(Ordering::Acquire) {
+					pending.clear();
+					self.scheduled.store(false, Ordering::Release);
+					return;
+				}
+				if pending.is_empty() {
+					self.scheduled.store(false, Ordering::Release);
+					return;
+				}
+				mem::take(&mut *pending)
+			};
+			let _ = self
+				.sender
+				.send_async(omp_agent::Up::Env(omp_agent::EnvEvent::LateDiagnostics(
+					omp_session::late_diagnostics::LateDiagnostics { files },
+				)))
+				.await;
+			let pending = self.pending.lock();
+			if pending.is_empty() {
+				self.scheduled.store(false, Ordering::Release);
+				return;
+			}
+		}
+	}
+}
+
 /// Sole-owner lease for Agent CONTROL routes installed in one environment.
 #[must_use]
 pub struct AgentControlBinding {
-	server: Arc<EnvServer>,
-	id:     u64,
+	server:      Arc<EnvServer>,
+	id:          u64,
+	diagnostics: Option<Arc<LateDiagnosticsBatcher>>,
+}
+
+impl AgentControlBinding {
+	/// Re-derives checkpoint state and drops obsolete deferred diagnostics when
+	/// the controller selects another journal with the same authenticated
+	/// mailbox.
+	pub fn refresh_session(&self, dom: &omp_dom::Dom) {
+		if let Some(diagnostics) = &self.diagnostics {
+			diagnostics.reset();
+		}
+		if let Some(environment) = &self.server.environment {
+			environment.documents.reset_late_diagnostics(self.id);
+		}
+		self.server.checkpoint_control.restore_session(self.id, dom);
+	}
 }
 
 impl Drop for AgentControlBinding {
 	fn drop(&mut self) {
+		if let Some(diagnostics) = &self.diagnostics {
+			diagnostics.active.store(false, Ordering::Release);
+		}
 		self.server.release_agent_control(self.id);
 	}
 }
@@ -2376,10 +2458,10 @@ impl EnvServer {
 		let workspace = WorkspaceHost::open(root)?;
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-		mcp.bind_config_paths(McpConfigPaths::new(
-			&omp_core::dirs::user_config_root()?,
-			workspace.root(),
-		));
+		mcp.bind_config_paths(
+			McpConfigPaths::new(&omp_core::dirs::user_config_root()?, workspace.root())
+				.with_agent_plugin_roots(bridges.content.agent_plugin_roots.clone()),
+		);
 		let lsp_settings = LspSettings::from_con(con);
 		let doc_config = omp_docserver::ServerConfig::new(root)
 			.map_err(|error| EnvdError::Document(Str::from(error.to_string())))?
@@ -2425,6 +2507,7 @@ impl EnvServer {
 			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
+		mcp_manager.bind_runtime_settings(con);
 		register_extension_convars(con, &ext_host_config.extensions)?;
 		let journal_external = ExternalJournalActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
@@ -2514,10 +2597,12 @@ impl EnvServer {
 			registry,
 			bridges,
 		)?;
+		checkpoint_control.bind_local_workspace(workspace_ops.clone());
 		control_bindings
 			.resources
 			.set(Arc::clone(&resources))
 			.map_err(|_| EnvdError::State(sf!("CONTROL URL resolver owner was already bound")))?;
+		ext_hosts.bind_journal_runtime(0, JournalRuntime { external: journal_external.sender() })?;
 		ext_hosts.activate_control_hosts().await?;
 		let identity = ServerIdentity {
 			workspace_id:   hello.workspace_id,
@@ -2604,10 +2689,10 @@ impl EnvServer {
 		let root = workspace.root().to_path_buf();
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-		mcp.bind_config_paths(McpConfigPaths::new(
-			&omp_core::dirs::user_config_root()?,
-			workspace.root(),
-		));
+		mcp.bind_config_paths(
+			McpConfigPaths::new(&omp_core::dirs::user_config_root()?, workspace.root())
+				.with_agent_plugin_roots(bridges.content.agent_plugin_roots.clone()),
+		);
 		let lsp_settings = LspSettings::from_con(con);
 		let document_lsp = omp_docserver::NativeLspOptions {
 			enabled: lsp_settings.enabled,
@@ -2696,6 +2781,7 @@ impl EnvServer {
 			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
+		mcp_manager.bind_runtime_settings(con);
 		register_extension_convars(con, &ext_host_config.extensions)?;
 		let journal_external = ExternalJournalActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
@@ -2788,10 +2874,12 @@ impl EnvServer {
 			registry,
 			bridges,
 		)?;
+		checkpoint_control.bind_local_workspace(workspace_ops.clone());
 		control_bindings
 			.resources
 			.set(Arc::clone(&resources))
 			.map_err(|_| EnvdError::State(sf!("CONTROL URL resolver owner was already bound")))?;
+		ext_hosts.bind_journal_runtime(0, JournalRuntime { external: journal_external.sender() })?;
 		ext_hosts.activate_control_hosts().await?;
 		let identity = ServerIdentity {
 			workspace_id:   hello.workspace_id,
@@ -2872,7 +2960,10 @@ impl EnvServer {
 
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
-		mcp.bind_config_paths(McpConfigPaths::new(&omp_core::dirs::user_config_root()?, &root));
+		mcp.bind_config_paths(
+			McpConfigPaths::new(&omp_core::dirs::user_config_root()?, &root)
+				.with_agent_plugin_roots(bridges.content.agent_plugin_roots.clone()),
+		);
 		let github_cache = Arc::new(
 			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
 				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
@@ -2895,6 +2986,7 @@ impl EnvServer {
 			local_root,
 		);
 		mcp.bind_manager(&mcp_manager);
+		mcp_manager.bind_runtime_settings(con);
 		let mcp_settings = McpSettings::from_con(con);
 		// Native config mounting requires the bound manager: reload resolves
 		// through the live transport supervisor.
@@ -2974,6 +3066,7 @@ impl EnvServer {
 			&root,
 			state_dir,
 			&telemetry,
+			Arc::clone(&github_cache),
 			ext_hosts.as_ref(),
 			con,
 			omp_tool::ToolsPolicy::Auto,
@@ -2989,12 +3082,16 @@ impl EnvServer {
 				ask_presenter,
 			},
 		)?;
+		session
+			.checkpoint_control
+			.bind_owner_workspace(owner.clone());
 
 		let resources = Arc::new(ResolverTable::default());
 		control_bindings
 			.resources
 			.set(Arc::clone(&resources))
 			.map_err(|_| EnvdError::State(sf!("CONTROL URL resolver owner was already bound")))?;
+		ext_hosts.bind_journal_runtime(0, JournalRuntime { external: journal_external.sender() })?;
 		ext_hosts.activate_control_hosts().await?;
 		let identity = ServerIdentity {
 			workspace_id:   owner_info.workspace_id,
@@ -3365,22 +3462,24 @@ impl EnvServer {
 			.bind_external_control_authorities(agents, domains)
 	}
 
-	/// Binds the active Agent Journal mailbox to authenticated extension
+	/// Binds the active Agent Journal mailbox to checkpoint and staged-preview
 	/// CONTROL until the returned lease is dropped.
-	///
-	/// # Errors
-	///
-	/// Fails if journal routing is concurrently owned or an initial binding is
-	/// attempted after extension child activation.
-	pub(crate) fn bind_agent_control(
-		self: &Arc<Self>,
-		sender: KernelSender,
-	) -> Result<AgentControlBinding, EnvdError> {
+	pub(crate) fn bind_agent_control(self: &Arc<Self>, sender: KernelSender) -> AgentControlBinding {
 		let id = NEXT_AGENT_CONTROL_BINDING.fetch_add(1, Ordering::Relaxed);
-		self
-			.ext_hosts
-			.bind_journal_runtime(id, JournalRuntime { external: self.journal_external.sender() })?;
 		self.checkpoint_control.bind(id, sender.clone());
+		let diagnostics = self.environment.as_ref().map(|environment| {
+			let diagnostics = Arc::new(LateDiagnosticsBatcher {
+				pending:   parking_lot::Mutex::new(Vec::new()),
+				scheduled: AtomicBool::new(false),
+				active:    AtomicBool::new(true),
+				sender:    sender.clone(),
+			});
+			let sink = Arc::clone(&diagnostics);
+			environment
+				.documents
+				.bind_late_diagnostics(id, Arc::new(move |batch| sink.push(batch)));
+			diagnostics
+		});
 		self
 			.previews
 			.install_activation_observer(Arc::new(move |pending| {
@@ -3395,7 +3494,7 @@ impl EnvServer {
 						.map_err(|_| omp_tools::staging::ProposalActivationError::Rejected)
 				})
 			}));
-		Ok(AgentControlBinding { server: Arc::clone(self), id })
+		AgentControlBinding { server: Arc::clone(self), id, diagnostics }
 	}
 
 	/// Installs the project-lifetime owner for durable scheduled Agent
@@ -3408,9 +3507,12 @@ impl EnvServer {
 	}
 
 	fn release_agent_control(&self, id: u64) {
-		self.previews.remove_activation_observer();
-		self.ext_hosts.unbind_journal_runtime(id);
-		self.checkpoint_control.unbind(id);
+		if let Some(environment) = &self.environment {
+			environment.documents.unbind_late_diagnostics(id);
+		}
+		if self.checkpoint_control.unbind(id) {
+			self.previews.remove_activation_observer();
+		}
 	}
 
 	/// Binds extension device availability to the active Agent turn boundary.
@@ -9174,6 +9276,19 @@ fn utf8_projection_prefix(text: &str, maximum: usize) -> usize {
 	end
 }
 
+fn valid_blob_media_type(media_type: &str) -> bool {
+	if media_type.bytes().any(|byte| byte.is_ascii_control()) {
+		return false;
+	}
+	let essence = media_type.split(';').next().unwrap_or_default().trim();
+	let Some((kind, subtype)) = essence.split_once('/') else {
+		return false;
+	};
+	!kind.is_empty()
+		&& !subtype.is_empty()
+		&& !essence.bytes().any(|byte| byte.is_ascii_whitespace())
+}
+
 fn project_wire_parts(
 	parts: &mut Vec<thread_pb::Part>,
 	request: omp_tool::OutputRequest,
@@ -9438,19 +9553,20 @@ fn spawn_worker_invocation(
 					break;
 				},
 				Some(WorkerEvent::Complete(complete)) => {
-					let (json, details_blob, is_error) = match worker_completion_json(&complete) {
-						Ok(completion) => completion,
-						Err(reason) => {
-							send_abort_verdict(
-								&responses,
-								request_id,
-								&invocation_id,
-								omp_tool::Abort::EffectsUnknown { reason },
-							)
-							.await;
-							break;
-						},
-					};
+					let (json, details_blob, is_error) =
+						match projected_worker_completion_json(&blobs, &complete, output_request) {
+							Ok(completion) => completion,
+							Err(reason) => {
+								send_abort_verdict(
+									&responses,
+									request_id,
+									&invocation_id,
+									omp_tool::Abort::EffectsUnknown { reason },
+								)
+								.await;
+								break;
+							},
+						};
 					if let Some(details) = details_blob.as_ref() {
 						let hash: [u8; 32] = match details.hash.as_ref().try_into() {
 							Ok(hash) => hash,
@@ -9489,14 +9605,73 @@ fn spawn_worker_invocation(
 							break;
 						}
 					}
+					let mut retained_media = BTreeSet::new();
+					let mut invalid_media = false;
+					for blob in complete
+						.parts
+						.iter()
+						.filter_map(|part| match part.kind.as_ref() {
+							Some(thread_pb::part::Kind::Blob(blob)) => Some(blob),
+							_ => None,
+						}) {
+						if !valid_blob_media_type(&blob.mime) {
+							invalid_media = true;
+							break;
+						}
+						if !blob.inline.is_empty() {
+							let size = u64::try_from(blob.inline.len()).unwrap_or(u64::MAX);
+							if size != blob.size
+								|| (!blob.hash.is_empty()
+									&& blob.hash.as_ref() != Hash32::sum(&blob.inline).as_bytes())
+							{
+								invalid_media = true;
+								break;
+							}
+							continue;
+						}
+						let Ok(hash) = <[u8; 32]>::try_from(blob.hash.as_ref()) else {
+							invalid_media = true;
+							break;
+						};
+						if retained_media.insert((hash, blob.size))
+							&& let Err(error) = blobs.retain_verdict_blob(
+								retention_session.as_deref(),
+								invocation_id.as_str(),
+								BlobId { hash, size: blob.size },
+							) {
+							tracing::error!(
+								%error,
+								invocation_id = %invocation_id,
+								"could not durably retain worker media before publication"
+							);
+							invalid_media = true;
+							break;
+						}
+					}
+					if invalid_media {
+						send_abort_verdict(
+							&responses,
+							request_id,
+							&invocation_id,
+							omp_tool::Abort::EffectsUnknown {
+								reason: sf!("worker verdict media is invalid or unavailable"),
+							},
+						)
+						.await;
+						break;
+					}
 					let mut parts = complete.parts;
-					let (source_bytes, inline_bytes, omitted) =
-						project_wire_parts(&mut parts, output_request);
+					let _ = project_wire_parts(&mut parts, output_request);
+					let source_bytes = details_blob.as_ref().map_or_else(
+						|| u64::try_from(json.len()).unwrap_or(u64::MAX),
+						|details| details.size,
+					);
+					let inline_bytes = u64::try_from(json.len()).unwrap_or(u64::MAX);
 					let projection = output_projection(
 						output_request,
 						source_bytes,
 						inline_bytes,
-						omitted,
+						inline_bytes != source_bytes,
 						details_blob.clone(),
 					);
 					send_invocation_terminal_body(
@@ -9532,11 +9707,16 @@ fn spawn_worker_invocation(
 					break;
 				},
 				None => {
-					let _ = send_invocation_stream_error(
+					let reason = if cancel_requested {
+						sf!("environment invocation cancelled")
+					} else {
+						sf!("tool worker event stream closed after effects authorization")
+					};
+					send_abort_verdict(
 						&responses,
 						request_id,
 						&invocation_id,
-						"tool worker event stream closed without a terminal verdict",
+						omp_tool::Abort::EffectsUnknown { reason },
 					)
 					.await;
 					break;
@@ -10064,6 +10244,19 @@ async fn send_mcp_error(
 	use super::mcp::McpServiceError;
 	let code = match error {
 		McpServiceError::InvalidRequest => pb::ProtocolErrorCode::InvalidArgument,
+		McpServiceError::Config(error) => match error {
+			super::mcp::config_store::ConfigStoreError::Io { .. }
+			| super::mcp::config_store::ConfigStoreError::NoParent { .. }
+			| super::mcp::config_store::ConfigStoreError::LockTimeout { .. } => {
+				pb::ProtocolErrorCode::Internal
+			},
+			super::mcp::config_store::ConfigStoreError::Json { .. }
+			| super::mcp::config_store::ConfigStoreError::Validation { .. }
+			| super::mcp::config_store::ConfigStoreError::AlreadyExists { .. }
+			| super::mcp::config_store::ConfigStoreError::NotFound { .. } => {
+				pb::ProtocolErrorCode::InvalidArgument
+			},
+		},
 		McpServiceError::ServerNotFound => pb::ProtocolErrorCode::NotFound,
 		McpServiceError::StaleDefinitionEpoch { .. }
 		| McpServiceError::StaleGeneration
@@ -10644,9 +10837,21 @@ fn materialize_worker_outcome(blobs: &BlobHost, complete: &WorkerCompletion) -> 
 		.as_ref()
 		.try_into()
 		.map_err(|_| sf!("worker result blob hash is invalid"))?;
-	blobs
+	let bytes = blobs
 		.get(BlobId { hash, size: blob.size })
-		.map_err(|_| sf!("worker result blob is unavailable"))
+		.map_err(|_| sf!("worker result blob is unavailable"))?;
+	if serde_json::from_slice::<CallOutcome<serde_json::Value, serde_json::Value>>(&bytes).is_ok() {
+		return Ok(bytes);
+	}
+	match complete.kind {
+		WorkerOutcomeKind::Ok | WorkerOutcomeKind::Faulted => {
+			worker_verdict_json(bytes, complete.kind == WorkerOutcomeKind::Faulted)
+				.map_err(|_| sf!("worker result blob is invalid"))
+		},
+		WorkerOutcomeKind::ArgsRejected | WorkerOutcomeKind::Aborted => {
+			Err(sf!("worker result blob omitted its terminal outcome envelope"))
+		},
+	}
 }
 
 fn materialize_worker_details(blobs: &BlobHost, complete: &WorkerCompletion) -> Result<Bytes, Str> {
@@ -10673,6 +10878,26 @@ fn materialize_worker_completion(
 	complete: &WorkerCompletion,
 ) -> Result<Bytes, Str> {
 	materialize_worker_outcome(blobs, complete)
+}
+
+fn projected_worker_completion_json(
+	blobs: &BlobHost,
+	complete: &WorkerCompletion,
+	request: omp_tool::OutputRequest,
+) -> Result<(Bytes, Option<thread_pb::Blob>, bool), Str> {
+	let (mut json, details_blob, is_error) = worker_completion_json(complete)?;
+	let inline_limit = match request {
+		omp_tool::OutputRequest::Bounded => DEFAULT_RESULT_PROJECTION_BYTES,
+		omp_tool::OutputRequest::Complete => COMPLETE_RESULT_PROJECTION_BYTES,
+	};
+	if json.is_empty()
+		&& details_blob
+			.as_ref()
+			.is_some_and(|details| details.size <= u64::try_from(inline_limit).unwrap_or(u64::MAX))
+	{
+		json = materialize_worker_outcome(blobs, complete)?;
+	}
+	Ok((json, details_blob, is_error))
 }
 
 fn worker_completion_json(
@@ -12092,6 +12317,52 @@ mod tests {
 
 	const TEST_DAP_SESSION_ID: [u8; 16] = [0x2a; 16];
 
+	#[tokio::test]
+	async fn late_diagnostics_batch_by_path_in_arrival_order() {
+		use omp_session::late_diagnostics::{LateDiagnostics, LateDiagnosticsFile};
+
+		let (sender, receiver) = flume::unbounded();
+		let batcher = Arc::new(LateDiagnosticsBatcher {
+			pending: parking_lot::Mutex::new(Vec::new()),
+			scheduled: AtomicBool::new(false),
+			active: AtomicBool::new(true),
+			sender,
+		});
+		batcher.push(LateDiagnostics {
+			files: vec![LateDiagnosticsFile {
+				path:     sf!("src/lib.rs"),
+				summary:  sf!("1 warning(s)"),
+				errored:  false,
+				messages: vec![sf!("src/lib.rs:9:1 [warning] [rustc] unused")],
+			}],
+		});
+		batcher.push(LateDiagnostics {
+			files: vec![LateDiagnosticsFile {
+				path:     sf!("src/lib.rs"),
+				summary:  sf!("1 error(s)"),
+				errored:  true,
+				messages: vec![sf!("src/lib.rs:2:1 [error] [rustc] broken (E1)")],
+			}],
+		});
+		let event = time::timeout(Duration::from_secs(1), receiver.recv_async())
+			.await
+			.expect("batch deadline")
+			.expect("batch event");
+		let omp_agent::Up::Env(omp_agent::EnvEvent::LateDiagnostics(diagnostics)) = event else {
+			panic!("expected late diagnostics");
+		};
+		assert_eq!(diagnostics.files.len(), 1);
+		assert_eq!(diagnostics.files[0].summary, "1 error(s), 1 warning(s)");
+		assert_eq!(
+			diagnostics.files[0]
+				.messages
+				.iter()
+				.map(Str::as_str)
+				.collect::<Vec<_>>(),
+			["src/lib.rs:9:1 [warning] [rustc] unused", "src/lib.rs:2:1 [error] [rustc] broken (E1)",]
+		);
+	}
+
 	fn accepted_hello(grants: Grants, approval_mode: Option<ApprovalMode>) -> AcceptedHello {
 		AcceptedHello { grants, capabilities: BTreeSet::new(), props: None, approval_mode }
 	}
@@ -12913,6 +13184,7 @@ mod tests {
 					command:             "variables".to_owned(),
 					arguments_json:      Bytes::from_static(b"{\"variablesReference\":0}"),
 					max_response_bytes:  4096,
+					timeout_ms:          0,
 				}),
 			))
 			.await
@@ -12964,6 +13236,7 @@ mod tests {
 					command:             "continue".to_owned(),
 					arguments_json:      Bytes::from_static(b"{}"),
 					max_response_bytes:  4096,
+					timeout_ms:          0,
 				}),
 			))
 			.await

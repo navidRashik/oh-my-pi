@@ -42,6 +42,7 @@ use omp_inference::{
 	receipt::UsageSource,
 };
 use omp_proto::{
+	env::v1 as env_wire,
 	inference::{v1, v1::tool_def},
 	prost::Message as _,
 	thread::v1::Blob,
@@ -73,7 +74,8 @@ use omp_tools::{
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio_util::sync::CancellationToken;
 
 use super::{
 	EnvdError,
@@ -125,7 +127,7 @@ use super::{
 		ExtHostSupervisor, SealedRegistryEvidence, SealedRegistryEvidenceError,
 		seal_registry_evidence,
 	},
-	workspace::WorkspaceHost,
+	workspace::{WorkspaceHost, WorkspaceOperationError, WorkspaceOperations},
 };
 use crate::{
 	browser_daemon::{BrowserDaemon, BrowserSettings},
@@ -265,6 +267,10 @@ where
 
 	fn spec(&self) -> &ToolSpec {
 		self.inner.spec()
+	}
+
+	fn execution_mode(&self) -> ExecutionMode {
+		self.inner.execution_mode()
 	}
 
 	fn prompt_examples(&self) -> &[omp_tool::ToolPromptExample] {
@@ -3098,6 +3104,9 @@ pub struct ActiveContentInputs {
 	pub authored_skills:     BTreeSet<Str>,
 	/// Managed-skill authority root.
 	pub managed_skills_root: Option<PathBuf>,
+	/// Explicit Agent Plugins roots whose data-only MCP declarations join
+	/// automatic project discovery.
+	pub agent_plugin_roots:  Vec<PathBuf>,
 }
 
 /// Object-safe composition boundary for one active internal-URL resolver.
@@ -3441,6 +3450,7 @@ fn register_session_base(
 	project_root: &Path,
 	state_dir: &Path,
 	telemetry: &Arc<TelemetryIndex>,
+	github_cache: Arc<GithubCache>,
 	tool_settings: &ToolSettings,
 	image_config: media_devices::ImageConfig,
 	speech_config: SpeechConfig,
@@ -3485,8 +3495,13 @@ fn register_session_base(
 		long_tail_presentation(policy),
 		builtin_device_claims(),
 	)?;
-	let github =
-		GithubService::new(project_root.to_path_buf(), state_dir, Arc::clone(&github_credentials));
+	let github = GithubService::new(
+		project_root.to_path_buf(),
+		state_dir,
+		Arc::clone(&github_credentials),
+		github_cache,
+		blobs.clone(),
+	);
 	if let Some(upload) = telemetry_upload {
 		upload.start(Arc::clone(telemetry), Arc::clone(&github_credentials));
 	}
@@ -3914,6 +3929,7 @@ pub(crate) fn session_registry(
 	project_root: &Path,
 	state_dir: &Path,
 	telemetry: &Arc<TelemetryIndex>,
+	github_cache: Arc<GithubCache>,
 	workers: &ExtHostSupervisor,
 	con: &Ctx,
 	policy: ToolsPolicy,
@@ -3943,6 +3959,7 @@ pub(crate) fn session_registry(
 		project_root,
 		state_dir,
 		telemetry,
+		github_cache,
 		tool_settings,
 		image_config(con),
 		speech_config(con),
@@ -4086,6 +4103,7 @@ pub(crate) fn production_registry<
 			workspace.root(),
 			state_dir,
 			telemetry,
+			Arc::clone(&github_cache),
 			tool_settings,
 			image_config(con),
 			speech_config(con),
@@ -4100,7 +4118,7 @@ pub(crate) fn production_registry<
 			builtin_device_claims(),
 		)?;
 	}
-	let computer = ComputerSessionHost::new(blobs.clone());
+	let computer = ComputerSessionHost::new(blobs.clone(), con);
 	environment_registry(
 		&mut registry,
 		omp_tools::computer::tool(computer),
@@ -4636,40 +4654,240 @@ struct CheckpointBinding {
 	sender: KernelSender,
 }
 
+#[derive(Clone)]
+enum CheckpointWorkspace {
+	Local(WorkspaceOperations),
+	Owner(EnvClient),
+}
+
+#[derive(Clone)]
+struct ActiveCheckpoint {
+	binding_id: u64,
+	token:      Str,
+	snapshot:   env_wire::WorkspaceSnapshot,
+}
+
 /// Late-bound bridge from environment-owned checkpoint tools to the active
 /// Agent CONTROL mailbox.
 #[derive(Clone, Default)]
 pub struct AgentCheckpointControl {
 	sender:            Arc<RwLock<Option<CheckpointBinding>>>,
-	active_checkpoint: Arc<RwLock<Option<Str>>>,
+	workspace:         Arc<RwLock<Option<CheckpointWorkspace>>>,
+	active_checkpoint: Arc<RwLock<Option<ActiveCheckpoint>>>,
+	last_completed:    Arc<RwLock<bool>>,
+	transition:        Arc<AsyncMutex<()>>,
 }
 
 impl AgentCheckpointControl {
+	/// Binds the local project environment's document-backed workspace owner.
+	pub fn bind_local_workspace(&self, workspace: WorkspaceOperations) {
+		*self.workspace.write() = Some(CheckpointWorkspace::Local(workspace));
+	}
+
+	/// Binds a child session host to its project environment's workspace owner.
+	pub fn bind_owner_workspace(&self, workspace: EnvClient) {
+		*self.workspace.write() = Some(CheckpointWorkspace::Owner(workspace));
+	}
+
 	/// Replaces the active session binding.
 	pub fn bind(&self, id: u64, sender: KernelSender) {
 		*self.sender.write() = Some(CheckpointBinding { id, sender });
 		*self.active_checkpoint.write() = None;
+		*self.last_completed.write() = false;
 	}
 
-	/// Releases the binding only when it is still owned by `id`.
-	pub fn unbind(&self, id: u64) {
+	/// Re-derives checkpoint execution state from the selected journal's DOM.
+	/// The process-local cache never decides whether a checkpoint survives a
+	/// switch, rewind, or resume.
+	pub fn restore_session(&self, id: u64, dom: &omp_dom::Dom) {
+		if !self
+			.sender
+			.read()
+			.as_ref()
+			.is_some_and(|binding| binding.id == id)
+		{
+			return;
+		}
+		let active = dom.handles().find_map(|handle| {
+			let node = dom.get(handle)?;
+			if node.tag != omp_dom::Tag::Custom(Str::new_static("rewind-checkpoint")) {
+				return None;
+			}
+			let text = |name: &'static str| {
+				node
+					.prop(&omp_dom::PropKey::Custom(Str::new_static(name)))
+					.and_then(omp_dom::Value::as_str)
+					.map(Str::new)
+			};
+			let number = |name: &'static str| match node
+				.prop(&omp_dom::PropKey::Custom(Str::new_static(name)))?
+			{
+				omp_dom::Value::Int(value) => u64::try_from(*value).ok(),
+				_ => None,
+			};
+			let token = text("token")?;
+			let snapshot_id = text("workspace-snapshot")?;
+			Some(ActiveCheckpoint {
+				binding_id: id,
+				token,
+				snapshot: env_wire::WorkspaceSnapshot {
+					snapshot_id: snapshot_id.to_string(),
+					generation: number("workspace-generation")?,
+					root_uri: text("workspace-root")?.to_string(),
+					tree_hash: text("workspace-tree")?.to_string(),
+					files: number("workspace-files")?,
+					bytes: number("workspace-bytes")?,
+					entry_count: number("workspace-files")?,
+					created_ms: number("started-at")?,
+					wire_revision: omp_proto::SCHEMA_REV,
+					..Default::default()
+				},
+			})
+		});
+		let completed = dom.handles().any(|handle| {
+			dom.get(handle).is_some_and(|node| {
+				node.tag == omp_dom::Tag::Known(omp_dom::KnownTag::Developer)
+					&& node
+						.prop(&omp_dom::PropKey::Custom(Str::new_static("checkpoint-token")))
+						.is_some()
+			})
+		});
+		*self.active_checkpoint.write() = active;
+		*self.last_completed.write() = completed;
+	}
+
+	/// Releases the binding only when it is still owned by `id`, returning
+	/// whether this lease was current.
+	pub fn unbind(&self, id: u64) -> bool {
 		let mut binding = self.sender.write();
 		if binding.as_ref().is_some_and(|binding| binding.id == id) {
 			*binding = None;
 			*self.active_checkpoint.write() = None;
+			*self.last_completed.write() = false;
+			true
+		} else {
+			false
 		}
 	}
 
-	fn sender(&self) -> Result<KernelSender, omp_tools::checkpoint::CheckpointFault> {
+	fn binding(&self) -> Result<CheckpointBinding, omp_tools::checkpoint::CheckpointFault> {
 		self
 			.sender
 			.read()
-			.as_ref()
-			.map(|binding| binding.sender.clone())
+			.clone()
 			.ok_or_else(|| omp_tools::checkpoint::CheckpointFault {
 				code:    checkpoint::FaultCode::Control,
 				message: sf!("active Agent CONTROL is not bound"),
 			})
+	}
+
+	fn ensure_binding(&self, id: u64) -> Result<(), omp_tools::checkpoint::CheckpointFault> {
+		if self
+			.sender
+			.read()
+			.as_ref()
+			.is_some_and(|binding| binding.id == id)
+		{
+			Ok(())
+		} else {
+			Err(checkpoint_fault(
+				checkpoint::FaultCode::WrongToken,
+				"checkpoint belongs to another session",
+			))
+		}
+	}
+
+	fn workspace(&self) -> Result<CheckpointWorkspace, omp_tools::checkpoint::CheckpointFault> {
+		self
+			.workspace
+			.read()
+			.clone()
+			.ok_or_else(|| omp_tools::checkpoint::CheckpointFault {
+				code:    checkpoint::FaultCode::Control,
+				message: sf!("workspace authority is not bound"),
+			})
+	}
+}
+
+impl CheckpointWorkspace {
+	async fn snapshot(
+		&self,
+		request: env_wire::SnapshotWorkspace,
+		cancel: &CancellationToken,
+	) -> Result<env_wire::WorkspaceSnapshot, omp_tools::checkpoint::CheckpointFault> {
+		let result = match self {
+			Self::Local(workspace) => {
+				let workspace = workspace.clone();
+				let cancel = cancel.clone();
+				tokio::task::spawn_blocking(move || workspace.snapshot(&request, &cancel))
+					.await
+					.map_err(|source| {
+						tracing::warn!(?source, "checkpoint workspace snapshot worker failed");
+						checkpoint_fault(
+							checkpoint::FaultCode::SnapshotFailed,
+							"workspace snapshot worker failed",
+						)
+					})?
+					.map_err(local_snapshot_fault)
+			},
+			Self::Owner(workspace) => {
+				tokio::select! {
+					result = workspace.snapshot_workspace(request) => {
+						result.map_err(|source| {
+							tracing::warn!(?source, "checkpoint workspace capture failed");
+							checkpoint_fault(
+								checkpoint::FaultCode::SnapshotFailed,
+								"workspace snapshot failed",
+							)
+						})
+					},
+					() = cancel.cancelled() => {
+						Err(checkpoint_fault(
+							checkpoint::FaultCode::RestoreCancelled,
+							"workspace snapshot was cancelled",
+						))
+					},
+				}
+			},
+		};
+		if cancel.is_cancelled() {
+			return Err(checkpoint_fault(
+				checkpoint::FaultCode::RestoreCancelled,
+				"workspace snapshot was cancelled",
+			));
+		}
+		result
+	}
+
+	async fn restore(
+		&self,
+		request: env_wire::RestoreWorkspace,
+		cancel: &CancellationToken,
+	) -> Result<env_wire::WorkspaceRestored, omp_tools::checkpoint::CheckpointFault> {
+		match self {
+			Self::Local(workspace) => workspace
+				.restore(&request, cancel)
+				.await
+				.map_err(local_workspace_fault),
+			Self::Owner(workspace) => {
+				if cancel.is_cancelled() {
+					return Err(checkpoint_fault(
+						checkpoint::FaultCode::RestoreCancelled,
+						"workspace restoration was cancelled",
+					));
+				}
+				workspace
+					.restore_workspace(request)
+					.await
+					.map_err(|source| {
+						tracing::warn!(?source, "checkpoint workspace restore failed");
+						checkpoint_fault(
+							checkpoint::FaultCode::RestoreFailed,
+							"workspace restoration failed",
+						)
+					})
+			},
+		}
 	}
 }
 
@@ -4677,72 +4895,253 @@ impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
 	async fn checkpoint(
 		&self,
 		goal: Str,
+		cancel: CancellationToken,
 	) -> Result<omp_tools::checkpoint::CheckpointAck, omp_tools::checkpoint::CheckpointFault> {
+		let _transition = self.transition.lock().await;
 		if self.active_checkpoint.read().is_some() {
-			return Err(omp_tools::checkpoint::CheckpointFault {
-				code:    checkpoint::FaultCode::AlreadyActive,
-				message: sf!("a checkpoint is already active"),
-			});
+			return Err(checkpoint_fault(
+				checkpoint::FaultCode::AlreadyActive,
+				"a checkpoint is already active",
+			));
 		}
-		let started_at = u64::try_from(
-			std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.map_err(|error| checkpoint_fault(Str::new(error.to_string())))?
-				.as_millis(),
-		)
-		.unwrap_or(u64::MAX);
-		let token = sf!("checkpoint-{started_at}");
-		let ack = omp_tools::checkpoint::CheckpointAck { token: token.clone(), started_at };
-		let payload = serde_json::to_string(&serde_json::json!({
-			"goal": goal,
-			"token": token,
-			"started_at": started_at,
-		}))
-		.map_err(|error| checkpoint_fault(Str::new(error.to_string())))?;
-		self
-			.sender()?
-			.send(omp_agent::Up::Env(omp_agent::EnvEvent::CheckpointControl {
-				operation: sf!("checkpoint"),
-				payload:   Str::new(payload),
+		let binding = self.binding()?;
+		let started_at = epoch_millis()?;
+		let token = sf!("checkpoint-{}-{}", binding.id, Ulid::generate());
+		let snapshot = self
+			.workspace()?
+			.snapshot(
+				env_wire::SnapshotWorkspace {
+					scope: "checkpoint".to_owned(),
+					label: Some(token.to_string()),
+					wire_revision: omp_proto::SCHEMA_REV,
+					..Default::default()
+				},
+				&cancel,
+			)
+			.await?;
+		self.ensure_binding(binding.id)?;
+		let workspace = checkpoint_snapshot(&snapshot);
+		binding
+			.sender
+			.send(omp_agent::Up::Env(omp_agent::EnvEvent::CheckpointOpened {
+				token: token.clone(),
+				goal: goal.clone(),
+				started_at,
+				workspace: snapshot.clone(),
 			}))
-			.map_err(|_| checkpoint_fault(sf!("active Agent mailbox is closed")))?;
-		*self.active_checkpoint.write() = Some(token);
-		Ok(ack)
+			.map_err(|_| {
+				checkpoint_fault(checkpoint::FaultCode::Control, "active Agent mailbox is closed")
+			})?;
+		*self.active_checkpoint.write() =
+			Some(ActiveCheckpoint { binding_id: binding.id, token: token.clone(), snapshot });
+		Ok(omp_tools::checkpoint::CheckpointAck { token, started_at, workspace })
 	}
 
 	async fn schedule_rewind(
 		&self,
 		report: Str,
+		cancel: CancellationToken,
 	) -> Result<omp_tools::checkpoint::RewindAck, omp_tools::checkpoint::CheckpointFault> {
-		let token = self.active_checkpoint.read().clone().ok_or_else(|| {
-			omp_tools::checkpoint::CheckpointFault {
-				code:    checkpoint::FaultCode::NoActive,
-				message: sf!("no active checkpoint"),
+		let _transition = self.transition.lock().await;
+		let binding = self.binding()?;
+		let active = self.active_checkpoint.read().clone().ok_or_else(|| {
+			if *self.last_completed.read() {
+				checkpoint_fault(
+					checkpoint::FaultCode::AlreadyCompleted,
+					"checkpoint already completed; continue from the retained rewind report",
+				)
+			} else {
+				checkpoint_fault(checkpoint::FaultCode::NoActive, "no active checkpoint")
 			}
 		})?;
-		let receipt = sf!("rewind-{}", token);
-		let ack =
-			omp_tools::checkpoint::RewindAck { token: token.clone(), receipt: receipt.clone() };
-		let payload = serde_json::to_string(&serde_json::json!({
-			"token": token,
-			"report": report,
-			"receipt": receipt,
-		}))
-		.map_err(|error| checkpoint_fault(Str::new(error.to_string())))?;
-		self
-			.sender()?
-			.send(omp_agent::Up::Env(omp_agent::EnvEvent::CheckpointControl {
-				operation: sf!("schedule_rewind"),
-				payload:   Str::new(payload),
+		if active.binding_id != binding.id {
+			return Err(checkpoint_fault(
+				checkpoint::FaultCode::WrongToken,
+				"checkpoint belongs to another session",
+			));
+		}
+		let workspace = self.workspace()?;
+		let request = env_wire::RestoreWorkspace {
+			snapshot_id: active.snapshot.snapshot_id.clone(),
+			dry_run: true,
+			scope: "checkpoint".to_owned(),
+			wire_revision: omp_proto::SCHEMA_REV,
+			..Default::default()
+		};
+		let preview = workspace.restore(request.clone(), &cancel).await?;
+		ensure_complete_restore(&preview)?;
+		self.ensure_binding(binding.id)?;
+		if cancel.is_cancelled() {
+			return Err(checkpoint_fault(
+				checkpoint::FaultCode::RestoreCancelled,
+				"workspace restoration was cancelled",
+			));
+		}
+		let restored = workspace
+			.restore(env_wire::RestoreWorkspace { dry_run: false, ..request }, &cancel)
+			.await?;
+		if let Err(fault) = ensure_complete_restore(&restored) {
+			if restored.partial {
+				rollback_workspace(&workspace, &restored).await;
+			}
+			return Err(fault);
+		}
+		if let Err(fault) = self.ensure_binding(binding.id) {
+			rollback_workspace(&workspace, &restored).await;
+			return Err(fault);
+		}
+		let receipt = sf!("rewind-{}", Ulid::generate());
+		let rewound_at = epoch_millis()?;
+		if binding
+			.sender
+			.send(omp_agent::Up::Env(omp_agent::EnvEvent::CheckpointRewind {
+				token: active.token.clone(),
+				report: report.clone(),
+				receipt: receipt.clone(),
+				workspace: restored.clone(),
+				rewound_at,
 			}))
-			.map_err(|_| checkpoint_fault(sf!("active Agent mailbox is closed")))?;
+			.is_err()
+		{
+			rollback_workspace(&workspace, &restored).await;
+			return Err(checkpoint_fault(
+				checkpoint::FaultCode::Control,
+				"active Agent mailbox is closed",
+			));
+		}
 		*self.active_checkpoint.write() = None;
-		Ok(ack)
+		*self.last_completed.write() = true;
+		Ok(omp_tools::checkpoint::RewindAck {
+			token: active.token,
+			receipt,
+			workspace: checkpoint_restore(&restored),
+		})
 	}
 }
 
-fn checkpoint_fault(message: Str) -> omp_tools::checkpoint::CheckpointFault {
-	omp_tools::checkpoint::CheckpointFault { code: checkpoint::FaultCode::Control, message }
+async fn rollback_workspace(
+	workspace: &CheckpointWorkspace,
+	restored: &env_wire::WorkspaceRestored,
+) {
+	if restored.undo_snapshot_id.is_empty() {
+		return;
+	}
+	let rollback_cancel = CancellationToken::new();
+	let rollback = workspace
+		.restore(
+			env_wire::RestoreWorkspace {
+				snapshot_id: restored.undo_snapshot_id.clone(),
+				scope: "checkpoint-rollback".to_owned(),
+				wire_revision: omp_proto::SCHEMA_REV,
+				..Default::default()
+			},
+			&rollback_cancel,
+		)
+		.await;
+	if rollback.as_ref().is_err()
+		|| rollback
+			.as_ref()
+			.is_ok_and(|value| value.partial || !value.conflicts.is_empty())
+	{
+		tracing::error!(
+			snapshot = %restored.undo_snapshot_id,
+			"checkpoint restoration and automatic rollback both failed"
+		);
+	}
+}
+
+fn epoch_millis() -> Result<u64, omp_tools::checkpoint::CheckpointFault> {
+	let elapsed = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map_err(|source| {
+			tracing::warn!(?source, "checkpoint clock is before the Unix epoch");
+			checkpoint_fault(checkpoint::FaultCode::Control, "system clock is unavailable")
+		})?;
+	Ok(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn local_snapshot_fault(source: WorkspaceOperationError) -> omp_tools::checkpoint::CheckpointFault {
+	let cancelled = matches!(
+		&source,
+		WorkspaceOperationError::Workspace(crate::workspace::WorkspaceError::Cancelled)
+	);
+	tracing::warn!(?source, "checkpoint workspace snapshot failed");
+	if cancelled {
+		checkpoint_fault(checkpoint::FaultCode::RestoreCancelled, "workspace snapshot was cancelled")
+	} else {
+		checkpoint_fault(checkpoint::FaultCode::SnapshotFailed, "workspace snapshot failed")
+	}
+}
+
+fn local_workspace_fault(
+	source: WorkspaceOperationError,
+) -> omp_tools::checkpoint::CheckpointFault {
+	let cancelled = matches!(
+		&source,
+		WorkspaceOperationError::Workspace(crate::workspace::WorkspaceError::Cancelled)
+	);
+	tracing::warn!(?source, "checkpoint workspace operation failed");
+	if cancelled {
+		checkpoint_fault(checkpoint::FaultCode::RestoreCancelled, "workspace operation was cancelled")
+	} else {
+		checkpoint_fault(checkpoint::FaultCode::RestoreFailed, "workspace operation failed")
+	}
+}
+
+fn ensure_complete_restore(
+	restored: &env_wire::WorkspaceRestored,
+) -> Result<(), omp_tools::checkpoint::CheckpointFault> {
+	if restored.partial {
+		return Err(checkpoint_fault(
+			checkpoint::FaultCode::RestoreFailed,
+			"workspace restoration partially committed; the undo snapshot was retained",
+		));
+	}
+	if !restored.conflicts.is_empty() {
+		return Err(omp_tools::checkpoint::CheckpointFault {
+			code:    checkpoint::FaultCode::RestoreConflict,
+			message: sf!(
+				"workspace restoration blocked by {} conflict(s), first at {}",
+				restored.conflicts.len(),
+				restored.conflicts[0].path
+			),
+		});
+	}
+	Ok(())
+}
+
+fn checkpoint_snapshot(
+	snapshot: &env_wire::WorkspaceSnapshot,
+) -> omp_tools::checkpoint::WorkspaceSnapshot {
+	omp_tools::checkpoint::WorkspaceSnapshot {
+		snapshot_id: Str::new(&snapshot.snapshot_id),
+		root_uri:    Str::new(&snapshot.root_uri),
+		generation:  snapshot.generation,
+		tree_hash:   Str::new(&snapshot.tree_hash),
+		files:       snapshot.files,
+		bytes:       snapshot.bytes,
+	}
+}
+
+fn checkpoint_restore(
+	restored: &env_wire::WorkspaceRestored,
+) -> omp_tools::checkpoint::WorkspaceRestore {
+	omp_tools::checkpoint::WorkspaceRestore {
+		snapshot_id:      Str::new(&restored.snapshot_id),
+		undo_snapshot_id: Str::new(&restored.undo_snapshot_id),
+		written:          restored.written,
+		deleted:          restored.deleted,
+		unchanged:        restored.unchanged,
+		from_generation:  restored.from_generation,
+		to_generation:    restored.to_generation,
+	}
+}
+
+fn checkpoint_fault(
+	code: checkpoint::FaultCode,
+	message: &'static str,
+) -> omp_tools::checkpoint::CheckpointFault {
+	omp_tools::checkpoint::CheckpointFault { code, message: sf!(message) }
 }
 
 pub(super) fn python_engine() -> Result<Arc<omp_py::Engine>, EnvdError> {
@@ -5131,6 +5530,61 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn checkpoint_cache_rehydrates_from_the_selected_branch_and_clears_on_switch() {
+		let control = AgentCheckpointControl::default();
+		let (sender, _mailbox) = flume::unbounded();
+		control.bind(7, sender);
+		let mut dom = omp_dom::Dom::new();
+		dom.apply(&omp_dom::Txn {
+			cause: omp_journal::EntryId::default(),
+			label: None,
+			ops:   vec![omp_dom::Op::Ins {
+				parent: dom.meta(),
+				after:  None,
+				node:   omp_dom::NodeSpec::new(omp_dom::Tag::Custom(sf!("rewind-checkpoint")))
+					.with_prop(
+						omp_dom::PropKey::Custom(sf!("token")),
+						omp_dom::Value::Str(sf!("checkpoint-1")),
+					)
+					.with_prop(
+						omp_dom::PropKey::Custom(sf!("workspace-snapshot")),
+						omp_dom::Value::Str(sf!("snapshot-1")),
+					)
+					.with_prop(
+						omp_dom::PropKey::Custom(sf!("workspace-generation")),
+						omp_dom::Value::Int(3),
+					)
+					.with_prop(
+						omp_dom::PropKey::Custom(sf!("workspace-root")),
+						omp_dom::Value::Str(sf!("file:///workspace")),
+					)
+					.with_prop(
+						omp_dom::PropKey::Custom(sf!("workspace-tree")),
+						omp_dom::Value::Str(sf!("tree")),
+					)
+					.with_prop(omp_dom::PropKey::Custom(sf!("workspace-files")), omp_dom::Value::Int(2))
+					.with_prop(omp_dom::PropKey::Custom(sf!("workspace-bytes")), omp_dom::Value::Int(12))
+					.with_prop(omp_dom::PropKey::Custom(sf!("started-at")), omp_dom::Value::Int(42)),
+			}],
+		})
+		.expect("checkpoint DOM");
+
+		control.restore_session(7, &dom);
+		let active = control.active_checkpoint.read();
+		assert_eq!(active.as_ref().map(|value| value.token.as_str()), Some("checkpoint-1"));
+		assert_eq!(
+			active
+				.as_ref()
+				.map(|value| value.snapshot.snapshot_id.as_str()),
+			Some("snapshot-1")
+		);
+		drop(active);
+
+		control.restore_session(7, &omp_dom::Dom::new());
+		assert!(control.active_checkpoint.read().is_none());
+	}
+
+	#[test]
 	fn skills_enabled_gates_managed_skill_runtime() {
 		let ctx = Ctx::new();
 		assert!(managed_skills_enabled(&ctx, true));
@@ -5279,9 +5733,14 @@ mod tests {
 		catalog
 			.install_registry(Arc::clone(&registry))
 			.expect("install device catalog");
-		let devices = catalog
-			.registry()
-			.expect("live catalog")
+		let live = catalog.registry().expect("live catalog");
+		let lsp = live
+			.devices()
+			.find(|device| device.name.as_str() == "lsp")
+			.expect("LSP dynamic device");
+		assert_eq!(lsp.rev.n, 3);
+		assert_eq!(lsp.schema, omp_tools::lsp::spec().schema.as_ref());
+		let devices = live
 			.devices()
 			.map(|device| device.name.clone())
 			.collect::<BTreeSet<_>>();

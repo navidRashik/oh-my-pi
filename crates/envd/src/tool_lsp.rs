@@ -1,7 +1,8 @@
-//! Production bridge from `lsp@2` to the project document authority.
+//! Production bridge from `lsp@3` to the project document authority.
 
 use std::{
 	collections::HashMap,
+	fs,
 	future::Future,
 	path::{Component, Path, PathBuf},
 	str,
@@ -10,8 +11,12 @@ use std::{
 };
 
 use bytes::Bytes;
+use globset::Glob;
 use omp_core::Str;
-use omp_docserver::position::{PositionEncoding, TextEdit, apply_text_edits};
+use omp_docserver::{
+	diagnostics::parse_pull,
+	position::{PositionEncoding, TextEdit, apply_text_edits},
+};
 use omp_proto::{
 	document::v1::{
 		self as pb, commit_transaction_response, document_mutation, lsp_response, text_mutation,
@@ -22,7 +27,7 @@ use omp_tools::lsp::{
 	Action, Fault, LspControl, Params, Payload, WorkspaceSymbolOutcome, actions,
 	aggregate_workspace_symbols,
 	checkers::{self, CheckerExecutor, CheckerFault, CheckerOutput, CheckerRequest, Preset},
-	diagnostics::{DiagnosticResult, render as render_diagnostics},
+	diagnostics::{DiagnosticResult, MAX_GLOB_TARGETS, render as render_diagnostics},
 	navigation, refactor, render,
 };
 use parking_lot::Mutex;
@@ -35,6 +40,8 @@ use super::{
 	exec::{ExecEvent, ExecHost},
 	tool_document::{read_whole, transaction_id},
 };
+
+const CHECKER_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ExecChecker {
@@ -108,10 +115,10 @@ impl CheckerExecutor for ExecChecker {
 				};
 				match event {
 					Some(ExecEvent::Output(frame)) if frame.channel == OutputChannel::Stdout as i32 => {
-						stdout.extend_from_slice(&frame.data);
+						append_checker_bytes(&mut stdout, &frame.data);
 					},
 					Some(ExecEvent::Output(frame)) if frame.channel == OutputChannel::Stderr as i32 => {
-						stderr.extend_from_slice(&frame.data);
+						append_checker_bytes(&mut stderr, &frame.data);
 					},
 					Some(ExecEvent::Exit(exit)) => break exit.status,
 					Some(ExecEvent::Started { .. } | ExecEvent::Output(_)) => {},
@@ -127,8 +134,8 @@ impl CheckerExecutor for ExecChecker {
 			}
 			Ok(CheckerOutput {
 				status: status.exit_code,
-				stdout: bounded_checker_output(&stdout, request.line_limit),
-				stderr: bounded_checker_output(&stderr, request.line_limit),
+				stdout: checker_output(&stdout),
+				stderr: checker_output(&stderr),
 			})
 		}
 	}
@@ -159,14 +166,13 @@ fn shell_quote(value: &str) -> String {
 	format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn bounded_checker_output(bytes: &[u8], limit: usize) -> Str {
-	Str::from(
-		String::from_utf8_lossy(bytes)
-			.lines()
-			.take(limit)
-			.collect::<Vec<_>>()
-			.join("\n"),
-	)
+fn append_checker_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+	let remaining = CHECKER_CAPTURE_BYTES.saturating_sub(output.len());
+	output.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+}
+
+fn checker_output(bytes: &[u8]) -> Str {
+	Str::from(String::from_utf8_lossy(bytes).as_ref())
 }
 
 fn merge_workspace_edits(edits: &[Value], renamed: Option<(&str, &str)>) -> Result<Value, Fault> {
@@ -215,9 +221,119 @@ fn append_text_edits(
 }
 
 fn rewrite_uri(uri: &str, renamed: Option<(&str, &str)>) -> String {
-	renamed
-		.filter(|(source, _)| *source == uri)
-		.map_or_else(|| uri.to_owned(), |(_, destination)| destination.to_owned())
+	let Some((source, destination)) = renamed else {
+		return uri.to_owned();
+	};
+	if uri == source {
+		return destination.to_owned();
+	}
+	uri.strip_prefix(source)
+		.filter(|suffix| suffix.starts_with('/'))
+		.map_or_else(|| uri.to_owned(), |suffix| format!("{destination}{suffix}"))
+}
+
+fn resolve_diagnostic_targets(
+	root: &Path,
+	pattern: &str,
+	cancel: Option<&CancellationToken>,
+) -> Result<(Vec<String>, bool), Fault> {
+	const MAX_ENTRIES: usize = 100_000;
+	if !pattern
+		.bytes()
+		.any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'{'))
+	{
+		return Ok((vec![pattern.to_owned()], false));
+	}
+	let matcher = Glob::new(pattern)
+		.map_err(|_| Fault::InvalidArguments)?
+		.compile_matcher();
+	let mut directories = vec![root.to_path_buf()];
+	let mut targets = Vec::new();
+	let mut visited = 0_usize;
+	let mut truncated = false;
+	while let Some(directory) = directories.pop() {
+		for entry in fs::read_dir(directory).map_err(|_| Fault::WorkspaceEdit)? {
+			if cancel.is_some_and(CancellationToken::is_cancelled) {
+				return Err(Fault::Cancelled);
+			}
+			let entry = entry.map_err(|_| Fault::WorkspaceEdit)?;
+			visited = visited.saturating_add(1);
+			if visited > MAX_ENTRIES {
+				truncated = true;
+				break;
+			}
+			let file_type = entry.file_type().map_err(|_| Fault::WorkspaceEdit)?;
+			if file_type.is_symlink() {
+				continue;
+			}
+			let path = entry.path();
+			if file_type.is_dir() {
+				if !matches!(
+					path.file_name().and_then(|name| name.to_str()),
+					Some(".git" | "node_modules")
+				) {
+					directories.push(path);
+				}
+			} else if file_type.is_file() {
+				let relative = path.strip_prefix(root).map_err(|_| Fault::WorkspaceEdit)?;
+				if matcher.is_match(relative) {
+					targets.push(relative.to_string_lossy().replace('\\', "/"));
+				}
+			}
+		}
+		if visited > MAX_ENTRIES {
+			break;
+		}
+	}
+	targets.sort();
+	if targets.len() > MAX_GLOB_TARGETS {
+		targets.truncate(MAX_GLOB_TARGETS);
+		truncated = true;
+	}
+	Ok((targets, truncated))
+}
+
+fn enumerate_directory_rename_pairs(
+	source: &Path,
+	destination: &Path,
+	cancel: Option<&CancellationToken>,
+) -> Result<Vec<(String, String)>, Fault> {
+	const MAX_RENAME_PAIRS: usize = 1_000;
+	let mut directories = vec![source.to_path_buf()];
+	let mut pairs = Vec::new();
+	while let Some(directory) = directories.pop() {
+		let entries = fs::read_dir(&directory).map_err(|_| Fault::WorkspaceEdit)?;
+		for entry in entries {
+			if cancel.is_some_and(CancellationToken::is_cancelled) {
+				return Err(Fault::Cancelled);
+			}
+			let entry = entry.map_err(|_| Fault::WorkspaceEdit)?;
+			let file_type = entry.file_type().map_err(|_| Fault::WorkspaceEdit)?;
+			if file_type.is_symlink() {
+				continue;
+			}
+			let path = entry.path();
+			if file_type.is_dir() {
+				directories.push(path);
+				continue;
+			}
+			if !file_type.is_file() {
+				continue;
+			}
+			if pairs.len() == MAX_RENAME_PAIRS {
+				return Err(Fault::WorkspaceEdit);
+			}
+			let relative = path
+				.strip_prefix(source)
+				.map_err(|_| Fault::WorkspaceEdit)?;
+			let next = destination.join(relative);
+			let old_uri = Url::from_file_path(&path).map_err(|()| Fault::WorkspaceEdit)?;
+			let new_uri = Url::from_file_path(next).map_err(|()| Fault::WorkspaceEdit)?;
+			pairs.push((old_uri.to_string(), new_uri.to_string()));
+		}
+	}
+	pairs.sort();
+	Ok(pairs)
 }
 fn reload_notification(binding: &pb::LspServerBinding) -> pb::LspNotificationRequest {
 	pb::LspNotificationRequest {
@@ -233,6 +349,15 @@ fn parse_request_payload(payload: Option<&str>) -> Result<Value, Fault> {
 		.transpose()
 		.map_err(|_| Fault::InvalidArguments)
 		.map(|value| value.unwrap_or_else(|| json!({})))
+}
+
+fn render_raw_response(server: &str, method: &str, data: &Value) -> Result<Str, Fault> {
+	let body = match data {
+		Value::String(text) => text.clone(),
+		Value::Null => String::from("null"),
+		_ => serde_json::to_string_pretty(data).map_err(|_| Fault::Server)?,
+	};
+	Ok(Str::from(format!("{server} \u{2190} {method}:\n{body}")))
 }
 
 /// Environment-owned implementation of the revisioned LSP tool.
@@ -286,6 +411,9 @@ impl DocumentLspControl {
 			.get("changes")
 			.and_then(Value::as_object)
 			.ok_or(Fault::WorkspaceEdit)?;
+		if changes.is_empty() {
+			return Ok(0);
+		}
 		let mut operations = Vec::with_capacity(changes.len());
 		for (uri, edits) in changes {
 			let lease = self
@@ -326,6 +454,295 @@ impl DocumentLspControl {
 			},
 			_ => Err(Fault::WorkspaceEdit),
 		}
+	}
+
+	async fn diagnostics(
+		&self,
+		pattern: &str,
+		cancel: &CancellationToken,
+	) -> Result<Payload, Fault> {
+		let root = Url::parse(self.documents.hello().root_uri.as_str())
+			.map_err(|_| Fault::Unavailable)?
+			.to_file_path()
+			.map_err(|()| Fault::Unavailable)?;
+		let authored_pattern = pattern.to_owned();
+		let scan_pattern = authored_pattern.clone();
+		let (targets, truncated) = {
+			let cancel = cancel.clone();
+			tokio::task::spawn_blocking(move || {
+				resolve_diagnostic_targets(&root, &scan_pattern, Some(&cancel))
+			})
+		}
+		.await
+		.map_err(|_| Fault::Server)??;
+		if targets.is_empty() {
+			return Ok(Payload {
+				action:  Action::Diagnostics,
+				servers: Vec::new(),
+				output:  Str::from(format!("No files matched pattern: {authored_pattern}")),
+				data:    json!({"diagnostics": [], "complete": true, "truncatedTargets": false}),
+			});
+		}
+		let mut diagnostics = Vec::new();
+		let mut servers = Vec::new();
+		let mut complete = !truncated;
+		for target in &targets {
+			if cancel.is_cancelled() {
+				return Err(Fault::Cancelled);
+			}
+			let uri = self.file_uri(target)?;
+			let lease = self
+				.documents
+				.open(Str::from(uri.as_str()), None, cancel)
+				.await
+				.map_err(|_| Fault::Unavailable)?;
+			let bindings = self
+				.documents
+				.get_lsp_bindings(
+					pb::GetLspBindingsRequest { document: Some(lease_target(&lease)) },
+					cancel,
+				)
+				.await
+				.map_err(|_| Fault::Server)?
+				.bindings;
+			if bindings.is_empty() {
+				complete = false;
+				continue;
+			}
+			for binding in bindings {
+				let request = json!({"textDocument": {"uri": uri.as_str()}});
+				let response = self
+					.documents
+					.lsp_request(
+						pb::LspRequest {
+							server_id:    binding.server_id.clone(),
+							method:       "textDocument/diagnostic".into(),
+							params_json:  Bytes::from(
+								serde_json::to_vec(&request).map_err(|_| Fault::InvalidArguments)?,
+							),
+							document:     Some(lease_target(&lease)),
+							revision:     lease.head().revision.clone(),
+							stale_policy: pb::LspStalePolicy::Fail as i32,
+						},
+						cancel,
+					)
+					.await;
+				let Ok(response) = response else {
+					complete = false;
+					continue;
+				};
+				let Some(lsp_response::Outcome::ResultJson(bytes)) = response.outcome else {
+					complete = false;
+					continue;
+				};
+				match parse_pull(Str::from(uri.as_str()), &bytes, binding.name.as_str()) {
+					Ok(Some(mut findings)) => {
+						servers.push(Str::from(binding.name.as_str()));
+						diagnostics.append(&mut findings);
+					},
+					Ok(None) | Err(_) => complete = false,
+				}
+			}
+		}
+		servers.sort();
+		servers.dedup();
+		let result = DiagnosticResult::new(diagnostics, complete);
+		let output = render_diagnostics(&result);
+		let data = json!({
+			"targets": targets,
+			"truncatedTargets": truncated,
+			"diagnostics": result.diagnostics,
+			"omitted": result.omitted,
+			"complete": result.complete,
+		});
+		Ok(Payload { action: Action::Diagnostics, servers, output, data })
+	}
+
+	async fn rename_directory(
+		&self,
+		source: Url,
+		destination: Url,
+		apply: Option<bool>,
+		cancel: &CancellationToken,
+	) -> Result<Payload, Fault> {
+		let source_path = source.to_file_path().map_err(|()| Fault::WorkspaceEdit)?;
+		let destination_path = destination
+			.to_file_path()
+			.map_err(|()| Fault::WorkspaceEdit)?;
+		let workspace_path = Url::parse(self.documents.hello().root_uri.as_str())
+			.map_err(|_| Fault::WorkspaceEdit)?
+			.to_file_path()
+			.map_err(|()| Fault::WorkspaceEdit)?;
+		let scan_cancel = cancel.clone();
+		let pairs = tokio::task::spawn_blocking(move || {
+			let workspace = fs::canonicalize(workspace_path).map_err(|_| Fault::WorkspaceEdit)?;
+			let metadata = fs::symlink_metadata(&source_path).map_err(|_| Fault::WorkspaceEdit)?;
+			if metadata.file_type().is_symlink() {
+				return Err(Fault::WorkspaceEdit);
+			}
+			let canonical = fs::canonicalize(&source_path).map_err(|_| Fault::WorkspaceEdit)?;
+			if !canonical.starts_with(&workspace) {
+				return Err(Fault::WorkspaceEdit);
+			}
+			enumerate_directory_rename_pairs(&canonical, &destination_path, Some(&scan_cancel))
+		})
+		.await
+		.map_err(|_| Fault::WorkspaceEdit)??;
+		let params = json!({
+			"files": pairs.iter().map(|(old_uri, new_uri)| {
+				json!({ "oldUri": old_uri, "newUri": new_uri })
+			}).collect::<Vec<_>>(),
+		});
+		let mut bindings = HashMap::<Vec<u8>, pb::LspServerBinding>::new();
+		for (old_uri, _) in &pairs {
+			if cancel.is_cancelled() {
+				return Err(Fault::Cancelled);
+			}
+			let lease = self
+				.documents
+				.open(Str::from(old_uri.as_str()), None, cancel)
+				.await
+				.map_err(|_| Fault::WorkspaceEdit)?;
+			for binding in self
+				.documents
+				.get_lsp_bindings(
+					pb::GetLspBindingsRequest { document: Some(lease_target(&lease)) },
+					cancel,
+				)
+				.await
+				.map_err(|_| Fault::Server)?
+				.bindings
+			{
+				bindings
+					.entry(binding.server_id.to_vec())
+					.or_insert(binding);
+			}
+		}
+		let mut bindings = bindings.into_values().collect::<Vec<_>>();
+		bindings.sort_by(|left, right| left.name.cmp(&right.name));
+		let mut edits = Vec::new();
+		for binding in &bindings {
+			let response = self
+				.documents
+				.lsp_request(
+					pb::LspRequest {
+						server_id:    binding.server_id.clone(),
+						method:       "workspace/willRenameFiles".into(),
+						params_json:  Bytes::from(
+							serde_json::to_vec(&params).map_err(|_| Fault::InvalidArguments)?,
+						),
+						document:     None,
+						revision:     None,
+						stale_policy: pb::LspStalePolicy::Fail as i32,
+					},
+					cancel,
+				)
+				.await
+				.map_err(|_| Fault::Server)?;
+			match response.outcome {
+				Some(lsp_response::Outcome::ResultJson(bytes)) => {
+					let edit: Value = serde_json::from_slice(&bytes).map_err(|_| Fault::Server)?;
+					if !edit.is_null() {
+						edits.push(edit);
+					}
+				},
+				Some(lsp_response::Outcome::Error(error)) if error.code == -32_601 => {},
+				Some(lsp_response::Outcome::Error(_)) | None => return Err(Fault::Server),
+			}
+		}
+		let preview = merge_workspace_edits(&edits, None)?;
+		let servers = bindings
+			.iter()
+			.map(|binding| Str::from(binding.name.as_str()))
+			.collect::<Vec<_>>();
+		let data = json!({
+			"oldUri": source.as_str(),
+			"newUri": destination.as_str(),
+			"directory": true,
+			"files": params["files"],
+			"workspaceEdit": preview,
+		});
+		if apply == Some(false) {
+			return Ok(Payload {
+				action: Action::RenameFile,
+				servers,
+				output: Str::from(format!(
+					"Rename preview: {} file(s) under {} -> {}",
+					pairs.len(),
+					source.path(),
+					destination.path(),
+				)),
+				data,
+			});
+		}
+		self
+			.documents
+			.rename(
+				pb::RenamePathRequest {
+					source_uri:           source.to_string(),
+					destination_uri:      destination.to_string(),
+					overwrite:            pb::DestinationOverwritePolicy::FailIfExists as i32,
+					source_revision:      None,
+					destination_revision: None,
+				},
+				cancel,
+			)
+			.await
+			.map_err(|_| Fault::WorkspaceEdit)?;
+		let committed = merge_workspace_edits(&edits, Some((source.as_str(), destination.as_str())))?;
+		let encoding = bindings
+			.first()
+			.and_then(|binding| binding.sync_policy.as_ref())
+			.map(|policy| PositionEncoding::from_lsp_name(Some(&policy.position_encoding)))
+			.unwrap_or_default();
+		if !edits.is_empty()
+			&& self
+				.apply_workspace_edit(&committed, encoding, cancel)
+				.await
+				.is_err()
+		{
+			self
+				.documents
+				.rename(
+					pb::RenamePathRequest {
+						source_uri:           destination.to_string(),
+						destination_uri:      source.to_string(),
+						overwrite:            pb::DestinationOverwritePolicy::FailIfExists as i32,
+						source_revision:      None,
+						destination_revision: None,
+					},
+					cancel,
+				)
+				.await
+				.map_err(|_| Fault::WorkspaceEdit)?;
+			return Err(Fault::WorkspaceEdit);
+		}
+		for binding in &bindings {
+			let _ = self
+				.documents
+				.lsp_notification(
+					pb::LspNotificationRequest {
+						server_id:   binding.server_id.clone(),
+						method:      "workspace/didRenameFiles".into(),
+						params_json: Bytes::from(
+							serde_json::to_vec(&params).map_err(|_| Fault::InvalidArguments)?,
+						),
+					},
+					cancel,
+				)
+				.await;
+		}
+		Ok(Payload {
+			action: Action::RenameFile,
+			servers,
+			output: Str::from(format!(
+				"Renamed {} file(s) under {} to {} with import updates",
+				pairs.len(),
+				source.path(),
+				destination.path(),
+			)),
+			data,
+		})
 	}
 
 	async fn workspace_symbols(
@@ -430,12 +847,8 @@ impl DocumentLspControl {
 			},
 			Some(lsp_response::Outcome::Error(_)) | None => return Err(Fault::Server),
 		};
-		Ok(Payload {
-			action: Action::Request,
-			servers: vec![Str::from(server.name)],
-			output: render::structured(&data, 200),
-			data,
-		})
+		let output = render_raw_response(&server.name, method, &data)?;
+		Ok(Payload { action: Action::Request, servers: vec![Str::from(server.name)], output, data })
 	}
 
 	async fn workspace_diagnostics(&self, cancel: &CancellationToken) -> Result<Payload, Fault> {
@@ -601,7 +1014,7 @@ impl LspControl for DocumentLspControl {
 						.lsp_status(
 							pb::LspStatusRequest {
 								reload: params.action == Action::Reload,
-								start:  false,
+								start:  params.action == Action::Reload,
 							},
 							&cancel,
 						)
@@ -615,52 +1028,17 @@ impl LspControl for DocumentLspControl {
 				}
 				return Err(Fault::InvalidArguments);
 			}
+			if params.action == Action::Diagnostics {
+				return self.diagnostics(file, &cancel).await;
+			}
 			if params.action == Action::RenameFile
 				&& uri.to_file_path().is_ok_and(|path| path.is_dir())
 			{
 				let destination =
 					self.file_uri(params.new_name.as_deref().ok_or(Fault::InvalidArguments)?)?;
-				let data = json!({
-					"oldUri": uri.as_str(),
-					"newUri": destination.as_str(),
-					"directory": true,
-				});
-				if params.apply == Some(false) {
-					return Ok(Payload {
-						action: params.action,
-						servers: Vec::new(),
-						output: Str::from(format!(
-							"Would rename directory {} to {}",
-							uri.path(),
-							destination.path(),
-						)),
-						data,
-					});
-				}
-				self
-					.documents
-					.rename(
-						pb::RenamePathRequest {
-							source_uri:           uri.to_string(),
-							destination_uri:      destination.to_string(),
-							overwrite:            pb::DestinationOverwritePolicy::FailIfExists as i32,
-							source_revision:      None,
-							destination_revision: None,
-						},
-						&cancel,
-					)
-					.await
-					.map_err(|_| Fault::WorkspaceEdit)?;
-				return Ok(Payload {
-					action: params.action,
-					servers: Vec::new(),
-					output: Str::from(format!(
-						"Renamed directory {} to {}",
-						uri.path(),
-						destination.path(),
-					)),
-					data,
-				});
+				return self
+					.rename_directory(uri, destination, params.apply, &cancel)
+					.await;
 			}
 			let lease = self
 				.documents
@@ -676,7 +1054,17 @@ impl LspControl for DocumentLspControl {
 				.await
 				.map_err(|_| Fault::Server)?
 				.bindings;
-			let selected = bindings;
+			let mut selected = bindings;
+			if !matches!(
+				params.action,
+				Action::Diagnostics | Action::RenameFile | Action::Capabilities
+			) {
+				// The registry is priority ordered. Pi routes semantic
+				// navigation/refactors and raw requests through the primary
+				// type-aware server; only diagnostics, capabilities, and
+				// file-rename notifications fan out to every applicable binding.
+				selected.truncate(1);
+			}
 			if selected.is_empty() {
 				return Err(Fault::Unavailable);
 			}
@@ -741,11 +1129,15 @@ impl LspControl for DocumentLspControl {
 						)
 						.await
 						.map_err(|_| Fault::Server)?;
-					if let Some(lsp_response::Outcome::ResultJson(bytes)) = response.outcome {
-						let edit: Value = serde_json::from_slice(&bytes).map_err(|_| Fault::Server)?;
-						if !edit.is_null() {
-							edits.push(edit);
-						}
+					match response.outcome {
+						Some(lsp_response::Outcome::ResultJson(bytes)) => {
+							let edit: Value = serde_json::from_slice(&bytes).map_err(|_| Fault::Server)?;
+							if !edit.is_null() {
+								edits.push(edit);
+							}
+						},
+						Some(lsp_response::Outcome::Error(error)) if error.code == -32_601 => {},
+						Some(lsp_response::Outcome::Error(_)) | None => return Err(Fault::Server),
 					}
 				}
 				let preview_edit = merge_workspace_edits(&edits, None)?;
@@ -843,7 +1235,7 @@ impl LspControl for DocumentLspControl {
 				return Ok(Payload {
 					action: params.action,
 					servers,
-					output: render::structured(&data, 50),
+					output: render::structured(&data, usize::MAX),
 					data,
 				});
 			}
@@ -895,6 +1287,8 @@ impl LspControl for DocumentLspControl {
 				actions::method(params.action).ok_or(Fault::InvalidArguments)?
 			};
 			let mut results = Vec::new();
+			let mut pulled_diagnostics = Vec::new();
+			let mut diagnostics_complete = true;
 			let mut workspace_outcomes = Vec::new();
 			for binding in &selected {
 				let encoding = binding
@@ -936,7 +1330,13 @@ impl LspControl for DocumentLspControl {
 				}
 				if params.action == Action::CodeActions {
 					request_params["range"] = json!({ "start": { "line": line - 1, "character": character }, "end": { "line": line - 1, "character": character } });
-					request_params["context"] = json!({ "diagnostics": [], "triggerKind": 1 });
+					let mut context = json!({ "diagnostics": [], "triggerKind": 1 });
+					if params.apply != Some(true)
+						&& let Some(query) = params.query.as_deref()
+					{
+						context["only"] = json!([query]);
+					}
+					request_params["context"] = context;
 				}
 				let response = self
 					.documents
@@ -986,10 +1386,28 @@ impl LspControl for DocumentLspControl {
 				let response = response.map_err(|_| Fault::Server)?;
 				match response.outcome {
 					Some(lsp_response::Outcome::ResultJson(bytes)) => {
+						if params.action == Action::Diagnostics {
+							match parse_pull(Str::from(uri.as_str()), &bytes, binding.name.as_str())
+								.map_err(|_| Fault::Server)?
+							{
+								Some(mut diagnostics) => pulled_diagnostics.append(&mut diagnostics),
+								None => diagnostics_complete = false,
+							}
+						}
 						results.push(serde_json::from_slice(&bytes).map_err(|_| Fault::Server)?)
 					},
 					Some(lsp_response::Outcome::Error(_)) | None => return Err(Fault::Server),
 				}
+			}
+			if params.action == Action::Diagnostics {
+				let result = DiagnosticResult::new(pulled_diagnostics, diagnostics_complete);
+				let output = render_diagnostics(&result);
+				let data = json!({
+					"diagnostics": result.diagnostics,
+					"omitted": result.omitted,
+					"complete": result.complete,
+				});
+				return Ok(Payload { action: params.action, servers, output, data });
 			}
 			if workspace_symbols {
 				return aggregate_workspace_symbols(
@@ -1015,14 +1433,7 @@ impl LspControl for DocumentLspControl {
 					| Action::Implementation
 					| Action::References
 			) {
-				data = Value::Array(navigation::normalize_locations(
-					&data,
-					if params.action == Action::References {
-						200
-					} else {
-						50
-					},
-				));
+				data = Value::Array(navigation::normalize_locations(&data, usize::MAX));
 			}
 			if params.action == Action::Rename {
 				refactor::validate_workspace_edit(&data).map_err(|_| Fault::WorkspaceEdit)?;
@@ -1051,20 +1462,27 @@ impl LspControl for DocumentLspControl {
 					.collect::<Vec<_>>();
 				if params.apply == Some(true) {
 					let selector = params.query.as_deref().ok_or(Fault::InvalidArguments)?;
+					let selector_folded = selector.to_ascii_lowercase();
 					let index = selector
 						.parse::<usize>()
 						.ok()
-						.and_then(|index| index.checked_sub(1))
 						.or_else(|| {
 							actions.iter().position(|action| {
 								action
 									.get("title")
 									.and_then(Value::as_str)
-									.is_some_and(|title| title.eq_ignore_ascii_case(selector))
+									.is_some_and(|title| {
+										title
+											.to_ascii_lowercase()
+											.contains(selector_folded.as_str())
+									})
 							})
 						})
 						.ok_or(Fault::InvalidArguments)?;
 					let mut action = actions.get(index).cloned().ok_or(Fault::InvalidArguments)?;
+					if action.get("disabled").is_some() {
+						return Err(Fault::InvalidArguments);
+					}
 					let binding = selected.first().ok_or(Fault::Unavailable)?;
 					if action.get("data").is_some() {
 						let response = self
@@ -1153,8 +1571,17 @@ impl LspControl for DocumentLspControl {
 				Action::Hover => data
 					.get("contents")
 					.map_or_else(|| Str::from("No hover information"), navigation::hover_text),
+				Action::Definition => navigation::render_locations("definition", &data),
+				Action::TypeDefinition => navigation::render_locations("type definition", &data),
+				Action::Implementation => navigation::render_locations("implementation", &data),
+				Action::References => navigation::render_references(&data),
+				Action::Request => render_raw_response(
+					servers.first().map_or("lsp", Str::as_str),
+					params.query.as_deref().unwrap_or_default(),
+					&data,
+				)?,
 				Action::Rename => refactor::preview(&data),
-				_ => render::structured(&data, 200),
+				_ => render::structured(&data, usize::MAX),
 			};
 			Ok(Payload { action: params.action, servers, output, data })
 		}
@@ -1183,6 +1610,18 @@ mod tests {
 	}
 
 	#[test]
+	fn raw_request_projection_names_server_method_and_preserves_nested_json() {
+		let output = render_raw_response(
+			"rust-analyzer",
+			"rust-analyzer/expandMacro",
+			&json!({"name": "expanded", "nested": {"ok": true}}),
+		)
+		.expect("raw response");
+		assert!(output.starts_with("rust-analyzer \u{2190} rust-analyzer/expandMacro:\n"));
+		assert!(output.contains("\"nested\": {"));
+	}
+
+	#[test]
 	fn request_payload_is_real_json_or_an_empty_object() {
 		assert_eq!(parse_request_payload(None).expect("default payload"), json!({}));
 		assert_eq!(
@@ -1194,6 +1633,54 @@ mod tests {
 			json!(["literal", 1])
 		);
 		assert!(matches!(parse_request_payload(Some("{broken")), Err(Fault::InvalidArguments)));
+	}
+
+	#[test]
+	fn diagnostic_globs_are_sorted_bounded_and_skip_dependency_trees() {
+		let root = tempfile::tempdir().expect("diagnostic root");
+		fs::create_dir_all(root.path().join("src")).expect("source directory");
+		fs::create_dir_all(root.path().join("node_modules/pkg")).expect("dependency directory");
+		for index in (0..25).rev() {
+			fs::write(root.path().join(format!("src/{index:02}.ts")), "const x = 1;\n")
+				.expect("source file");
+		}
+		fs::write(root.path().join("node_modules/pkg/hidden.ts"), "bad").expect("dependency file");
+		let (targets, truncated) =
+			resolve_diagnostic_targets(root.path(), "**/*.ts", None).expect("glob targets");
+		assert!(truncated);
+		assert_eq!(targets.len(), 20);
+		assert_eq!(targets.first().map(String::as_str), Some("src/00.ts"));
+		assert_eq!(targets.last().map(String::as_str), Some("src/19.ts"));
+		assert!(!targets.iter().any(|path| path.contains("node_modules")));
+	}
+
+	#[test]
+	fn directory_rename_enumerates_regular_files_and_rewrites_nested_edit_uris() {
+		let root = tempfile::tempdir().expect("rename root");
+		let source = root.path().join("old");
+		let destination = root.path().join("new");
+		fs::create_dir_all(source.join("nested")).expect("nested source");
+		fs::write(source.join("a.rs"), "mod nested;\n").expect("source file");
+		fs::write(source.join("nested/b.rs"), "pub struct B;\n").expect("nested file");
+		let pairs =
+			enumerate_directory_rename_pairs(&source, &destination, None).expect("rename pairs");
+		assert_eq!(pairs.len(), 2);
+		assert!(pairs.iter().any(|(_, next)| next.ends_with("/new/a.rs")));
+		assert!(
+			pairs
+				.iter()
+				.any(|(_, next)| next.ends_with("/new/nested/b.rs"))
+		);
+
+		let old = Url::from_file_path(&source).expect("source URL");
+		let new = Url::from_file_path(&destination).expect("destination URL");
+		let nested = Url::from_file_path(source.join("nested/b.rs")).expect("nested URL");
+		assert_eq!(
+			rewrite_uri(nested.as_str(), Some((old.as_str(), new.as_str()))),
+			Url::from_file_path(destination.join("nested/b.rs"))
+				.expect("rewritten URL")
+				.to_string(),
+		);
 	}
 
 	#[test]

@@ -936,7 +936,7 @@ impl GitMutation {
 					&omp_vcs::PushOptions {
 						remote:           Some(remote.to_owned()),
 						refspec:          Some((*refspec).to_owned()),
-						force_with_lease: options.force_with_lease.is_some(),
+						force_with_lease: options.force_with_lease.map(str::to_owned),
 					},
 					Some(cancel.clone()),
 				)

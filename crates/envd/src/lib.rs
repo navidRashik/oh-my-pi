@@ -22,6 +22,7 @@ pub mod github_url;
 pub mod host_info;
 pub mod host_settings;
 mod http_egress;
+pub mod model_discovery;
 mod journal_runtime;
 pub mod lsp_settings;
 mod managed_skills;
@@ -123,9 +124,10 @@ use omp_tools::{
 };
 use parking_lot::{Mutex, RwLock};
 pub use presence::PresenceError;
-pub use server::{
-	AgentControlBinding, EnvServer, EnvdError, ExtensionDataBinding, document_user_config_root,
-};
+/// Generation-fenced lease routing environment checkpoint controls to one
+/// active Agent session.
+pub use server::AgentControlBinding;
+pub use server::{EnvServer, EnvdError, ExtensionDataBinding, document_user_config_root};
 pub use site::validate_trusted_module;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -187,7 +189,9 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("tools.eval_interpreters", "sv_tools_eval_interpreters"),
 	("tools.output_spill_bytes", "sv_tools_output_spill_bytes"),
 	("tools.output_max_bytes", "sv_tools_output_max_bytes"),
+	("inspect_image.timeoutMs", "sv_inspect_image_timeout_ms"),
 	("tools.intentTracing", "sv_tools_intent_tracing"),
+	("tools.abortOnFabricatedResult", "sv_tools_abort_on_fabricated_result"),
 	("tools.loop_guard_limit", "sv_tools_loop_guard_limit"),
 	("acp.routing", "sv_acp_routing"),
 	("async.enabled", "sv_async_enabled"),
@@ -574,6 +578,22 @@ impl McpInspectorHandle {
 		self.manager.inspector_snapshots()
 	}
 
+	/// Atomically snapshots the current MCP leaf catalog and subscribes to exact
+	/// tool/resource/prompt diffs which follow it.
+	pub fn subscribe_definitions(
+		&self,
+	) -> (
+		omp_tool::LeafCatalogSnapshot<mcp::McpLeaf>,
+		flume::Receiver<mcp::manager::McpDefinitionDiff>,
+	) {
+		self.manager.subscribe_definitions()
+	}
+
+	/// Subscribes to setting-gated, URI-debounced MCP resource updates.
+	pub fn subscribe_resource_updates(&self) -> flume::Receiver<mcp::manager::McpResourceUpdate> {
+		self.manager.subscribe_resource_updates()
+	}
+
 	/// Manually reconnects one server, clearing its burst circuit breaker
 	/// (`/mcp reconnect`, `/mcp test`).
 	pub async fn reconnect(&self, name: &str) -> Result<(), mcp::manager::ManagerError> {
@@ -592,17 +612,18 @@ impl McpInspectorHandle {
 		self.manager.clear_authorization(name).await
 	}
 
-	/// Runs a fresh OAuth grant while exposing the complete authorization URL
-	/// to the application shell.
+	/// Runs a cancellable fresh OAuth grant while exposing browser or device
+	/// authorization instructions to the application shell.
 	pub async fn reauthorize<F>(
 		&self,
 		name: &str,
 		present: F,
+		cancel: CancellationToken,
 	) -> Result<bool, mcp::manager::ManagerError>
 	where
-		F: Fn(&str) + Send + Sync,
+		F: for<'a> Fn(mcp::oauth::OAuthPresentation<'a>) + Send + Sync,
 	{
-		self.manager.reauthorize(name, &present).await
+		self.manager.reauthorize(name, &present, cancel).await
 	}
 }
 
@@ -1290,17 +1311,9 @@ impl ProjectEnvironment {
 			.bind_external_control_authorities(agents, domains)
 	}
 
-	/// Binds authenticated extension CONTROL to the active Agent Journal until
-	/// the returned sole-owner lease is dropped.
-	///
-	/// # Errors
-	///
-	/// Fails if a journal runtime is concurrently owned or an initial binding
-	/// is attempted after child activation began.
-	pub fn bind_agent_control(
-		&self,
-		sender: KernelSender,
-	) -> Result<server::AgentControlBinding, EnvdError> {
+	/// Binds checkpoint and staged-preview CONTROL to the active Agent Journal
+	/// until the returned sole-owner lease is dropped.
+	pub fn bind_agent_control(&self, sender: KernelSender) -> AgentControlBinding {
 		self.lifecycle.server.bind_agent_control(sender)
 	}
 

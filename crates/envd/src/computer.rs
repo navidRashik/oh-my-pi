@@ -3,9 +3,11 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use omp_con::Ctx;
 use omp_core::{ArtifactUrl, Str, sf};
 use omp_desktop::{
-	AxNode, AxQuery, AxSnapshotOptions, CaptureCaps, DesktopPoint, DesktopSession, Target,
+	AxNode, AxQuery, AxSnapshotOptions, CaptureCaps, DesktopPoint, DesktopSession,
+	DesktopSessionOptions, Target,
 };
 use omp_tools::computer::{Action, ComputerHost, Fault, NativeParams, Params, Payload};
 use parking_lot::Mutex;
@@ -13,17 +15,66 @@ use serde_json::{Map, Value, json};
 
 use super::blobs::{BlobError, BlobHost};
 
+omp_con::var! {
+	/// Native display id selected for the computer session, or `all` for the composite desktop.
+	pub static SV_COMPUTER_DISPLAY = sv_computer_display: Str {
+		default: Str::new_static("all"),
+		flags: archive,
+	};
+	/// Maximum width of a computer screenshot in pixels.
+	pub static SV_COMPUTER_MAX_WIDTH = sv_computer_max_width: u32 {
+		default: 3840,
+		min: 1,
+		flags: archive,
+	};
+	/// Maximum height of a computer screenshot in pixels.
+	pub static SV_COMPUTER_MAX_HEIGHT = sv_computer_max_height: u32 {
+		default: 2400,
+		min: 1,
+		flags: archive,
+	};
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ComputerSettings {
+	display:    Str,
+	max_width:  u32,
+	max_height: u32,
+}
+
+impl ComputerSettings {
+	fn from_con(con: &Ctx) -> Self {
+		Self {
+			display:    SV_COMPUTER_DISPLAY.get(con),
+			max_width:  SV_COMPUTER_MAX_WIDTH.get(con),
+			max_height: SV_COMPUTER_MAX_HEIGHT.get(con),
+		}
+	}
+}
+
 /// Persistent native desktop owner shared by every `computer` invocation in a
 /// session-scoped Environment registry.
 pub(crate) struct ComputerSessionHost {
-	session: DesktopSession,
-	blobs:   BlobHost,
-	state:   Mutex<Map<String, Value>>,
+	session:      DesktopSession,
+	capture_caps: CaptureCaps,
+	blobs:        BlobHost,
+	state:        Mutex<Map<String, Value>>,
 }
 
 impl ComputerSessionHost {
-	pub(crate) fn new(blobs: BlobHost) -> Arc<Self> {
-		Arc::new(Self { session: DesktopSession::new(None), blobs, state: Mutex::new(Map::new()) })
+	pub(crate) fn new(blobs: BlobHost, con: &Ctx) -> Arc<Self> {
+		let settings = ComputerSettings::from_con(con);
+		Arc::new(Self {
+			session: DesktopSession::new(Some(DesktopSessionOptions {
+				display: Some(settings.display.to_string()),
+			})),
+			capture_caps: CaptureCaps {
+				max_width:  Some(settings.max_width),
+				max_height: Some(settings.max_height),
+			},
+			blobs,
+			state: Mutex::new(Map::new()),
+		})
 	}
 }
 
@@ -143,8 +194,8 @@ impl ComputerSessionHost {
 				let capture = self
 					.session
 					.capture(target(&params), CaptureCaps {
-						max_width:  params.max_width,
-						max_height: params.max_height,
+						max_width:  bounded_cap(params.max_width, self.capture_caps.max_width),
+						max_height: bounded_cap(params.max_height, self.capture_caps.max_height),
 					})
 					.await
 					.map_err(native_fault)?;
@@ -741,6 +792,13 @@ fn require_arity_range(arguments: &[Value], minimum: usize, maximum: usize) -> R
 	}
 }
 
+fn bounded_cap(requested: Option<u32>, configured: Option<u32>) -> Option<u32> {
+	match configured {
+		Some(configured) => Some(requested.map_or(configured, |requested| requested.min(configured))),
+		None => requested,
+	}
+}
+
 fn target(params: &NativeParams) -> Target {
 	params
 		.window
@@ -809,9 +867,33 @@ fn blob_fault(error: BlobError) -> Fault {
 
 #[cfg(test)]
 mod tests {
+	use omp_con::Ctx;
+	use omp_core::Str;
 	use serde_json::{Map, json};
 
-	use super::{Action, Statement, evaluate_assertion, parse_program};
+	use super::{
+		Action, ComputerSettings, SV_COMPUTER_DISPLAY, SV_COMPUTER_MAX_HEIGHT,
+		SV_COMPUTER_MAX_WIDTH, Statement, bounded_cap, evaluate_assertion, parse_program,
+	};
+
+	#[test]
+	fn computer_settings_project_from_typed_convars() {
+		let con = Ctx::new();
+		SV_COMPUTER_DISPLAY
+			.set(&con, Str::new_static("display-2"))
+			.expect("set display");
+		SV_COMPUTER_MAX_WIDTH.set(&con, 1600).expect("set width");
+		SV_COMPUTER_MAX_HEIGHT.set(&con, 900).expect("set height");
+
+		assert_eq!(ComputerSettings::from_con(&con), ComputerSettings {
+			display:    Str::new_static("display-2"),
+			max_width:  1600,
+			max_height: 900,
+		});
+		assert_eq!(bounded_cap(None, Some(1600)), Some(1600));
+		assert_eq!(bounded_cap(Some(1200), Some(1600)), Some(1200));
+		assert_eq!(bounded_cap(Some(2000), Some(1600)), Some(1600));
+	}
 
 	#[test]
 	fn computer_program_composes_desktop_wait_and_assert() {

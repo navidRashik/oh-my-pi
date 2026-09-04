@@ -68,8 +68,7 @@ const SECRET_MARKERS: &[&str] =
 const MAX_RUNTIME_CWD_BYTES: usize = 16 * 1024;
 const MAX_MANAGED_ENV_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_MANAGED_ENV_BYTES: usize = 2 * 1024 * 1024;
-const MANAGED_ENV_KEYS: [&str; 3] =
-	["OMP_ARTIFACTS_DIR", "OMP_EVAL_LOCAL_ROOTS", "OMP_SESSION_FILE"];
+const MANAGED_ENV_KEYS: [&str; 1] = ["OMP_EVAL_LOCAL_ROOTS"];
 const EMBEDDED_INTERPRETER: &str = "embedded:cpython-3.14t";
 const EXTERNAL_RUNNER_SOURCE: &str = include_str!("external_runner.py");
 
@@ -337,7 +336,12 @@ impl ProcessEvalExec {
 		tokio::spawn(async move {
 			let _gate = gate;
 			if task_cancelled.is_cancelled() {
-				owned.needs_reset.store(true, Ordering::Release);
+				if forced_reset {
+					owned.needs_reset.store(true, Ordering::Release);
+				}
+				let _ = events_tx
+					.send_async(Ok(RunEvent::Completed(cancelled_completion(0))))
+					.await;
 				return;
 			}
 			let mut child_slot = owned.child.lock().await;
@@ -459,7 +463,13 @@ impl EvalRun for ProcessEvalRun {
 				self.terminal = true;
 				Err(error)
 			},
-			Err(_) => Ok(None),
+			Err(_) if self.terminal => Ok(None),
+			Err(_) => {
+				self.terminal = true;
+				Err(Fault::SessionLost {
+					message: sf!("Python eval supervisor exited without a terminal completion"),
+				})
+			},
 		}
 	}
 
@@ -793,6 +803,13 @@ impl EvalChild {
 					{
 						needs_reset.store(true, Ordering::Release);
 						cancel_bridge_tasks(&mut bridge_tasks).await;
+						let _ = events
+							.send_async(Err(Fault::SessionLost {
+								message: sf!(
+									"Python eval child exited during a host bridge progress update",
+								),
+							}))
+							.await;
 						return RunCellDisposition::Drop;
 					}
 					continue;
@@ -927,6 +944,13 @@ impl EvalChild {
 						{
 							needs_reset.store(true, Ordering::Release);
 							cancel_bridge_tasks(&mut bridge_tasks).await;
+							let _ = events
+								.send_async(Err(Fault::SessionLost {
+									message: sf!(
+										"Python eval child exited during a denied host bridge response",
+									),
+								}))
+								.await;
 							return RunCellDisposition::Drop;
 						}
 						continue;
@@ -958,6 +982,7 @@ impl EvalChild {
 				ChildFrame::Fatal { message } => {
 					needs_reset.store(true, Ordering::Release);
 					let _ = events.send_async(Err(Fault::SessionLost { message })).await;
+					return RunCellDisposition::Drop;
 				},
 				_ => {
 					needs_reset.store(true, Ordering::Release);
@@ -996,7 +1021,15 @@ impl EvalChild {
 			.await
 			.is_ok_and(|status| status.is_ok())
 		{
-			self.process_group.take();
+			#[cfg(unix)]
+			if let Some(pid) = self.process_group.take() {
+				let group = Pid::from_raw(pid.cast_signed());
+				if signal::killpg(group, None).is_ok() {
+					let _ = signal::killpg(group, signal::Signal::SIGKILL);
+				}
+			}
+			#[cfg(windows)]
+			let _ = self.process_group.take();
 			return;
 		}
 		let pid = self.process_group.take();
@@ -1012,6 +1045,13 @@ impl EvalChild {
 			.await
 			.is_ok_and(|status| status.is_ok())
 		{
+			#[cfg(unix)]
+			if let Some(pid) = pid {
+				let group = Pid::from_raw(pid.cast_signed());
+				if signal::killpg(group, None).is_ok() {
+					let _ = signal::killpg(group, signal::Signal::SIGKILL);
+				}
+			}
 			return;
 		}
 		#[cfg(unix)]
@@ -2051,6 +2091,20 @@ fn session_lost(error: ProcessError) -> Fault {
 mod tests {
 	use super::*;
 
+	#[tokio::test]
+	async fn run_channel_eof_before_completion_is_a_typed_session_loss() {
+		let (events_tx, events) = flume::bounded(1);
+		drop(events_tx);
+		let mut run = ProcessEvalRun {
+			events,
+			cancelled: CancellationToken::new(),
+			terminal: false,
+			effective_reset: false,
+		};
+		assert!(matches!(run.next_event().await, Err(Fault::SessionLost { .. })));
+		assert!(run.next_event().await.expect("terminal EOF").is_none());
+	}
+
 	#[test]
 	fn spawn_environment_is_allowlisted_and_rejects_secret_names() {
 		assert!(spawn_env_allowed(OsStr::new("PATH")));
@@ -2222,8 +2276,6 @@ mod tests {
 			Ok(crate::eval::bridge::EvalSessionConfig {
 				cwd:              self.cwd.clone(),
 				local_roots_json: None,
-				artifacts_dir:    None,
-				session_file:     None,
 			})
 		}
 
@@ -2342,7 +2394,7 @@ mod tests {
 		assert!(validate_runtime_snapshot(runtime_snapshot(cwd.clone())).is_ok());
 
 		let mut missing = runtime_snapshot(cwd.clone());
-		missing.managed_env.remove("OMP_SESSION_FILE");
+		missing.managed_env.remove("OMP_EVAL_LOCAL_ROOTS");
 		assert!(matches!(
 			validate_runtime_snapshot(missing),
 			Err(ProcessError::InvalidManagedEnvironment)

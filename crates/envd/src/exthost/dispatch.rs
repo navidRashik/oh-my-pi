@@ -28,9 +28,11 @@ use omp_proto::{
 		},
 	},
 	ui::v1::{
-		CommandDecl, ShortcutDecl, TriggerDecl, UiDispatch, UiDispatchResult, ui_dispatch_result,
+		CommandDecl, RenderRequest, ShortcutDecl, TriggerDecl, UiDispatch, UiDispatchResult,
+		ui_dispatch, ui_dispatch_result,
 	},
 };
+use omp_session::custom_message::{CustomMessage, MessageRendererIdentity, RenderedMessage};
 use parking_lot::{Mutex, RwLock};
 use prost::Message;
 use thiserror::Error;
@@ -143,7 +145,7 @@ use super::{
 	},
 	lifecycle::{
 		AvailabilityBatch, AvailabilitySink, HeadlessLifecycleSink, HeadlessSinkError,
-		VerifiedRendererDeclaration, VerifiedUiRoster,
+		VerifiedMessageRendererDeclaration, VerifiedRendererDeclaration, VerifiedUiRoster,
 	},
 };
 use crate::worker::HostKey;
@@ -183,8 +185,8 @@ pub trait CallbackDispatcher: Send + Sync + 'static {
 		target: Arc<ControlConnectionIdentity>,
 		dispatch: ControlDispatch,
 	) -> Result<serde_json::Value, ControlProtocolError>;
-	/// Calls one manifest-verified command or shortcut through the typed UI
-	/// envelope route.
+	/// Calls one manifest-verified command, shortcut, completion, or renderer
+	/// through the typed UI envelope route.
 	async fn dispatch_ui(
 		&self,
 		_target: Arc<ControlConnectionIdentity>,
@@ -291,6 +293,88 @@ pub struct UiShortcutRosterEntry {
 	pub declaration: ShortcutDecl,
 }
 
+/// One manifest-verified transcript-message renderer roster entry.
+#[derive(Clone, Debug)]
+pub struct UiMessageRendererRosterEntry {
+	/// Generation-fenced callback owner.
+	pub owner:       UiCallbackOwner,
+	/// Frozen renderer declaration.
+	pub declaration: VerifiedMessageRendererDeclaration,
+}
+
+impl UiMessageRendererRosterEntry {
+	/// Builds one generation-fenced pure message-renderer dispatch.
+	///
+	/// `ctx` is the actor's serialized `RenderCtx`; the semantic message body
+	/// is copied into the bounded worker request but remains authoritative in
+	/// the session tree.
+	///
+	/// # Errors
+	/// Returns a JSON encoding error when `ctx` cannot be serialized.
+	pub fn dispatch(
+		&self,
+		stable_id: &str,
+		message: &CustomMessage,
+		ctx: serde_json::Value,
+	) -> Result<UiCallbackDispatch, serde_json::Error> {
+		let role: &'static str = message.kind.into();
+		let presentation: &'static str = message.presentation.into();
+		let state = serde_json::to_vec(&serde_json::json!({
+			"message": {
+				"id": stable_id,
+				"kind": message.custom_type,
+				"role": role,
+				"text": message.body,
+				"presentation": {
+					"frame": presentation,
+					"display": message.display,
+				},
+			},
+			"ctx": ctx,
+		}))?;
+		Ok(UiCallbackDispatch {
+			owner:    self.owner.clone(),
+			dispatch: UiDispatch {
+				kind:           Some(ui_dispatch::Kind::Render(RenderRequest {
+					name:    message.custom_type.to_string(),
+					rev:     "message@1".to_owned(),
+					call_id: stable_id.to_owned(),
+					state:   state.into(),
+				})),
+				generation:     self.owner.generation,
+				declaration_id: self.owner.declaration_id.to_string(),
+				props:          None,
+			},
+		})
+	}
+
+	/// Converts a successful callback result into replay-stable renderer
+	/// metadata.
+	///
+	/// Missing, failed, or non-UTF-8 renderer results select native Markdown
+	/// fallback by returning `None`.
+	#[must_use]
+	pub fn rendered(&self, result: &UiDispatchResult) -> Option<RenderedMessage> {
+		if result.generation != self.owner.generation
+			|| result.declaration_id != self.owner.declaration_id.as_str()
+		{
+			return None;
+		}
+		let ui_dispatch_result::Result::Rendered(rendered) = result.result.as_ref()? else {
+			return None;
+		};
+		let source = std::str::from_utf8(&rendered.content.as_ref()?.source).ok()?;
+		Some(RenderedMessage {
+			renderer: MessageRendererIdentity {
+				extension:   self.owner.host.extension().clone(),
+				declaration: self.owner.declaration_id.clone(),
+				generation:  self.owner.generation,
+			},
+			tml:      Str::new(source),
+		})
+	}
+}
+
 /// One manifest-verified exact-revision renderer roster entry.
 #[derive(Clone, Debug)]
 pub struct UiRendererRosterEntry {
@@ -308,13 +392,15 @@ pub struct UiCompletionRosterEntry {
 	pub declaration: TriggerDecl,
 }
 
-/// Atomic manifest-verified command, shortcut, and completion ownership table.
+/// Atomic manifest-verified command, shortcut, completion, and renderer
+/// ownership table.
 #[derive(Clone, Debug, Default)]
 pub struct UiRoster {
-	commands:    BTreeMap<Str, UiCommandRosterEntry>,
-	shortcuts:   BTreeMap<Str, UiShortcutRosterEntry>,
-	completions: BTreeMap<Str, Vec<UiCompletionRosterEntry>>,
-	renderers:   BTreeMap<omp_tool::ToolIdentity, Vec<UiRendererRosterEntry>>,
+	commands:          BTreeMap<Str, UiCommandRosterEntry>,
+	shortcuts:         BTreeMap<Str, UiShortcutRosterEntry>,
+	completions:       BTreeMap<Str, Vec<UiCompletionRosterEntry>>,
+	message_renderers: BTreeMap<Str, UiMessageRendererRosterEntry>,
+	renderers:         BTreeMap<omp_tool::ToolIdentity, Vec<UiRendererRosterEntry>>,
 }
 
 /// A roster publication attempted to shadow another admitted owner.
@@ -336,6 +422,7 @@ impl UiRoster {
 		let mut commands = self.commands.clone();
 		let mut shortcuts = self.shortcuts.clone();
 		let mut completions = self.completions.clone();
+		let mut message_renderers = self.message_renderers.clone();
 		let mut renderers = self.renderers.clone();
 		commands.retain(|_, entry| entry.owner.host != host);
 		shortcuts.retain(|_, entry| entry.owner.host != host);
@@ -343,6 +430,7 @@ impl UiRoster {
 			entries.retain(|entry| entry.owner.host != host);
 			!entries.is_empty()
 		});
+		message_renderers.retain(|_, entry| entry.owner.host != host);
 		renderers.retain(|_, entries| {
 			entries.retain(|entry| entry.owner.host != host);
 			!entries.is_empty()
@@ -406,6 +494,26 @@ impl UiRoster {
 					declaration: declaration.clone(),
 				});
 		}
+		for declaration in &roster.message_renderers {
+			if message_renderers.contains_key(declaration.custom_type.as_str()) {
+				tracing::warn!(
+					extension_id = %host.extension(),
+					host_generation = roster.generation,
+					renderer = %declaration.custom_type,
+					"extension message renderer publication rejected",
+				);
+				return Err(UiRosterConflict { key: declaration.custom_type.clone() });
+			}
+			message_renderers.insert(declaration.custom_type.clone(), UiMessageRendererRosterEntry {
+				owner:       UiCallbackOwner {
+					host:           host.clone(),
+					generation:     roster.generation,
+					declaration_id: declaration.declaration_id.clone(),
+					callback:       declaration.callback.clone(),
+				},
+				declaration: declaration.clone(),
+			});
+		}
 		for declaration in &roster.renderers {
 			let entries = renderers.entry(declaration.identity.clone()).or_default();
 			if !declaration.decorates && entries.iter().any(|entry| !entry.declaration.decorates) {
@@ -433,6 +541,7 @@ impl UiRoster {
 		self.commands = commands;
 		self.shortcuts = shortcuts;
 		self.completions = completions;
+		self.message_renderers = message_renderers;
 		self.renderers = renderers;
 		tracing::info!(
 			extension_id = %host.extension(),
@@ -440,6 +549,7 @@ impl UiRoster {
 			command_count = roster.commands.len(),
 			shortcut_count = roster.shortcuts.len(),
 			completion_count = roster.triggers.len(),
+			message_renderer_count = roster.message_renderers.len(),
 			renderer_count = roster.renderers.len(),
 			"extension UI roster published",
 		);
@@ -454,6 +564,9 @@ impl UiRoster {
 			entries.retain(|entry| &entry.owner.host != host);
 			!entries.is_empty()
 		});
+		self
+			.message_renderers
+			.retain(|_, entry| &entry.owner.host != host);
 		self.renderers.retain(|_, entries| {
 			entries.retain(|entry| &entry.owner.host != host);
 			!entries.is_empty()
@@ -482,6 +595,11 @@ impl UiRoster {
 	/// Iterates every normalized shortcut row.
 	pub fn shortcuts(&self) -> impl Iterator<Item = &UiShortcutRosterEntry> {
 		self.shortcuts.values()
+	}
+
+	/// Resolves the one extension fold registered for a custom message type.
+	pub fn message_renderer(&self, custom_type: &str) -> Option<&UiMessageRendererRosterEntry> {
+		self.message_renderers.get(custom_type)
 	}
 
 	/// Returns extension folds registered for one exact tool revision.
@@ -1055,7 +1173,7 @@ pub struct DispatchRequest {
 	pub payload:  CowBytes<'static>,
 }
 
-/// One typed command or shortcut callback routed to an exact roster owner.
+/// One typed UI callback routed to an exact roster owner.
 #[derive(Clone, Debug)]
 pub struct UiCallbackDispatch {
 	/// Generation-fenced roster owner.
@@ -1577,6 +1695,111 @@ mod tests {
 		let succeeded = ui_result(ui_dispatch_result::Result::Shortcut(ShortcutDispatchResult {}));
 		assert!(shortcut_dispatch_succeeded(&succeeded, &owner));
 		assert!(!shortcut_dispatch_succeeded(&[0xff], &owner));
+	}
+
+	fn message_renderer_declaration(
+		declaration_id: &'static str,
+		custom_type: &'static str,
+	) -> VerifiedMessageRendererDeclaration {
+		VerifiedMessageRendererDeclaration {
+			declaration_id: sf!(declaration_id),
+			custom_type:    sf!(custom_type),
+			callback:       sf!("extension.render_message"),
+			module:         sf!("extension"),
+		}
+	}
+
+	#[test]
+	fn message_renderer_roster_replaces_its_own_generation_and_rejects_competing_owners() {
+		let host = HostKey::new("project", "trusted", "extension");
+		let mut roster = UiRoster::default();
+		roster
+			.install(host.clone(), &VerifiedUiRoster {
+				generation: 7,
+				extension: sf!("extension"),
+				message_renderers: vec![message_renderer_declaration("renderer-v1", "audit")]
+					.into_boxed_slice(),
+				..Default::default()
+			})
+			.expect("first generation");
+		assert_eq!(
+			roster
+				.message_renderer("audit")
+				.expect("message renderer")
+				.owner
+				.generation,
+			7
+		);
+		roster
+			.install(host.clone(), &VerifiedUiRoster {
+				generation: 8,
+				extension: sf!("extension"),
+				message_renderers: vec![message_renderer_declaration("renderer-v2", "audit")]
+					.into_boxed_slice(),
+				..Default::default()
+			})
+			.expect("same owner replaces its generation");
+		let replacement = roster.message_renderer("audit").expect("replacement");
+		assert_eq!(replacement.owner.generation, 8);
+		assert_eq!(replacement.declaration.declaration_id, "renderer-v2");
+
+		let competing = HostKey::new("project", "trusted", "competing");
+		assert!(
+			roster
+				.install(competing, &VerifiedUiRoster {
+					generation: 1,
+					extension: sf!("competing"),
+					message_renderers: vec![message_renderer_declaration("competing", "audit")]
+						.into_boxed_slice(),
+					..Default::default()
+				})
+				.is_err()
+		);
+		let entry = roster.message_renderer("audit").expect("replacement");
+		let request = entry
+			.dispatch(
+				"01message",
+				&CustomMessage::live_delegation("semantic body"),
+				serde_json::json!({
+					"width": 80,
+					"charset": "unicode",
+					"appearance": "dark",
+					"graphics": "none",
+					"hyperlinks": true,
+					"focused": true,
+					"collapsed": false,
+					"place": "transcript",
+				}),
+			)
+			.expect("typed message dispatch");
+		let Some(ui_dispatch::Kind::Render(render)) = request.dispatch.kind else {
+			panic!("render dispatch");
+		};
+		let state: serde_json::Value =
+			serde_json::from_slice(&render.state).expect("renderer state JSON");
+		assert_eq!(state["message"]["text"], "semantic body");
+		assert_eq!(state["message"]["presentation"]["frame"], "live-delegation");
+		let rendered = entry
+			.rendered(&UiDispatchResult {
+				result: Some(ui_dispatch_result::Result::Rendered(omp_proto::ui::v1::RenderedView {
+					content: Some(omp_proto::ui::v1::Tml {
+						source: bytes::Bytes::from_static(b"<text>replacement</text>"),
+						hash:   0,
+					}),
+					state:   bytes::Bytes::new(),
+				})),
+				generation: 8,
+				declaration_id: "renderer-v2".to_owned(),
+				..Default::default()
+			})
+			.expect("durable renderer result");
+		assert_eq!(rendered.renderer.extension, "extension");
+		assert_eq!(rendered.renderer.declaration, "renderer-v2");
+		assert_eq!(rendered.renderer.generation, 8);
+		assert_eq!(rendered.tml, "<text>replacement</text>");
+
+		roster.remove(&host);
+		assert!(roster.message_renderer("audit").is_none());
 	}
 
 	fn renderer_declaration(

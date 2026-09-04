@@ -110,8 +110,22 @@ impl McpDefinitionCache {
 				|row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?)),
 			)
 			.optional()?;
+		let Some((definitions_json, stored_at_ms, expires_at_ms)) = row else {
+			transaction.commit()?;
+			return Ok(None);
+		};
+		let valid = serde_json::from_slice::<Value>(&definitions_json)
+			.is_ok_and(|definitions| definitions.is_array());
+		if !valid {
+			transaction.execute(
+				"DELETE FROM mcp_definitions WHERE server_name = ?1 AND config_sha256 = ?2",
+				params![server_name, digest.as_slice()],
+			)?;
+			transaction.commit()?;
+			return Ok(None);
+		}
 		transaction.commit()?;
-		Ok(row.map(|(definitions_json, stored_at_ms, expires_at_ms)| CachedDefinitions {
+		Ok(Some(CachedDefinitions {
 			definitions_json: Bytes::from(definitions_json),
 			stored_at_ms,
 			expires_at_ms,
@@ -241,5 +255,55 @@ mod tests {
 				.expect("expired get")
 				.is_none()
 		);
+	}
+
+	#[test]
+	fn replacement_invalidates_other_config_generations() {
+		let directory = tempfile::tempdir().expect("cache directory");
+		let cache =
+			McpDefinitionCache::open(directory.path().join("mcp.sqlite3")).expect("open cache");
+		let first = br#"{"url":"https://one.example"}"#;
+		let second = br#"{"url":"https://two.example"}"#;
+		cache
+			.put("alpha", first, br#"[{"name":"old"}]"#, 1_000)
+			.expect("first generation");
+		cache
+			.put("alpha", second, br#"[{"name":"new"}]"#, 2_000)
+			.expect("second generation");
+		assert!(cache.get("alpha", first, 2_001).expect("old get").is_none());
+		assert_eq!(
+			cache
+				.get("alpha", second, 2_001)
+				.expect("new get")
+				.expect("new generation")
+				.definitions_json,
+			Bytes::from_static(br#"[{"name":"new"}]"#)
+		);
+	}
+
+	#[test]
+	fn malformed_persisted_payload_is_invalidated_on_read() {
+		let directory = tempfile::tempdir().expect("cache directory");
+		let cache =
+			McpDefinitionCache::open(directory.path().join("mcp.sqlite3")).expect("open cache");
+		let config = br#"{"url":"https://one.example"}"#;
+		cache
+			.put("alpha", config, br#"[{"name":"tool"}]"#, 1_000)
+			.expect("valid generation");
+		cache
+			.connection
+			.lock()
+			.execute(
+				"UPDATE mcp_definitions SET definitions_json = ?1 WHERE server_name = ?2",
+				params![b"{broken".as_slice(), "alpha"],
+			)
+			.expect("corrupt fixture");
+		assert!(cache.get("alpha", config, 1_001).expect("corrupt get").is_none());
+		let remaining = cache
+			.connection
+			.lock()
+			.query_row("SELECT count(*) FROM mcp_definitions", [], |row| row.get::<_, u64>(0))
+			.expect("remaining rows");
+		assert_eq!(remaining, 0);
 	}
 }

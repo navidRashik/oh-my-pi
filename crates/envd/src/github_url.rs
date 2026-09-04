@@ -2,7 +2,6 @@
 
 use std::{
 	fmt::{self, Display},
-	fs,
 	path::{Path, PathBuf},
 	str,
 	sync::{Arc, OnceLock},
@@ -23,6 +22,7 @@ use omp_inference::{
 	id::{AccountId, PrincipalId},
 };
 use omp_tools::read::{Fault, resolver::Resolve, selector::ParsedSelector};
+use omp_vcs::git::GitRepo;
 use serde_json::Value;
 
 use super::tool_url;
@@ -54,7 +54,7 @@ impl GithubRepo {
 	}
 
 	pub(super) fn new(host: &str, owner: &str, name: &str) -> Result<Self, Fault> {
-		if !valid_repo_component(host) || !valid_repo_component(owner) || !valid_repo_component(name)
+		if !valid_github_host(host) || !valid_repo_component(owner) || !valid_repo_component(name)
 		{
 			return Err(invalid("GitHub repository must be [host/]owner/repo."));
 		}
@@ -91,6 +91,14 @@ pub(super) fn api_url_for_host(host: &str, path: &str) -> String {
 	} else {
 		format!("https://{host}/api/v3{path}")
 	}
+}
+
+fn valid_github_host(host: &str) -> bool {
+	!host.is_empty()
+		&& host.len() <= 255
+		&& host
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn valid_repo_component(component: &str) -> bool {
@@ -730,8 +738,10 @@ fn render_diff(text: &str, mode: &DiffMode, repo: &str, number: u64) -> Result<V
 	Ok(out.into_bytes())
 }
 pub(super) fn infer_repo(root: &Path) -> Result<GithubRepo, Fault> {
-	let config = fs::read_to_string(root.join(".git/config"))
+	let repo = GitRepo::require(root)
 		.map_err(|_| invalid("Cannot infer GitHub repo; use [host/]owner/repo explicitly."))?;
+	let config = std::fs::read_to_string(repo.info().common_dir.join("config"))
+		.map_err(|_| invalid("Git repository config is unavailable."))?;
 	let mut in_origin = false;
 	let mut first_remote = None;
 	let mut origin = None;
@@ -762,7 +772,10 @@ fn repo_from_remote(remote: &str) -> Result<GithubRepo, Fault> {
 		let host = parsed
 			.host_str()
 			.ok_or_else(|| invalid("Git origin is not a GitHub remote."))?;
-		repo_from_host_path(host, parsed.path().trim_start_matches('/'))
+		let host = parsed
+			.port()
+			.map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+		repo_from_host_path(&host, parsed.path().trim_start_matches('/'))
 	} else {
 		let (authority, path) = remote
 			.split_once(':')

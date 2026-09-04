@@ -1,10 +1,11 @@
 //! Direct GitHub API and isolated pull-request worktree host.
 
 use std::{
+	fmt::Write as _,
 	fs, io,
 	path::{Path, PathBuf},
 	sync::Arc,
-	time::{Duration, SystemTime, UNIX_EPOCH},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -12,28 +13,41 @@ use bytes::BytesMut;
 use futures::StreamExt as _;
 use http::{
 	HeaderMap, HeaderValue,
-	header::{ACCEPT, LOCATION, USER_AGENT},
+	header::{ACCEPT, LOCATION, RETRY_AFTER, USER_AGENT},
 };
+use omp_cache::github_cache::GithubCache;
 use omp_core::{Str, sf};
+use omp_journal::blob::BlobRef;
 use omp_inference::auth::HeaderPlacement;
-use omp_tools::github::{DateField, Fault, GithubHost, Operation, Params, Payload};
+use omp_tools::github::{Artifact, DateField, Fault, GithubHost, Operation, Params, Payload, Update};
 use omp_vcs::{PushOptions, git::GitRepo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use strum::EnumMessage as _;
 use tokio::{task, time};
 use tokio_util::sync::CancellationToken;
 
-use super::github_url::{self, GithubCredentialBridge, GithubRepo};
+use super::{
+	blobs::BlobHost,
+	github_url::{self, GithubCredentialBridge, GithubRepo},
+};
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
+const SEARCH_LIMIT_DEFAULT: u32 = 10;
+const SEARCH_LIMIT_MAX: u32 = 50;
 const RUN_WATCH_TAIL_DEFAULT: usize = 15;
 const RUN_WATCH_TAIL_MAX: usize = 200;
+const RUN_WATCH_FAST_WINDOW: Duration = Duration::from_secs(60);
+const RUN_WATCH_NO_RUNS_LIMIT: Duration = Duration::from_secs(90);
+const RUN_WATCH_RATE_LIMIT_RETRIES: u8 = 5;
 
 /// Combined-credential GitHub owner.
 pub(crate) struct GithubService {
 	root:        PathBuf,
 	worktrees:   PathBuf,
 	credentials: Arc<GithubCredentialBridge>,
+	cache:       Arc<GithubCache>,
+	blobs:       BlobHost,
 	client:      omp_http::Client,
 }
 
@@ -42,11 +56,15 @@ impl GithubService {
 		root: PathBuf,
 		state_dir: &Path,
 		credentials: Arc<GithubCredentialBridge>,
+		cache: Arc<GithubCache>,
+		blobs: BlobHost,
 	) -> Arc<Self> {
 		Arc::new(Self {
 			root,
 			worktrees: state_dir.join("github-worktrees"),
 			credentials,
+			cache,
+			blobs,
 			client: omp_http::no_redirect_client(),
 		})
 	}
@@ -68,10 +86,16 @@ impl GithubService {
 		body: Option<&Value>,
 		cancellation: &CancellationToken,
 	) -> Result<ApiResponse, Fault> {
-		let headers = self.api_headers(cancellation).await?;
+		let mut headers = self.api_headers(cancellation).await?;
+		if method == Method::GetTextMatch {
+			headers.insert(
+				ACCEPT,
+				HeaderValue::from_static("application/vnd.github.text-match+json"),
+			);
+		}
 		let url = github_url::api_url_for_host(host, path);
 		let request = match method {
-			Method::Get => self.client.get(url),
+			Method::Get | Method::GetTextMatch => self.client.get(url),
 			Method::Post => self.client.post(url),
 		};
 		let request = if let Some(body) = body {
@@ -94,18 +118,55 @@ impl GithubService {
 			.get("x-ratelimit-reset")
 			.and_then(|value| value.to_str().ok())
 			.and_then(|value| value.parse().ok());
+		let retry_after = response
+			.headers()
+			.get(RETRY_AFTER)
+			.and_then(|value| value.to_str().ok())
+			.and_then(|value| value.parse().ok());
 		let bytes = read_body(response, cancellation).await?;
 		if !(200..300).contains(&status) {
-			let message = serde_json::from_slice::<Value>(&bytes)
+			let remote_message = serde_json::from_slice::<Value>(&bytes)
 				.ok()
 				.and_then(|value| {
 					value
 						.get("message")
 						.and_then(Value::as_str)
-						.map(str::to_owned)
-				})
-				.unwrap_or_else(|| format!("GitHub API returned HTTP {status}"));
-			return Err(Fault { code: sf!("github_http_error"), message: Str::new(message) });
+						.map(sanitize_remote_message)
+				});
+			let rate_limited = status == 429
+				|| remaining == Some(0)
+				|| remote_message
+					.as_deref()
+					.is_some_and(|message| {
+						message.to_ascii_lowercase().contains("rate limit")
+							|| message.to_ascii_lowercase().contains("abuse detection")
+					});
+			let (code, message) = if rate_limited {
+				(
+					sf!("github_rate_limited"),
+					sf!("GitHub rate limit was reached; retry after the reported reset"),
+				)
+			} else if matches!(status, 401 | 403) {
+				(
+					sf!("github_authentication_failed"),
+					sf!("GitHub authentication or authorization failed"),
+				)
+			} else {
+				(
+					sf!("github_http_error"),
+					remote_message
+						.map(Str::new)
+						.unwrap_or_else(|| sf!("GitHub API request failed")),
+				)
+			};
+			return Err(Fault {
+				code,
+				message,
+				status: Some(status),
+				rate_limit_remaining: remaining,
+				rate_limit_reset: reset,
+				retry_after_seconds: retry_after,
+			});
 		}
 		let value = if bytes.is_empty() {
 			Value::Null
@@ -113,7 +174,7 @@ impl GithubService {
 			serde_json::from_slice(&bytes)
 				.map_err(|_| fault("github_invalid_response", "GitHub returned malformed JSON"))?
 		};
-		Ok(ApiResponse { value, remaining, reset })
+		Ok(ApiResponse { value, remaining, reset, artifact: None })
 	}
 
 	/// Builds the authenticated GitHub API header set for one request.
@@ -126,16 +187,18 @@ impl GithubService {
 			result = self.credentials.lease() => result,
 			() = cancellation.cancelled() => return Err(cancelled_fault()),
 		}
-		.map_err(|error| Fault {
-			code:    sf!("github_credentials_failed"),
-			message: Str::new(error.message().clone()),
+		.map_err(|_| {
+			fault(
+				"github_credentials_failed",
+				"GitHub credential lease failed",
+			)
 		})? {
 			lease
 				.apply_header(&HeaderPlacement::bearer(), &mut headers)
-				.map_err(|_| Fault {
-					code:    sf!("github_credentials_failed"),
-					message: sf!("GitHub credential projection failed"),
-				})?;
+				.map_err(|_| fault(
+					"github_credentials_failed",
+					"GitHub credential projection failed",
+				))?;
 		}
 		Ok(headers)
 	}
@@ -186,18 +249,60 @@ impl GithubService {
 	fn repo(&self, requested: Option<&str>) -> Result<GithubRepo, Fault> {
 		requested.map_or_else(
 			|| {
-				github_url::infer_repo(&self.root).map_err(|error| Fault {
-					code:    sf!("github_repo_unresolved"),
-					message: Str::new(error.message().clone()),
+				github_url::infer_repo(&self.root).map_err(|_| {
+					fault(
+						"github_repo_unresolved",
+						"Cannot infer GitHub repository; pass [host/]owner/repo",
+					)
 				})
 			},
 			|repo| {
-				GithubRepo::parse(repo).map_err(|error| Fault {
-					code:    sf!("github_invalid_repo"),
-					message: Str::new(error.message().clone()),
+				GithubRepo::parse(repo).map_err(|_| {
+					fault(
+						"github_invalid_repo",
+						"GitHub repository must be [host/]owner/repo",
+					)
 				})
 			},
 		)
+	}
+
+	fn pr_repo(&self, requested: Option<&str>, prs: &[Str]) -> Result<GithubRepo, Fault> {
+		if let Some(requested) = requested {
+			return self.repo(Some(requested));
+		}
+		let mut from_url = None;
+		for pr in prs {
+			let Some((repo, _)) = parse_pr_url(pr)? else {
+				continue;
+			};
+			if from_url
+				.as_ref()
+				.is_some_and(|current: &GithubRepo| {
+					!current.identity().eq_ignore_ascii_case(repo.identity())
+				})
+			{
+				return Err(fault(
+					"github_repo_mismatch",
+					"pull request URLs in one batch must belong to one repository",
+				));
+			}
+			from_url = Some(repo);
+		}
+		from_url.map_or_else(|| self.repo(None), Ok)
+	}
+
+	fn invalidate_repo(&self, repo: &GithubRepo) -> Result<(), Fault> {
+		self
+			.cache
+			.invalidate_repo(repo.identity())
+			.map(|_| ())
+			.map_err(|_| {
+				fault(
+					"github_cache_failed",
+					"GitHub cache invalidation failed after mutation",
+				)
+			})
 	}
 }
 
@@ -208,11 +313,12 @@ impl GithubHost for GithubService {
 		&self,
 		params: Params,
 		cancellation: CancellationToken,
+		updates: flume::Sender<Update>,
 	) -> Result<Payload, Fault> {
 		let response = match params.op {
 			Operation::RepoView => {
 				let repo = self.repo(params.repo.as_deref())?;
-				self
+				let mut response = self
 					.request(
 						repo.host(),
 						Method::Get,
@@ -220,16 +326,39 @@ impl GithubHost for GithubService {
 						None,
 						&cancellation,
 					)
-					.await?
+					.await?;
+				if let Some(branch) = params
+					.branch
+					.as_deref()
+					.map(str::trim)
+					.filter(|branch| !branch.is_empty())
+					&& let Some(object) = response.value.as_object_mut()
+				{
+					object.insert("requested_branch".to_owned(), Value::String(branch.to_owned()));
+				}
+				response
 			},
 			Operation::FileRead => {
 				let repo = self.repo(params.repo.as_deref())?;
 				let path = required(params.path.as_deref(), "file_read requires `path`")?;
-				let endpoint = file_endpoint(repo.slug(), path, params.branch.as_deref())?;
+				let branch = params
+					.branch
+					.as_deref()
+					.map(str::trim)
+					.filter(|branch| !branch.is_empty());
+				let endpoint = file_endpoint(repo.slug(), path, branch)?;
 				let mut response = self
 					.request(repo.host(), Method::Get, &endpoint, None, &cancellation)
 					.await?;
-				response.value = decode_file_response(&response.value, repo.identity(), path)?;
+				let (value, artifact) = decode_file_response(
+					&response.value,
+					repo.identity(),
+					path,
+					branch,
+					&self.blobs,
+				)?;
+				response.value = value;
+				response.artifact = artifact;
 				response
 			},
 			Operation::PrCreate => self.create_pr(&params, &cancellation).await?,
@@ -240,13 +369,28 @@ impl GithubHost for GithubService {
 			| Operation::SearchCode
 			| Operation::SearchCommits
 			| Operation::SearchRepos => self.search(&params, &cancellation).await?,
-			Operation::RunWatch => self.watch(&params, &cancellation).await?,
+			Operation::RunWatch => self.watch(&params, &cancellation, &updates).await?,
 		};
+		let mut result = response.value;
+		let output = if params.op == Operation::FileRead
+			&& result.get("binary").and_then(Value::as_bool) != Some(true)
+		{
+			match result.get_mut("content").map(Value::take) {
+				Some(Value::String(output)) => output,
+				_ => String::new(),
+			}
+		} else {
+			render_output(params.op, &result, response.artifact.as_ref())
+		};
+		let useless = operation_is_useless(params.op, &result);
 		Ok(Payload {
-			op:                   params.op,
-			result:               response.value,
+			op: params.op,
+			result,
+			output: Str::new(output),
+			artifact: response.artifact,
+			useless,
 			rate_limit_remaining: response.remaining,
-			rate_limit_reset:     response.reset,
+			rate_limit_reset: response.reset,
 		})
 	}
 }
@@ -258,10 +402,60 @@ impl GithubService {
 		cancellation: &CancellationToken,
 	) -> Result<ApiResponse, Fault> {
 		let repo = self.repo(params.repo.as_deref())?;
-		let head = required(params.head.as_deref(), "pr_create requires `head`")?;
-		let base = params.base.as_deref().unwrap_or("main");
+		let inferred_head;
+		let head = if let Some(head) = params
+			.head
+			.as_deref()
+			.map(str::trim)
+			.filter(|head| !head.is_empty())
+		{
+			head
+		} else {
+			let root = self.root.clone();
+			let worker = task::spawn_blocking(move || current_git_snapshot(&root));
+			let (branch, _) = tokio::select! {
+				result = worker => result
+					.map_err(|_| fault("github_git_failed", "GitHub Git lookup worker failed"))??,
+				() = cancellation.cancelled() => return Err(cancelled_fault()),
+			};
+			inferred_head = branch;
+			&inferred_head
+		};
+		let default_base;
+		let base = if let Some(base) = params
+			.base
+			.as_deref()
+			.map(str::trim)
+			.filter(|base| !base.is_empty())
+		{
+			base
+		} else {
+			let metadata = self
+				.request(
+					repo.host(),
+					Method::Get,
+					&format!("/repos/{}", repo.slug()),
+					None,
+					cancellation,
+				)
+				.await?;
+			default_base = metadata
+				.value
+				.get("default_branch")
+				.and_then(Value::as_str)
+				.ok_or_else(|| {
+					fault("github_invalid_response", "GitHub repository has no default branch")
+				})?
+				.to_owned();
+			&default_base
+		};
+		let title = params
+			.title
+			.as_deref()
+			.map(str::trim)
+			.filter(|title| !title.is_empty());
 		let (title, body) = if params.fill {
-			if params.title.is_some() || params.body.is_some() {
+			if title.is_some() || params.body.is_some() {
 				return Err(fault(
 					"github_invalid_request",
 					"fill is mutually exclusive with title and body",
@@ -288,7 +482,7 @@ impl GithubService {
 				.collect::<Vec<_>>();
 			fill_from_commits(head, &messages)?
 		} else {
-			let title = required(params.title.as_deref(), "title is required unless fill is true")?;
+			let title = required(title, "title is required unless fill is true")?;
 			(title.to_owned(), params.body.as_deref().unwrap_or("").to_owned())
 		};
 		let request = json!({
@@ -307,6 +501,7 @@ impl GithubService {
 				cancellation,
 			)
 			.await?;
+		self.invalidate_repo(&repo)?;
 		let metadata = PrMetadata::from_params(params);
 		if metadata.is_empty() {
 			return Ok(created);
@@ -349,11 +544,6 @@ impl GithubService {
 			Operation::SearchRepos => ("repositories", None),
 			_ => unreachable!(),
 		};
-		let repo = if params.op == Operation::SearchRepos && params.repo.is_none() {
-			None
-		} else {
-			Some(self.repo(params.repo.as_deref())?)
-		};
 		if params.op == Operation::SearchCode
 			&& (params.since.is_some() || params.until.is_some() || params.date_field.is_some())
 		{
@@ -363,13 +553,23 @@ impl GithubService {
 			));
 		}
 		let mut query = params.query.as_deref().unwrap_or("").trim().to_owned();
+		let caller_scoped = has_scope(&query);
+		let repo = if params.op == Operation::SearchRepos {
+			None
+		} else if let Some(requested) = params.repo.as_deref() {
+			Some(self.repo(Some(requested))?)
+		} else if caller_scoped {
+			None
+		} else {
+			Some(self.repo(None)?)
+		};
 		if let Some(tag) = tag {
 			append_query_part(&mut query, tag);
 		}
-		if params.op != Operation::SearchRepos && !has_scope(&query) {
+		if params.op != Operation::SearchRepos && !caller_scoped {
 			append_query_part(
 				&mut query,
-				&format!("repo:{}", repo.as_ref().expect("scoped search repository").slug()),
+				&format!("repo:{}", repo.as_ref().expect("inferred search repository").slug()),
 			);
 		}
 		if let Some(qualifier) = search_date_qualifier(params, SystemTime::now())? {
@@ -379,18 +579,36 @@ impl GithubService {
 			return Err(fault("github_invalid_search", "search requires `query` or a date bound"));
 		}
 		let encoded = encode_query(&query);
-		let limit = params.limit.unwrap_or(30).clamp(1, 100);
-		self
+		let limit = match params.limit {
+			Some(0) => {
+				return Err(fault("github_invalid_search", "limit must be a positive number"));
+			},
+			Some(limit) => limit.min(SEARCH_LIMIT_MAX),
+			None => SEARCH_LIMIT_DEFAULT,
+		};
+		let mut response = self
 			.request(
 				repo
 					.as_ref()
 					.map_or(github_url::GITHUB_HOST, GithubRepo::host),
-				Method::Get,
+				if params.op == Operation::SearchCode {
+					Method::GetTextMatch
+				} else {
+					Method::Get
+				},
 				&format!("/search/{kind}?q={encoded}&per_page={limit}"),
 				None,
 				cancellation,
 			)
-			.await
+			.await?;
+		if let Some(object) = response.value.as_object_mut() {
+			object.insert("query".to_owned(), Value::String(query));
+			object.insert("limit".to_owned(), Value::from(limit));
+			if let Some(repo) = repo {
+				object.insert("repository".to_owned(), Value::String(repo.identity().to_owned()));
+			}
+		}
+		Ok(response)
 	}
 
 	async fn resolve_pr(
@@ -486,7 +704,6 @@ impl GithubService {
 		params: &Params,
 		cancellation: &CancellationToken,
 	) -> Result<ApiResponse, Fault> {
-		let repo = self.repo(params.repo.as_deref())?;
 		let prs = params
 			.pr
 			.as_ref()
@@ -495,55 +712,105 @@ impl GithubService {
 		if prs.is_empty() {
 			return Err(fault("github_invalid_pr", "pr_checkout requires at least one `pr`"));
 		}
+		let repo = self.pr_repo(params.repo.as_deref(), prs)?;
 		let mut checkouts = Vec::new();
+		let mut failures = Vec::new();
+		let mut first_failure = None;
 		for value in prs {
-			let (number, api) = self.resolve_pr(&repo, value, cancellation).await?;
-			let clone_url = api
-				.value
-				.pointer("/head/repo/clone_url")
-				.and_then(Value::as_str)
-				.ok_or_else(|| {
-					fault("github_invalid_response", "pull request head repository is unavailable")
-				})?;
-			let head = api
-				.value
-				.pointer("/head/ref")
-				.and_then(Value::as_str)
-				.ok_or_else(|| {
-					fault("github_invalid_response", "pull request head branch is unavailable")
-				})?;
-			let path = self.worktrees.join(format!("pr-{number}"));
-			let force = params.force;
-			tokio::select! {
-				result = checkout_git(
-					&self.root,
-					&path,
-					number,
-					clone_url,
-					head,
-					force,
-					cancellation.clone(),
-				) => result?,
-				() = cancellation.cancelled() => return Err(cancelled_fault()),
+			match self
+				.checkout_one(&repo, value, params.force, cancellation)
+				.await
+			{
+				Ok(checkout) => checkouts.push(checkout),
+				Err(error) if error.code == "github_cancelled" => return Err(error),
+				Err(error) => {
+					failures.push(json!({
+						"pr": value,
+						"code": error.code.clone(),
+						"message": error.message.clone(),
+					}));
+					first_failure.get_or_insert(error);
+				},
 			}
-			fs::create_dir_all(&path).map_err(io_fault)?;
-			let metadata = CheckoutMetadata {
-				repo:      repo.identity().to_owned(),
-				clone_url: clone_url.to_owned(),
-				head:      head.to_owned(),
-			};
-			fs::write(
-				path.join(".omp-pr-checkout.json"),
-				serde_json::to_vec(&metadata).expect("metadata serializes"),
-			)
-			.map_err(io_fault)?;
-			checkouts.push(json!({ "pr": number, "branch": format!("pr-{number}"), "path": path }));
+		}
+		if checkouts.is_empty() {
+			return Err(first_failure.unwrap_or_else(|| {
+				fault("github_git_failed", "all pull request checkouts failed")
+			}));
 		}
 		Ok(ApiResponse {
-			value:     json!({ "checkouts": checkouts }),
+			value: json!({ "checkouts": checkouts, "failures": failures }),
 			remaining: None,
-			reset:     None,
+			reset: None,
+			artifact: None,
 		})
+	}
+
+	async fn checkout_one(
+		&self,
+		repo: &GithubRepo,
+		value: &str,
+		force: bool,
+		cancellation: &CancellationToken,
+	) -> Result<Value, Fault> {
+		let (number, api) = self.resolve_pr(repo, value, cancellation).await?;
+		let clone_url = api
+			.value
+			.pointer("/head/repo/clone_url")
+			.and_then(Value::as_str)
+			.ok_or_else(|| {
+				fault("github_invalid_response", "pull request head repository is unavailable")
+			})?;
+		let head = api
+			.value
+			.pointer("/head/ref")
+			.and_then(Value::as_str)
+			.ok_or_else(|| {
+				fault("github_invalid_response", "pull request head branch is unavailable")
+			})?;
+		let expected_head = api
+			.value
+			.pointer("/head/sha")
+			.and_then(Value::as_str)
+			.ok_or_else(|| {
+				fault("github_invalid_response", "pull request head commit is unavailable")
+			})?;
+		let path = self.worktrees.join(format!("pr-{number}"));
+		let reused = path.exists();
+		tokio::select! {
+			result = checkout_git(
+				&self.root,
+				&path,
+				number,
+				clone_url,
+				head,
+				force,
+				cancellation.clone(),
+			) => result?,
+			() = cancellation.cancelled() => return Err(cancelled_fault()),
+		}
+		fs::create_dir_all(&path).map_err(io_fault)?;
+		let metadata = CheckoutMetadata {
+			repo: repo.identity().to_owned(),
+			clone_url: clone_url.to_owned(),
+			head: head.to_owned(),
+			expected_head: expected_head.to_owned(),
+		};
+		fs::write(
+			self.worktrees.join(format!("pr-{number}.json")),
+			serde_json::to_vec(&metadata).expect("metadata serializes"),
+		)
+		.map_err(io_fault)?;
+		Ok(json!({
+			"pr": number,
+			"url": api.value.get("html_url").and_then(Value::as_str),
+			"branch": format!("pr-{number}"),
+			"path": path,
+			"remote": clone_url,
+			"remote_branch": head,
+			"head_sha": expected_head,
+			"reused": reused,
+		}))
 	}
 
 	async fn push(
@@ -551,7 +818,6 @@ impl GithubService {
 		params: &Params,
 		cancellation: &CancellationToken,
 	) -> Result<ApiResponse, Fault> {
-		let repo = self.repo(params.repo.as_deref())?;
 		let prs = params
 			.pr
 			.as_ref()
@@ -562,40 +828,162 @@ impl GithubService {
 		if prs.is_empty() {
 			return Err(fault("github_invalid_pr", "pr_push requires at least one `pr`"));
 		}
+		let repo = self.pr_repo(params.repo.as_deref(), prs)?;
 		let mut pushed = Vec::new();
+		let mut failures = Vec::new();
+		let mut first_failure = None;
 		for value in prs {
-			let number = if let Some(number) = parse_pr_number(value, &repo)? {
-				number
-			} else {
-				self.resolve_pr(&repo, value, cancellation).await?.0
-			};
-			let path = self.worktrees.join(format!("pr-{number}"));
-			let metadata: CheckoutMetadata = serde_json::from_slice(
-				&fs::read(path.join(".omp-pr-checkout.json")).map_err(io_fault)?,
-			)
-			.map_err(|_| {
-				fault("github_checkout_missing", "pull request checkout metadata is invalid")
-			})?;
-			let force = params.force_with_lease;
-			tokio::select! {
-				result = push_git(path.clone(), &metadata, force, cancellation.clone()) => result?,
-				() = cancellation.cancelled() => return Err(cancelled_fault()),
+			match self
+				.push_one(&repo, value, params.force_with_lease, cancellation)
+				.await
+			{
+				Ok(result) => pushed.push(result),
+				Err(error) if error.code == "github_cancelled" => return Err(error),
+				Err(error) => {
+					failures.push(json!({
+						"pr": value,
+						"code": error.code.clone(),
+						"message": error.message.clone(),
+					}));
+					first_failure.get_or_insert(error);
+				},
 			}
-			pushed.push(json!({ "pr": number, "path": path }));
 		}
-		Ok(ApiResponse { value: json!({ "pushed": pushed }), remaining: None, reset: None })
+		if pushed.is_empty() {
+			return Err(first_failure.unwrap_or_else(|| {
+				fault("github_git_failed", "all pull request pushes failed")
+			}));
+		}
+		Ok(ApiResponse {
+			value: json!({ "pushed": pushed, "failures": failures }),
+			remaining: None,
+			reset: None,
+			artifact: None,
+		})
+	}
+
+	async fn push_one(
+		&self,
+		repo: &GithubRepo,
+		value: &str,
+		force: bool,
+		cancellation: &CancellationToken,
+	) -> Result<Value, Fault> {
+		let number = if let Some(number) = parse_pr_number(value, repo)? {
+			number
+		} else {
+			self.resolve_pr(repo, value, cancellation).await?.0
+		};
+		let path = self.worktrees.join(format!("pr-{number}"));
+		let mut metadata: CheckoutMetadata = serde_json::from_slice(
+			&fs::read(self.worktrees.join(format!("pr-{number}.json"))).map_err(io_fault)?,
+		)
+		.map_err(|_| {
+			fault("github_checkout_missing", "pull request checkout metadata is invalid")
+		})?;
+		if !metadata.repo.eq_ignore_ascii_case(repo.identity()) {
+			return Err(fault(
+				"github_repo_mismatch",
+				"pull request checkout belongs to a different repository",
+			));
+		}
+		let pushed_head = tokio::select! {
+			result = push_git(path.clone(), &metadata, force, cancellation.clone()) => result?,
+			() = cancellation.cancelled() => return Err(cancelled_fault()),
+		};
+		metadata.expected_head = pushed_head.to_string();
+		fs::write(
+			self.worktrees.join(format!("pr-{number}.json")),
+			serde_json::to_vec(&metadata).expect("metadata serializes"),
+		)
+		.map_err(io_fault)?;
+		self.invalidate_repo(repo)?;
+		Ok(json!({
+			"pr": number,
+			"path": path,
+			"remote_branch": metadata.head,
+			"force_with_lease": force,
+		}))
+	}
+
+	async fn fetch_watch_snapshot(
+		&self,
+		repo: &GithubRepo,
+		target: &WatchTarget,
+		cancellation: &CancellationToken,
+	) -> Result<ApiResponse, Fault> {
+		match target {
+			WatchTarget::Run(id) => {
+				let mut run = self
+					.request(
+						repo.host(),
+						Method::Get,
+						&format!("/repos/{}/actions/runs/{id}", repo.slug()),
+						None,
+						cancellation,
+					)
+					.await?;
+				let jobs = self.fetch_run_jobs(repo, *id, cancellation).await?;
+				run.value = json!({ "run": run.value, "jobs": jobs });
+				Ok(run)
+			},
+			WatchTarget::Commit { branch, head_sha } => {
+				let mut runs = self
+					.request(
+						repo.host(),
+						Method::Get,
+						&actions_runs_endpoint(repo.slug(), head_sha),
+						None,
+						cancellation,
+					)
+					.await?;
+				self
+					.attach_run_jobs(repo, &mut runs.value, cancellation)
+					.await?;
+				if let Some(object) = runs.value.as_object_mut() {
+					object.insert("branch".to_owned(), Value::String(branch.to_string()));
+					object.insert("head_sha".to_owned(), Value::String(head_sha.to_string()));
+				}
+				Ok(runs)
+			},
+		}
 	}
 
 	async fn watch(
 		&self,
 		params: &Params,
 		cancellation: &CancellationToken,
+		updates: &flume::Sender<Update>,
 	) -> Result<ApiResponse, Fault> {
 		let tail = tail_limit(params.tail)?;
-		let repo = self.repo(params.repo.as_deref())?;
-		let target = if let Some(run) = &params.run {
-			WatchTarget::Run(run_id(run)?)
-		} else if let Some(branch) = &params.branch {
+		let run = params
+			.run
+			.as_deref()
+			.map(parse_run_reference)
+			.transpose()?;
+		let repo = match (params.repo.as_deref(), run.as_ref().and_then(|run| run.repo.as_ref())) {
+			(Some(requested), Some(from_run)) => {
+				let requested = self.repo(Some(requested))?;
+				if !requested.identity().eq_ignore_ascii_case(from_run.identity()) {
+					return Err(fault(
+						"github_repo_mismatch",
+						"Actions run URL belongs to a different repository",
+					));
+				}
+				requested
+			},
+			(Some(requested), None) => self.repo(Some(requested))?,
+			(None, Some(from_run)) => from_run.clone(),
+			(None, None) => self.repo(None)?,
+		};
+		let target = if let Some(run) = run {
+			WatchTarget::Run(run.id)
+		} else if let Some(branch) = params
+			.branch
+			.as_deref()
+			.map(str::trim)
+			.filter(|branch| !branch.is_empty())
+		{
 			let branch_endpoint = branch_endpoint(repo.slug(), branch);
 			let response = self
 				.request(repo.host(), Method::Get, &branch_endpoint, None, cancellation)
@@ -605,13 +993,10 @@ impl GithubService {
 				.pointer("/commit/sha")
 				.and_then(Value::as_str)
 				.ok_or_else(|| fault("github_invalid_response", "GitHub branch has no head commit"))?;
-			WatchTarget::Commit { branch: branch.clone(), head_sha: Str::new(head_sha) }
+			WatchTarget::Commit { branch: Str::new(branch), head_sha: Str::new(head_sha) }
 		} else {
 			let current_repo = self.repo(None)?;
-			if !current_repo
-				.identity()
-				.eq_ignore_ascii_case(repo.identity())
-			{
+			if !current_repo.identity().eq_ignore_ascii_case(repo.identity()) {
 				return Err(fault(
 					"github_repo_mismatch",
 					"current checkout does not match `repo`; pass `branch` or `run`",
@@ -626,98 +1011,153 @@ impl GithubService {
 			};
 			WatchTarget::Commit { branch, head_sha }
 		};
-		let mut receipt = None;
-		for attempt in 0..100u32 {
-			let mut response = match &target {
-				WatchTarget::Run(id) => {
-					let mut run = self
-						.request(
-							repo.host(),
-							Method::Get,
-							&format!("/repos/{}/actions/runs/{id}", repo.slug()),
-							None,
-							cancellation,
-						)
-						.await?;
-					let jobs = self.fetch_run_jobs(&repo, *id, cancellation).await?;
-					run.value = json!({ "run": run.value, "jobs": jobs });
-					run
+
+		let started = Instant::now();
+		let mut poll_count = 0u32;
+		let mut rate_limit_failures = 0u8;
+		let mut ever_saw_runs = false;
+		let mut successful_signature = None;
+		loop {
+			poll_count = poll_count.saturating_add(1);
+			let fetched = self
+				.fetch_watch_snapshot(&repo, &target, cancellation)
+				.await;
+			let mut response = match fetched {
+				Ok(response) => {
+					rate_limit_failures = 0;
+					response
 				},
-				WatchTarget::Commit { branch, head_sha } => {
-					let mut runs = self
-						.request(
-							repo.host(),
-							Method::Get,
-							&actions_runs_endpoint(repo.slug(), head_sha),
-							None,
-							cancellation,
-						)
-						.await?;
-					self
-						.attach_run_jobs(&repo, &mut runs.value, cancellation)
-						.await?;
-					if let Some(object) = runs.value.as_object_mut() {
-						object.insert("branch".to_owned(), Value::String(branch.to_string()));
-						object.insert("head_sha".to_owned(), Value::String(head_sha.to_string()));
-					}
-					runs
+				Err(error)
+					if error.is_rate_limited()
+						&& rate_limit_failures < RUN_WATCH_RATE_LIMIT_RETRIES =>
+				{
+					rate_limit_failures += 1;
+					let delay = Duration::from_secs(error.retry_after_seconds.unwrap_or(15).min(60));
+					poll_sleep(delay, cancellation).await?;
+					continue;
 				},
+				Err(error) => return Err(error),
 			};
+			let run_count = response
+				.value
+				.get("workflow_runs")
+				.and_then(Value::as_array)
+				.map_or(1, Vec::len);
+			ever_saw_runs |= run_count != 0;
 			let state = actions_state(&response.value);
 			if let Some(object) = response.value.as_object_mut() {
+				object.insert("poll_count".to_owned(), Value::from(poll_count));
 				object.insert(
 					"outcome".to_owned(),
-					Value::String(
-						match state {
-							ActionsState::Pending => "pending",
-							ActionsState::Success => "success",
-							ActionsState::Failure => "failure",
-						}
-						.to_owned(),
-					),
+					Value::String(<&'static str>::from(state).to_owned()),
 				);
 			}
-			let failed = if state == ActionsState::Failure {
-				Some(
-					self
-						.failed_job_logs(&repo, &response.value, tail, cancellation)
-						.await?,
-				)
+			let output = render_output(Operation::RunWatch, &response.value, None);
+			let _ = updates.try_send(Update {
+				op: Operation::RunWatch,
+				result: response.value.clone(),
+				output: Str::new(output),
+			});
+
+			if state == ActionsState::Failure {
+				poll_sleep(Duration::from_secs(5), cancellation).await?;
+				if let Ok(mut refetched) = self
+					.fetch_watch_snapshot(&repo, &target, cancellation)
+					.await
+					&& actions_state(&refetched.value) == ActionsState::Failure
+				{
+					if let Some(object) = refetched.value.as_object_mut() {
+						object.insert("poll_count".to_owned(), Value::from(poll_count));
+						object.insert("outcome".to_owned(), Value::String("failure".to_owned()));
+					}
+					response = refetched;
+				}
+				let failed = self
+					.failed_job_logs(&repo, &response.value, tail, cancellation)
+					.await?;
+				if let Some(object) = response.value.as_object_mut() {
+					object.insert("tail".to_owned(), Value::from(tail));
+					object.insert("failed_logs".to_owned(), Value::Array(failed.rows));
+				}
+				response.artifact = failed.artifact;
+				return Ok(response);
+			}
+			if state == ActionsState::Success {
+				if matches!(&target, WatchTarget::Run(_)) {
+					return Ok(response);
+				}
+				let signature = actions_signature(&response.value);
+				if successful_signature.as_deref() == Some(signature.as_str()) {
+					return Ok(response);
+				}
+				successful_signature = Some(signature);
 			} else {
-				None
+				successful_signature = None;
+			}
+			if !ever_saw_runs && started.elapsed() >= RUN_WATCH_NO_RUNS_LIMIT {
+				if let Some(object) = response.value.as_object_mut() {
+					object.insert("outcome".to_owned(), Value::String("no_runs".to_owned()));
+				}
+				return Ok(response);
+			}
+			let delay = if started.elapsed() < RUN_WATCH_FAST_WINDOW {
+				Duration::from_secs(3)
+			} else {
+				Duration::from_secs(15)
 			};
-			if let Some(object) = response.value.as_object_mut() {
-				object.insert("tail".to_owned(), Value::from(tail));
-				object.insert("failed_logs".to_owned(), Value::Array(failed.unwrap_or_default()));
-			}
-			receipt = Some(response);
-			if state != ActionsState::Pending || attempt == 99 {
-				break;
-			}
-			let delay = Duration::from_secs(if attempt < 20 { 3 } else { 15 });
 			poll_sleep(delay, cancellation).await?;
 		}
-		receipt
-			.ok_or_else(|| fault("github_actions_missing", "no GitHub Actions response was returned"))
 	}
 
-	/// Fetches the last `tail` log lines of every failed job in a watch
-	/// response.
+	/// Fetches bounded tails for failed jobs and retains their complete logs as
+	/// one content-addressed artifact.
 	async fn failed_job_logs(
 		&self,
 		repo: &GithubRepo,
 		value: &Value,
 		tail: usize,
 		cancellation: &CancellationToken,
-	) -> Result<Vec<Value>, Fault> {
-		let mut logs = Vec::new();
+	) -> Result<FailedLogs, Fault> {
+		let mut rows = Vec::new();
+		let mut complete = None;
 		for (run_id, job) in failed_jobs(value) {
 			let Some(job_id) = job.get("id").and_then(Value::as_u64) else {
 				continue;
 			};
 			let full = self.job_log(repo, job_id, cancellation).await?;
 			let tail_text = full.as_deref().and_then(|log| tail_lines(log, tail));
-			logs.push(json!({
+			if let Some(full) = &full {
+				let name = job.get("name").and_then(Value::as_str).unwrap_or("unnamed job");
+				let stage = match complete.as_mut() {
+					Some(stage) => stage,
+					None => complete.insert(self.blobs.begin_spill().map_err(|_| {
+						fault(
+							"github_artifact_failed",
+							"GitHub output artifact could not be opened",
+						)
+					})?),
+				};
+				let heading = format!("## {name} (run {run_id}, job {job_id})\n\n");
+				io::Write::write_all(stage, heading.as_bytes()).map_err(|_| {
+					fault(
+						"github_artifact_failed",
+						"GitHub output artifact could not be written",
+					)
+				})?;
+				io::Write::write_all(stage, full.as_bytes()).map_err(|_| {
+					fault(
+						"github_artifact_failed",
+						"GitHub output artifact could not be written",
+					)
+				})?;
+				io::Write::write_all(stage, b"\n\n").map_err(|_| {
+					fault(
+						"github_artifact_failed",
+						"GitHub output artifact could not be written",
+					)
+				})?;
+			}
+			rows.push(json!({
 				"run_id": run_id,
 				"job_id": job_id,
 				"job_name": job.get("name").and_then(Value::as_str),
@@ -726,7 +1166,27 @@ impl GithubService {
 				"tail": tail_text,
 			}));
 		}
-		Ok(logs)
+		let artifact = complete
+			.map(|stage| {
+				stage
+					.finish()
+					.map_err(|_| {
+						fault(
+							"github_artifact_failed",
+							"GitHub output artifact could not be committed",
+						)
+					})
+					.map(|reference| Artifact {
+						uri: Str::new(format!(
+							"artifact://sha256/{}",
+							reference.to_hex().as_str()
+						)),
+						size: reference.size,
+						media_type: sf!("text/plain"),
+					})
+			})
+			.transpose()?;
+		Ok(FailedLogs { rows, artifact })
 	}
 
 	async fn fetch_run_jobs(
@@ -789,20 +1249,27 @@ impl GithubService {
 	}
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Method {
 	Get,
+	GetTextMatch,
 	Post,
 }
 fn api_path(path: &str) -> &str {
 	path.split_once('?').map_or(path, |(path, _)| path)
 }
 #[derive(Clone)]
+struct RunReference {
+	id:   u64,
+	repo: Option<GithubRepo>,
+}
+#[derive(Clone)]
 enum WatchTarget {
 	Run(u64),
 	Commit { branch: Str, head_sha: Str },
 }
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum ActionsState {
 	Pending,
 	Success,
@@ -812,12 +1279,19 @@ struct ApiResponse {
 	value:     Value,
 	remaining: Option<u64>,
 	reset:     Option<u64>,
+	artifact:  Option<Artifact>,
+}
+struct FailedLogs {
+	rows:     Vec<Value>,
+	artifact: Option<Artifact>,
 }
 #[derive(Deserialize, Serialize)]
 struct CheckoutMetadata {
-	repo:      String,
-	clone_url: String,
-	head:      String,
+	repo:          String,
+	clone_url:     String,
+	head:          String,
+	#[serde(default)]
+	expected_head: String,
 }
 
 async fn checkout_git(
@@ -839,6 +1313,10 @@ async fn checkout_git(
 		.await
 		.map_err(|_| fault("github_git_failed", "GitHub checkout worker failed"))?
 		.map_err(git_fault)?;
+	let repository = crate::vcs::git::repo::Repository::from_handle(Arc::clone(&repo));
+	let _guard = crate::vcs::git::lock::write(&repository, &cancel)
+		.await
+		.map_err(|_| fault("github_git_failed", "Git repository mutation lock failed"))?;
 	let fetch_branch = format!("omp/github-fetch/pr-{number}");
 	let fetch_ref = format!("refs/heads/{fetch_branch}");
 	repo
@@ -910,22 +1388,44 @@ async fn push_git(
 	metadata: &CheckoutMetadata,
 	force: bool,
 	cancel: CancellationToken,
-) -> Result<(), Fault> {
+) -> Result<Str, Fault> {
 	let repo = task::spawn_blocking(move || GitRepo::require(&path).map(Arc::new))
 		.await
 		.map_err(|_| fault("github_git_failed", "GitHub push worker failed"))?
 		.map_err(git_fault)?;
+	let repository = crate::vcs::git::repo::Repository::from_handle(Arc::clone(&repo));
+	let _guard = crate::vcs::git::lock::write(&repository, &cancel)
+		.await
+		.map_err(|_| fault("github_git_failed", "Git repository mutation lock failed"))?;
+	let pushed_head = repo
+		.head_sha()
+		.map_err(git_fault)?
+		.ok_or_else(|| fault("github_git_failed", "pull request worktree has no HEAD commit"))?;
 	repo
 		.push(
 			&PushOptions {
-				remote:           Some(metadata.clone_url.clone()),
-				refspec:          Some(format!("HEAD:{}", metadata.head)),
-				force_with_lease: force,
+				remote: Some(metadata.clone_url.clone()),
+				refspec: Some(format!("HEAD:refs/heads/{}", metadata.head)),
+				force_with_lease: if force {
+					if metadata.expected_head.is_empty() {
+						return Err(fault(
+							"github_checkout_missing",
+							"checkout metadata has no remote head for force-with-lease",
+						));
+					}
+					Some(format!(
+						"refs/heads/{}:{}",
+						metadata.head, metadata.expected_head
+					))
+				} else {
+					None
+				},
 			},
 			Some(cancel),
 		)
 		.await
-		.map_err(git_fault)
+		.map_err(git_fault)?;
+	Ok(Str::new(pushed_head))
 }
 
 fn current_git_snapshot(root: &Path) -> Result<(Str, Str), Fault> {
@@ -947,9 +1447,10 @@ fn current_git_snapshot(root: &Path) -> Result<(Str, Str), Fault> {
 }
 fn has_scope(query: &str) -> bool {
 	query.split_whitespace().any(|part| {
+		let part = part.strip_prefix('-').unwrap_or(part);
 		["repo:", "org:", "user:", "owner:"]
 			.iter()
-			.any(|prefix| part.starts_with(prefix))
+			.any(|prefix| part.get(..prefix.len()).is_some_and(|value| value.eq_ignore_ascii_case(prefix)))
 	})
 }
 fn parse_pr_number(value: &str, repo: &GithubRepo) -> Result<Option<u64>, Fault> {
@@ -961,17 +1462,27 @@ fn parse_pr_number(value: &str, repo: &GithubRepo) -> Result<Option<u64>, Fault>
 			Err(fault("github_invalid_pr", "pull request number must be positive"))
 		};
 	}
+	let Some((url_repo, number)) = parse_pr_url(value)? else {
+		return Ok(None);
+	};
+	if !url_repo.identity().eq_ignore_ascii_case(repo.identity()) {
+		return Err(fault("github_invalid_pr", "pull request URL belongs to a different repository"));
+	}
+	Ok(Some(number))
+}
+
+fn parse_pr_url(value: &str) -> Result<Option<(GithubRepo, u64)>, Fault> {
 	if !value.contains("://") {
 		return Ok(None);
 	}
 	let parsed = url::Url::parse(value)
 		.map_err(|_| fault("github_invalid_pr", "pull request URL is not a valid GitHub URL"))?;
-	let host = parsed.host_str().unwrap_or_default();
+	let host = parsed_url_host(&parsed);
 	let parts = parsed
 		.path_segments()
 		.map(|parts| parts.collect::<Vec<_>>())
 		.unwrap_or_default();
-	let (repo_host, owner, name, number) = match (host, parts.as_slice()) {
+	let (repo_host, owner, name, number) = match (host.as_str(), parts.as_slice()) {
 		("api.github.com", ["repos", owner, name, "pulls", number, ..]) => {
 			("github.com", *owner, *name, *number)
 		},
@@ -988,26 +1499,62 @@ fn parse_pr_number(value: &str, repo: &GithubRepo) -> Result<Option<u64>, Fault>
 			));
 		},
 	};
-	let url_repo = GithubRepo::new(repo_host, owner, name)
+	let repo = GithubRepo::new(repo_host, owner, name)
 		.map_err(|_| fault("github_invalid_pr", "pull request URL has an invalid repository"))?;
-	if !url_repo.identity().eq_ignore_ascii_case(repo.identity()) {
-		return Err(fault("github_invalid_pr", "pull request URL belongs to a different repository"));
-	}
-	number
+	let number = number
 		.parse::<u64>()
 		.ok()
 		.filter(|number| *number > 0)
-		.map(Some)
-		.ok_or_else(|| fault("github_invalid_pr", "pull request URL has no positive number"))
+		.ok_or_else(|| fault("github_invalid_pr", "pull request URL has no positive number"))?;
+	Ok(Some((repo, number)))
 }
-fn run_id(value: &str) -> Result<u64, Fault> {
-	value
-		.trim_end_matches('/')
-		.rsplit('/')
-		.next()
-		.unwrap_or(value)
-		.parse()
-		.map_err(|_| fault("github_invalid_run", "Actions run must be an id or URL"))
+fn parsed_url_host(parsed: &url::Url) -> String {
+	let host = parsed.host_str().unwrap_or_default();
+	parsed
+		.port()
+		.map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"))
+}
+
+fn parse_run_reference(value: &str) -> Result<RunReference, Fault> {
+	let value = value.trim();
+	if let Ok(id) = value.parse::<u64>() {
+		if id == 0 {
+			return Err(fault("github_invalid_run", "Actions run id must be positive"));
+		}
+		return Ok(RunReference { id, repo: None });
+	}
+	let parsed = url::Url::parse(value)
+		.map_err(|_| fault("github_invalid_run", "Actions run must be an id or GitHub run URL"))?;
+	let host = parsed_url_host(&parsed);
+	let parts = parsed
+		.path_segments()
+		.map(|parts| parts.collect::<Vec<_>>())
+		.unwrap_or_default();
+	let (repo_host, owner, name, id) = match (host.as_str(), parts.as_slice()) {
+		("api.github.com", ["repos", owner, name, "actions", "runs", id, ..]) => {
+			("github.com", *owner, *name, *id)
+		},
+		(host, ["api", "v3", "repos", owner, name, "actions", "runs", id, ..]) => {
+			(host, *owner, *name, *id)
+		},
+		(host, [owner, name, "actions", "runs", id, ..]) if !host.is_empty() => {
+			(host, *owner, *name, *id)
+		},
+		_ => {
+			return Err(fault(
+				"github_invalid_run",
+				"Actions run URL must identify a GitHub Actions run",
+			));
+		},
+	};
+	let id = id
+		.parse::<u64>()
+		.ok()
+		.filter(|id| *id != 0)
+		.ok_or_else(|| fault("github_invalid_run", "Actions run URL has no positive id"))?;
+	let repo = GithubRepo::new(repo_host, owner, name)
+		.map_err(|_| fault("github_invalid_run", "Actions run URL has an invalid repository"))?;
+	Ok(RunReference { id, repo: Some(repo) })
 }
 fn actions_state(value: &Value) -> ActionsState {
 	if let Some(run) = value.get("run") {
@@ -1088,7 +1635,13 @@ fn file_endpoint(repo: &str, path: &str, branch: Option<&str>) -> Result<String,
 	}
 	Ok(endpoint)
 }
-fn decode_file_response(value: &Value, repo: &str, path: &str) -> Result<Value, Fault> {
+fn decode_file_response(
+	value: &Value,
+	repo: &str,
+	path: &str,
+	branch: Option<&str>,
+	blobs: &BlobHost,
+) -> Result<(Value, Option<Artifact>), Fault> {
 	if value.get("type").and_then(Value::as_str) != Some("file") {
 		return Err(fault("github_invalid_content", "GitHub Contents response was not a file"));
 	}
@@ -1109,12 +1662,57 @@ fn decode_file_response(value: &Value, repo: &str, path: &str) -> Result<Value, 
 	let decoded = omp_core::base64::decode(&compact)
 		.into_vec()
 		.map_err(|_| fault("github_invalid_content", "GitHub file content was not valid base64"))?;
-	Ok(json!({
-		"repo": repo,
-		"path": path,
-		"content": String::from_utf8_lossy(&decoded),
-		"size": decoded.len(),
-	}))
+	let source_url = value.get("html_url").and_then(Value::as_str);
+	let prefix = &decoded[..decoded.len().min(omp_tools::read::BINARY_SNIFF_BYTES)];
+	let binary = omp_tools::read::is_probably_binary_header(prefix);
+	match std::str::from_utf8(&decoded) {
+		Ok(content) if !binary => Ok((
+			json!({
+				"repo": repo,
+				"path": path,
+				"branch": branch,
+				"content": content,
+				"size": decoded.len(),
+				"source_url": source_url,
+				"binary": false,
+			}),
+			None,
+		)),
+		_ => {
+			let id = blobs.put(&decoded).map_err(|_| {
+				fault(
+					"github_artifact_failed",
+					"GitHub file artifact could not be retained",
+				)
+			})?;
+			let reference = BlobRef::from(id);
+			let image = omp_tools::read::image::sniff_metadata(&decoded);
+			let artifact = Artifact {
+				uri: Str::new(format!("artifact://sha256/{}", reference.to_hex().as_str())),
+				size: id.size,
+				media_type: image.map_or_else(
+					|| sf!("application/octet-stream"),
+					|metadata| Str::new_static(metadata.kind.media_type()),
+				),
+			};
+			Ok((
+				json!({
+					"repo": repo,
+					"path": path,
+					"branch": branch,
+					"content": Value::Null,
+					"size": decoded.len(),
+					"source_url": source_url,
+					"binary": true,
+					"artifact": artifact.uri.as_str(),
+					"media_type": artifact.media_type.as_str(),
+					"width": image.and_then(|metadata| metadata.width),
+					"height": image.and_then(|metadata| metadata.height),
+				}),
+				Some(artifact),
+			))
+		},
+	}
 }
 fn pr_branch_endpoint(repo: &str, head: &str) -> String {
 	format!("/repos/{repo}/pulls?state=open&head={}&per_page=100", encode_query(head),)
@@ -1616,23 +2214,386 @@ fn format_epoch_datetime(seconds: i64) -> Result<String, Fault> {
 	let second = within_day % 60;
 	Ok(format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"))
 }
+
+fn actions_signature(value: &Value) -> String {
+	let runs = value
+		.get("workflow_runs")
+		.and_then(Value::as_array)
+		.cloned()
+		.unwrap_or_default();
+	serde_json::to_string(&runs).unwrap_or_default()
+}
+
+fn operation_is_useless(op: Operation, value: &Value) -> bool {
+	match op {
+		Operation::SearchIssues
+		| Operation::SearchPrs
+		| Operation::SearchCode
+		| Operation::SearchCommits
+		| Operation::SearchRepos => value
+			.get("items")
+			.and_then(Value::as_array)
+			.is_none_or(Vec::is_empty),
+		Operation::RunWatch => value.get("outcome").and_then(Value::as_str) == Some("no_runs"),
+		_ => false,
+	}
+}
+
+fn render_output(op: Operation, value: &Value, artifact: Option<&Artifact>) -> String {
+	let mut output = match op {
+		Operation::RepoView => render_repo(value),
+		Operation::FileRead => render_file(value),
+		Operation::PrCreate => render_created_pr(value),
+		Operation::PrCheckout => render_checkout(value),
+		Operation::PrPush => render_push(value),
+		Operation::SearchIssues
+		| Operation::SearchPrs
+		| Operation::SearchCode
+		| Operation::SearchCommits
+		| Operation::SearchRepos => render_search(op, value),
+		Operation::RunWatch => render_actions(value),
+	};
+	if let Some(artifact) = artifact {
+		let _ = write!(
+			output,
+			"\n\nComplete output: {} ({} bytes, {})",
+			artifact.uri, artifact.size, artifact.media_type
+		);
+	}
+	output
+}
+
+fn render_repo(value: &Value) -> String {
+	let name = value
+		.get("full_name")
+		.and_then(Value::as_str)
+		.unwrap_or("GitHub Repository");
+	let mut output = format!("# {name}");
+	if let Some(description) = value.get("description").and_then(Value::as_str)
+		&& !description.trim().is_empty()
+	{
+		let _ = write!(output, "\n\n{}", description.trim());
+	}
+	for (label, pointer) in [
+		("URL", "/html_url"),
+		("Default branch", "/default_branch"),
+		("Branch", "/requested_branch"),
+		("Visibility", "/visibility"),
+		("Language", "/language"),
+		("Updated", "/updated_at"),
+		("Homepage", "/homepage"),
+	] {
+		if let Some(text) = value.pointer(pointer).and_then(Value::as_str)
+			&& !text.is_empty()
+		{
+			let _ = write!(output, "\n{label}: {text}");
+		}
+	}
+	for (label, pointer) in [
+		("Stars", "/stargazers_count"),
+		("Forks", "/forks_count"),
+		("Open issues", "/open_issues_count"),
+	] {
+		if let Some(number) = value.pointer(pointer).and_then(Value::as_u64) {
+			let _ = write!(output, "\n{label}: {number}");
+		}
+	}
+	for (label, pointer) in [("Archived", "/archived"), ("Fork", "/fork")] {
+		if let Some(flag) = value.pointer(pointer).and_then(Value::as_bool) {
+			let _ = write!(output, "\n{label}: {flag}");
+		}
+	}
+	if let Some(topics) = value.get("topics").and_then(Value::as_array) {
+		let topics = topics.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+		if !topics.is_empty() {
+			let _ = write!(output, "\nTopics: {topics}");
+		}
+	}
+	output
+}
+
+fn render_file(value: &Value) -> String {
+	let path = value.get("path").and_then(Value::as_str).unwrap_or("(unknown path)");
+	if value.get("binary").and_then(Value::as_bool) == Some(true) {
+		let size = value.get("size").and_then(Value::as_u64).unwrap_or_default();
+		if let Some(media_type) = value
+			.get("media_type")
+			.and_then(Value::as_str)
+			.filter(|media_type| media_type.starts_with("image/"))
+		{
+			let mut output = format!("Image file: {path}\nMIME: {media_type}\nSize: {size} bytes");
+			if let (Some(width), Some(height)) = (
+				value.get("width").and_then(Value::as_u64),
+				value.get("height").and_then(Value::as_u64),
+			) {
+				let _ = write!(output, "\nDimensions: {width}x{height}");
+			}
+			return output;
+		}
+		return format!("[Cannot inline binary GitHub file '{path}' ({size} bytes).]");
+	}
+	value
+		.get("content")
+		.and_then(Value::as_str)
+		.unwrap_or_default()
+		.to_owned()
+}
+
+fn render_created_pr(value: &Value) -> String {
+	let number = value.get("number").and_then(Value::as_u64);
+	let title = value.get("title").and_then(Value::as_str).unwrap_or("Untitled");
+	let mut output = match number {
+		Some(number) => format!("# Pull Request #{number}: {title}"),
+		None => format!("# Pull Request: {title}"),
+	};
+	if let Some(url) = value.get("html_url").and_then(Value::as_str) {
+		let _ = write!(output, "\nURL: {url}");
+	}
+	if let (Some(head), Some(base)) = (
+		value.pointer("/head/ref").and_then(Value::as_str),
+		value.pointer("/base/ref").and_then(Value::as_str),
+	) {
+		let _ = write!(output, "\nBranch: {head} -> {base}");
+	}
+	output
+}
+
+fn render_checkout(value: &Value) -> String {
+	let rows = value
+		.get("checkouts")
+		.and_then(Value::as_array)
+		.map(Vec::as_slice)
+		.unwrap_or_default();
+	let mut output = format!("# {} Pull Request Worktree(s)", rows.len());
+	for row in rows {
+		let number = row.get("pr").and_then(Value::as_u64).unwrap_or_default();
+		let branch = row.get("branch").and_then(Value::as_str).unwrap_or("unknown");
+		let path = row.get("path").and_then(Value::as_str).unwrap_or("unknown");
+		let reused = row.get("reused").and_then(Value::as_bool).unwrap_or(false);
+		let _ = write!(
+			output,
+			"\n- #{number} {branch}{}\n  Path: {path}",
+			if reused { " (reused)" } else { "" }
+		);
+		if let Some(remote) = row.get("remote_branch").and_then(Value::as_str) {
+			let _ = write!(output, "\n  Remote branch: {remote}");
+		}
+	}
+	render_batch_failures(&mut output, value);
+	output
+}
+
+fn render_push(value: &Value) -> String {
+	let rows = value
+		.get("pushed")
+		.and_then(Value::as_array)
+		.map(Vec::as_slice)
+		.unwrap_or_default();
+	let mut output = format!("# {} Pull Request Branch(es) pushed", rows.len());
+	for row in rows {
+		let number = row.get("pr").and_then(Value::as_u64).unwrap_or_default();
+		let branch = row
+			.get("remote_branch")
+			.and_then(Value::as_str)
+			.unwrap_or("unknown");
+		let force = row
+			.get("force_with_lease")
+			.and_then(Value::as_bool)
+			.unwrap_or(false);
+		let _ = write!(
+			output,
+			"\n- #{number} -> {branch}{}",
+			if force { " (force-with-lease)" } else { "" }
+		);
+	}
+	render_batch_failures(&mut output, value);
+	output
+}
+
+fn render_batch_failures(output: &mut String, value: &Value) {
+	let failures = value
+		.get("failures")
+		.and_then(Value::as_array)
+		.map(Vec::as_slice)
+		.unwrap_or_default();
+	if failures.is_empty() {
+		return;
+	}
+	output.push_str("\n\n## Failed");
+	for failure in failures {
+		let reference = failure.get("pr").and_then(Value::as_str).unwrap_or("unknown");
+		let message = failure.get("message").and_then(Value::as_str).unwrap_or("failed");
+		let _ = write!(output, "\n- {reference}: {message}");
+	}
+}
+
+fn render_search(op: Operation, value: &Value) -> String {
+	let label = op.get_message().unwrap_or("Search");
+	let rows = value
+		.get("items")
+		.and_then(Value::as_array)
+		.map(Vec::as_slice)
+		.unwrap_or_default();
+	let mut output = format!("# GitHub {label}\n");
+	if let Some(query) = value.get("query").and_then(Value::as_str) {
+		let _ = write!(output, "\nQuery: {query}");
+	}
+	if let Some(repo) = value.get("repository").and_then(Value::as_str) {
+		let _ = write!(output, "\nRepository: {repo}");
+	}
+	let _ = write!(output, "\nResults: {}", rows.len());
+	for row in rows {
+		match op {
+			Operation::SearchIssues | Operation::SearchPrs => {
+				let number = row.get("number").and_then(Value::as_u64).unwrap_or_default();
+				let title = row.get("title").and_then(Value::as_str).unwrap_or("Untitled");
+				let state = row.get("state").and_then(Value::as_str).unwrap_or("unknown");
+				let _ = write!(output, "\n- [{state}] #{number} {title}");
+			},
+			Operation::SearchCode => {
+				let repo = row
+					.pointer("/repository/full_name")
+					.and_then(Value::as_str)
+					.unwrap_or("unknown repository");
+				let path = row.get("path").and_then(Value::as_str).unwrap_or("unknown path");
+				let _ = write!(output, "\n- {repo}:{path}");
+				if let Some(fragment) = row
+					.pointer("/text_matches/0/fragment")
+					.and_then(Value::as_str)
+					.and_then(|text| text.lines().next())
+				{
+					let _ = write!(output, "\n  Match: {}", fragment.trim());
+				}
+			},
+			Operation::SearchCommits => {
+				let sha = row
+					.get("sha")
+					.and_then(Value::as_str)
+					.unwrap_or("unknown");
+				let subject = row
+					.pointer("/commit/message")
+					.and_then(Value::as_str)
+					.and_then(|text| text.lines().next())
+					.unwrap_or("(no commit message)");
+				let _ = write!(output, "\n- {} {subject}", &sha[..sha.len().min(8)]);
+			},
+			Operation::SearchRepos => {
+				let repo = row
+					.get("full_name")
+					.and_then(Value::as_str)
+					.unwrap_or("unknown repository");
+				let stars = row
+					.get("stargazers_count")
+					.and_then(Value::as_u64)
+					.unwrap_or_default();
+				let _ = write!(output, "\n- {repo} ({stars} stars)");
+			},
+			_ => unreachable!(),
+		}
+		if let Some(url) = row.get("html_url").and_then(Value::as_str) {
+			let _ = write!(output, "\n  URL: {url}");
+		}
+	}
+	output
+}
+
+fn render_actions(value: &Value) -> String {
+	let outcome = value
+		.get("outcome")
+		.and_then(Value::as_str)
+		.unwrap_or("pending");
+	let poll = value
+		.get("poll_count")
+		.and_then(Value::as_u64)
+		.unwrap_or_default();
+	let mut output = format!("# GitHub Actions\n\nOutcome: {outcome}\nPoll: {poll}");
+	let runs = if let Some(run) = value.get("run") {
+		std::slice::from_ref(run)
+	} else {
+		value
+			.get("workflow_runs")
+			.and_then(Value::as_array)
+			.map(Vec::as_slice)
+			.unwrap_or_default()
+	};
+	for run in runs {
+		let id = run.get("id").and_then(Value::as_u64).unwrap_or_default();
+		let name = run
+			.get("name")
+			.or_else(|| run.get("display_title"))
+			.and_then(Value::as_str)
+			.unwrap_or("workflow");
+		let state = run
+			.get("conclusion")
+			.or_else(|| run.get("status"))
+			.and_then(Value::as_str)
+			.unwrap_or("pending");
+		let _ = write!(output, "\n- {name} ({id}): {state}");
+		let jobs = run
+			.get("jobs")
+			.and_then(Value::as_array)
+			.or_else(|| value.get("jobs").and_then(Value::as_array));
+		for job in jobs.into_iter().flatten() {
+			let name = job.get("name").and_then(Value::as_str).unwrap_or("job");
+			let state = job
+				.get("conclusion")
+				.or_else(|| job.get("status"))
+				.and_then(Value::as_str)
+				.unwrap_or("pending");
+			let _ = write!(output, "\n  - {name}: {state}");
+		}
+	}
+	if let Some(logs) = value.get("failed_logs").and_then(Value::as_array) {
+		for log in logs {
+			let name = log.get("job_name").and_then(Value::as_str).unwrap_or("job");
+			let _ = write!(output, "\n\n## {name}");
+			if let Some(tail) = log.get("tail").and_then(Value::as_str) {
+				let _ = write!(output, "\n{tail}");
+			} else {
+				output.push_str("\nLog unavailable.");
+			}
+		}
+	}
+	output
+}
+
 fn required<'a>(value: Option<&'a str>, message: &'static str) -> Result<&'a str, Fault> {
-	value.ok_or_else(|| fault("github_invalid_request", message))
+	value
+		.map(str::trim)
+		.filter(|value| !value.is_empty())
+		.ok_or_else(|| fault("github_invalid_request", message))
 }
 fn fault(code: &'static str, message: &'static str) -> Fault {
-	Fault { code: Str::new_static(code), message: Str::new_static(message) }
+	Fault {
+		code: Str::new_static(code),
+		message: Str::new_static(message),
+		status: None,
+		rate_limit_remaining: None,
+		rate_limit_reset: None,
+		retry_after_seconds: None,
+	}
 }
 fn cancelled_fault() -> Fault {
 	fault("github_cancelled", "GitHub operation was cancelled")
 }
-fn http_fault(error: reqwest::Error) -> Fault {
-	Fault { code: sf!("github_transport_failed"), message: Str::new(error.to_string()) }
+fn http_fault(_: reqwest::Error) -> Fault {
+	fault(
+		"github_transport_failed",
+		"GitHub transport failed before a response was received",
+	)
 }
-fn git_fault(error: omp_vcs::Error) -> Fault {
-	Fault { code: sf!("github_git_failed"), message: Str::new(error.to_string()) }
+fn git_fault(_: omp_vcs::Error) -> Fault {
+	fault("github_git_failed", "Git operation failed")
 }
-fn io_fault(error: io::Error) -> Fault {
-	Fault { code: sf!("github_io_failed"), message: Str::new(error.to_string()) }
+fn io_fault(_: io::Error) -> Fault {
+	fault("github_io_failed", "Local GitHub worktree operation failed")
+}
+fn sanitize_remote_message(message: &str) -> String {
+	message
+		.chars()
+		.filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+		.take(1_024)
+		.collect()
 }
 #[cfg(test)]
 mod tests {
@@ -1644,8 +2605,9 @@ mod tests {
 	use super::{
 		ActionsState, DateField, Operation, Params, PrMetadata, UNIX_EPOCH, actions_runs_endpoint,
 		actions_state, branch_endpoint, compare_endpoint, date_qualifier, days_from_civil,
-		decode_file_response, failed_jobs, file_endpoint, fill_from_commits, normalize_date_bound,
-		parse_pr_number, poll_sleep, pr_branch_endpoint, run_jobs_endpoint, tail_limit, tail_lines,
+		decode_file_response, failed_jobs, file_endpoint, fill_from_commits, has_scope,
+		normalize_date_bound, parse_pr_number, parse_run_reference, poll_sleep, pr_branch_endpoint,
+		render_output, run_jobs_endpoint, tail_limit, tail_lines,
 	};
 	use crate::github_url::GithubRepo;
 
@@ -1773,21 +2735,48 @@ mod tests {
 
 	#[test]
 	fn contents_response_must_be_a_base64_file() {
-		let decoded = decode_file_response(
-			&json!({ "type": "file", "encoding": "base64", "content": "aGVsbG8=" }),
+		let dir = tempfile::tempdir().expect("blob tempdir");
+		let blobs = super::BlobHost::open(dir.path()).expect("blob store");
+		let (decoded, artifact) = decode_file_response(
+			&json!({
+				"type": "file",
+				"encoding": "base64",
+				"content": "aGVsbG8=",
+				"html_url": "https://github.com/owner/repo/blob/main/hello.txt",
+			}),
 			"owner/repo",
 			"hello.txt",
+			None,
+			&blobs,
 		)
 		.expect("file response");
 		assert_eq!(decoded["content"], "hello");
-		assert!(decode_file_response(&json!([]), "owner/repo", "dir").is_err());
+		assert!(artifact.is_none());
+		assert!(decode_file_response(&json!([]), "owner/repo", "dir", None, &blobs).is_err());
 		assert!(
 			decode_file_response(
 				&json!({ "type": "file", "encoding": "utf-8", "content": "hello" }),
 				"owner/repo",
 				"hello.txt",
+				None,
+				&blobs,
 			)
 			.is_err(),
+		);
+		let (binary, artifact) = decode_file_response(
+			&json!({ "type": "file", "encoding": "base64", "content": "AP8=" }),
+			"owner/repo",
+			"image.bin",
+			None,
+			&blobs,
+		)
+		.expect("binary response");
+		assert_eq!(binary["binary"], true);
+		assert!(
+			artifact
+				.expect("binary artifact")
+				.uri
+				.starts_with("artifact://sha256/")
 		);
 	}
 
@@ -1829,10 +2818,42 @@ mod tests {
 				.expect("enterprise URL"),
 			Some(23),
 		);
+		let run = parse_run_reference(
+			"https://ghe.example.com/OWNER/REPO/actions/runs/987/jobs/1",
+		)
+		.expect("enterprise run URL");
+		assert_eq!(run.id, 987);
+		assert_eq!(
+			run.repo.expect("run repo").identity().to_ascii_lowercase(),
+			"ghe.example.com/owner/repo",
+		);
 		assert!(
 			parse_pr_number("https://github.com/owner/repo/pull/23", &enterprise).is_err(),
 			"a PR URL from another host must not drive the enterprise checkout",
 		);
+	}
+
+	#[test]
+	fn search_scope_and_projection_cover_all_search_families() {
+		assert!(has_scope("bug -repo:owner/legacy"));
+		assert!(has_scope("ORG:example parser"));
+		assert!(!has_scope("parser regression"));
+		let output = render_output(
+			Operation::SearchCode,
+			&json!({
+				"query": "needle repo:owner/repo",
+				"repository": "owner/repo",
+				"items": [{
+					"path": "src/lib.rs",
+					"html_url": "https://github.com/owner/repo/blob/main/src/lib.rs",
+					"repository": {"full_name": "owner/repo"},
+					"text_matches": [{"fragment": "needle();\ncontext"}],
+				}],
+			}),
+			None,
+		);
+		assert!(output.contains("owner/repo:src/lib.rs"));
+		assert!(output.contains("Match: needle();"));
 	}
 
 	#[test]

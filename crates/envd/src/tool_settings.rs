@@ -111,7 +111,7 @@ omp_con::var! {
 	};
 	/// Bytes retained inline before tool output spills.
 	pub static SV_TOOLS_OUTPUT_SPILL_BYTES = sv_tools_output_spill_bytes: i64 {
-		default: 64 * 1024,
+		default: 50 * 1024,
 		min: 1,
 		validate: |ctx, value| {
 			if *value <= SV_TOOLS_OUTPUT_MAX_BYTES.get(ctx) {
@@ -135,8 +135,18 @@ omp_con::var! {
 		},
 		flags: archive,
 	};
+	/// Legacy pi inspection timeout retained only for configuration migration.
+	pub static SV_INSPECT_IMAGE_TIMEOUT_MS = sv_inspect_image_timeout_ms: Span {
+		default: Span::Finite(Duration::new(300, omp_core::DurationUnit::Seconds)),
+		flags: archive,
+	};
 	/// Include tool-intent decisions in diagnostic tracing.
 	pub static SV_TOOLS_INTENT_TRACING = sv_tools_intent_tracing: bool {
+		default: true,
+		flags: archive,
+	};
+	/// Stop an owned in-band stream as soon as it fabricates a tool result.
+	pub static SV_TOOLS_ABORT_ON_FABRICATED_RESULT = sv_tools_abort_on_fabricated_result: bool {
 		default: true,
 		flags: archive,
 	};
@@ -155,104 +165,107 @@ omp_con::var! {
 pub struct ToolSettings {
 	/// Explicit per-tool enablement overrides; absent names remain enabled.
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
-	pub enabled:              BTreeMap<Str, bool>,
+	pub enabled: BTreeMap<Str, bool>,
 	/// Global ceiling for tool deadlines.
 	#[serde(skip_serializing_if = "Option::is_none", with = "optional_duration")]
-	pub max_timeout:          Option<Duration>,
+	pub max_timeout: Option<Duration>,
 	/// Optional pinned edit revision (`rep.2`, `patch.2`, or `hl.1`) for this
 	/// client.
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub edit_dialect:         Option<Str>,
+	pub edit_dialect: Option<Str>,
 	/// Optional JSONL destination for edit black-box diagnostics.
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub edit_blackbox_path:   Option<PathBuf>,
+	pub edit_blackbox_path: Option<PathBuf>,
 	/// Repair newly introduced syntax parse errors before commit after validated
 	/// reparse and non-revert checks.
-	pub edit_auto_repair:     bool,
+	pub edit_auto_repair: bool,
 	/// Abort a streaming turn as soon as the edit guard proves it invalid.
 	pub edit_streaming_abort: bool,
 	/// Permit HTTP(S) URL dispatch from read.
-	pub fetch_enabled:        bool,
+	pub fetch_enabled: bool,
 	/// Convert supported documents to Markdown.
-	pub render_markdown:      bool,
+	pub render_markdown: bool,
 	/// Normalize images to model pixel/output bounds.
-	pub auto_resize_images:   bool,
+	pub auto_resize_images: bool,
 	/// Formatter requirement for write/edit transactions.
-	pub format_policy:        FormatPolicy,
+	pub format_policy: FormatPolicy,
 	/// Capture one final diagnostics batch after write.
 	pub diagnostics_on_write: bool,
 	/// Capture one final diagnostics batch after edit.
-	pub diagnostics_on_edit:  bool,
+	pub diagnostics_on_edit: bool,
 	/// Collapse identical final diagnostics across server bindings.
-	pub diagnostic_dedup:     bool,
+	pub diagnostic_dedup: bool,
 	/// Default approval posture, applied after effect-tier resolution.
-	pub approval_mode:        ApprovalMode,
+	pub approval_mode: ApprovalMode,
 	/// Authoritative per-tool approval policy overrides.
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
-	pub approval:             BTreeMap<Str, ApprovalPolicy>,
+	pub approval: BTreeMap<Str, ApprovalPolicy>,
 	/// Permit fuzzy edit matching when exact anchors are unavailable.
-	pub edit_fuzzy:           bool,
+	pub edit_fuzzy: bool,
 	/// Similarity threshold for accepted fuzzy edit anchors.
 	pub edit_fuzzy_threshold: f64,
 	/// Require files to have been read before mutation.
-	pub edit_require_seen:    bool,
+	pub edit_require_seen: bool,
 	/// Refuse generated-file edits unless explicitly requested.
 	pub edit_guard_generated: bool,
 	/// Maximum bytes returned by one read call before spill/summarization.
-	pub read_max_bytes:       u64,
+	pub read_max_bytes: u64,
 	/// Summarize supported oversized documents.
-	pub read_summarize:       bool,
+	pub read_summarize: bool,
 	/// Include source line numbers in text reads.
-	pub read_line_numbers:    bool,
+	pub read_line_numbers: bool,
 	/// Context lines before each grep match.
-	pub grep_context_before:  u16,
+	pub grep_context_before: u16,
 	/// Context lines after each grep match.
-	pub grep_context_after:   u16,
+	pub grep_context_after: u16,
 	/// Named eval interpreter command overrides.
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
-	pub eval_interpreters:    BTreeMap<Str, Str>,
+	pub eval_interpreters: BTreeMap<Str, Str>,
 	/// Bytes retained inline before tool output spills.
-	pub output_spill_bytes:   u64,
+	pub output_spill_bytes: u64,
 	/// Hard byte ceiling for one materialized tool output.
-	pub output_max_bytes:     u64,
+	pub output_max_bytes: u64,
 	/// Include tool-intent decisions in diagnostic tracing.
-	pub intent_tracing:       bool,
+	pub intent_tracing: bool,
+	/// Stop an owned in-band stream as soon as it fabricates a tool result.
+	pub abort_on_fabricated_tool_result: bool,
 	/// Maximum repeated equivalent tool calls before the loop guard trips.
-	pub loop_guard_limit:     u32,
+	pub loop_guard_limit: u32,
 }
 
 impl Default for ToolSettings {
 	fn default() -> Self {
 		Self {
-			enabled:              BTreeMap::from([(Str::new_static("ast_grep"), false)]),
-			max_timeout:          None,
-			edit_dialect:         None,
-			edit_blackbox_path:   None,
-			edit_auto_repair:     false,
+			enabled: BTreeMap::from([(Str::new_static("ast_grep"), false)]),
+			max_timeout: None,
+			edit_dialect: None,
+			edit_blackbox_path: None,
+			edit_auto_repair: false,
 			edit_streaming_abort: false,
-			fetch_enabled:        true,
-			render_markdown:      false,
-			auto_resize_images:   true,
-			format_policy:        FormatPolicy::Disabled,
+			fetch_enabled: true,
+			render_markdown: false,
+			auto_resize_images: true,
+			format_policy: FormatPolicy::Disabled,
 			diagnostics_on_write: true,
-			diagnostics_on_edit:  false,
-			diagnostic_dedup:     true,
-			approval_mode:        ApprovalMode::Yolo,
-			approval:             BTreeMap::new(),
-			edit_fuzzy:           true,
+			diagnostics_on_edit: false,
+			diagnostic_dedup: true,
+			approval_mode: ApprovalMode::Yolo,
+			approval: BTreeMap::new(),
+			edit_fuzzy: true,
 			edit_fuzzy_threshold: 0.95,
-			edit_require_seen:    false,
+			edit_require_seen: false,
 			edit_guard_generated: true,
-			read_max_bytes:       1024 * 1024,
-			read_summarize:       true,
-			read_line_numbers:    false,
-			grep_context_before:  1,
-			grep_context_after:   3,
-			eval_interpreters:    BTreeMap::new(),
-			output_spill_bytes:   64 * 1024,
-			output_max_bytes:     16 * 1024 * 1024,
-			intent_tracing:       true,
-			loop_guard_limit:     8,
+			read_max_bytes: 1024 * 1024,
+			read_summarize: true,
+			read_line_numbers: false,
+			grep_context_before: 1,
+			grep_context_after: 3,
+			eval_interpreters: BTreeMap::new(),
+			output_spill_bytes: 50 * 1024,
+			output_max_bytes: 16 * 1024 * 1024,
+			intent_tracing: true,
+			abort_on_fabricated_tool_result: true,
+			loop_guard_limit: 8,
 		}
 	}
 }
@@ -308,6 +321,7 @@ impl ToolSettings {
 			output_spill_bytes: SV_TOOLS_OUTPUT_SPILL_BYTES.get(ctx) as u64,
 			output_max_bytes: SV_TOOLS_OUTPUT_MAX_BYTES.get(ctx) as u64,
 			intent_tracing: SV_TOOLS_INTENT_TRACING.get(ctx),
+			abort_on_fabricated_tool_result: SV_TOOLS_ABORT_ON_FABRICATED_RESULT.get(ctx),
 			loop_guard_limit: SV_TOOLS_LOOP_GUARD_LIMIT.get(ctx),
 		}
 	}
@@ -491,6 +505,17 @@ mod tests {
 				(Str::new_static("eval"), false),
 				(Str::new_static("ast_grep"), false),
 			]),
+			..ToolSettings::default()
+		});
+	}
+
+	#[test]
+	fn execution_group_convars_reach_the_runtime_projection() {
+		let ctx = Ctx::new();
+		ctx.run("sv_tools_abort_on_fabricated_result false")
+			.expect("fabricated-result policy");
+		assert_eq!(ToolSettings::from_con(&ctx), ToolSettings {
+			abort_on_fabricated_tool_result: false,
 			..ToolSettings::default()
 		});
 	}

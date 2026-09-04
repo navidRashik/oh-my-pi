@@ -489,6 +489,8 @@ impl EditDocuments for DocumentHost {
 			}
 		}
 
+		let _late_diagnostics =
+			self.begin_late_diagnostics(prepared.iter().map(|document| document.lease.head()));
 		let transaction_id = transaction_id(self.hello().server_epoch.as_ref());
 		let response = self
 			.commit_transaction(transaction_id.clone(), operations, &CancellationToken::new())
@@ -553,6 +555,9 @@ impl EditDocuments for DocumentHost {
 				(Some(revision), Some(content))
 			};
 			let (diagnostics, diagnostics_complete) = committed_diagnostics(operation);
+			if let Some(head) = operation.head.as_ref() {
+				self.expect_late_diagnostics(head, diagnostics_complete);
+			}
 			sections.push(CommittedSection {
 				new_revision,
 				rebased: operation.rebased,
@@ -1668,6 +1673,7 @@ impl WriteDocuments for DocumentHost {
 
 		let content = Bytes::copy_from_slice(request.content.as_bytes());
 		let absolute_path = Str::from(resolved.path.to_string_lossy().into_owned());
+		self.invalidate_late_diagnostics_path(&absolute_path);
 		if let Some(result) = self
 			.write_acp_text(absolute_path.clone(), request.content.clone())
 			.await
@@ -1716,6 +1722,7 @@ impl WriteDocuments for DocumentHost {
 				snapshot_tag,
 			});
 		}
+		let _late_diagnostics = self.begin_late_diagnostics_uri(resolved.uri.clone());
 		let transaction_id = transaction_id(self.hello().server_epoch.as_ref());
 		let response = self
 			.commit_transaction(
@@ -1784,6 +1791,8 @@ impl WriteDocuments for DocumentHost {
 			})?;
 		validate_committed_metadata(operation, head)
 			.map_err(|message| WriteCommitError::EffectsUnknown { reason: Str::from(message) })?;
+		let (_, diagnostics_complete) = committed_diagnostics(operation);
+		self.expect_late_diagnostics(head, diagnostics_complete);
 		let revision = revision_identity(head)
 			.map_err(|message| WriteCommitError::EffectsUnknown { reason: Str::from(message) })?;
 		let resolved_path = document_path(head)

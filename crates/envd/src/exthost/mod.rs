@@ -29,12 +29,13 @@ pub use dispatch::{
 	CallbackConcurrency, DispatchError, DispatchPending, DispatchRequest, DispatchRouter,
 	EventDeadline, PromptContributionProvider, PromptContributionRecord, PromptDispatchError,
 	PromptPullContext, PromptSlotBinding, UiCallbackDispatch, UiCallbackOwner, UiCommandRosterEntry,
-	UiCompletionRosterEntry, UiDispatchError, UiRendererRosterEntry, UiRoster, UiRosterConflict,
-	UiShortcutRosterEntry, decode_ui_dispatch_result, shortcut_dispatch_succeeded,
+	UiCompletionRosterEntry, UiDispatchError, UiMessageRendererRosterEntry, UiRendererRosterEntry,
+	UiRoster, UiRosterConflict, UiShortcutRosterEntry, decode_ui_dispatch_result,
+	shortcut_dispatch_succeeded,
 };
 pub use extensions::{
 	DEFAULT_EXTENSION_HOOK_TIMEOUT, ExtensionConvarError, PyComponent, PyDirector, PyExtensionError,
-	register_extension_setting_convars, register_python_extensions,
+	register_extension_setting_convars,
 };
 pub use lifecycle::{
 	ActivateReason, ActivationCause, ActivationDisposition, ActivationEvent, ActivationTrigger,
@@ -42,7 +43,8 @@ pub use lifecycle::{
 	ExtensionManifest, GenerationFence, HookDeclarationKey, LifecycleError, LifecycleHost,
 	LifecycleMachine, Principal, PrincipalAuthority, PrincipalMismatch, RegistryAvailabilitySink,
 	RestartReason, ToolDeclarationKey, UiRegistrationError, VerifiedMarkdownTransformer,
-	VerifiedRendererDeclaration, VerifiedUiRoster, verify_ui_registration,
+	VerifiedMessageRendererDeclaration, VerifiedRendererDeclaration, VerifiedUiRoster,
+	verify_ui_registration,
 };
 pub(crate) use lifecycle::{notify_extension_load, notify_extension_unload, notify_host_reconnect};
 pub use params::{

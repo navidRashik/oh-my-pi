@@ -2,7 +2,7 @@
 
 mod artifact;
 mod attachment;
-mod docs;
+pub(crate) mod docs;
 pub mod host;
 pub(super) mod local;
 mod mcp;
@@ -10,12 +10,13 @@ mod memory;
 pub(super) mod ssh;
 pub(super) mod vault;
 
-use std::{fmt::Display, path::PathBuf, str, sync::Arc};
+use std::{fmt::Display, path::PathBuf, sync::Arc};
 
-use omp_agent::SessionAuthority;
+use omp_agent::{SessionAuthority, SessionEndpoint};
 use omp_cache::github_cache::GithubCache;
 use omp_core::{CowBytes, Str};
-use omp_journal::blob::BlobStore;
+use omp_dom::{Dom, KnownTag, PropId, PropKey, Tag, Value as DomValue};
+use omp_journal::blob::{BlobRef, BlobStore};
 use omp_tools::read::{
 	Fault,
 	conflicts::{ConflictRegistry, ConflictResolver},
@@ -46,11 +47,16 @@ pub(super) struct RegistryResolver {
 	resource:  RegistryResource,
 	lines:     LineOffsetCache,
 	authority: Option<Arc<dyn SessionAuthority>>,
+	blobs:     BlobStore,
 }
 
 impl RegistryResolver {
-	fn new(resource: RegistryResource, authority: Option<Arc<dyn SessionAuthority>>) -> Self {
-		Self { resource, lines: LineOffsetCache::default(), authority }
+	fn new(
+		resource: RegistryResource,
+		authority: Option<Arc<dyn SessionAuthority>>,
+		blobs: BlobStore,
+	) -> Self {
+		Self { resource, lines: LineOffsetCache::default(), authority, blobs }
 	}
 
 	fn authority(&self) -> Result<&dyn SessionAuthority, Fault> {
@@ -92,10 +98,6 @@ impl Resolve for RegistryResolver {
 			serde_json::to_vec(&rows).map_err(json_fault)?
 		} else {
 			let (base, path) = resource.split_once('/').unwrap_or((resource, ""));
-			let endpoint = authority.lookup(base).ok_or_else(|| Fault::Source {
-				message: Str::new(format!("Session `{base}` is not live.")),
-			})?;
-			let bytes = endpoint.snapshot.read().as_bytes().to_vec();
 			match self.resource {
 				RegistryResource::Agent => {
 					if query.is_some() && !path.is_empty() {
@@ -103,9 +105,16 @@ impl Resolve for RegistryResolver {
 							message: Str::new_static("agent:// cannot combine path extraction with ?q=."),
 						});
 					}
+					let projection = agent_projection(authority, &self.blobs, base)?;
+					let bytes = serde_json::to_vec(&projection).map_err(json_fault)?;
 					project_json(bytes, query, (!path.is_empty()).then_some(path))?
 				},
-				RegistryResource::History => render_history(resource, bytes)?,
+				RegistryResource::History => {
+					let endpoint = authority.lookup(base).ok_or_else(|| Fault::Source {
+						message: Str::new(format!("Session `{base}` is not live.")),
+					})?;
+					render_history(resource, &endpoint)?
+				},
 			}
 		};
 		select_bytes(&self.lines, resource, CowBytes::from(bytes), selector)
@@ -477,7 +486,7 @@ pub(super) fn production_url_resolvers(
 			)
 			.with_capabilities(true, true, true),
 			UrlResolver::Artifact(
-				artifact::ArtifactUrlResolver::open(blob_store, session_id)
+				artifact::ArtifactUrlResolver::open(blob_store.clone(), session_id)
 					.expect("artifact catalog opens with the environment blob store"),
 			),
 		)
@@ -503,6 +512,7 @@ pub(super) fn production_url_resolvers(
 			UrlResolver::Agent(RegistryResolver::new(
 				RegistryResource::Agent,
 				session_authority.clone(),
+				blob_store.clone(),
 			)),
 		)
 		.expect("agent URL resolver is unique");
@@ -510,7 +520,11 @@ pub(super) fn production_url_resolvers(
 		.register(
 			SchemeEntry::new(Scheme::History, true, false, "read-only agent transcript index")
 				.with_capabilities(true, false, true),
-			UrlResolver::History(RegistryResolver::new(RegistryResource::History, session_authority)),
+			UrlResolver::History(RegistryResolver::new(
+				RegistryResource::History,
+				session_authority,
+				blob_store,
+			)),
 		)
 		.expect("history URL resolver is unique");
 	builder
@@ -567,29 +581,145 @@ fn project_json(bytes: Vec<u8>, query: Option<&str>, path: Option<&str>) -> Resu
 		.map_err(json_fault)
 }
 
-fn render_history(resource: &str, bytes: Vec<u8>) -> Result<Vec<u8>, Fault> {
-	if resource.trim_matches('/').is_empty() {
-		return Ok(bytes);
+fn agent_projection(
+	authority: &dyn SessionAuthority,
+	blobs: &BlobStore,
+	id: &str,
+) -> Result<serde_json::Value, Fault> {
+	for endpoint in authority.list() {
+		let snapshot = endpoint.snapshot.read().clone();
+		let dom = Dom::from_snapshot(&snapshot);
+		for handle in dom.handles() {
+			let Some(node) = dom.get(handle) else {
+				continue;
+			};
+			let kind = match node.tag {
+				Tag::Known(KnownTag::Job) => "job",
+				Tag::Known(KnownTag::Subagent) => "subagent",
+				_ => continue,
+			};
+			if dom_str(node, PropId::Id) != Some(id) {
+				continue;
+			}
+			let status = dom_str(node, PropId::Status).unwrap_or("running");
+			let result: Option<serde_json::Value> = node
+				.prop(&PropKey::from(PropId::Data))
+				.and_then(|value| match value {
+					DomValue::Json(raw) => serde_json::from_str(raw.get()).ok(),
+					_ => None,
+				})
+				.map(|value| resolve_job_artifact(blobs, value))
+				.transpose()?;
+			let output = result
+				.as_ref()
+				.and_then(|value| value.get("text").and_then(serde_json::Value::as_str))
+				.filter(|text| !text.is_empty())
+				.map(|text| serde_json::Value::String(text.to_owned()))
+				.or_else(|| {
+					result
+						.as_ref()
+						.and_then(|value| value.pointer("/output/data").cloned())
+				})
+				.or_else(|| result.as_ref().and_then(|value| value.get("text").cloned()))
+				.or_else(|| result.clone())
+				.unwrap_or(serde_json::Value::Null);
+			let data = result
+				.as_ref()
+				.and_then(|value| value.pointer("/output/data").cloned());
+			return Ok(serde_json::json!({
+				"id": id,
+				"kind": kind,
+				"status": status,
+				"output": output,
+				"data": data,
+				"result": result,
+			}));
+		}
 	}
-	let text = str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
-		message: Str::new_static("Agent transcript is not UTF-8 text."),
-	})?;
+	if let Some(endpoint) = authority.lookup(id) {
+		return Ok(session_projection(&endpoint));
+	}
+	Err(Fault::Source {
+		message: Str::new(format!("Agent or job `{id}` is not live in the session tree.")),
+	})
+}
+
+fn resolve_job_artifact(
+	blobs: &BlobStore,
+	value: serde_json::Value,
+) -> Result<serde_json::Value, Fault> {
+	let Some(object) = value.as_object() else {
+		return Ok(value);
+	};
+	let Some(address) = object.get("artifact").and_then(serde_json::Value::as_str) else {
+		return Ok(value);
+	};
+	let Some(size) = object.get("byte_len").and_then(serde_json::Value::as_u64) else {
+		return Ok(value);
+	};
+	let Some(digest) = address.strip_prefix("artifact://sha256/") else {
+		return Ok(value);
+	};
+	let reference = BlobRef::parse_hex(digest, size).map_err(json_fault)?;
+	let bytes = blobs.get(&reference).map_err(json_fault)?;
+	serde_json::from_slice(&bytes).map_err(json_fault)
+}
+
+fn session_projection(endpoint: &SessionEndpoint) -> serde_json::Value {
+	let snapshot = endpoint.snapshot.read().clone();
+	let dom = Dom::from_snapshot(&snapshot);
+	let mut output = "";
+	let mut status = "running";
+	for turn in dom.children(dom.body()).iter().rev() {
+		let Some((text, settled)) = dom.children(*turn).iter().rev().find_map(|child| {
+			let node = dom.get(*child)?;
+			(node.tag == Tag::Known(KnownTag::Assistant)).then(|| {
+				(
+					dom_str(node, PropId::Text).or(node.content.as_deref()).unwrap_or(""),
+					node.prop(&PropKey::from(PropId::StopReason)).is_some(),
+				)
+			})
+		}) else {
+			continue;
+		};
+		output = text;
+		status = if settled { "completed" } else { "running" };
+		break;
+	}
+	serde_json::json!({
+		"id": endpoint.id,
+		"name": endpoint.name,
+		"status": status,
+		"output": output,
+		"text": output,
+	})
+}
+
+fn render_history(resource: &str, endpoint: &SessionEndpoint) -> Result<Vec<u8>, Fault> {
+	let snapshot = endpoint.snapshot.read().clone();
+	let dom = Dom::from_snapshot(&snapshot);
 	let mut output = format!("# {} transcript\n\n", resource.trim_matches('/'));
 	let mut rendered = 0usize;
-	for line in text.lines().filter(|line| !line.trim().is_empty()) {
-		let value: serde_json::Value =
-			serde_json::from_str(line).map_err(|source| Fault::Invalid {
-				message: Str::new(format!("Agent transcript contains invalid JSONL: {source}")),
-			})?;
-		let role = find_json_string(&value, "role");
-		let content = find_json_string(&value, "text")
-			.or_else(|| find_json_string(&value, "content"))
-			.or_else(|| find_json_string(&value, "message"));
-		if let Some(content) = content {
+	for turn in dom.children(dom.body()) {
+		for child in dom.children(*turn) {
+			let Some(node) = dom.get(*child) else {
+				continue;
+			};
+			let (role, text) = match node.tag {
+				Tag::Known(KnownTag::User) => ("user", node.content.as_deref()),
+				Tag::Known(KnownTag::Developer) => ("developer", node.content.as_deref()),
+				Tag::Known(KnownTag::Assistant) => {
+					("assistant", dom_str(node, PropId::Text).or(node.content.as_deref()))
+				},
+				_ => continue,
+			};
+			let Some(text) = text.filter(|text| !text.is_empty()) else {
+				continue;
+			};
 			output.push_str("## ");
-			output.push_str(role.unwrap_or("event"));
+			output.push_str(role);
 			output.push_str("\n\n");
-			output.push_str(content);
+			output.push_str(text);
 			output.push_str("\n\n");
 			rendered += 1;
 		}
@@ -600,21 +730,8 @@ fn render_history(resource: &str, bytes: Vec<u8>) -> Result<Vec<u8>, Fault> {
 	Ok(output.into_bytes())
 }
 
-fn find_json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-	match value {
-		serde_json::Value::Object(object) => object
-			.get(key)
-			.and_then(serde_json::Value::as_str)
-			.or_else(|| {
-				object
-					.values()
-					.find_map(|value| find_json_string(value, key))
-			}),
-		serde_json::Value::Array(values) => {
-			values.iter().find_map(|value| find_json_string(value, key))
-		},
-		_ => None,
-	}
+fn dom_str(node: &omp_dom::Node, prop: PropId) -> Option<&str> {
+	node.prop(&PropKey::from(prop)).and_then(DomValue::as_str)
 }
 
 fn json_fault(error: impl Display) -> Fault {
@@ -644,4 +761,122 @@ pub(super) fn select_bytes(
 		output.extend_from_slice(&piece);
 	}
 	Ok(CowBytes::from(output))
+}
+
+#[cfg(test)]
+mod tests {
+	use omp_agent::{SessionRole, SessionTopology, Up};
+	use omp_core::sf;
+	use omp_dom::{NodeSpec, Op, Txn};
+	use omp_journal::EntryId;
+	use parking_lot::RwLock;
+
+	use super::*;
+
+	struct Authority {
+		endpoints: Vec<SessionEndpoint>,
+	}
+
+	impl SessionAuthority for Authority {
+		fn lookup(&self, id_or_name: &str) -> Option<SessionEndpoint> {
+			self
+				.endpoints
+				.iter()
+				.find(|endpoint| endpoint.id == id_or_name || endpoint.name == id_or_name)
+				.cloned()
+		}
+
+		fn list(&self) -> Vec<SessionEndpoint> {
+			self.endpoints.clone()
+		}
+
+		fn relay_target(
+			&self,
+			_from: &SessionEndpoint,
+			_to: &SessionEndpoint,
+		) -> Option<SessionEndpoint> {
+			None
+		}
+	}
+
+	fn endpoint(id: &'static str, dom: &Dom) -> SessionEndpoint {
+		let (up, _rx) = flume::unbounded::<Up>();
+		SessionEndpoint {
+			id: sf!(id),
+			name: sf!(id),
+			up,
+			snapshot: Arc::new(RwLock::new(dom.snapshot())),
+			topology: SessionTopology {
+				role:      SessionRole::Main,
+				parent_id: None,
+				main_id:   sf!(id),
+			},
+			autoreply: None,
+		}
+	}
+
+	#[test]
+	fn agent_projection_resolves_job_output_from_the_dom_and_session_cas() {
+		let root = tempfile::tempdir().expect("temporary blob root");
+		let blobs = BlobStore::open(root.path()).expect("blob store");
+		let result = serde_json::json!({
+			"id": "child-1",
+			"text": "durable child output",
+			"output": {
+				"mode": "strict",
+				"status": "valid",
+				"data": {"answer": 42},
+				"error": null
+			}
+		});
+		let encoded = serde_json::to_vec(&result).expect("encode child result");
+		let blob = blobs.put(&encoded).expect("persist child result");
+
+		let mut parent = Dom::new();
+		let jobs = parent.high_water() + 1;
+		let job = jobs + 1;
+		parent
+			.apply(&Txn {
+				cause: EntryId::default(),
+				label: None,
+				ops:   vec![
+					Op::Ins {
+						parent: parent.meta(),
+						after:  None,
+						node:   NodeSpec::new(KnownTag::Jobs),
+					},
+					Op::Ins {
+						parent: omp_dom::Handle::new(jobs).expect("jobs handle"),
+						after:  None,
+						node:   NodeSpec::new(KnownTag::Subagent)
+							.with_prop(PropId::Id, DomValue::Str(sf!("child-1")))
+							.with_prop(PropId::Status, DomValue::Str(sf!("completed")))
+							.with_prop(
+								PropId::Data,
+								DomValue::Json(
+									serde_json::value::to_raw_value(&serde_json::json!({
+										"artifact": format!(
+											"artifact://sha256/{}",
+											blob.to_hex()
+										),
+										"byte_len": blob.size,
+										"text": "bounded head"
+									}))
+									.expect("encode spilled output"),
+								),
+							),
+					},
+				],
+			})
+			.expect("materialize parent jobs");
+		assert_eq!(job, parent.high_water());
+
+		let authority = Authority { endpoints: vec![endpoint("parent", &parent)] };
+		let projection =
+			agent_projection(&authority, &blobs, "child-1").expect("resolve journal job output");
+		assert_eq!(projection["status"], "completed");
+		assert_eq!(projection["output"], "durable child output");
+		assert_eq!(projection["data"], serde_json::json!({"answer": 42}));
+		assert_eq!(projection["result"], result);
+	}
 }

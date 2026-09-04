@@ -2,7 +2,7 @@
 
 use std::{
 	collections::HashMap,
-	fmt,
+	fmt::{self, Write as _},
 	future::Future,
 	mem,
 	path::{Path, PathBuf},
@@ -15,10 +15,11 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use omp_core::{Str, sf};
+use omp_core::{FastHashMap, FastHashSet, Str, StrMut, sf};
 use omp_docserver::{
 	client::{TerminalEventReceiver, terminal_event_channel},
 	connection::{PROTOCOL_MAJOR, PROTOCOL_MINOR},
+	diagnostics::{Diagnostic, Severity, parse_push},
 	wire::{self, FrameConfig},
 };
 use omp_hashline::{Clipboard, NoopLoopGuard, SnapshotStore};
@@ -341,6 +342,16 @@ struct ConnState {
 	shutdown:                 CancellationToken,
 }
 
+type LateDiagnosticsSink =
+	Arc<dyn Fn(omp_session::late_diagnostics::LateDiagnostics) + Send + Sync + 'static>;
+
+#[derive(Clone, Debug)]
+struct PendingLateDiagnostics {
+	revision:  pb::Revision,
+	path:      Str,
+	delivered: FastHashSet<Str>,
+}
+
 struct Inner {
 	hello:              DocumentHello,
 	resource_mutations: RwLock<Option<ResourceMutationServices>>,
@@ -353,6 +364,11 @@ struct Inner {
 	snapshot_store:     Mutex<SnapshotStore>,
 	clipboard:          Mutex<Clipboard>,
 	noop_loop_guard:    Mutex<NoopLoopGuard>,
+	late_diagnostics:   Mutex<FastHashMap<Bytes, PendingLateDiagnostics>>,
+	recent_diagnostics: Mutex<FastHashMap<Bytes, pb::LspEvent>>,
+	late_inflight:      Mutex<FastHashSet<Bytes>>,
+	late_inflight_uris: Mutex<FastHashSet<Str>>,
+	late_sink:          RwLock<Option<(u64, LateDiagnosticsSink)>>,
 }
 
 impl fmt::Debug for Inner {
@@ -380,7 +396,143 @@ pub struct DocumentHost {
 	inner: Arc<Inner>,
 }
 
+/// Commit-lifetime diagnostic fence closing the response/event race.
+pub(crate) struct LateDiagnosticsAttempt {
+	host:      DocumentHost,
+	documents: Vec<Bytes>,
+	uris:      Vec<Str>,
+}
+
+impl Drop for LateDiagnosticsAttempt {
+	fn drop(&mut self) {
+		let mut inflight = self.host.inner.late_inflight.lock();
+		let mut inflight_uris = self.host.inner.late_inflight_uris.lock();
+		let mut recent = self.host.inner.recent_diagnostics.lock();
+		for document in &self.documents {
+			inflight.remove(document);
+			recent.remove(document);
+		}
+		for uri in &self.uris {
+			inflight_uris.remove(uri);
+		}
+	}
+}
+
 impl DocumentHost {
+	/// Binds the current Agent mailbox projection for deferred diagnostics.
+	pub(crate) fn bind_late_diagnostics(&self, id: u64, sink: LateDiagnosticsSink) {
+		*self.inner.late_sink.write() = Some((id, sink));
+	}
+
+	/// Clears pending delivery while retaining the currently bound sink.
+	pub(crate) fn reset_late_diagnostics(&self, id: u64) {
+		if self
+			.inner
+			.late_sink
+			.read()
+			.as_ref()
+			.is_some_and(|(owner, _)| *owner == id)
+		{
+			self.inner.late_diagnostics.lock().clear();
+			self.inner.recent_diagnostics.lock().clear();
+			self.inner.late_inflight.lock().clear();
+			self.inner.late_inflight_uris.lock().clear();
+		}
+	}
+
+	/// Removes the deferred-diagnostics projection only when `id` still owns it.
+	pub(crate) fn unbind_late_diagnostics(&self, id: u64) {
+		let mut sink = self.inner.late_sink.write();
+		if sink.as_ref().is_some_and(|(owner, _)| *owner == id) {
+			*sink = None;
+			self.inner.late_diagnostics.lock().clear();
+			self.inner.recent_diagnostics.lock().clear();
+			self.inner.late_inflight.lock().clear();
+			self.inner.late_inflight_uris.lock().clear();
+		}
+	}
+
+	/// Invalidates late findings superseded by any non-document-host mutation.
+	pub(crate) fn invalidate_late_diagnostics_path(&self, path: &str) {
+		self
+			.inner
+			.late_diagnostics
+			.lock()
+			.retain(|_, pending| pending.path != path);
+	}
+
+	/// Opens a commit-lifetime fence so diagnostics racing its response can be
+	/// retained.
+	pub(crate) fn begin_late_diagnostics<'a>(
+		&self,
+		heads: impl IntoIterator<Item = &'a pb::DocumentHead>,
+	) -> LateDiagnosticsAttempt {
+		let documents = heads
+			.into_iter()
+			.filter_map(|head| head.document.as_ref())
+			.map(|document| document.id.clone())
+			.collect::<Vec<_>>();
+		self
+			.inner
+			.late_diagnostics
+			.lock()
+			.retain(|document, _| !documents.contains(document));
+		self
+			.inner
+			.late_inflight
+			.lock()
+			.extend(documents.iter().cloned());
+		LateDiagnosticsAttempt { host: self.clone(), documents, uris: Vec::new() }
+	}
+
+	/// Opens a commit fence for a create whose document identity is not minted
+	/// yet.
+	pub(crate) fn begin_late_diagnostics_uri(&self, uri: Str) -> LateDiagnosticsAttempt {
+		let path = absolute_document_path(&uri);
+		self
+			.inner
+			.late_diagnostics
+			.lock()
+			.retain(|_, pending| pending.path != path);
+		self.inner.late_inflight_uris.lock().insert(uri.clone());
+		LateDiagnosticsAttempt {
+			host:      self.clone(),
+			documents: Vec::new(),
+			uris:      vec![uri],
+		}
+	}
+
+	/// Fences the next published diagnostics snapshot to an incomplete commit.
+	pub(crate) fn expect_late_diagnostics(&self, head: &pb::DocumentHead, complete: bool) {
+		let (Some(document), Some(revision)) = (&head.document, &head.revision) else {
+			return;
+		};
+		self.inner.late_inflight.lock().remove(&document.id);
+		if complete {
+			self.inner.late_diagnostics.lock().remove(&document.id);
+			self.inner.recent_diagnostics.lock().remove(&document.id);
+			return;
+		}
+		self
+			.inner
+			.late_diagnostics
+			.lock()
+			.insert(document.id.clone(), PendingLateDiagnostics {
+				revision:  revision.clone(),
+				path:      absolute_document_path(&document.uri),
+				delivered: FastHashSet::default(),
+			});
+		let ready = self
+			.inner
+			.recent_diagnostics
+			.lock()
+			.remove(&document.id)
+			.filter(|event| event.revision.as_ref() == Some(revision));
+		if let Some(event) = ready {
+			self.inner.publish_late_diagnostics(event);
+		}
+	}
+
 	/// Binds or clears the editor-owned document authority.
 	pub(crate) fn bind_acp_documents(&self, backend: Option<Arc<dyn AcpDocumentBackend>>) {
 		self.inner.acp_documents.bind(backend);
@@ -480,6 +632,11 @@ impl DocumentHost {
 			snapshot_store: Mutex::new(SnapshotStore::default()),
 			clipboard: Mutex::new(Clipboard::default()),
 			noop_loop_guard: Mutex::new(NoopLoopGuard::default()),
+			late_diagnostics: Mutex::new(FastHashMap::default()),
+			recent_diagnostics: Mutex::new(FastHashMap::default()),
+			late_inflight: Mutex::new(FastHashSet::default()),
+			late_inflight_uris: Mutex::new(FastHashSet::default()),
+			late_sink: RwLock::new(None),
 		});
 		install_connection(&inner, negotiated.1, negotiated.2, negotiated.3, negotiated.4, None);
 		Ok(Self { inner })
@@ -1333,6 +1490,85 @@ impl Drop for PendingRequest {
 	}
 }
 impl Inner {
+	fn observe_lsp_event(&self, event: &pb::LspEvent) {
+		if event.method != "textDocument/publishDiagnostics" {
+			return;
+		}
+		let Some(document) = event
+			.document
+			.as_ref()
+			.filter(|document| !document.id.is_empty())
+		else {
+			return;
+		};
+		let Some(revision) = event.revision.as_ref() else {
+			return;
+		};
+		let ready = self
+			.late_diagnostics
+			.lock()
+			.get(&document.id)
+			.is_some_and(|pending| &pending.revision == revision);
+		if ready {
+			self.publish_late_diagnostics(event.clone());
+		} else if self.late_inflight.lock().contains(&document.id)
+			|| self
+				.late_inflight_uris
+				.lock()
+				.contains(document.uri.as_str())
+		{
+			self
+				.recent_diagnostics
+				.lock()
+				.insert(document.id.clone(), event.clone());
+		}
+	}
+
+	fn publish_late_diagnostics(&self, event: pb::LspEvent) {
+		let Some(document) = event.document.as_ref() else {
+			return;
+		};
+		let path = {
+			let pending = self.late_diagnostics.lock();
+			let Some(pending) = pending.get(&document.id) else {
+				return;
+			};
+			if event.revision.as_ref() != Some(&pending.revision) {
+				return;
+			}
+			pending.path.clone()
+		};
+		let Ok((_, _, diagnostics)) = parse_push(&event.params_json, "lsp") else {
+			return;
+		};
+		let display_path = display_document_path(&document.uri, self.hello.root_uri.as_str());
+		let mut file = late_diagnostics_file(path, display_path, diagnostics);
+		{
+			let mut pending = self.late_diagnostics.lock();
+			let Some(pending) = pending.get_mut(&document.id) else {
+				return;
+			};
+			if event.revision.as_ref() != Some(&pending.revision) {
+				return;
+			}
+			file
+				.messages
+				.retain(|message| pending.delivered.insert(message.clone()));
+		}
+		file.recount();
+		if file.messages.is_empty() {
+			return;
+		}
+		let sink = self
+			.late_sink
+			.read()
+			.as_ref()
+			.map(|(_, sink)| Arc::clone(sink));
+		if let Some(sink) = sink {
+			sink(omp_session::late_diagnostics::LateDiagnostics { files: vec![file] });
+		}
+	}
+
 	fn current_connection(&self) -> Option<Arc<ConnState>> {
 		self.connection.read().current.clone()
 	}
@@ -1519,6 +1755,9 @@ where
 			};
 			if frame.request_id == 0 {
 				if let Some(body) = frame.body {
+					let Some(inner) = reader_inner.upgrade() else {
+						break;
+					};
 					dispatch_event_frame(
 						body,
 						&reader_connection.document_events,
@@ -1526,6 +1765,7 @@ where
 						&reader_connection.document_event_sequences,
 						&reader_connection.pending_dap_events,
 						&reader_connection.lsp_event_sender,
+						&inner,
 					);
 				}
 				continue;
@@ -1732,6 +1972,89 @@ fn ensure_requested_head(
 pub(crate) fn lease_target(lease: &DocumentLease) -> pb::DocumentTarget {
 	pb::DocumentTarget { target: Some(document_target::Target::LeaseId(lease.lease_id.clone())) }
 }
+fn absolute_document_path(uri: &str) -> Str {
+	url::Url::parse(uri)
+		.ok()
+		.and_then(|url| url.to_file_path().ok())
+		.and_then(|path| path.to_str().map(Str::new))
+		.unwrap_or_else(|| Str::new(uri))
+}
+
+fn display_document_path(uri: &str, root_uri: &str) -> Str {
+	let Some(path) = url::Url::parse(uri)
+		.ok()
+		.and_then(|url| url.to_file_path().ok())
+	else {
+		return Str::new(uri);
+	};
+	let root = url::Url::parse(root_uri)
+		.ok()
+		.and_then(|url| url.to_file_path().ok());
+	let display = root
+		.as_deref()
+		.and_then(|root| path.strip_prefix(root).ok())
+		.unwrap_or(path.as_path());
+	display
+		.to_str()
+		.map(Str::new)
+		.unwrap_or_else(|| Str::new(uri))
+}
+
+fn late_diagnostics_file(
+	path: Str,
+	display_path: Str,
+	diagnostics: Vec<Diagnostic>,
+) -> omp_session::late_diagnostics::LateDiagnosticsFile {
+	let mut counts = [0usize; 4];
+	let mut messages = Vec::with_capacity(diagnostics.len());
+	for diagnostic in diagnostics {
+		let rank = match diagnostic.severity {
+			Severity::Error => 0,
+			Severity::Warning => 1,
+			Severity::Information => 2,
+			Severity::Hint => 3,
+		};
+		counts[rank] += 1;
+		let severity: &'static str = diagnostic.severity.into();
+		let mut message = StrMut::with_capacity(display_path.len() + diagnostic.message.len() + 48);
+		let _ = write!(
+			message,
+			"{}:{}:{} [{severity}]",
+			display_path,
+			diagnostic.range.start.line + 1,
+			diagnostic.range.start.character + 1
+		);
+		if !diagnostic.source.is_empty() {
+			let _ = write!(message, " [{}]", diagnostic.source);
+		}
+		let _ = write!(message, " {}", diagnostic.message);
+		if let Some(code) = diagnostic.code {
+			let _ = write!(message, " ({code})");
+		}
+		messages.push(message.freeze());
+	}
+	let labels = ["error(s)", "warning(s)", "info(s)", "hint(s)"];
+	let mut summary = StrMut::new("");
+	for (count, label) in counts.into_iter().zip(labels) {
+		if count == 0 {
+			continue;
+		}
+		if !summary.is_empty() {
+			summary.push_str(", ");
+		}
+		let _ = write!(summary, "{count} {label}");
+	}
+	if summary.is_empty() {
+		summary.push_str("no issues");
+	}
+	omp_session::late_diagnostics::LateDiagnosticsFile {
+		path,
+		summary: summary.freeze(),
+		errored: counts[0] > 0,
+		messages,
+	}
+}
+
 fn dispatch_event_frame(
 	body: server_frame::Body,
 	document_events: &Mutex<DocumentEventSubscribers>,
@@ -1739,6 +2062,7 @@ fn dispatch_event_frame(
 	document_event_sequences: &Mutex<HashMap<Bytes, u64>>,
 	dap_events: &Mutex<PendingDapEvents>,
 	lsp_events: &flume::Sender<Result<LspRegistryEvent, EventStreamError>>,
+	inner: &Inner,
 ) {
 	match body {
 		server_frame::Body::DocumentEvent(event) => {
@@ -1804,6 +2128,7 @@ fn dispatch_event_frame(
 			}
 		},
 		server_frame::Body::LspEvent(event) => {
+			inner.observe_lsp_event(&event);
 			let _ = lsp_events.send(Ok(LspRegistryEvent::Event(event)));
 		},
 		server_frame::Body::LspBindingEvent(event) => {
@@ -1865,6 +2190,45 @@ mod tests {
 	const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 	const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 	const GAP_SETTLE: Duration = Duration::from_millis(100);
+
+	#[test]
+	fn late_diagnostics_payload_keeps_path_summary_and_message_order() {
+		let file = late_diagnostics_file(
+			Str::new_static("/workspace/src/lib.rs"),
+			Str::new_static("src/lib.rs"),
+			vec![
+				Diagnostic {
+					uri:      Str::new_static("file:///workspace/src/lib.rs"),
+					range:    omp_docserver::diagnostics::Range {
+						start: omp_docserver::diagnostics::Position { line: 9, character: 3 },
+						end:   omp_docserver::diagnostics::Position { line: 9, character: 4 },
+					},
+					severity: Severity::Warning,
+					message:  Str::new_static("unused binding"),
+					code:     Some(Str::new_static("unused")),
+					source:   Str::new_static("rustc"),
+				},
+				Diagnostic {
+					uri:      Str::new_static("file:///workspace/src/lib.rs"),
+					range:    omp_docserver::diagnostics::Range {
+						start: omp_docserver::diagnostics::Position { line: 1, character: 0 },
+						end:   omp_docserver::diagnostics::Position { line: 1, character: 1 },
+					},
+					severity: Severity::Error,
+					message:  Str::new_static("mismatched types"),
+					code:     Some(Str::new_static("E0308")),
+					source:   Str::new_static("rustc"),
+				},
+			],
+		);
+		assert_eq!(file.path, "/workspace/src/lib.rs");
+		assert_eq!(file.summary, "1 error(s), 1 warning(s)");
+		assert!(file.errored);
+		assert_eq!(file.messages.iter().map(Str::as_str).collect::<Vec<_>>(), [
+			"src/lib.rs:10:4 [warning] [rustc] unused binding (unused)",
+			"src/lib.rs:2:1 [error] [rustc] mismatched types (E0308)",
+		]);
+	}
 
 	struct TestDocServer {
 		shutdown: CancellationToken,

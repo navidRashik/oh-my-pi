@@ -266,7 +266,7 @@ fn valid_host(host: &str) -> bool {
 		&& host.len() <= 255
 		&& host
 			.bytes()
-			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn sql_integer(value: u64) -> Result<i64, GithubCacheError> {

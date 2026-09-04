@@ -282,8 +282,10 @@ impl ArtifactMetadataStore {
 
 /// Durable delivery leases plus journal-derived roots for worker verdict blobs.
 ///
-/// Each lease is keyed by durable session plus invocation identity, so equal
-/// call ids or equal content in another session cannot acknowledge it. Only
+/// Each lease is keyed by durable session, invocation identity, and blob
+/// digest, so one verdict can deliver its structured outcome plus every media
+/// part without one lease overwriting another. Equal call ids or equal content
+/// in another session cannot acknowledge it. Only
 /// blobs registered by [`BlobHost::retain_verdict`] participate in this
 /// collector. Other environment CAS users keep their existing lifetime.
 struct VerdictRetention {
@@ -315,10 +317,11 @@ impl VerdictRetention {
 			 created_ms INTEGER NOT NULL
 			 ) WITHOUT ROWID;
 			 CREATE TABLE IF NOT EXISTS verdict_lease (
-			 delivery_key TEXT PRIMARY KEY,
+			 delivery_key TEXT NOT NULL,
 			 hash BLOB NOT NULL,
 			 deadline_ms INTEGER NOT NULL,
 			 downloaded INTEGER NOT NULL DEFAULT 0,
+			 PRIMARY KEY(delivery_key, hash),
 			 FOREIGN KEY(hash) REFERENCES verdict_blob(hash) ON DELETE CASCADE
 			 ) WITHOUT ROWID;
 			 CREATE INDEX IF NOT EXISTS verdict_lease_hash
@@ -336,6 +339,28 @@ impl VerdictRetention {
 		if legacy_key {
 			connection
 				.execute("ALTER TABLE verdict_lease RENAME COLUMN invocation_id TO delivery_key", [])?;
+		}
+		let hash_is_key = connection.query_row(
+			"SELECT pk FROM pragma_table_info('verdict_lease') WHERE name = 'hash'",
+			[],
+			|row| row.get::<_, i64>(0),
+		)? != 0;
+		if !hash_is_key {
+			connection.execute_batch(
+				"ALTER TABLE verdict_lease RENAME TO verdict_lease_single;
+				 CREATE TABLE verdict_lease (
+				  delivery_key TEXT NOT NULL,
+				  hash BLOB NOT NULL,
+				  deadline_ms INTEGER NOT NULL,
+				  downloaded INTEGER NOT NULL DEFAULT 0,
+				  PRIMARY KEY(delivery_key, hash),
+				  FOREIGN KEY(hash) REFERENCES verdict_blob(hash) ON DELETE CASCADE
+				 ) WITHOUT ROWID;
+				 INSERT INTO verdict_lease(delivery_key, hash, deadline_ms, downloaded)
+				  SELECT delivery_key, hash, deadline_ms, downloaded FROM verdict_lease_single;
+				 DROP TABLE verdict_lease_single;
+				 CREATE INDEX verdict_lease_hash ON verdict_lease(hash);",
+			)?;
 		}
 		Ok(Self {
 			connection: Mutex::new(connection),
@@ -402,8 +427,7 @@ impl VerdictRetention {
 		transaction.execute(
 			"INSERT INTO verdict_lease(delivery_key, hash, deadline_ms, downloaded)
 			 VALUES (?1, ?2, ?3, 0)
-			 ON CONFLICT(delivery_key) DO UPDATE SET
-			 hash = excluded.hash,
+			 ON CONFLICT(delivery_key, hash) DO UPDATE SET
 			 deadline_ms = excluded.deadline_ms,
 			 downloaded = 0",
 			params![
@@ -458,8 +482,7 @@ impl VerdictRetention {
 		transaction.execute(
 			"INSERT INTO verdict_lease(delivery_key, hash, deadline_ms, downloaded)
 			 VALUES (?1, ?2, ?3, 0)
-			 ON CONFLICT(delivery_key) DO UPDATE SET
-			 hash = excluded.hash,
+			 ON CONFLICT(delivery_key, hash) DO UPDATE SET
 			 deadline_ms = excluded.deadline_ms,
 			 downloaded = 0",
 			params![delivery_key(session_id, invocation_id), id.hash.as_slice(), deadline],
@@ -840,6 +863,30 @@ impl BlobHost {
 		Ok(self.reference(id, sf!("application/json"), thread_pb::blob::Detail::Original))
 	}
 
+	/// Copies a tool-result media blob into the verdict-delivery namespace and
+	/// retains it for the same session/invocation handshake as the structured
+	/// outcome. Repeated references are content-addressed and idempotent.
+	pub(crate) fn retain_verdict_blob(
+		&self,
+		session_id: Option<&str>,
+		invocation_id: &str,
+		id: BlobId,
+	) -> Result<(), BlobError> {
+		let reference = BlobRef::from(id);
+		let verdicts = self.worker_verdict_store();
+		if !verdicts.has(&reference) {
+			let bytes = self.store.get(&reference)?;
+			let copied = verdicts.put(&bytes)?;
+			if copied != reference {
+				return Err(BlobError::HashMismatch);
+			}
+		}
+		if !verdicts.verify(&reference)? {
+			return Err(BlobError::HashMismatch);
+		}
+		self.retain_verdict(session_id, invocation_id, id)
+	}
+
 	/// Atomically finishes the worker-verdict stage and its provisional lease.
 	pub(crate) fn finish_worker_verdict(&self, stage: BlobStage) -> Result<BlobId, BlobError> {
 		let reference = match &self.retention {
@@ -1183,6 +1230,41 @@ mod tests {
 	fn managed_host(root: &Path) -> BlobHost {
 		BlobHost::open_managed(root.join("blobs"), root.join("sessions"))
 			.expect("open managed blob host")
+	}
+
+	#[test]
+	fn worker_media_is_copied_into_the_verdict_delivery_store_idempotently() {
+		let root = tempfile::tempdir().expect("project root");
+		let host = managed_host(root.path());
+		let media = host.put(b"tool image bytes").expect("store worker media");
+		let second = host
+			.put(b"tool audio bytes")
+			.expect("store second worker media");
+		host
+			.retain_verdict_blob(Some("session-a"), "call-a", media)
+			.expect("retain media");
+		host
+			.retain_verdict_blob(Some("session-a"), "call-a", second)
+			.expect("retain second media");
+		host
+			.retain_verdict_blob(Some("session-a"), "call-a", media)
+			.expect("repeat retention");
+		for id in [media, second] {
+			let reference = id.into();
+			assert!(
+				host
+					.worker_verdict_store()
+					.verify(&reference)
+					.expect("verify retained media"),
+				"scoped verdict downloads read the exact media bytes"
+			);
+			assert!(
+				host
+					.renew_verdict_delivery(Some("session-a"), "call-a", id)
+					.expect("renew retained media"),
+				"every blob from one invocation has an independent lease"
+			);
+		}
 	}
 
 	fn put_verdict(host: &BlobHost, data: &[u8]) -> BlobId {

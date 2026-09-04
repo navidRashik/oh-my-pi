@@ -48,7 +48,7 @@ impl CloudClient {
 		let credential_id = std::env::var("OMP_CODEX_SECURITY_CREDENTIAL_ID")
 			.ok()
 			.and_then(|value| value.parse().ok());
-		let client = Client::builder()
+		let client = omp_http::client_builder()
 			.timeout(Duration::from_secs(120))
 			.build()
 			.ok()?;
@@ -64,7 +64,7 @@ impl CloudClient {
 
 	#[cfg(test)]
 	pub fn fixed(base: &str, token: &str, credential_id: u64) -> Self {
-		let client = Client::builder()
+		let client = omp_http::client_builder()
 			.timeout(Duration::from_secs(120))
 			.build()
 			.expect("test client");
@@ -79,7 +79,7 @@ impl CloudClient {
 	}
 
 	pub fn from_authority(authority: Arc<GithubCredentialBridge>) -> Option<Self> {
-		let client = Client::builder()
+		let client = omp_http::client_builder()
 			.timeout(Duration::from_secs(120))
 			.build()
 			.ok()?;

@@ -59,8 +59,8 @@ use omp_proto::{
 	},
 	ui::v1::{
 		CommandArgDecl, CommandDecl, CommandDispatchResult, CompletionCandidate, RegisterUi,
-		ShortcutDecl, ShortcutDispatchResult, TriggerDecl, UiDispatchResult, UiError,
-		command_dispatch_result, ui_dispatch, ui_dispatch_result,
+		RenderedView, ShortcutDecl, ShortcutDispatchResult, Tml, TriggerDecl, UiDispatchResult,
+		UiError, command_dispatch_result, ui_dispatch, ui_dispatch_result,
 	},
 };
 use omp_tool::{Abort, CallOutcome, Rev, ToolIdentity};
@@ -100,7 +100,7 @@ use crate::{
 		GenerationFence, HostControlAuthorityFactory, LifecycleHost, RunningHost, RunningHostError,
 		ServiceBroker, ServiceCallId, ServiceConnection, ServiceKey, ServiceRequestMeta,
 		ServiceResponse, SpawnSpec, SpawnedHost, ToolDeclarationKey, VerifiedMarkdownTransformer,
-		VerifiedRendererDeclaration, VerifiedUiRoster,
+		VerifiedMessageRendererDeclaration, VerifiedRendererDeclaration, VerifiedUiRoster,
 		control::{
 			ActivationCliValue, ContributedValueDelivery, ControlAuthoritySnapshot,
 			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlHandle,
@@ -113,6 +113,7 @@ use crate::{
 			PromptPullContext, PromptSlotBinding, UiCallbackDispatch, decode_prompt_contribution,
 			prompt_prop, prompt_pull_frame, prompt_slot_binding,
 		},
+		extensions::PyCallbackRoute,
 		notify_extension_load, notify_extension_unload, notify_host_reconnect,
 		services::{
 			ServiceControlAuthorityFactory, ServiceDispatch, ServiceDispatchBackend,
@@ -1229,6 +1230,38 @@ fn same_control_identity(
 		&& expected.capabilities == actual.capabilities
 }
 
+fn python_registration_authority(
+	key: &HostKey,
+	session: &Str,
+	host_generation: u64,
+	settings: &serde_json::Map<String, serde_json::Value>,
+) -> ControlInvocationAuthority {
+	ControlInvocationAuthority {
+		invocation: sf!(
+			"extension-register:{}:{}",
+			key.extension(),
+			host_generation
+		),
+		phase: InvocationPhase::Open,
+		session: session.clone(),
+		turn: None,
+		event: Some(sf!("extension.register")),
+		call: None,
+		device: None,
+		effects: Box::new([]),
+		place_kind: sf!("host"),
+		lifecycle: LifecyclePhase::Active,
+		roots: Box::new([]),
+		remote: false,
+		has_ui: false,
+		headless: true,
+		settings: settings.clone(),
+		secret_settings: Box::new([]),
+		data: None,
+		direct_filesystem: None,
+	}
+}
+
 #[derive(Clone)]
 struct PendingControlActivation {
 	control:            ControlHandle,
@@ -1244,9 +1277,11 @@ struct PendingControlActivation {
 	host_factory:       Arc<HostControlAuthorityFactory>,
 	agents_factory:     Arc<dyn ControlAuthorityFactory>,
 	registry_control:   Option<Arc<RegistryControlFactory>>,
+	hook_control:       Option<Arc<HookControlFactory>>,
 	lifecycle_gate:     Option<Arc<HookGate>>,
 	registered_ui:      Arc<RwLock<Option<RegisterUi>>>,
 	settings:           serde_json::Map<String, serde_json::Value>,
+	python_route:       PyCallbackRoute,
 	roots:              Box<[Str]>,
 }
 struct LiveControlRoute {
@@ -1264,6 +1299,7 @@ struct FrozenControlLifecycleHost {
 	manifest:        ExtensionManifest,
 	verified_ui:     VerifiedUiRoster,
 	frozen_registry: Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
+	staged_evidence: Option<((Str, Str, Str), Arc<SealedRegistryEvidence>)>,
 	settings:        serde_json::Map<String, serde_json::Value>,
 }
 
@@ -1289,6 +1325,7 @@ impl FrozenControlLifecycleHost {
 			manifest,
 			verified_ui,
 			frozen_registry,
+			staged_evidence: None,
 			settings,
 		}
 	}
@@ -1350,14 +1387,23 @@ impl LifecycleHost for FrozenControlLifecycleHost {
 			.map_err(|error| Str::from(error.to_string()))?;
 			evidence.ui = self.verified_ui.clone();
 			let evidence = Arc::new(evidence);
-			self.frozen_registry.lock().insert(
-				(
-					self.identity.layer.clone(),
-					self.identity.tier.clone(),
-					self.identity.extension.clone(),
-				),
-				evidence,
+			let key = (
+				self.identity.layer.clone(),
+				self.identity.tier.clone(),
+				self.identity.extension.clone(),
 			);
+			let registry = self.frozen_registry.lock();
+			if let Some(previous) = registry.get(&key)
+				&& previous.identity.host_generation < self.identity.host_generation
+				&& (previous.directors != evidence.directors
+					|| previous.components != evidence.components)
+			{
+				return Err(sf!(
+					"hot reload changed the sealed Director or Component declaration set"
+				));
+			}
+			drop(registry);
+			self.staged_evidence = Some((key, evidence));
 			Ok(())
 		}
 	}
@@ -1411,8 +1457,11 @@ impl LifecycleHost for FrozenControlLifecycleHost {
 				.control
 				.dispatch(dispatch)
 				.await
-				.map(|_| ())
-				.map_err(|error| Str::from(error.to_string()))
+				.map_err(|error| Str::from(error.to_string()))?;
+			if let Some((key, evidence)) = self.staged_evidence.take() {
+				self.frozen_registry.lock().insert(key, evidence);
+			}
+			Ok(())
 		}
 	}
 }
@@ -1483,7 +1532,7 @@ impl ExtHostSupervisor {
 		let mut live_controls = BTreeMap::new();
 		let mut control_actors = Vec::new();
 		let frozen_registry = Arc::new(Mutex::new(BTreeMap::new()));
-		for extension in &config.extensions {
+		'extension: for extension in &config.extensions {
 			let (Some(python_site), Some(env_socket)) =
 				(&extension.python_site, &extension.data_socket)
 			else {
@@ -1513,7 +1562,18 @@ impl ExtHostSupervisor {
 			let mut modules = Vec::with_capacity(extension.manifest.declaration_modules.len() + 1);
 			modules.push(extension.manifest.entry.clone());
 			modules.extend(extension.manifest.declaration_modules.iter().cloned());
-			let spawned = spawn(SpawnSpec {
+			let manifest_snapshot = match control_manifest_snapshot(extension) {
+				Ok(snapshot) => snapshot,
+				Err(error) => {
+					tracing::warn!(
+						extension_id = %extension.key.extension(),
+						error = %error,
+						"Python extension manifest could not be lowered; containing load failure",
+					);
+					continue;
+				},
+			};
+			let spawned = match spawn(SpawnSpec {
 				key:                 extension.key.clone(),
 				executable:          extension
 					.host_executable
@@ -1532,11 +1592,24 @@ impl ExtHostSupervisor {
 				host_generation:     1,
 				session_generation:  config.session_generation,
 				package_snapshot:    None,
-				manifest_snapshot:   control_manifest_snapshot(extension)?,
+				manifest_snapshot,
 				declaration_modules: modules.into_boxed_slice(),
 			})
 			.await
-			.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+			{
+				Ok(spawned) => spawned,
+				Err(error @ crate::exthost::SpawnError::Python(_)) => {
+					tracing::warn!(
+						extension_id = %extension.key.extension(),
+						error = %error,
+						"Python extension child failed to load; containing failure",
+					);
+					continue;
+				},
+				Err(error) => {
+					return Err(WorkerError::Protocol(Str::from(error.to_string())));
+				},
+			};
 			let running = spawned
 				.start_control((*identity).clone(), authority, &ControlAuthoritySnapshot::default())
 				.await
@@ -1548,53 +1621,38 @@ impl ExtHostSupervisor {
 					.static_declarations()
 					.providers
 					.is_empty())
-				&& let Some(hooks) = &hook_control
+				&& hook_control.is_some()
 			{
 				let registry = registry_control.as_ref().ok_or_else(|| {
 					WorkerError::Protocol(sf!("hook CONTROL owner requires registry CONTROL owner"))
 				})?;
-				let evidence = time::timeout(config.spawn_timeout, registry.wait_evidence(&identity))
+				if time::timeout(config.spawn_timeout, registry.wait_evidence(&identity))
 					.await
-					.map_err(|_| {
-						// Blind timeouts are undiagnosable; carry the child's captured
-						// output tail as evidence.
-						let mut tail = Vec::new();
-						while let Ok(log) = running.logs().try_recv() {
-							tail.extend_from_slice(&log.bytes);
-						}
-						let start = tail.len().saturating_sub(800);
-						WorkerError::Protocol(Str::from(format!(
-							"CONTROL handshake timed out before sealed hook registry evidence; host \
-							 output tail: {}",
-							String::from_utf8_lossy(&tail[start..]).trim()
-						)))
-					})?;
-				for hook in evidence.hooks.iter() {
-					hooks
-						.subscribe(HookSubscription {
-							identity:     Arc::clone(&identity),
-							session:      config.session_id.clone(),
-							event:        hook.event.clone(),
-							phase:        hook.phase.clone(),
-							name:         hook.name.clone(),
-							order:        hook.order,
-							on_failure:   hook.on_failure,
-							timeout:      hook.timeout,
-							concurrency:  hook.concurrency,
-							providers:    hook.providers.clone(),
-							servers:      hook.servers.clone(),
-							method_globs: hook.method_globs.clone(),
-							event_policy: HookEventPolicy {
-								revision:    hook.event_revision,
-								timeout:     hook.event_timeout,
-								on_failure:  hook.event_on_failure,
-								default:     hook.event_default.clone(),
-								composition: hook.composition.clone(),
-							},
-						})
-						.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+					.is_err()
+				{
+					let mut tail = Vec::new();
+					while let Ok(log) = running.logs().try_recv() {
+						tail.extend_from_slice(&log.bytes);
+					}
+					let start = tail.len().saturating_sub(800);
+					tracing::warn!(
+						extension_id = %extension.key.extension(),
+						output_tail = %String::from_utf8_lossy(&tail[start..]).trim(),
+						"Python extension declaration freeze timed out; containing failure",
+					);
+					running.shutdown().await;
+					continue 'extension;
 				}
 			}
+			let python_route = PyCallbackRoute::new(
+				running.control(),
+				python_registration_authority(
+					&extension.key,
+					&config.session_id,
+					1,
+					&extension.settings,
+				),
+			);
 			let activation = PendingControlActivation {
 				control: running.control(),
 				identity: Arc::clone(&identity),
@@ -1609,9 +1667,11 @@ impl ExtHostSupervisor {
 				host_factory: Arc::clone(factory),
 				agents_factory: Arc::clone(&agents),
 				registry_control: registry_control.clone(),
+				hook_control: hook_control.clone(),
 				lifecycle_gate: hook_control.as_ref().map(|hooks| hooks.admission_gate()),
 				registered_ui: Arc::new(RwLock::new(None)),
 				settings: extension.settings.clone(),
+				python_route,
 				roots: config
 					.workspace_root
 					.iter()
@@ -1706,6 +1766,10 @@ impl ExtHostSupervisor {
 
 		let mut prepared = Vec::with_capacity(groups.len());
 		for (key, extensions) in groups {
+			let extension_ids = extensions
+				.iter()
+				.map(|extension| extension.key.extension().clone())
+				.collect::<Vec<_>>();
 			let process_config = ProcessConfig::new(
 				&config,
 				key,
@@ -1716,6 +1780,13 @@ impl ExtHostSupervisor {
 			)?;
 			match WorkerProcess::spawn(&process_config, 1, ActivationCause::FirstReach).await {
 				Ok(process) => prepared.push((process_config, process)),
+				Err(error @ WorkerError::Python(_)) => {
+					tracing::warn!(
+						extensions = ?extension_ids,
+						error = %error,
+						"Python extension worker failed to load; containing failure",
+					);
+				},
 				Err(error) => {
 					for (prepared_config, mut process) in prepared {
 						process.terminate(prepared_config.interrupt_grace).await;
@@ -1949,19 +2020,54 @@ impl ExtHostSupervisor {
 	/// installed. Late app/driver domains remain fail-closed until their atomic
 	/// factory bundle is bound before first user reach.
 	pub async fn activate_control_hosts(&self) -> Result<(), WorkerError> {
+		let mut activated = BTreeSet::new();
 		for activation in &self.control_activations {
-			activate_control_generation(
+			match activate_control_generation(
 				activation,
 				activation.control.clone(),
 				1,
 				ActivationCause::FirstReach,
 				Arc::clone(&self.frozen_registry),
 			)
-			.await?;
+			.await
+			{
+				Ok(()) => {
+					if let Err(error) = install_control_hooks(activation) {
+						tracing::warn!(
+							extension_id = %activation.key.extension(),
+							error = %error,
+							"Python extension hook registry was rejected; containing failure",
+						);
+						self.frozen_registry.lock().remove(&(
+							activation.identity.layer.clone(),
+							activation.identity.tier.clone(),
+							activation.identity.extension.clone(),
+						));
+						continue;
+					}
+					activated.insert(activation.key.extension().clone());
+				},
+				Err(error @ WorkerError::ExtensionLifecycle { .. }) => {
+					tracing::warn!(
+						extension_id = %activation.key.extension(),
+						error = %error,
+						"Python extension activation failed; containing failure",
+					);
+					self.frozen_registry.lock().remove(&(
+						activation.identity.layer.clone(),
+						activation.identity.tier.clone(),
+						activation.identity.extension.clone(),
+					));
+					continue;
+				},
+				Err(error) => return Err(error),
+			}
 			wait_control_registry(activation).await?;
 		}
 		if let Some(gate) = self.lifecycle_gate.as_deref() {
-			for manifest in self.lifecycle_manifests.iter() {
+			for manifest in self.lifecycle_manifests.iter().filter(|manifest| {
+				activated.contains(manifest.provenance.extension_id())
+			}) {
 				notify_extension_load(gate, &manifest.provenance, false);
 			}
 		}
@@ -2108,25 +2214,11 @@ impl ExtHostSupervisor {
 			let Some(sealed) = evidence.get(&key) else {
 				continue;
 			};
-			let mut host = FrozenControlLifecycleHost::new(
-				activation.control.clone(),
-				activation.identity.extension.clone(),
-				activation.session_id.clone(),
-				activation.identity.host_generation,
-				Arc::clone(&activation.identity),
-				activation.manifest.clone(),
-				sealed.ui.clone(),
-				Arc::clone(&self.frozen_registry),
-				activation.settings.clone(),
-			);
-			let authority =
-				host.authority("extension.register", InvocationPhase::Open, LifecyclePhase::Active);
-			components.extend(crate::exthost::register_python_extensions(
+			components.extend(crate::exthost::extensions::register_python_extensions(
 				registrar,
 				&sealed.directors,
 				&sealed.components,
-				activation.control.clone(),
-				authority,
+				activation.python_route.clone(),
 				None,
 			)?);
 		}
@@ -2283,10 +2375,46 @@ impl ExtHostSupervisor {
 				};
 				(operation, arguments, UiDispatchKind::Completion)
 			},
+			Some(ui_dispatch::Kind::Render(render)) => {
+				if render.rev != "message@1" || render.name.is_empty() || render.call_id.is_empty() {
+					return Err(ControlProtocolError::new(
+						"InvalidUiDispatch",
+						"message renderer dispatch has an invalid identity",
+					));
+				}
+				let state: serde_json::Value = serde_json::from_slice(&render.state).map_err(|_| {
+					ControlProtocolError::new(
+						"InvalidUiDispatch",
+						"message renderer state is not valid JSON",
+					)
+				})?;
+				let mut state = state.as_object().cloned().ok_or_else(|| {
+					ControlProtocolError::new(
+						"InvalidUiDispatch",
+						"message renderer state must be an object",
+					)
+				})?;
+				let message = state.remove("message").ok_or_else(|| {
+					ControlProtocolError::new(
+						"InvalidUiDispatch",
+						"message renderer state omitted message",
+					)
+				})?;
+				let ctx = state.remove("ctx").unwrap_or_else(|| serde_json::json!({}));
+				(
+					sf!("omp.ui.message_renderer"),
+					serde_json::Map::from_iter([
+						("kind".to_owned(), serde_json::Value::String(render.name)),
+						("message".to_owned(), message),
+						("ctx".to_owned(), ctx),
+					]),
+					UiDispatchKind::MessageRenderer,
+				)
+			},
 			_ => {
 				return Err(ControlProtocolError::new(
 					"InvalidUiDispatch",
-					"typed UI callback route accepts only commands, shortcuts, and completions",
+					"typed UI callback route does not accept this payload",
 				));
 			},
 		};
@@ -2309,6 +2437,22 @@ impl ExtHostSupervisor {
 					(Some(ui_dispatch_result::Result::Shortcut(ShortcutDispatchResult {})), Vec::new())
 				},
 				UiDispatchKind::Completion => (None, ui_completion_candidates(value)),
+				UiDispatchKind::MessageRenderer => {
+					let source = value
+						.as_object()
+						.and_then(|value| value.get("source").or_else(|| value.get("_source")))
+						.and_then(serde_json::Value::as_str);
+					let rendered = source.map(|source| {
+						ui_dispatch_result::Result::Rendered(RenderedView {
+							content: Some(Tml {
+								source: Bytes::copy_from_slice(source.as_bytes()),
+								hash:   0,
+							}),
+							state:   Bytes::new(),
+						})
+					});
+					(rendered, Vec::new())
+				},
 			},
 			Err(ExtensionCallbackError::Runtime(ControlRuntimeError::Remote(error))) => (
 				Some(ui_dispatch_result::Result::Error(UiError {
@@ -2530,6 +2674,7 @@ enum UiDispatchKind {
 	Command,
 	Shortcut,
 	Completion,
+	MessageRenderer,
 }
 
 fn ui_completion_candidates(value: serde_json::Value) -> Vec<CompletionCandidate> {
@@ -2979,6 +3124,15 @@ pub enum WorkerError {
 		/// Requested tool revision.
 		rev:  Str,
 	},
+	/// A Python extension declaration or activation generation failed.
+	#[error("Python extension {extension} lifecycle failed")]
+	ExtensionLifecycle {
+		/// Extension whose generation was quarantined.
+		extension: Str,
+		/// Typed lifecycle transition failure.
+		#[source]
+		source:    crate::exthost::LifecycleError,
+	},
 	/// A Python extension declaration or invocation failed.
 	#[error("python tool extension failed: {0}")]
 	Python(Str),
@@ -3341,7 +3495,7 @@ struct RegisteredCallback {
 	callable: String,
 }
 #[derive(Deserialize)]
-struct RegisteredMarkdownTransformer {
+struct RegisteredNamedUiCallback {
 	kind:    String,
 	name:    String,
 	value:   RegisteredCallback,
@@ -3525,7 +3679,9 @@ struct RegisteredRegistrySnapshot {
 	#[serde(default)]
 	completions:           Vec<RegisteredCompletion>,
 	#[serde(default)]
-	markdown_transformers: Vec<RegisteredMarkdownTransformer>,
+	message_renderers:     Vec<RegisteredNamedUiCallback>,
+	#[serde(default)]
+	markdown_transformers: Vec<RegisteredNamedUiCallback>,
 	#[serde(default)]
 	verdict_renderers:     Vec<RegisteredRenderer>,
 	#[serde(default)]
@@ -3601,7 +3757,8 @@ pub struct SealedRegistryEvidence {
 	pub tools:      Arc<[SealedToolRegistration]>,
 	/// Verified runtime hook declaration keys.
 	pub hooks:      Arc<[SealedHookRegistration]>,
-	/// Manifest-verified command and shortcut declarations.
+	/// Manifest-verified command, shortcut, completion, and renderer
+	/// declarations.
 	pub ui:         VerifiedUiRoster,
 	/// Full frozen runtime provider declaration documents.
 	pub providers:  Arc<[serde_json::Value]>,
@@ -3857,6 +4014,7 @@ pub fn seal_registry_evidence(
 		snapshot.commands,
 		snapshot.shortcuts,
 		snapshot.completions,
+		snapshot.message_renderers,
 		snapshot.markdown_transformers,
 		snapshot.verdict_renderers,
 	)?;
@@ -3905,7 +4063,8 @@ fn seal_registered_ui(
 	commands: Vec<RegisteredCommand>,
 	shortcuts: Vec<RegisteredShortcut>,
 	completions: Vec<RegisteredCompletion>,
-	markdown_transformers: Vec<RegisteredMarkdownTransformer>,
+	message_renderers: Vec<RegisteredNamedUiCallback>,
+	markdown_transformers: Vec<RegisteredNamedUiCallback>,
 	renderers: Vec<RegisteredRenderer>,
 ) -> Result<VerifiedUiRoster, SealedRegistryEvidenceError> {
 	let mut register = RegisterUi {
@@ -3953,6 +4112,34 @@ fn seal_registered_ui(
 		.map(|completion| seal_registered_completion(manifest, completion))
 		.collect::<Result<Vec<_>, _>>()?;
 	let mut verified = verify_ui_registration(manifest.static_declarations(), register)?;
+	verified.message_renderers = message_renderers
+		.into_iter()
+		.map(|renderer| {
+			if renderer.kind != "message_renderer" || renderer.name.is_empty() {
+				return Err(SealedRegistryEvidenceError::ManifestDrift);
+			}
+			let row = manifest
+				.static_declarations()
+				.ui
+				.message_renderers
+				.iter()
+				.find(|row| row.key.as_str() == renderer.name)
+				.ok_or(SealedRegistryEvidenceError::ManifestDrift)?;
+			let module = manifest_module_for_callback(manifest, renderer.value.callable.as_str())?;
+			if row.module.as_str() != module
+				|| (!row.trigger.is_empty() && row.trigger.as_str() != renderer.trigger)
+			{
+				return Err(SealedRegistryEvidenceError::ManifestDrift);
+			}
+			Ok(VerifiedMessageRendererDeclaration {
+				declaration_id: row.id.clone(),
+				custom_type:    Str::new(renderer.name),
+				callback:       Str::new(renderer.value.callable),
+				module:         row.module.clone(),
+			})
+		})
+		.collect::<Result<Vec<_>, _>>()?
+		.into_boxed_slice();
 	verified.markdown_transformers = markdown_transformers
 		.into_iter()
 		.map(|transformer| {
@@ -4774,7 +4961,17 @@ impl WorkerProcess {
 	async fn terminate(&mut self, grace: Duration) {
 		let pid = self.child.id();
 		self.courtesy_interrupt();
-		if time::timeout(grace, self.child.wait()).await.is_ok() {
+		if time::timeout(grace, self.child.wait())
+			.await
+			.is_ok_and(|status| status.is_ok())
+		{
+			#[cfg(unix)]
+			if let Some(pid) = pid {
+				let group = Pid::from_raw(pid.cast_signed());
+				if signal::killpg(group, None).is_ok() {
+					let _ = signal::killpg(group, signal::Signal::SIGKILL);
+				}
+			}
 			return;
 		}
 		#[cfg(unix)]
@@ -5117,13 +5314,28 @@ async fn activate_control_generation(
 		)
 		.await
 		.map(|_| ())
-		.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))
+		.map_err(|source| WorkerError::ExtensionLifecycle {
+			extension: activation.key.extension().clone(),
+			source,
+		})
 }
 fn advance_control_activation(activation: &mut PendingControlActivation, running: &RunningHost) {
 	let mut identity = (*activation.identity).clone();
 	identity.host_generation = running.generation();
 	activation.control = running.control();
 	activation.identity = Arc::new(identity);
+}
+
+fn publish_python_generation(activation: &PendingControlActivation, running: &RunningHost) {
+	activation.python_route.replace(
+		running.control(),
+		python_registration_authority(
+			&activation.key,
+			&activation.session_id,
+			running.generation(),
+			&activation.settings,
+		),
+	);
 }
 fn next_control_authority(
 	activation: &PendingControlActivation,
@@ -5217,6 +5429,58 @@ fn control_completion(
 	})
 }
 
+fn install_hook_evidence(
+	hooks: &HookControlFactory,
+	identity: &Arc<ControlConnectionIdentity>,
+	session: &Str,
+	evidence: &SealedRegistryEvidence,
+) -> Result<(), WorkerError> {
+	for hook in evidence.hooks.iter() {
+		hooks
+			.subscribe(HookSubscription {
+				identity:     Arc::clone(identity),
+				session:      session.clone(),
+				event:        hook.event.clone(),
+				phase:        hook.phase.clone(),
+				name:         hook.name.clone(),
+				order:        hook.order,
+				on_failure:   hook.on_failure,
+				timeout:      hook.timeout,
+				concurrency:  hook.concurrency,
+				providers:    hook.providers.clone(),
+				servers:      hook.servers.clone(),
+				method_globs: hook.method_globs.clone(),
+				event_policy: HookEventPolicy {
+					revision:    hook.event_revision,
+					timeout:     hook.event_timeout,
+					on_failure:  hook.event_on_failure,
+					default:     hook.event_default.clone(),
+					composition: hook.composition.clone(),
+				},
+			})
+			.map_err(|error| WorkerError::Protocol(Str::from(error.to_string())))?;
+	}
+	Ok(())
+}
+
+fn install_control_hooks(activation: &PendingControlActivation) -> Result<(), WorkerError> {
+	let Some(hooks) = activation.hook_control.as_deref() else {
+		return Ok(());
+	};
+	let Some(registry) = activation.registry_control.as_deref() else {
+		return Ok(());
+	};
+	let evidence = registry.evidence(&activation.identity).ok_or_else(|| {
+		WorkerError::Protocol(sf!("CONTROL child omitted sealed hook registry evidence"))
+	})?;
+	install_hook_evidence(
+		hooks,
+		&activation.identity,
+		&activation.session_id,
+		&evidence,
+	)
+}
+
 async fn wait_control_registry(activation: &PendingControlActivation) -> Result<(), WorkerError> {
 	let Some(registry) = activation.registry_control.as_ref() else {
 		return Ok(());
@@ -5297,6 +5561,10 @@ async fn run_control_supervisor(
 							{
 								continue;
 							}
+							if install_control_hooks(&activation).is_err() {
+								continue;
+							}
+							publish_python_generation(&activation, &running);
 							*live_control.control.write() = running.control();
 							*live_control.identity.write() = Arc::clone(&activation.identity);
 							host_generation.store(running.generation(), Ordering::Release);
@@ -5505,6 +5773,8 @@ async fn run_control_supervisor(
 						Arc::clone(&frozen_registry),
 					)
 					.await?;
+					install_control_hooks(&activation)?;
+					publish_python_generation(&activation, &running);
 					*live_control.control.write() = running.control();
 					*live_control.identity.write() = Arc::clone(&activation.identity);
 					host_generation.store(running.generation(), Ordering::Release);
@@ -9459,9 +9729,12 @@ async def handler(params, ctx):
 			serde_json::json!({"step": 2})
 		);
 		let (start, payload, complete) = read_streamed_result(&mut cursor, limit, &mut scratch);
-		assert_eq!(start.call_id, "ctx-call");
-		assert_eq!(complete.call_id, "ctx-call");
-		assert!(serde_json::from_slice::<serde_json::Value>(&payload).is_ok());
+		assert_eq!(start.call_id, "stream-call");
+		assert_eq!(complete.call_id, "stream-call");
+		assert_eq!(
+			serde_json::from_slice::<serde_json::Value>(&payload).expect("artifact verdict JSON"),
+			serde_json::json!({"kind": "ok", "value": {"done": true}}),
+		);
 	}
 
 	#[test]

@@ -234,6 +234,12 @@ pub fn redact_url_for_log(url: &str) -> Str {
 	let Ok(mut parsed) = Url::parse(url) else {
 		return Str::from(url.split_once('?').map_or(url, |(base, _)| base));
 	};
+	if !parsed.username().is_empty() {
+		let _ = parsed.set_username("[redacted]");
+	}
+	if parsed.password().is_some() {
+		let _ = parsed.set_password(Some("[redacted]"));
+	}
 	let values = parsed
 		.query_pairs()
 		.map(|(name, value)| (name.into_owned(), value.into_owned()))
@@ -280,12 +286,35 @@ mod tests {
 	}
 
 	#[test]
+	fn string_ids_are_fixed_width_unique_snowflakes_and_numbers_do_not_wrap() {
+		let mut allocator = RequestIdAllocator::new();
+		let first = allocator.next(RequestIdFormat::String).expect("first");
+		let second = allocator.next(RequestIdFormat::String).expect("second");
+		assert_ne!(first, second);
+		for id in [first, second] {
+			let RequestId::String(id) = id else {
+				panic!("string request ID");
+			};
+			assert_eq!(id.len(), 16);
+			assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+		}
+		allocator.previous_numeric = u64::MAX;
+		assert_eq!(
+			allocator.next(RequestIdFormat::Number),
+			Err(RequestIdError::Exhausted)
+		);
+	}
+
+	#[test]
 	fn sse_skips_keepalive_and_redacts_credentials() {
 		let value = parse_sse("data: ping\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
 			.expect("JSON data");
 		assert_eq!(value["id"], 1);
-		let redacted = redact_url_for_log("https://mcp.example/mcp?apiKey=secret&foo=bar");
+		let redacted =
+			redact_url_for_log("https://user:password@mcp.example/mcp?apiKey=secret&foo=bar");
 		assert!(!redacted.contains("secret"));
+		assert!(!redacted.contains("password"));
+		assert!(!redacted.contains("user"));
 		assert!(redacted.contains("foo=bar"));
 	}
 }

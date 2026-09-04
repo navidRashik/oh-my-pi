@@ -456,6 +456,8 @@ pub struct VerifiedUiRoster {
 	pub shortcuts:             Box<[ShortcutDecl]>,
 	/// Verified completion trigger declarations.
 	pub triggers:              Box<[TriggerDecl]>,
+	/// Verified transcript message renderer declarations.
+	pub message_renderers:     Box<[VerifiedMessageRendererDeclaration]>,
 	/// Verified transcript markdown transformer declarations.
 	pub markdown_transformers: Box<[VerifiedMarkdownTransformer]>,
 	/// Verified exact-revision device renderer declarations.
@@ -475,6 +477,19 @@ pub struct VerifiedRendererDeclaration {
 	pub reduce:         Option<Str>,
 	/// Whether this fold augments rather than replaces the winning base.
 	pub decorates:      bool,
+	/// Package-contained declaration module.
+	pub module:         Str,
+}
+
+/// One manifest-verified transcript-message renderer callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedMessageRendererDeclaration {
+	/// Stable signed declaration id.
+	pub declaration_id: Str,
+	/// Exact custom message type selected by the fold.
+	pub custom_type:    Str,
+	/// Python callable address admitted by the signed manifest.
+	pub callback:       Str,
 	/// Package-contained declaration module.
 	pub module:         Str,
 }
@@ -1068,7 +1083,17 @@ impl ExtensionManifest {
 				"" => Some(match row.kind.as_str() {
 					"completion" => ActivationTrigger::BeforeUiInput,
 					"prompt_slot" => ActivationTrigger::BeforeFirstPrompt,
-					"credential" | "secret" | "placement" => ActivationTrigger::Static,
+					"credential"
+					| "secret"
+					| "placement"
+					| "skills"
+					| "rules"
+					| "context-files"
+					| "prompts"
+					| "themes"
+					| "agents"
+					| "lsp-servers"
+					| "dap-adapters" => ActivationTrigger::Static,
 					_ => ActivationTrigger::FirstReach,
 				}),
 				_ => Some(ActivationTrigger::FirstReach),
@@ -1447,6 +1472,7 @@ pub fn verify_ui_registration(
 		commands: registration.commands.into_boxed_slice(),
 		shortcuts: registration.shortcuts.into_boxed_slice(),
 		triggers: registration.triggers.into_boxed_slice(),
+		message_renderers: Box::new([]),
 		markdown_transformers: Box::new([]),
 		renderers: Box::new([]),
 	})

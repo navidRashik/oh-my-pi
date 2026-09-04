@@ -494,16 +494,21 @@ impl WorkspaceOperations {
 				"document authority omitted an uncontested workspace lease",
 			)));
 		};
+		if cancel.is_cancelled() {
+			return Err(WorkspaceError::Cancelled.into());
+		}
+		// Once the workspace-wide lease is held, restoration is a foreground
+		// mutation: finish the authorized plan even if its caller disconnects.
+		// Stopping between per-document commits would expose a half-restored
+		// tree and violate the cancellation boundary.
+		let commit_cancel = CancellationToken::new();
 
 		let mut written = 0_u64;
 		let mut deleted = 0_u64;
 		for plan in plans {
-			if cancel.is_cancelled() {
-				return Err(WorkspaceError::Cancelled.into());
-			}
 			let path = plan.path().clone();
 			let delete = plan.is_delete();
-			match self.apply_restore_plan(plan, cancel).await {
+			match self.apply_restore_plan(plan, &commit_cancel).await {
 				Ok(()) if delete => deleted += 1,
 				Ok(()) => written += 1,
 				Err(failure) => {
@@ -520,7 +525,7 @@ impl WorkspaceOperations {
 		restored.deleted = deleted;
 		if restored.partial || restored.conflicts.is_empty() {
 			let current = self.publish_snapshot(
-				self.snapshot_at(self.inner.workspace.root(), &[], cancel)?,
+				self.snapshot_at(self.inner.workspace.root(), &[], &commit_cancel)?,
 				None,
 				reserved.generation,
 				false,

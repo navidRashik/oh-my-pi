@@ -165,31 +165,51 @@ impl DynHost {
 	fn proposal_schema(name: &str) -> Option<DynSchema> {
 		matches!(name, "resolve" | "reject").then(|| DynSchema {
 			name:        Str::new(name),
-			description: Some(Str::new_static("Finalize the latest staged proposal.")),
+			description: Some(Str::new_static("Finalize one exact staged proposal.")),
 			schema:      json!({
 				"type": "object",
 				"properties": {
+					"proposal_id": {
+						"type": "string",
+						"minLength": 1,
+						"description": "Exact pending proposal id printed by the staging tool."
+					},
 					"reason": {
 						"type": "string",
+						"minLength": 1,
 						"description": "One-sentence decision reason."
 					}
 				},
-				"required": ["reason"]
+				"required": ["proposal_id", "reason"],
+				"additionalProperties": false
 			}),
 		})
 	}
 
 	fn finalize_proposal(&self, name: &str, args: &Value) -> Result<DynOutput, DynFault> {
+		let object = args
+			.as_object()
+			.ok_or_else(|| DynFault::new("proposal finalization arguments must be an object"))?;
+		if object
+			.keys()
+			.any(|key| !matches!(key.as_str(), "proposal_id" | "reason"))
+		{
+			return Err(DynFault::new(
+				"proposal finalization accepts only `proposal_id` and `reason`",
+			));
+		}
+		let id = args
+			.get("proposal_id")
+			.and_then(Value::as_str)
+			.map(str::trim)
+			.filter(|id| !id.is_empty())
+			.ok_or_else(|| DynFault::new("an exact staged proposal id is required"))?;
 		let reason = args
 			.get("reason")
 			.and_then(Value::as_str)
 			.map(str::trim)
 			.filter(|reason| !reason.is_empty())
 			.ok_or_else(|| DynFault::new("a one-sentence reason is required"))?;
-		let id = self
-			.proposals
-			.latest_pending()
-			.ok_or_else(|| DynFault::new("no staged proposal is pending"))?;
 		let decision = if name == "resolve" {
 			ProposalDecision::Resolve { reason: Str::new(reason) }
 		} else {
@@ -197,9 +217,11 @@ impl DynHost {
 		};
 		let outcome = self
 			.proposals
-			.finalize(id.as_str(), decision)
-			.map_err(|_| DynFault::new("failed to finalize the staged proposal"))?;
-		Ok(DynOutput::Json(outcome.payload))
+			.finalize(id, decision)
+			.map_err(|error| DynFault::new(error.to_string()))?;
+		let payload =
+			serde_json::to_value(outcome).map_err(|error| DynFault::new(error.to_string()))?;
+		Ok(DynOutput::Json(payload))
 	}
 }
 
@@ -225,6 +247,18 @@ impl ShellDynHost for DynHost {
 						.is_none_or(|names| names.contains(device.name.as_str()))
 				})
 				.collect::<Vec<_>>();
+			if self.proposals.latest_pending().is_some() {
+				devices.extend([
+					DynDevice {
+						name:        sf!("resolve"),
+						description: Some(sf!("Apply one exact staged proposal.")),
+					},
+					DynDevice {
+						name:        sf!("reject"),
+						description: Some(sf!("Discard one exact staged proposal.")),
+					},
+				]);
+			}
 			devices.sort_by(|left, right| left.name.cmp(&right.name));
 			devices.dedup_by(|left, right| left.name == right.name);
 			Ok(devices)
@@ -263,6 +297,11 @@ impl ShellDynHost for DynHost {
 		let name = Str::new(name);
 		Box::pin(async move {
 			if matches!(name.as_str(), "resolve" | "reject") {
+				if cancellation.is_cancelled() {
+					return Err(DynFault::new("staged proposal finalization was cancelled"));
+				}
+				// Finalization is the foreground mutation boundary: once the
+				// exact transaction starts, it runs through commit or rollback.
 				return self.finalize_proposal(name.as_str(), &args);
 			}
 			let registry = self
@@ -301,7 +340,7 @@ impl ShellDynHost for DynHost {
 			let args_json = Bytes::from(raw.clone());
 			let mut stream = match target.route.clone() {
 				ToolRoute::Native => {
-					let (feed, params) = IncomingParams::channel();
+					let (feed, params) = IncomingParams::channel_for(None, Some(invocation_id.clone()));
 					feed
 						.args_committed(raw)
 						.map_err(|_| DynFault::new("device argument channel closed before dispatch"))?;
@@ -442,7 +481,7 @@ fn project_external_verdict(verdict: &[u8]) -> Result<DynOutput, DynFault> {
 
 fn output_error_message(output: DynOutput) -> Str {
 	match output {
-		DynOutput::Text(text) => text,
+		DynOutput::Text(text) | DynOutput::Markdown(text) => text,
 		DynOutput::Json(value) => Str::new(value.to_string()),
 		DynOutput::Blob { mime, .. } => sf!("device returned a binary error payload ({mime})"),
 		DynOutput::Parts(parts) => {
@@ -565,6 +604,19 @@ mod tests {
 			_request: DeviceInvokeRequest,
 		) -> impl Future<Output = ErasedStream<'static>> + Send {
 			async { Box::pin(futures::stream::empty()) as ErasedStream<'static> }
+		}
+	}
+
+	#[test]
+	fn proposal_dyn_schema_requires_exact_identity_and_reason() {
+		for name in ["resolve", "reject"] {
+			let schema = DynHost::proposal_schema(name).expect("proposal device schema");
+			assert_eq!(schema.schema["required"], json!(["proposal_id", "reason"]));
+			assert_eq!(schema.schema["additionalProperties"], false);
+			assert_eq!(
+				schema.schema["properties"]["proposal_id"]["description"],
+				"Exact pending proposal id printed by the staging tool."
+			);
 		}
 	}
 
