@@ -463,7 +463,7 @@ fn computer_card_previews_code_and_output_when_collapsed() {
 	let payload = json!({"code": code, "results": results, "artifacts": []});
 	let collapsed = render_done::<omp_tools::computer::Payload>(
 		"computer",
-		r#"{"code":"x"}"#,
+		r#"{"action":"run","code":"x"}"#,
 		payload.clone(),
 		false,
 	);
@@ -473,7 +473,12 @@ fn computer_card_previews_code_and_output_when_collapsed() {
 	assert!(collapsed.contains("… 4 more lines"), "{collapsed}");
 	assert!(collapsed.contains("Output"), "{collapsed}");
 	let expanded =
-		render_done::<omp_tools::computer::Payload>("computer", r#"{"code":"x"}"#, payload, true);
+		render_done::<omp_tools::computer::Payload>(
+			"computer",
+			r#"{"action":"run","code":"x"}"#,
+			payload,
+			true,
+		);
 	assert!(expanded.contains("desktop.step(14)"), "{expanded}");
 	assert!(!expanded.contains("… 4 more lines"), "{expanded}");
 	// Output stays bounded even when expanded (pi `OUTPUT_EXPANDED`): the
@@ -493,7 +498,10 @@ fn computer_card_previews_code_and_output_when_collapsed() {
 
 	// A failed script names the error state in the header and shows the
 	// fault beneath the script.
-	let input = node(KnownTag::Input, r#"{"code":"await desktop.click(1, 2)"}"#);
+	let input = node(
+		KnownTag::Input,
+		r#"{"action":"run","code":"await desktop.click(1, 2)"}"#,
+	);
 	let diag = fault_node("input permission denied");
 	let failed = render("computer", &input, None, Some(&diag), CardStatus::Failed, false);
 	assert!(failed.contains("Computer: error"), "{failed}");

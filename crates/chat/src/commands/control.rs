@@ -166,7 +166,7 @@ fn dump(cx: &PanelCx<'_>) -> PanelEvent {
 	}
 	let mut doc = text.to_string();
 	let mut status = vec![Str::new_static("Session copied to clipboard")];
-	match cx.services.dump_request() {
+	match cx.services.dump_request(cx.dom) {
 		Ok(path) => {
 			let _ = write!(
 				doc,

@@ -35,27 +35,74 @@ impl Card for CheckpointCard {
 		"checkpoint"
 	}
 
-	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::checkpoint::CheckpointParams>(view);
 		let result = typed_result::<omp_tools::checkpoint::CheckpointPayload>(view);
-		let goal = result
+		let created = result
 			.as_ref()
-			.and_then(|value| value.get("goal"))
+			.filter(|value| value.get("action").and_then(Value::as_str) == Some("created"))
+			.and_then(|value| value.get("checkpoints"))
+			.and_then(Value::as_array)
+			.and_then(|checkpoints| checkpoints.first());
+		let listed = result
+			.as_ref()
+			.filter(|value| value.get("action").and_then(Value::as_str) == Some("listed"))
+			.and_then(|value| value.get("checkpoints"))
+			.and_then(Value::as_array);
+		let action = args
+			.as_ref()
+			.and_then(|value| value.get("action"))
+			.and_then(Value::as_str)
+			.unwrap_or("create");
+		let detail = created
+			.and_then(|checkpoint| checkpoint.get("goal"))
 			.and_then(Value::as_str)
 			.or_else(|| args.as_ref()?.get("goal")?.as_str())
-			.unwrap_or_default();
-		let token = result
-			.as_ref()
-			.and_then(|value| value.get("token"))
-			.and_then(Value::as_str);
-		semantic_row(
+			.unwrap_or_else(|| if action == "list" { "selected branch" } else { "" });
+		let receipt = created
+			.and_then(|checkpoint| checkpoint.get("label"))
+			.and_then(Value::as_str)
+			.map(Str::new)
+			.or_else(|| listed.map(|rows| sf!("{} checkpoint(s)", rows.len())));
+		let card = semantic_row(
 			"checkpoint",
-			"Checkpoint",
-			goal,
-			token,
+			if action == "list" { "Checkpoints" } else { "Checkpoint" },
+			detail,
+			receipt.as_deref(),
 			typed_fault::<omp_tools::checkpoint::Fault>(view),
 			view,
-		)
+		);
+		if !expanded {
+			return card;
+		}
+		let rows = listed
+			.into_iter()
+			.flatten()
+			.filter_map(|checkpoint| {
+				Some((
+					Str::new(checkpoint.get("label")?.as_str()?),
+					Str::new(checkpoint.get("token")?.as_str()?),
+					checkpoint
+						.get("parent_token")
+						.and_then(Value::as_str)
+						.map(Str::new),
+				))
+			})
+			.collect::<Vec<_>>();
+		dom! {
+			<col>
+				{card}
+				for (label, token, parent) in rows {
+					<row gap=1 pad-x=2>
+						<text bold>{label}</text><text fg=muted>{token}</text>
+						if let Some(parent) = parent {
+							<text fg=muted>{"←"}</text><text fg=muted>{parent}</text>
+						}
+					</row>
+				}
+			</col>
+		}
+		.into_component()
 	}
 }
 
@@ -73,15 +120,30 @@ impl Card for RewindCard {
 			.and_then(Value::as_str)
 			.or_else(|| args.as_ref()?.get("report")?.as_str())
 			.unwrap_or_default();
+		let label = result
+			.as_ref()
+			.and_then(|value| value.get("checkpoint"))
+			.and_then(|checkpoint| checkpoint.get("label"))
+			.and_then(Value::as_str)
+			.or_else(|| args.as_ref()?.get("checkpoint")?.as_str());
 		let receipt = result
 			.as_ref()
-			.and_then(|value| value.get("receipt"))
-			.and_then(Value::as_str);
+			.and_then(|value| value.get("workspace"))
+			.map(|workspace| {
+				sf!(
+					"{} · {} written · {} deleted · {} unchanged",
+					label.unwrap_or_default(),
+					workspace.get("written").and_then(Value::as_u64).unwrap_or_default(),
+					workspace.get("deleted").and_then(Value::as_u64).unwrap_or_default(),
+					workspace.get("unchanged").and_then(Value::as_u64).unwrap_or_default(),
+				)
+			})
+			.or_else(|| label.map(Str::new));
 		semantic_row(
 			"rewind",
 			"Rewind",
 			report,
-			receipt,
+			receipt.as_deref(),
 			typed_fault::<omp_tools::checkpoint::Fault>(view),
 			view,
 		)
@@ -122,14 +184,6 @@ impl Card for YieldCard {
 	}
 }
 
-#[derive(Deserialize, Serialize)]
-struct MemoryEditOutcome {
-	operation: Value,
-	status:    Value,
-	id:        Str,
-	bank:      Option<Value>,
-}
-
 impl Card for MemoryEditCard {
 	fn tool(&self) -> &'static str {
 		"memory_edit"
@@ -137,7 +191,7 @@ impl Card for MemoryEditCard {
 
 	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::memory_edit::Params>(view);
-		let result = typed_result::<MemoryEditOutcome>(view);
+		let result = typed_result::<omp_tools::memory_edit::EditOutcome>(view);
 		let operation = result
 			.as_ref()
 			.and_then(|value| value.get("operation"))
@@ -154,11 +208,20 @@ impl Card for MemoryEditCard {
 			.as_ref()
 			.and_then(|value| value.get("status"))
 			.and_then(Value::as_str);
+		let tier = result
+			.as_ref()
+			.and_then(|value| value.get("tier"))
+			.and_then(Value::as_str);
+		let meta = match (status, tier) {
+			(Some(status), Some(tier)) => Some(sf!("{status} · {tier}")),
+			(Some(status), None) => Some(Str::new(status)),
+			(None, _) => None,
+		};
 		semantic_row(
 			"memory-tool",
 			"Memory",
 			&sf!("{operation} {id}"),
-			status,
+			meta.as_deref(),
 			typed_fault::<omp_tools::memory_edit::Fault>(view),
 			view,
 		)

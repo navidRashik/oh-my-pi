@@ -83,6 +83,8 @@ pub struct Options<'a> {
 	/// Collapse fenced code in reasoning to an ellipsis
 	/// (`cl_thinking_prose_only`).
 	pub prose_only:    bool,
+	/// Show token and timing telemetry (`cl_display_show_token_usage` / `cl_display_show_turn_time`).
+	pub show_usage:    bool,
 	/// Tool start instants, speed gauge, and reset banner.
 	pub local:         &'a Local,
 }
@@ -98,6 +100,7 @@ impl<'a> Options<'a> {
 			expanded: false,
 			smooth: true,
 			prose_only: true,
+			show_usage: false,
 			local,
 		}
 	}
@@ -124,9 +127,9 @@ pub(crate) fn project(
 	if let Some(banner) = options.local.banner() {
 		blocks.push(banner_block(banner));
 	}
-	if let Some(update) = options.local.update() {
-		blocks.push(update_block(update));
-	}
+			if let Some(update) = options.local.update() {
+			blocks.push(update_block(update, options.expanded));
+		}
 	let turns = dom.children(dom.body());
 	let cache_misses = cache::cache_invalidations(dom);
 	// pi `pickReactionTarget`: the nearest preceding user bubble, looking
@@ -141,6 +144,7 @@ pub(crate) fn project(
 		}
 		let start = blocks.len();
 		let last_turn = index + 1 == turns.len();
+		let mut interleaved_tools = Vec::new();
 		for handle in dom.children(*turn) {
 			let Some(node) = dom.get(*handle) else {
 				continue;
@@ -228,7 +232,43 @@ pub(crate) fn project(
 					blocks.push(rendered(*handle, BlockKind::User, raw, Mode::Mutable, true, component));
 				},
 				Tag::Known(KnownTag::Assistant) => {
+					let ordered_start = blocks.len();
 					assistant_blocks(dom, *handle, node, ui, options, &mut blocks, &mut reaction_target);
+					let siblings = dom.children(*turn);
+					let Some(position) = siblings.iter().position(|candidate| candidate == handle) else {
+						continue;
+					};
+					for tool_handle in siblings.iter().skip(position + 1) {
+						let Some(tool_node) = dom.get(*tool_handle) else {
+							continue;
+						};
+						if tool_node.tag == Tag::Known(KnownTag::Assistant) {
+							break;
+						}
+						let Tag::Custom(tool) = &tool_node.tag else {
+							continue;
+						};
+						if provider_block_index_opt(tool_node).is_none() {
+							continue;
+						}
+						interleaved_tools.push(*tool_handle);
+						let block = if local::is_local(tool_node) {
+							local_block(dom, *tool_handle, tool_node, options)
+						} else if options.show_tools {
+							tool_block(dom, *tool_handle, tool_node, tool, cards, ui, options)
+						} else {
+							None
+						};
+						if let Some(block) = block {
+							blocks.push(block);
+						}
+					}
+					blocks[ordered_start..].sort_by_key(|block| {
+						Handle::new(block.view.key / 8)
+							.and_then(|handle| dom.get(handle))
+							.and_then(provider_block_index_opt)
+							.unwrap_or(i64::MAX)
+					});
 				},
 				Tag::Known(KnownTag::Developer) => {
 					if prop_text(node, PropId::Kind).as_deref()
@@ -301,6 +341,9 @@ pub(crate) fn project(
 					));
 				},
 				Tag::Known(KnownTag::Usage) => {
+					if !options.show_usage {
+						continue;
+					}
 					if node.prop(&PropId::Kind.into()).and_then(Value::as_str) == Some("advisor") {
 						continue;
 					}
@@ -328,6 +371,9 @@ pub(crate) fn project(
 					}
 				},
 				Tag::Custom(tool) => {
+					if interleaved_tools.contains(handle) {
+						continue;
+					}
 					let block = if local::is_local(node) {
 						local_block(dom, *handle, node, options)
 					} else if options.show_tools {
@@ -469,13 +515,16 @@ fn is_artifact(node: &Node) -> bool {
 }
 
 fn provider_block_index(node: &Node) -> i64 {
+	provider_block_index_opt(node).unwrap_or(i64::MAX)
+}
+
+fn provider_block_index_opt(node: &Node) -> Option<i64> {
 	node
 		.prop(&PropKey::Custom(Str::new_static(PROVIDER_BLOCK_INDEX_PROP)))
 		.and_then(|value| match value {
 			Value::Int(index) => Some(*index),
 			_ => None,
 		})
-		.unwrap_or(i64::MAX)
 }
 
 /// Assistant reasoning, answer, and artifact blocks in exact provider order.
@@ -704,7 +753,7 @@ fn banner_block(banner: &Banner) -> RenderedBlock {
 }
 
 /// Observer-local typed update-availability card.
-fn update_block(update: &UpdateBanner) -> RenderedBlock {
+fn update_block(update: &UpdateBanner, expanded: bool) -> RenderedBlock {
 	RenderedBlock {
 		view:      BlockView {
 			key: update.key,
@@ -713,7 +762,7 @@ fn update_block(update: &UpdateBanner) -> RenderedBlock {
 			mode: Mode::Mutable,
 			finalized: true,
 		},
-		component: update::card(&update.notice),
+		component: update::card(&update.notice, expanded),
 		stream:    None,
 	}
 }
@@ -1401,14 +1450,22 @@ mod tests {
 
 		let local = Local::default();
 		let options = Options { smooth: false, ..Options::new(&local) };
+		let status = crate::status_line::StatusLine::from_dom(session.dom());
+		assert_eq!(status.cost_nano_usd, 120_000_000);
+		assert_eq!(
+			status.advisor.as_ref().map(|advisor| advisor.cost_nano_usd),
+			Some(80_000_000),
+			"advisor accounting remains available to the status projection",
+		);
+
 		let blocks = projected(&session, &options);
 		assert_eq!(
 			blocks
 				.iter()
 				.filter(|block| block.view.kind == BlockKind::Usage)
 				.count(),
-			1,
-			"the auxiliary advisor receipt is status/accounting state, not a transcript row"
+			0,
+			"default transcript projection does not append primary or advisor telemetry rows",
 		);
 	}
 
@@ -2258,6 +2315,82 @@ mod tests {
 					"artifact://sha256/0404040404040404040404040404040404040404040404040404040404040404"
 				),
 			]
+		);
+	}
+
+	#[test]
+	fn tool_cards_preserve_interleaved_provider_order_after_replay() {
+		let local = Local::default();
+		let options = Options { smooth: false, ..Options::new(&local) };
+		let mut session = empty_session();
+		let path = session.journal_path().to_path_buf();
+		session.begin_turn().expect("turn");
+		session.user("mix tools", Vec::new()).expect("user");
+		session
+			.assistant_start("test/model", "test", "test/model")
+			.expect("assistant");
+		let turn = *session.dom().children(session.dom().body()).last().expect("turn");
+		let assistant = *session.dom().children(turn).last().expect("assistant");
+
+		let before = insert_assistant_part(&mut session, assistant, 0, "text");
+		let sid = session.stream_open(before, PropId::Text.into()).expect("before stream");
+		session.stream_append(sid, "before").expect("before text");
+		session.stream_close(sid).expect("before close");
+		let call = session
+			.call(
+				"read",
+				1,
+				"call-ordered",
+				None,
+				Some(
+					serde_json::value::RawValue::from_string(r#"{"path":"README.md"}"#.to_owned())
+						.expect("arguments"),
+				),
+				None,
+			)
+			.expect("ordered call");
+		let tool = session.call_handle(call).expect("tool handle");
+		session
+			.patch(omp_dom::Txn {
+				cause: call,
+				label: Some(Str::new_static("tool.provider-order")),
+				ops:   vec![omp_dom::Op::Set {
+					h:     tool,
+					prop:  PropKey::Custom(Str::new_static(PROVIDER_BLOCK_INDEX_PROP)),
+					value: Value::Int(1),
+				}],
+			})
+			.expect("provider order");
+		session
+			.settle(
+				call,
+				serde_json::value::RawValue::from_string(
+					r#"{"content":[{"type":"text","text":"ok"}]}"#.to_owned(),
+				)
+				.expect("outcome"),
+			)
+			.expect("settle");
+		let after = insert_assistant_part(&mut session, assistant, 2, "text");
+		let sid = session.stream_open(after, PropId::Text.into()).expect("after stream");
+		session.stream_append(sid, "after").expect("after text");
+		session.stream_close(sid).expect("after close");
+		session.assistant_end("stop").expect("assistant end");
+		drop(session);
+
+		let replayed = Session::open(path, ComponentRegistry::standard()).expect("replay");
+		let ordered = projected(&replayed, &options)
+			.into_iter()
+			.filter(|block| {
+				matches!(
+					block.view.kind,
+					BlockKind::Assistant | BlockKind::Tool
+				)
+			})
+			.map(|block| block.view.kind)
+			.collect::<Vec<_>>();
+		assert_eq!(
+			ordered,
+			[BlockKind::Assistant, BlockKind::Tool, BlockKind::Assistant],
 		);
 	}
 

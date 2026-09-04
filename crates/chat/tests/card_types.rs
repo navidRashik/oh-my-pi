@@ -230,10 +230,14 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 		tools::checkpoint::Fault,
 	>(
 		"checkpoint",
-		json!({"token":"checkpoint-1","goal":"explore parser","started_at":1,"workspace":{
-			"snapshot_id":"snapshot-1","root_uri":"file:///workspace","generation":1,
-			"tree_hash":"tree","files":2,"bytes":12
-		}}),
+		json!({"action":"created","checkpoints":[{
+			"token":"checkpoint-1","label":"parser-baseline","goal":"explore parser",
+			"started_at":1,"parent_token":null,"session_target":"01K4TARGET","workspace":{
+				"snapshot_id":"snapshot-1","root_uri":"file:///workspace","generation":1,
+				"tree_hash":"tree","files":2,"bytes":12,"label":"parser-baseline",
+				"parent_snapshot_id":null,"created_at":1,"partial":false
+			}
+		}]}),
 	);
 	renders_typed::<
 		tools::checkpoint::RewindParams,
@@ -241,7 +245,14 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 		tools::checkpoint::Fault,
 	>(
 		"rewind",
-		json!({"token":"checkpoint-1","report":"parser is sound","receipt":"r1","scheduled":true,
+		json!({"checkpoint":{
+				"token":"checkpoint-1","label":"parser-baseline","goal":"explore parser",
+				"started_at":1,"parent_token":null,"session_target":"01K4TARGET","workspace":{
+					"snapshot_id":"snapshot-1","root_uri":"file:///workspace","generation":1,
+					"tree_hash":"tree","files":2,"bytes":12,"label":"parser-baseline",
+					"parent_snapshot_id":null,"created_at":1,"partial":false
+				}
+			},"report":"parser is sound","receipt":"r1","scheduled":true,
 			"workspace":{"snapshot_id":"snapshot-1","undo_snapshot_id":"undo-1","written":1,
 				"deleted":1,"unchanged":0,"from_generation":1,"to_generation":2}}),
 	);
@@ -330,10 +341,20 @@ fn typed_outcomes_are_not_shadowed_by_projection_json() {
 	let goal = renders_typed::<tools::goal::Params, tools::goal::Payload, tools::goal::Fault>(
 		"goal",
 		json!({"op":"get","goal":{"id":"g1","objective":"ship","status":"active",
-			"token_budget":1000,"tokens_used":100,"time_used_secs":60},
+			"token_budget":1000,"tokens_used":100,"time_used_secs":60,
+			"created_at_ms":1_749_200_000_000_u64,"updated_at_ms":1_749_200_060_000_u64},
 			"remaining_tokens":900,"completion_report":null}),
 	);
 	assert!(goal.contains("1K left"), "{goal}");
+
+	let legacy_goal =
+		renders_typed::<tools::goal::Params, tools::goal::Payload, tools::goal::Fault>(
+			"goal",
+			json!({"op":"get","goal":{"id":"g0","objective":"legacy","status":"active",
+				"token_budget":null,"tokens_used":100,"time_used_secs":60},
+				"remaining_tokens":null,"completion_report":null}),
+		);
+	assert!(legacy_goal.contains("legacy"), "{legacy_goal}");
 
 	let github = renders_typed::<tools::github::Params, tools::github::Payload, tools::github::Fault>(
 		"github",

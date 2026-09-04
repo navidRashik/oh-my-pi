@@ -3,12 +3,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use omp_core::{Str, sf};
+use omp_proto::inference::v1::{self as pb, search_response};
 use omp_tui::{Border, IntoComponent as _, UiContext, dom};
-use serde_json::Value;
 
-use super::{
-	Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, typed_result,
-};
+use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_fault};
 
 /// Renders a web-search answer, source list, provider metadata, or fault.
 pub struct WebSearchCard;
@@ -19,25 +17,32 @@ impl Card for WebSearchCard {
 	}
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
-		let args = typed_input::<omp_tools::web_search::Params>(view).unwrap_or(Value::Null);
+		let args = view.input::<omp_tools::web_search::Params>();
 		let query = args
-			.get("query")
-			.and_then(Value::as_str)
-			.unwrap_or_default();
+			.as_ref()
+			.map_or("", |params| params.query.as_str());
 		if view.status == CardStatus::Failed {
 			let fault = view.fault::<omp_tools::web_search::Fault>();
-			let provider = fault
-				.as_ref()
-				.and_then(|fault| serde_json::to_value(fault).ok())
-				.and_then(|value| {
-					value
-						.get("provider")
-						.and_then(Value::as_str)
-						.map(provider_name)
-				})
-				.filter(|provider| !provider.is_empty());
-			let error = typed_fault::<omp_tools::web_search::Fault>(view)
-				.unwrap_or_else(|| omp_core::Str::new_static("search failed"));
+			let provider = match fault.as_ref() {
+				Some(omp_tools::web_search::Fault::Search { provider: Some(provider), .. }) => {
+					let name: &'static str = (*provider).into();
+					Some(provider_name(name))
+				},
+				_ => None,
+			};
+			let error = match fault.as_ref() {
+				Some(omp_tools::web_search::Fault::Search {
+					category,
+					code,
+					status,
+					..
+				}) => match status {
+					Some(status) => sf!("{category}: {code} (HTTP {status})"),
+					None => sf!("{category}: {code}"),
+				},
+				None => typed_fault::<omp_tools::web_search::Fault>(view)
+					.unwrap_or_else(|| omp_core::Str::new_static("search failed")),
+			};
 			return dom! {
 				<box border=round bc=err bg=error_surface bleed title_pad=3 pad="0 1">
 					<row kind=title gap=0><i:error fg=err/><text>{" "}</text><text fg=accent>{"Web Search"}</text>
@@ -48,7 +53,7 @@ impl Card for WebSearchCard {
 				</box>
 			}.into_component();
 		}
-		let Some(_typed) = typed_result::<omp_tools::web_search::Payload>(view) else {
+		let Some(payload) = view.result::<omp_tools::web_search::Payload>() else {
 			return dom! {
 				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Web Search"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {query}")}</text>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
@@ -56,43 +61,24 @@ impl Card for WebSearchCard {
 			}
 			.into_component();
 		};
-		let payload = view.outcome_json().unwrap_or(Value::Null);
-		let result = payload.get("response").unwrap_or(&Value::Null);
-		let provider = provider_name(
-			result
-				.get("engine")
-				.and_then(Value::as_str)
-				.unwrap_or("web"),
-		);
-		let sources = result
-			.get("sources")
-			.and_then(Value::as_array)
-			.cloned()
-			.unwrap_or_default();
+		let result = payload.response;
+		let provider = provider_name(if result.engine.is_empty() {
+			"web"
+		} else {
+			result.engine.as_str()
+		});
+		let sources = &result.sources;
 		let source_count = format!("{} sources", sources.len());
-		let answer = result
-			.get("answer")
-			.and_then(Value::as_str)
-			.unwrap_or_default()
-			.replace("<br>\n", "\n");
-		let usage = result.get("usage").unwrap_or(&Value::Null);
+		let answer = result.answer.replace("<br>\n", "\n");
+		let usage = result.usage.as_ref();
 		let usage_text = format!(
 			"Usage: in {} · out {} · total {} · search {}",
+			usage.map_or(0, |usage| usage.input_tokens),
+			usage.map_or(0, |usage| usage.output_tokens),
+			usage.and_then(|usage| usage.total_tokens).unwrap_or_default(),
 			usage
-				.get("input_tokens")
-				.and_then(Value::as_u64)
-				.unwrap_or_default(),
-			usage
-				.get("output_tokens")
-				.and_then(Value::as_u64)
-				.unwrap_or_default(),
-			usage
-				.get("total_tokens")
-				.and_then(Value::as_u64)
-				.unwrap_or_default(),
-			usage
-				.get("search_requests")
-				.and_then(Value::as_u64)
+				.and_then(|usage| usage.server_tools.as_ref())
+				.and_then(|tools| tools.web_search_requests)
 				.unwrap_or_default(),
 		);
 		let (branch, last, _) = ui.charset.guides(Border::Square);
@@ -112,21 +98,19 @@ impl Card for WebSearchCard {
 			} else {
 				branch
 			};
-			let name = source
-				.get("title")
-				.and_then(Value::as_str)
-				.filter(|title| !title.trim().is_empty())
-				.or_else(|| source.get("url").and_then(Value::as_str))
-				.unwrap_or("Untitled");
-			let domain = source
-				.get("url")
-				.and_then(Value::as_str)
-				.map(domain_of)
+			let name = if source.title.trim().is_empty() {
+				if source.url.is_empty() {
+					"Untitled"
+				} else {
+					source.url.as_str()
+				}
+			} else {
+				source.title.as_str()
+			};
+			let domain = (!source.url.is_empty())
+				.then(|| domain_of(&source.url))
 				.filter(|domain| !domain.is_empty());
-			let href = source
-				.get("url")
-				.and_then(Value::as_str)
-				.unwrap_or_default();
+			let href = source.url.as_str();
 			let age = source_age(source).map(|age| match age {
 				SourceAge::Relative(ms) => {
 					dom! { <row gap=1 fg=muted><text>{"·"}</text><time kind="relative" ms={ms}/></row> }
@@ -139,11 +123,14 @@ impl Card for WebSearchCard {
 			});
 			source_rows.push(
 				dom! {
-					<row gap=0>
-						<text fg=muted wrap=pre>{format!("{prefix} ")}</text><text fg=accent href={href} wrap=pre>{name}</text>
-						if let Some(domain) = domain { <text fg=muted wrap=pre>{format!(" ({domain})")}</text> }
-						if let Some(age) = age { <text>{" "}</text>{age} }
-					</row>
+					<col>
+						<row gap=0>
+							<text fg=muted wrap=pre>{format!("{prefix} ")}</text><text fg=accent href={href} wrap=pre>{name}</text>
+							if let Some(domain) = domain { <text fg=muted wrap=pre>{format!(" ({domain})")}</text> }
+							if let Some(age) = age { <text>{" "}</text>{age} }
+						</row>
+						if expanded && !source.snippet.is_empty() { <text fg=muted>{source.snippet.as_str()}</text> }
+					</col>
 				}
 				.into_component(),
 			);
@@ -160,14 +147,62 @@ impl Card for WebSearchCard {
 		} else {
 			Str::new(answer)
 		};
-		let query = query.to_owned();
-		let provider_line = format!(
-			"Provider: {} @ {provider} (API)",
-			result
-				.get("model")
-				.and_then(Value::as_str)
-				.unwrap_or_default(),
-		);
+		let shown_citations = if expanded {
+			result.citations.len()
+		} else {
+			result.citations.len().min(COLLAPSED_SOURCES)
+		};
+		let hidden_citations = result.citations.len() - shown_citations;
+		let mut citation_rows =
+			Vec::with_capacity(shown_citations + usize::from(hidden_citations > 0));
+		for (index, citation) in result.citations.iter().take(shown_citations).enumerate() {
+			let title = if citation.title.trim().is_empty() {
+				citation.url.as_str()
+			} else {
+				citation.title.as_str()
+			};
+			citation_rows.push(
+				dom! {
+					<col>
+						<row gap=1><text fg=muted>{format!("[{}]", index + 1)}</text><text fg=accent href={citation.url.as_str()}>{title}</text></row>
+						if expanded && !citation.cited_text.is_empty() { <text fg=muted>{citation.cited_text.as_str()}</text> }
+					</col>
+				}
+				.into_component(),
+			);
+		}
+		if hidden_citations > 0 {
+			citation_rows.push(
+				dom! { <text fg=muted>{format!("… {hidden_citations} more citations")}</text> }
+					.into_component(),
+			);
+		}
+		let mut warning_rows = Vec::with_capacity(result.warnings.len() + result.failures.len());
+		for warning in &result.warnings {
+			warning_rows.push(
+				dom! { <callout kind="warn">{warning.as_str()}</callout> }.into_component(),
+			);
+		}
+		for failure in &result.failures {
+			let kind = search_response::failure::Kind::try_from(failure.kind)
+				.unwrap_or(search_response::failure::Kind::Unspecified)
+				.as_str_name();
+			let detail = match (failure.status, failure.code.is_empty()) {
+				(Some(status), false) => {
+					sf!("{}: {kind} [{}] (HTTP {status})", failure.provider, failure.code)
+				},
+				(Some(status), true) => sf!("{}: {kind} (HTTP {status})", failure.provider),
+				(None, false) => sf!("{}: {kind} [{}]", failure.provider, failure.code),
+				(None, true) => sf!("{}: {kind}", failure.provider),
+			};
+			warning_rows.push(dom! { <callout kind="warn">{detail}</callout> }.into_component());
+		}
+		let query = Str::new(query);
+		let provider_line = if result.auth_mode.is_empty() {
+			sf!("Provider: {provider}")
+		} else {
+			sf!("Provider: {provider} ({})", result.auth_mode)
+		};
 		dom! {
 			<box border=round bc=muted bg=panel bleed title_pad=3 pad="0 1">
 				<row kind=title gap=0><i:web-search fg=accent/><text>{" "}</text><text fg=accent>{"Web Search"}</text><text>{":"}</text>
@@ -179,6 +214,11 @@ impl Card for WebSearchCard {
 					<md>{answer}</md>
 					<hr title="Sources" title_pad=3 bc=muted/>
 					{source_rows}
+					if !citation_rows.is_empty() {
+						<hr title="Citations" title_pad=3 bc=muted/>
+						{citation_rows}
+					}
+					{warning_rows}
 					<hr title="Metadata" title_pad=3 bc=muted/>
 					<text fg=output>{provider_line}</text>
 					<text fg=output>{usage_text}</text>
@@ -206,22 +246,14 @@ enum SourceAge {
 /// `age_seconds` or the facade encoded `published_at` as Unix seconds
 /// (`omp_serve::inference`), the date text verbatim when it is an ISO date,
 /// nothing when unknown. Never invented.
-fn source_age(source: &Value) -> Option<SourceAge> {
-	if let Some(age) = source
-		.get("age_seconds")
-		.or_else(|| source.get("ageSeconds"))
-		.and_then(Value::as_u64)
-		.filter(|age| *age > 0)
-	{
-		return Some(SourceAge::Relative(age.saturating_mul(1000)));
+fn source_age(source: &pb::search_response::Source) -> Option<SourceAge> {
+	if source.age_seconds > 0 {
+		return Some(SourceAge::Relative(source.age_seconds.saturating_mul(1000)));
 	}
-	let published = source
-		.get("published_at")
-		.or_else(|| source.get("published_date"))
-		.or_else(|| source.get("publishedDate"))
-		.and_then(Value::as_str)
-		.map(str::trim)
-		.filter(|text| !text.is_empty())?;
+	let published = source.published_at.trim();
+	if published.is_empty() {
+		return None;
+	}
 	match published.parse::<u64>() {
 		Ok(secs) if secs > 0 => {
 			let now = SystemTime::now()

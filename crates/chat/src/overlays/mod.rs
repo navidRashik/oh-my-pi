@@ -21,6 +21,7 @@ use omp_dom::{Dom, KnownTag, PropId, PropKey, Tag, Value};
 use omp_tui::{
 	Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, assets::provider_logo, dom,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{history::HistoryEntry, host::HostCommand};
 
@@ -62,8 +63,6 @@ pub mod plugins;
 pub mod report;
 /// Confirmation selector for spending a saved usage reset.
 pub mod reset_usage;
-/// `/branch` rewind selector.
-pub mod rewind;
 /// Application-supplied data feeds for dashboards and account commands.
 pub mod services;
 /// Focused `/session info` panel.
@@ -304,6 +303,8 @@ pub trait Panel {
 	fn notify(&mut self, _note: PanelNote<'_>) -> PanelEvent {
 		PanelEvent::Ignored
 	}
+	/// Applies a new ambient presentation context to retained panel state.
+	fn set_context(&mut self, _ctx: &UiContext) {}
 	/// Reflows for a viewport and returns the frame to composite.
 	fn frame(&mut self, viewport: Size) -> &Frame;
 	/// Advances animations (countdowns); returns whether a repaint is due.
@@ -324,6 +325,110 @@ pub trait Panel {
 	/// panel-event path.
 	fn settled(&mut self) -> Option<PanelEvent> {
 		None
+	}
+}
+
+/// A panel dismissed by a controller-owned cancellation token.
+///
+/// Used by collaboration dialogs so a response from another peer closes the
+/// local projection without synthesizing a second answer.
+pub struct CancelledPanel {
+	inner:  Box<dyn Panel>,
+	cancel: CancellationToken,
+	wake:   Duration,
+}
+
+impl CancelledPanel {
+	/// Wraps a projected panel with its controller-owned lifetime.
+	#[must_use]
+	pub fn new(inner: Box<dyn Panel>, cancel: CancellationToken) -> Self {
+		Self { inner, cancel, wake: Duration::ZERO }
+	}
+}
+
+impl Panel for CancelledPanel {
+	fn id(&self) -> &'static str {
+		self.inner.id()
+	}
+
+	fn anchor(&self) -> PanelAnchor {
+		self.inner.anchor()
+	}
+
+	fn action(&mut self, action: PanelAction) -> PanelEvent {
+		if self.cancel.is_cancelled() {
+			PanelEvent::Close
+		} else {
+			self.inner.action(action)
+		}
+	}
+
+	fn key(&mut self, key: Key) -> PanelEvent {
+		if self.cancel.is_cancelled() {
+			PanelEvent::Close
+		} else {
+			self.inner.key(key)
+		}
+	}
+
+	fn paste(&mut self, text: &str) -> PanelEvent {
+		if self.cancel.is_cancelled() {
+			PanelEvent::Close
+		} else {
+			self.inner.paste(text)
+		}
+	}
+
+	fn touch(&mut self, now: Duration) {
+		self.inner.touch(now);
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		if self.cancel.is_cancelled() {
+			PanelEvent::Close
+		} else {
+			self.inner.mouse(report)
+		}
+	}
+
+	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
+		if self.cancel.is_cancelled() {
+			PanelEvent::Close
+		} else {
+			self.inner.notify(note)
+		}
+	}
+
+	fn set_context(&mut self, ctx: &UiContext) {
+		self.inner.set_context(ctx);
+	}
+
+	fn frame(&mut self, viewport: Size) -> &Frame {
+		self.inner.frame(viewport)
+	}
+
+	fn tick(&mut self, now: Duration) -> bool {
+		self.wake = now.saturating_add(Duration::from_millis(50));
+		self.inner.tick(now) || self.cancel.is_cancelled()
+	}
+
+	fn next_wake(&self) -> Option<Duration> {
+		self
+			.inner
+			.next_wake()
+			.map_or(Some(self.wake), |inner| Some(inner.min(self.wake)))
+	}
+
+	fn finished(&self) -> bool {
+		self.cancel.is_cancelled() || self.inner.finished()
+	}
+
+	fn settled(&mut self) -> Option<PanelEvent> {
+		if self.cancel.is_cancelled() {
+			None
+		} else {
+			self.inner.settled()
+		}
 	}
 }
 
@@ -547,6 +652,12 @@ impl ModelPicker {
 		};
 		picker.rebuild();
 		picker
+	}
+
+	/// Restyles the retained picker without changing its query or selection.
+	pub(crate) fn set_context(&mut self, ctx: &UiContext) {
+		self.ctx = ctx.clone();
+		self.ui.set_context(ctx.clone());
 	}
 
 	/// Whether the pick stays session-local.
@@ -950,6 +1061,12 @@ impl HistoryPicker {
 		picker
 	}
 
+	/// Restyles the retained picker without changing its query or selection.
+	pub(crate) fn set_context(&mut self, ctx: &UiContext) {
+		self.ctx = ctx.clone();
+		self.ui.set_context(ctx.clone());
+	}
+
 	/// Entries in current query order.
 	#[must_use]
 	pub fn entries(&self) -> &[HistoryEntry] {
@@ -1162,6 +1279,15 @@ pub enum Overlay {
 }
 
 impl Overlay {
+	fn set_context(&mut self, ctx: &UiContext) {
+		match self {
+			Self::Models(picker) => picker.set_context(ctx),
+			Self::History(picker) => picker.set_context(ctx),
+			Self::Panel(panel) => panel.set_context(ctx),
+			Self::Approval(_) => {},
+		}
+	}
+
 	/// Stable identity for `HostCommand::Overlay` and the debug `values` op.
 	#[must_use]
 	pub fn id(&self) -> &'static str {
@@ -1192,6 +1318,13 @@ pub struct Overlays {
 }
 
 impl Overlays {
+	/// Applies a new ambient context to every retained overlay.
+	pub fn set_context(&mut self, ctx: &UiContext) {
+		for overlay in &mut self.stack {
+			overlay.set_context(ctx);
+		}
+	}
+
 	/// Pushes an overlay on top of the stack.
 	pub fn show(&mut self, overlay: Overlay) {
 		self.stack.push(overlay);

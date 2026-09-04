@@ -170,6 +170,35 @@ fn frame_to_json(frame: &CollabFrame) -> Result<Value, CodecError> {
 			},
 			"data": serde_json::from_slice::<Value>(&value.data_json).unwrap_or(Value::Null),
 		}),
+		collab_frame::Payload::AgentViewRequest(value) => json!({
+			"t": "agent-view-request",
+			"reqId": value.request_id,
+			"agentId": value.agent_id,
+		}),
+		collab_frame::Payload::AgentViewCancel(value) => json!({
+			"t": "agent-view-cancel",
+			"reqId": value.request_id,
+		}),
+		collab_frame::Payload::AgentViewSnapshot(value) => json!({
+			"t": "agent-view-snapshot",
+			"reqId": value.request_id,
+			"index": value.chunk_index,
+			"data": base64_url::encode_raw(&value.snapshot_bytes).into_string(),
+			"final": value.r#final,
+		}),
+		collab_frame::Payload::AgentViewEvent(value) => json!({
+			"t": "agent-view-event",
+			"reqId": value.request_id,
+			"event": value.event.as_ref().and_then(record_value),
+		}),
+		collab_frame::Payload::AgentViewEnd(value) => json!({
+			"t": "agent-view-end",
+			"reqId": value.request_id,
+			"error": value.error.as_ref().map(|error| json!({
+				"code": error.code,
+				"message": error.message,
+			})),
+		}),
 		collab_frame::Payload::Event(_) => {
 			return Err(CodecError::UnsupportedPayload("event".into()));
 		},
@@ -261,6 +290,50 @@ fn frame_from_json(value: &Value) -> Result<CollabFrame, CodecError> {
 			request_id: json_u32(object, "reqId")?,
 			agent_id:   json_str(object, "agentId")?.to_owned(),
 			from_byte:  json_u64(object, "fromByte")?,
+		}),
+		"agent-view-request" => collab_frame::Payload::AgentViewRequest(v1::AgentViewRequest {
+			request_id: json_u32(object, "reqId")?,
+			agent_id:   json_str(object, "agentId")?.to_owned(),
+		}),
+		"agent-view-cancel" => collab_frame::Payload::AgentViewCancel(v1::AgentViewCancel {
+			request_id: json_u32(object, "reqId")?,
+		}),
+		"agent-view-snapshot" => {
+			collab_frame::Payload::AgentViewSnapshot(v1::AgentViewSnapshot {
+				request_id:    json_u32(object, "reqId")?,
+				chunk_index:   json_u32(object, "index")?,
+				snapshot_bytes: Bytes::from(decode_base64(json_str(object, "data")?)?),
+				r#final:       object
+					.get("final")
+					.and_then(Value::as_bool)
+					.unwrap_or(false),
+			})
+		},
+		"agent-view-event" => collab_frame::Payload::AgentViewEvent(v1::AgentViewEvent {
+			request_id: json_u32(object, "reqId")?,
+			event:      object
+				.get("event")
+				.filter(|value| !value.is_null())
+				.map(|value| json_record(value, 0))
+				.transpose()?,
+		}),
+		"agent-view-end" => collab_frame::Payload::AgentViewEnd(v1::AgentViewEnd {
+			request_id: json_u32(object, "reqId")?,
+			error:      object
+				.get("error")
+				.and_then(Value::as_object)
+				.map(|error| v1::ErrorMessage {
+					code:    error
+						.get("code")
+						.and_then(Value::as_str)
+						.unwrap_or_default()
+						.to_owned(),
+					message: error
+						.get("message")
+						.and_then(Value::as_str)
+						.unwrap_or_default()
+						.to_owned(),
+				}),
 		}),
 		other => return Err(CodecError::UnsupportedPayload(other.to_owned())),
 	};
@@ -705,6 +778,11 @@ enum Node {
 	TranscriptRequest,
 	TranscriptChunk,
 	BusEvent,
+	AgentViewRequest,
+	AgentViewCancel,
+	AgentViewSnapshot,
+	AgentViewEvent,
+	AgentViewEnd,
 	#[strum(serialize = "OpaqueImportedMessage")]
 	Opaque,
 }
@@ -731,6 +809,11 @@ impl Node {
 			(Self::CollabFrame, 41) => Some(Self::UiRequestEnd),
 			(Self::CollabFrame, 42) => Some(Self::TranscriptChunk),
 			(Self::CollabFrame, 43) => Some(Self::BusEvent),
+			(Self::CollabFrame, 44) => Some(Self::AgentViewRequest),
+			(Self::CollabFrame, 45) => Some(Self::AgentViewCancel),
+			(Self::CollabFrame, 46) => Some(Self::AgentViewSnapshot),
+			(Self::CollabFrame, 47) => Some(Self::AgentViewEvent),
+			(Self::CollabFrame, 48) => Some(Self::AgentViewEnd),
 			(Self::Welcome, 2) => Some(Self::SessionHeader),
 			(Self::Welcome, 3) => Some(Self::SessionState),
 			(Self::Welcome, 4) => Some(Self::Registry),
@@ -747,6 +830,9 @@ impl Node {
 			(Self::UiRequest, 3) => Some(Self::SelectSpec),
 			(Self::UiRequest, 4) => Some(Self::EditorSpec),
 			(Self::SelectSpec, 1) => Some(Self::SelectOption),
+			(Self::AgentViewSnapshot, 3) => Some(Self::Opaque),
+			(Self::AgentViewEvent, 2) => Some(Self::Journal),
+			(Self::AgentViewEnd, 2) => Some(Self::Error),
 			_ => None,
 		}
 	}
@@ -929,6 +1015,32 @@ mod tests {
 			Err(CodecError::UnsupportedRevision { actual: 2, .. })
 		));
 	}
+
+	#[test]
+	fn native_agent_view_frames_preserve_correlation_and_binary_snapshot_bytes() {
+		let (key, _) = RoomKey::generate().unwrap();
+		let frame = CollabFrame {
+			protocol_revision: PROTOCOL_REVISION,
+			sequence: 17,
+			payload: Some(collab_frame::Payload::AgentViewSnapshot(v1::AgentViewSnapshot {
+				request_id: 9,
+				chunk_index: 2,
+				snapshot_bytes: Bytes::from_static(b"\0snapshot\xff"),
+				r#final: true,
+			})),
+			..Default::default()
+		};
+		let encoded = encode_envelope(&key, RelayRoute { peer_id: 4 }, &frame).unwrap();
+		let decoded = decode_envelope(&key, &encoded).unwrap();
+		let Some(collab_frame::Payload::AgentViewSnapshot(snapshot)) = decoded.frame.payload else {
+			panic!("agent view snapshot");
+		};
+		assert_eq!(snapshot.request_id, 9);
+		assert_eq!(snapshot.chunk_index, 2);
+		assert_eq!(snapshot.snapshot_bytes.as_ref(), b"\0snapshot\xff");
+		assert!(snapshot.r#final);
+	}
+
 	#[test]
 	fn refuses_packed_repetition_before_decode() {
 		let mut encoded = vec![0x22, 0x81, 0x08];

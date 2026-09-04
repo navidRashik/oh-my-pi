@@ -63,7 +63,7 @@ pub use chrome::ModelBadge;
 pub use extension_status::{ExtensionStatus, ExtensionStatuses};
 pub use host::{
 	CtrlCAction, Host, HostCommand, HostError, HostOptions, InitialPanel, LocalFacts, NativeEffect,
-	NativeHost, UpEvent, ctrl_c_action, render_surface,
+	NativeHost, NativeOverlay, PendingInputGate, UpEvent, ctrl_c_action, render_surface,
 };
 pub use overlays::{ModelRow, PickerEvent};
 pub use project::{BlockKind, BlockView, block_views};

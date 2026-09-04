@@ -7,8 +7,12 @@
 
 use std::{
 	env, future, io,
+	ops::Range,
 	path::PathBuf,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::{Duration, Instant},
 };
 
@@ -22,8 +26,11 @@ use omp_con::{
 use omp_core::{Str, sf};
 use omp_dom::{Dom, Event, Handle, KnownTag, Op, PropId, PropKey, Snapshot, Tag, Value};
 use omp_journal::EntryId;
+use tokio::sync::Notify;
+
 use omp_tui::{
-	CursorStyle, DebugOp, Dim, Frame, InputEvent, Key, KeyEvent, Layer, MouseReport, OverlayAnchor,
+	Appearance, CursorStyle, DebugOp, Dim, Frame, InputEvent, Key, KeyEvent, Layer, MouseReport,
+	OverlayAnchor,
 	OverlayOptions, Progress, Renderer, Size, SpellingFeatures, Terminal, TerminalEvent,
 	TerminalOptions, TtyOut, Ui, UiContext,
 	anim::Intro,
@@ -71,12 +78,13 @@ use crate::{
 	},
 	project::{BlockKind, BlockView, RenderedBlock, project},
 	settings::{
-		CL_AUTOCOMPLETE_MAX_VISIBLE, CL_EMOJI_AUTOCOMPLETE, CL_PASTE_LARGE_MENU_THRESHOLD,
-		CL_SPELLING_AUTOCOMPLETE, CL_SPELLING_AUTOCORRECT, CL_SPELLING_TYPO_DETECTION,
+		CL_AUTOCOMPLETE_MAX_VISIBLE, CL_EMOJI_AUTOCOMPLETE, CL_GOAL_STATUS_IN_FOOTER,
+		CL_PASTE_LARGE_MENU_THRESHOLD, CL_SPELLING_AUTOCOMPLETE, CL_SPELLING_AUTOCORRECT,
+		CL_SPELLING_TYPO_DETECTION,
 		CL_STATUS_LINE_CONTEXT_LINE, CL_STATUS_LINE_LEFT_SEGMENTS, CL_STATUS_LINE_PRESET,
 		CL_STATUS_LINE_RIGHT_SEGMENTS, CL_STATUS_LINE_SEGMENT_OPTIONS, CL_STATUS_LINE_SEPARATOR,
 		CL_STATUS_LINE_SHOW_HOOK_STATUS, CL_STATUS_LINE_TIME_FORMAT,
-		CL_STATUS_LINE_TIME_SHOW_SECONDS, CL_STATUS_LINE_TRANSPARENT,
+		CL_STATUS_LINE_TIME_SHOW_SECONDS, CL_STATUS_LINE_TRANSPARENT, CL_THEME_DARK, CL_THEME_LIGHT,
 	},
 	status_band::{
 		ActiveTime, CollabStatus, CollabStatusRole, ContextLine, GitStatus, ModeChip, PullRequest,
@@ -224,6 +232,37 @@ pub enum SpawnKind {
 	Btw,
 	/// `/tan`: a fire-and-forget background task.
 	Tan,
+}
+
+/// Observer-local composer gate shared with the application controller.
+///
+/// This is deliberately not session state: it answers only whether this
+/// particular actor has unsent input that must win an idle continuation.
+#[derive(Default)]
+pub struct PendingInputGate {
+	pending: AtomicBool,
+	changed: Notify,
+}
+
+impl PendingInputGate {
+	/// Returns whether this actor currently holds a submittable draft.
+	#[must_use]
+	pub fn pending(&self) -> bool {
+		self.pending.load(Ordering::Acquire)
+	}
+
+	/// Waits until the actor changes whether it has pending input.
+	pub async fn changed(&self) {
+		self.changed.notified().await;
+	}
+
+	/// Updates the actor-local draft fact and wakes the idle controller when
+	/// the boundary changes.
+	pub fn set_pending(&self, pending: bool) {
+		if self.pending.swap(pending, Ordering::AcqRel) != pending {
+			self.changed.notify_one();
+		}
+	}
 }
 
 /// Commands emitted by the presentation actor to the application controller.
@@ -695,6 +734,8 @@ pub(crate) struct Presenter {
 	pub(crate) stt_recording: bool,
 	/// Whether a live-voice session is on (pi `liveVoiceActive`).
 	pub(crate) live_active: bool,
+	/// Last archived dark/light palette names applied to `ui`.
+	palette_names: [Str; 2],
 	/// Observer-local palette before a settings submenu preview.
 	preview_ui: Option<(Str, UiContext)>,
 	/// Observer-local composer shape before a settings submenu preview.
@@ -1108,6 +1149,7 @@ impl Presenter {
 			}));
 			vocalizer
 		});
+		let palette_names = [CL_THEME_DARK.get(&options.con), CL_THEME_LIGHT.get(&options.con)];
 		let mut presenter = Self {
 			replica,
 			dom_events: options.dom_events,
@@ -1149,6 +1191,7 @@ impl Presenter {
 			space_hold: SpaceHold::default(),
 			stt_recording: false,
 			live_active: false,
+			palette_names,
 			preview_ui: None,
 			preview_shape: None,
 			preview_status: None,
@@ -1507,6 +1550,8 @@ impl Presenter {
 			expanded:      crate::actions::CL_TOOLS_EXPANDED.get(&self.con),
 			smooth:        crate::transcript::CL_SMOOTH_STREAMING.get(&self.con),
 			prose_only:    crate::transcript::CL_THINKING_PROSE_ONLY.get(&self.con),
+			show_usage:    crate::settings::CL_DISPLAY_SHOW_TOKEN_USAGE.get(&self.con)
+				|| crate::settings::CL_DISPLAY_SHOW_TURN_TIME.get(&self.con),
 			local:         &self.transcript,
 		}
 	}
@@ -1745,6 +1790,48 @@ impl Presenter {
 		if let Some((_, _, preview)) = &self.preview_status {
 			self.local.status_appearance = preview.clone();
 		}
+	}
+
+	/// Publishes one complete ambient context to every retained local surface.
+	fn set_ui_context(&mut self, ui: UiContext) {
+		self.ui = ui;
+		self.composer.set_context(self.ui.clone());
+		self.overlays.set_context(&self.ui);
+	}
+
+	/// Applies newly persisted dark/light names as one ambient-context swap.
+	///
+	/// A preview starts from a saved baseline, so committing the inactive
+	/// appearance restores the palette appropriate to the terminal rather than
+	/// leaving the preview palette active. Components continue to read only
+	/// `UiContext`; palette names never thread through the tree.
+	fn sync_palette_settings(&mut self) -> bool {
+		let names = [CL_THEME_DARK.get(&self.con), CL_THEME_LIGHT.get(&self.con)];
+		if names == self.palette_names {
+			return false;
+		}
+		let dark = match self.services.theme(names[0].as_str()) {
+			Ok(theme) => theme,
+			Err(error) => {
+				self.overlays.notify(error.to_string());
+				return false;
+			},
+		};
+		let light = match self.services.theme(names[1].as_str()) {
+			Ok(theme) => theme,
+			Err(error) => {
+				self.overlays.notify(error.to_string());
+				return false;
+			},
+		};
+		let mut ui = self
+			.preview_ui
+			.as_ref()
+			.map_or_else(|| self.ui.clone(), |(_, baseline)| baseline.clone());
+		ui.set_appearance_palettes(dark, light);
+		self.set_ui_context(ui);
+		self.palette_names = names;
+		true
 	}
 
 	/// Samples and formats the local wall clock only when its visible unit or
@@ -2049,13 +2136,14 @@ impl Presenter {
 				&self.ui,
 			))));
 		}
+		self.sync_pending_input();
 		Routed::Repaint
 	}
 
 	/// Applies a large-paste menu choice (pi `presentLargePasteMenu`): a
 	/// failed file save falls back to the chip so the paste is never lost.
 	fn land_paste(&mut self, text: &Str, choice: PasteChoice) -> Routed {
-		match choice {
+		let routed = match choice {
 			PasteChoice::Wrapped => {
 				self
 					.composer
@@ -2079,7 +2167,9 @@ impl Presenter {
 					))
 				},
 			},
-		}
+		};
+		self.sync_pending_input();
+		routed
 	}
 
 	/// Composer-bound gestures that run before the editor sees the key:
@@ -2189,7 +2279,20 @@ impl Presenter {
 
 	fn composer_key(&mut self, key: Key) -> Result<Routed, HostError> {
 		let action = self.composer.preview_key(key);
-		self.preview_composer_action(action)
+		let routed = self.preview_composer_action(action)?;
+		self.sync_pending_input();
+		Ok(routed)
+	}
+
+	fn sync_pending_input(&self) {
+		let pending = self.composer.has_pending_submission();
+		if let Some(gate) = self.con.user::<PendingInputGate>() {
+			gate.set_pending(pending);
+		} else {
+			let gate = PendingInputGate::default();
+			gate.set_pending(pending);
+			self.con.insert_user(gate);
+		}
 	}
 
 	/// Commits an accepted editor submission to local recall and the
@@ -2205,7 +2308,9 @@ impl Presenter {
 
 	fn composer_mouse(&mut self, report: MouseReport) -> Result<Routed, HostError> {
 		let action = self.composer.mouse(report);
-		self.preview_composer_action(action)
+		let routed = self.preview_composer_action(action)?;
+		self.sync_pending_input();
+		Ok(routed)
 	}
 
 	/// Validates a submission while its exact editor buffer and attachment
@@ -2518,6 +2623,9 @@ impl Presenter {
 			self.overlays.notify(error.to_string());
 			routed = routed.max(Routed::Repaint);
 		}
+		if self.sync_palette_settings() {
+			routed = routed.max(Routed::RebuildProjection);
+		}
 		if self.refresh_wall_clock(self.clock.elapsed()) {
 			routed = routed.max(Routed::Repaint);
 		}
@@ -2550,6 +2658,9 @@ impl Presenter {
 		if let Some(error) = failure {
 			self.overlays.notify(error.to_string());
 			routed = routed.max(Routed::Repaint);
+		}
+		if self.sync_palette_settings() {
+			routed = routed.max(Routed::RebuildProjection);
 		}
 		if self.refresh_wall_clock(self.clock.elapsed()) {
 			routed = routed.max(Routed::Repaint);
@@ -2669,6 +2780,7 @@ impl Presenter {
 			},
 		}
 		self.composer.restore_focus();
+		self.sync_pending_input();
 	}
 
 	fn set_collab_status(&mut self, status: Option<CollabStatus>) -> Routed {
@@ -2689,6 +2801,7 @@ impl Presenter {
 	/// composer verbatim (pi `editor.setText(text)`) with the reason shown.
 	fn refuse_local(&mut self, draft: &str, reason: impl Into<Str>) -> Routed {
 		self.composer.set_text(draft);
+		self.sync_pending_input();
 		self.notice(reason)
 	}
 
@@ -3259,8 +3372,9 @@ impl Presenter {
 				}
 				match self.services.theme(value.as_str()) {
 					Ok(palette) => {
-						self.ui.set_palette(palette);
-						self.composer.set_context(self.ui.clone());
+						let mut ui = self.ui.clone();
+						ui.set_palette(palette);
+						self.set_ui_context(ui);
 						Routed::RebuildProjection
 					},
 					Err(error) => self.notice(error.to_string()),
@@ -3307,8 +3421,7 @@ impl Presenter {
 			.is_some_and(|(name, _)| name == convar)
 			&& let Some((_, ui)) = self.preview_ui.take()
 		{
-			self.ui = ui;
-			self.composer.set_context(self.ui.clone());
+			self.set_ui_context(ui);
 		}
 		if self
 			.preview_shape
@@ -3911,11 +4024,8 @@ impl Host {
 			self.presenter.title.reset_delivery();
 			self.presenter.progress_shown = false;
 			let (caps, probe) = negotiate_async(Duration::from_millis(120)).await;
-			self.presenter.ui = self.presenter.ui.clone().with_terminal_caps(&caps);
-			self
-				.presenter
-				.composer
-				.set_context(self.presenter.ui.clone());
+			let ui = self.presenter.ui.clone().with_terminal_caps(&caps);
+			self.presenter.set_ui_context(ui);
 			let mut terminal = Terminal::enter(
 				TerminalOptions::new(caps)
 					.probe_results(probe)
@@ -4152,11 +4262,7 @@ impl Host {
 			if let Some(appearance) = terminal.appearance() {
 				let mut ui = self.presenter.ui.clone();
 				if ui.apply_appearance(appearance) {
-					self.presenter.ui = ui;
-					self
-						.presenter
-						.composer
-						.set_context(self.presenter.ui.clone());
+					self.presenter.set_ui_context(ui);
 					self.reconcile_projection(size);
 					self.present(renderer, size)?;
 				}
@@ -4474,6 +4580,7 @@ impl Host {
 		let mirror = self.presenter.blocks();
 		match self.projection.as_mut() {
 			Some(projection) => {
+				projection.set_context(&self.presenter.ui);
 				projection.reconcile(blocks, mirror, now);
 			},
 			None => self.rebuild_projection(size),
@@ -4598,6 +4705,17 @@ pub enum NativeEffect {
 	Quit,
 }
 
+/// One owned native overlay projection. The window adapter borrows these
+/// fields into a [`Layer`] for the duration of one paint.
+pub struct NativeOverlay {
+	/// Retained overlay cells produced by the shared terminal/native actor.
+	pub frame:   Frame,
+	/// Viewport placement and z-order shared with terminal presentation.
+	pub options: OverlayOptions,
+	/// Whether this overlay owns input and the retained caret.
+	pub active:  bool,
+}
+
 /// Native-window actor over the same detached snapshot and patch stream as
 /// [`Host`].
 ///
@@ -4607,6 +4725,7 @@ pub struct NativeHost {
 	presenter:           Presenter,
 	frame:               Frame,
 	approval_frame:      Option<Frame>,
+	overlay:             Option<NativeOverlay>,
 	size:                Size,
 	/// Presentation-clock instant the composited status row (retry
 	/// countdown loader) next changes, so [`NativeHost::poll`] repaints it
@@ -4627,6 +4746,7 @@ impl NativeHost {
 			presenter: Presenter::new(options, size.width),
 			frame: Frame::new(size),
 			approval_frame: None,
+			overlay: None,
 			size,
 			status_deadline: None,
 			space_hold_deadline: None,
@@ -4688,6 +4808,73 @@ impl NativeHost {
 		self.presenter.composer.resize(size.width, size.height);
 		self.presenter.composer.restore_focus();
 		self.refresh();
+	}
+
+	/// Shows or replaces native input-method marked text at the composer
+	/// caret. The byte-indexed selection is kept inside the volatile span;
+	/// marked text never enters history, submission, or the session DOM.
+	pub fn ime_preedit(&mut self, text: &str, selection: Option<Range<usize>>) -> NativeEffect {
+		if self.presenter.overlays.active().is_some() {
+			self.presenter.composer.clear_volatile_text();
+			return NativeEffect::Ignored;
+		}
+		if text.is_empty() {
+			self.presenter.composer.clear_volatile_text();
+		} else {
+			self
+				.presenter
+				.composer
+				.set_volatile_text_selection(text, selection);
+		}
+		self.refresh();
+		NativeEffect::Consumed
+	}
+
+	/// Commits one native input-method segment exactly once. A composer
+	/// commit is one undo unit; an active overlay receives the same character
+	/// key sequence as physical input instead.
+	pub fn ime_commit(&mut self, text: &str) -> Result<NativeEffect, HostError> {
+		if self.presenter.overlays.active().is_none() {
+			self.presenter.composer.commit_volatile_text(text);
+			self.refresh();
+			return Ok(NativeEffect::Consumed);
+		}
+		let mut effect = NativeEffect::Ignored;
+		for character in text.chars() {
+			let next = self.key(Key::Char(character))?;
+			if next == NativeEffect::Quit {
+				return Ok(next);
+			}
+			if next == NativeEffect::Consumed {
+				effect = next;
+			}
+		}
+		Ok(effect)
+	}
+
+	/// Applies native focus lifecycle without touching controller state.
+	/// Losing focus clears marked text and gesture state; gaining it restores
+	/// the retained composer's logical focus.
+	pub fn focus(&mut self, focused: bool) -> NativeEffect {
+		self.presenter.composer.clear_volatile_text();
+		self.presenter.composer.reset_escape_sequence();
+		if focused {
+			self.presenter.composer.restore_focus();
+		}
+		self.refresh();
+		NativeEffect::Consumed
+	}
+
+	/// Applies the OS light/dark appearance through the same ambient
+	/// [`UiContext`] the terminal actor uses.
+	pub fn appearance(&mut self, appearance: Appearance) -> NativeEffect {
+		let mut ui = self.presenter.ui.clone();
+		if !ui.apply_appearance(appearance) {
+			return NativeEffect::Ignored;
+		}
+		self.presenter.set_ui_context(ui);
+		self.refresh();
+		NativeEffect::Consumed
 	}
 
 	/// Routes one real native key through the chat input path.
@@ -4836,12 +5023,17 @@ impl NativeHost {
 		self.presenter.overlays.pointer() || self.presenter.composer.popup_open()
 	}
 
+	/// Owned projection of the open picker or panel, when one is showing.
+	///
+	/// Terminal and native actors resolve the same anchor, composer margin,
+	/// width, z-order, and keyboard ownership through one placement path.
+	pub const fn picker_overlay(&self) -> Option<&NativeOverlay> {
+		self.overlay.as_ref()
+	}
+
 	/// Frame of the open picker or panel, when one is showing.
-	pub fn picker_frame(&mut self) -> Option<Frame> {
-		self
-			.presenter
-			.overlay_frame(self.size)
-			.map(|(frame, _)| frame)
+	pub fn picker_frame(&self) -> Option<Frame> {
+		self.overlay.as_ref().map(|overlay| overlay.frame.clone())
 	}
 
 	/// Viewport band the open picker or panel is composited into — the
@@ -5030,6 +5222,12 @@ impl NativeHost {
 		frame.blit(&chrome, 0, chrome.size().height, 0, rows.saturating_add(status_rows));
 		self.frame = frame;
 		self.approval_frame = self.presenter.approval_frame(self.size.width);
+		let composer_rows = self.presenter.composer.height();
+		let size = self.size;
+		self.overlay = self.presenter.overlay_frame(size).map(|(frame, anchor)| {
+			let (options, active) = overlay_options(anchor, size.width, composer_rows);
+			NativeOverlay { frame, options, active }
+		});
 		self.status_deadline = [self.presenter.retry_wake(), self.presenter.wall_clock.next_wake()]
 			.into_iter()
 			.flatten()
@@ -5167,9 +5365,12 @@ fn status_facts(
 		.map(Str::new);
 	// Both chips project the `<meta><directors>` subtree, so a headless
 	// render and the first frame show the same band as the live loop.
+	let mode = director_mode(dom).and_then(|mode| {
+		(!matches!(mode, ModeChip::Goal(_)) || CL_GOAL_STATUS_IN_FOOTER.get(con)).then_some(mode)
+	});
 	let mut facts = StatusFacts {
 		model,
-		mode: director_mode(dom),
+		mode,
 		thinking: local.thinking.clone(),
 		compact_thinking: local.compact_thinking,
 		fast: local.fast,

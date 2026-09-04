@@ -181,7 +181,7 @@ impl Services for Feed {
 		Ok(WorktreeInfo { path: self.project.join("wt").join(branch), branch: Str::new(branch) })
 	}
 
-	fn dump_request(&self) -> ServiceResult<PathBuf> {
+	fn dump_request(&self, _dom: &omp_dom::Dom) -> ServiceResult<PathBuf> {
 		Ok(PathBuf::from("/tmp/omp-request-commands.json"))
 	}
 

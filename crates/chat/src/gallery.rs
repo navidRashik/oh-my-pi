@@ -128,17 +128,19 @@ fn render_fixture(
 	session.begin_turn()?;
 	let state_fixture = fixture.states[state.index()];
 	let call_id = format!("gallery-{}-{}", fixture.tool, state.index());
+	let tool_name = card_tool(fixture.tool);
+	let revision = if tool_name == "github" { 3 } else { 1 };
 	let call = if state == GalleryState::StreamingArgs {
 		let (call, sid) =
-			session.call_streaming(card_tool(fixture.tool), 1, call_id.as_str(), None)?;
+			session.call_streaming(tool_name, revision, call_id.as_str(), None)?;
 		if !state_fixture.args.is_empty() {
 			session.stream_append(sid, state_fixture.args)?;
 		}
 		call
 	} else {
 		session.call(
-			card_tool(fixture.tool),
-			1,
+			tool_name,
+			revision,
 			call_id.as_str(),
 			None,
 			Some(raw(state_fixture.args)?),
@@ -488,7 +490,10 @@ fn fixture_payload(
 		}),
 		"github" => serde_json::json!({
 			"op": args.get("op").cloned().unwrap_or_else(|| serde_json::json!("repo_view")),
+			"output": value.get("output").and_then(serde_json::Value::as_str).unwrap_or_default(),
 			"result": value,
+			"artifact": null,
+			"useless": false,
 			"rate_limit_remaining": null,
 			"rate_limit_reset": null,
 		}),
@@ -500,6 +505,8 @@ fn fixture_payload(
 				"token_budget": goal.get("token_budget").or_else(|| goal.get("tokenBudget")).cloned(),
 				"tokens_used": goal.get("tokens_used").or_else(|| goal.get("tokensUsed")).cloned().unwrap_or_else(|| serde_json::json!(0)),
 				"time_used_secs": goal.get("time_used_secs").or_else(|| goal.get("timeUsedSeconds")).cloned().unwrap_or_else(|| serde_json::json!(0)),
+				"created_at_ms": goal.get("created_at_ms").or_else(|| goal.get("createdAt")).cloned(),
+				"updated_at_ms": goal.get("updated_at_ms").or_else(|| goal.get("updatedAt")).cloned(),
 			}));
 			serde_json::json!({
 				"op": value.get("op").cloned().unwrap_or_else(|| serde_json::json!("get")),
@@ -767,9 +774,11 @@ fn fixture_payload(
 			"browser": value.get("browser").cloned()
 		}),
 		"computer" => serde_json::json!({
-			"code": args.get("code").cloned().unwrap_or_else(|| serde_json::json!("")),
+			"action": value.get("action").or_else(|| args.get("action")).cloned().unwrap_or_else(|| serde_json::json!("run")),
+			"code": value.get("code").or_else(|| args.get("code")).cloned(),
 			"results": value.get("results").cloned().unwrap_or_else(|| serde_json::json!([])),
-			"artifacts": value.get("artifacts").cloned().unwrap_or_else(|| serde_json::json!([]))
+			"artifacts": value.get("artifacts").cloned().unwrap_or_else(|| serde_json::json!([])),
+			"capabilities": value.get("capabilities").cloned()
 		}),
 		"task" => {
 			let children = value
@@ -1134,11 +1143,11 @@ mod tests {
 	}
 
 	#[test]
-	fn all_52_fixtures_use_projected_production_settlement() {
+	fn all_51_fixtures_use_projected_production_settlement() {
 		let sections = render_sections(None, &GalleryState::ALL, 100, false)
 			.expect("every fixture should fold through settle_projected/fail_projected");
-		assert_eq!(fixture_names().len(), 52);
-		assert_eq!(sections.len(), 52 * GalleryState::ALL.len());
+		assert_eq!(fixture_names().len(), 51);
+		assert_eq!(sections.len(), 51 * GalleryState::ALL.len());
 		assert!(
 			sections
 				.iter()

@@ -74,6 +74,44 @@ fn fixture() -> (Session, omp_journal::EntryId) {
 }
 
 #[test]
+fn terminal_and_native_project_the_same_detached_snapshot() {
+	let (mut session, _) = fixture();
+	let expected = block_views(session.dom(), true);
+	let (snapshot, dom_events) = session.subscribe();
+	let (_, kernel_events) = flume::unbounded();
+	let (commands, _) = flume::unbounded();
+	let (up, _) = flume::unbounded();
+	let native = NativeHost::new(
+		HostOptions {
+			snapshot,
+			dom_events,
+			kernel_events,
+			commands,
+			up,
+			con: Arc::new(omp_con::Ctx::new()),
+			models: Vec::new(),
+			cycle: Vec::new(),
+			resize_policy: ResizePolicy::Rebuild,
+			model: omp_chat::ModelBadge::from_identifier("test/model"),
+			project: std::path::PathBuf::new(),
+			welcome: omp_chat::welcome::WelcomeFacts::default(),
+			ui: UiContext::default(),
+			services: Arc::new(omp_chat::overlays::NoServices),
+			speech: None,
+			resuming: true,
+			initial_panel: None,
+		},
+		Size::new(80, 24),
+	);
+	let actual = native
+		.blocks()
+		.into_iter()
+		.filter(|block| block.kind != BlockKind::Welcome)
+		.collect::<Vec<_>>();
+	assert_eq!(actual, expected);
+}
+
+#[test]
 fn fixture_session_projects_expected_block_sequence() {
 	let (session, _) = fixture();
 	let blocks = block_views(session.dom(), true);
@@ -82,22 +120,19 @@ fn fixture_session_projects_expected_block_sequence() {
 		BlockKind::Thinking,
 		BlockKind::Assistant,
 		BlockKind::Tool,
-		BlockKind::Usage,
 	]);
 	assert_eq!(blocks[0].text, "hello");
 	assert_eq!(blocks[1].text, "considering");
 	assert_eq!(blocks[2].text, "answer");
 	assert!(blocks[3].text.contains("hello from fixture"));
-	// pi usage row: `YYYY-MM-DD HH:mm:ss  ⏱Δ<wait>  ⤵ <in>  ⤴ <out>` (USG-01..03).
-	let usage = blocks[4].text.as_str();
-	let mut parts = usage.split("  ");
-	let stamp = parts.next().expect("timestamp part");
-	assert_eq!(stamp.len(), 19, "{usage}");
-	assert!(stamp.as_bytes()[4] == b'-' && stamp.as_bytes()[10] == b' ', "{usage}");
-	let rest = parts.collect::<Vec<_>>();
-	assert!(rest.iter().any(|part| part.contains('Δ')), "{usage}");
-	assert!(rest.iter().any(|part| part.ends_with(" 12")), "{usage}");
-	assert!(rest.iter().any(|part| part.ends_with(" 7")), "{usage}");
+	assert!(
+		blocks.iter().all(|block| block.kind != BlockKind::Usage),
+		"default transcript does not append timestamp, token, latency, or rate telemetry",
+	);
+
+	let status = omp_chat::status_line::StatusLine::from_dom(session.dom());
+	assert_eq!(status.tokens_in, 12);
+	assert_eq!(status.tokens_out, 7);
 }
 
 #[test]
@@ -430,6 +465,46 @@ fn dropping_terminal_host_requests_controller_teardown_exactly_once() {
 	assert!(matches!(command_rx.recv().expect("quit"), HostCommand::Quit));
 	assert!(up_rx.try_recv().is_err(), "teardown sends one cancellation");
 	assert!(command_rx.try_recv().is_err(), "teardown sends one quit");
+}
+
+#[test]
+fn dropping_native_host_requests_controller_teardown_exactly_once() {
+	let directory = tempdir().expect("temp directory");
+	let mut session =
+		Session::create(directory.path().join("native-drop.oms"), ComponentRegistry::standard())
+			.expect("empty session");
+	let (snapshot, dom_events) = session.subscribe();
+	let (_, kernel_events) = flume::unbounded();
+	let (commands, command_rx) = flume::unbounded();
+	let (up, up_rx) = flume::unbounded();
+	let host = NativeHost::new(
+		HostOptions {
+			snapshot,
+			dom_events,
+			kernel_events,
+			commands,
+			up,
+			con: Arc::new(omp_con::Ctx::new()),
+			models: Vec::new(),
+			cycle: Vec::new(),
+			resize_policy: ResizePolicy::Rebuild,
+			model: omp_chat::ModelBadge::from_identifier("test/model"),
+			project: std::path::PathBuf::new(),
+			welcome: omp_chat::welcome::WelcomeFacts::default(),
+			ui: UiContext::default(),
+			services: Arc::new(omp_chat::overlays::NoServices),
+			speech: None,
+			resuming: false,
+			initial_panel: None,
+		},
+		Size::new(80, 24),
+	);
+	drop(host);
+
+	assert!(matches!(up_rx.recv().expect("cancel"), Up::Cancel));
+	assert!(matches!(command_rx.recv().expect("quit"), HostCommand::Quit));
+	assert!(up_rx.try_recv().is_err(), "native teardown sends one cancellation");
+	assert!(command_rx.try_recv().is_err(), "native teardown sends one quit");
 }
 
 #[test]

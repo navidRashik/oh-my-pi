@@ -47,28 +47,41 @@ impl UpdateAvailable {
 	}
 }
 
-/// Warning-framed typed component matching pi's startup notification.
+/// Typed component for the native OMP update notice style.
 #[must_use]
-pub fn card(update: &UpdateAvailable) -> Component {
+pub fn card(update: &UpdateAvailable, expanded: bool) -> Component {
 	let version = update.version.clone();
 	let channel = update.channel.clone();
-	dom! {
-		<box border=round bc=warn bg=surface pad="0 1" title_pad=3>
-			<row kind=title gap=1>
-				<i:warning fg=warn/>
-				<text fg=warn bold>{"Update Available"}</text>
-			</row>
-			<row gap=0 wrap=word>
-				<text fg=muted>{"New version "}</text>
+	if expanded {
+		dom! {
+			<col gap=0 pad-x=1>
+				<row gap=1>
+					<i:package fg=accent/>
+					<text fg=accent bold>{"Update Available"}</text>
+				</row>
+				<row gap=1 wrap=word>
+					<text fg=muted>{"New version"}</text>
+					<text fg=accent>{version}</text>
+					<text fg=muted>{"is available on the"}</text>
+					<text fg=accent>{channel}</text>
+					<text fg=muted>{"channel. Run:"}</text>
+					<text fg=accent>{"omp update"}</text>
+				</row>
+			</col>
+		}
+		.into_component()
+	} else {
+		dom! {
+			<row gap=1 pad-x=1 wrap=word>
+				<i:package fg=muted/>
+				<text fg=accent>{"Update Available"}</text>
+				<text fg=muted>{"—"}</text>
+				<text fg=muted>{"version"}</text>
 				<text fg=accent>{version}</text>
-				<text fg=muted>{" is available on the "}</text>
-				<text fg=accent>{channel}</text>
-				<text fg=muted>{" channel. Run: "}</text>
-				<text fg=accent>{"omp update"}</text>
 			</row>
-		</box>
+		}
+		.into_component()
 	}
-	.into_component()
 }
 
 #[cfg(test)]
@@ -85,7 +98,7 @@ mod tests {
 			"Update Available\nNew version 19.2.0 is available on the canary channel. Run: omp update"
 		);
 		let rendered =
-			frame_text(Ui::from_root(card(&update), 80, UiContext::default()).frame());
+			frame_text(Ui::from_root(card(&update, true), 80, UiContext::default()).frame());
 		assert!(rendered.contains("Update Available"));
 		assert!(rendered.contains("omp update"));
 		assert!(!rendered.contains("installing"));

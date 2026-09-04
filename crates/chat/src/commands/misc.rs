@@ -278,7 +278,7 @@ omp_con::cmd! {
 	/// Exports the session transcript: `/export [path]`.
 	export(?path: Str) = |ctx, args| {
 		let path = args.opt::<Str>(0)?.map(|path| PathBuf::from(path.as_str()));
-		call(ctx, PanelCall::new(move |cx| match cx.services.export(path.as_deref()) {
+		call(ctx, PanelCall::new(move |cx| match cx.services.export(cx.dom, path.as_deref()) {
 			Ok(written) => notice(sf!("Session exported to: {}", written.display())),
 			Err(error) => notice(sf!("Failed to export session: {error}")),
 		}))

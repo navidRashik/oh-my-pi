@@ -21,7 +21,6 @@ use crate::{
 		move_panel::MovePanel,
 		plan_review::PlanReviewPanel,
 		report::ReportPanel,
-		rewind::RewindPanel,
 		services::{ForeignSessionSource, Mutation},
 		session_info::SessionInfoPanel,
 		sessions::{ForeignSessionPicker, SessionPicker},
@@ -70,10 +69,12 @@ pub const FORCE: &str = "force_tool";
 /// `<meta><directors>` (frames nest, so the scan is recursive).
 #[must_use]
 pub fn director_active(dom: &Dom, family: &str) -> bool {
-	director_frame(dom, family).is_some()
+	director_frame(dom, family)
+		.and_then(|handle| dom.get(handle))
+		.is_some_and(|node| custom(node, "status") == Some("active"))
 }
 
-/// The active frame of one Director family.
+/// The engaged (active or paused) frame of one Director family.
 #[must_use]
 pub fn director_frame(dom: &Dom, family: &str) -> Option<Handle> {
 	let directors = dom.children(dom.meta()).iter().copied().find(|handle| {
@@ -87,7 +88,9 @@ pub fn director_frame(dom: &Dom, family: &str) -> Option<Handle> {
 			if node.tag != Tag::Known(KnownTag::Director) {
 				continue;
 			}
-			if custom(node, "family") == Some(family) && custom(node, "status") == Some("active") {
+			if custom(node, "family") == Some(family)
+				&& matches!(custom(node, "status"), Some("active" | "paused"))
+			{
 				return Some(child);
 			}
 			stack.push(child);
@@ -187,12 +190,7 @@ impl Presenter {
 				Routed::Repaint
 			},
 			CommandAction::Resume { id } => self.resume(id)?,
-			CommandAction::Select(Selector::Rewind) => {
-				self.act(HostAction::Open(PanelOpener::new(|cx| {
-					RewindPanel::open(cx).map(|panel| Box::new(panel) as Box<_>)
-				})))?
-			},
-			CommandAction::Select(Selector::Tree) => {
+			CommandAction::Select(Selector::Rewind | Selector::Tree) => {
 				self.act(HostAction::Open(PanelOpener::new(|cx| {
 					TreePanel::open(cx).map(|panel| Box::new(panel) as Box<_>)
 				})))?
@@ -442,6 +440,11 @@ impl Presenter {
 				None => self.notice("Usage: /goal <objective> — or /guided-goal for an interview"),
 			},
 			GoalOp::Set(objective) => {
+				if frame.is_some() && !director_active(&self.replica, GOAL) {
+					return Ok(self.notice(
+						"Resume the current goal first, or drop it before setting a new objective.",
+					));
+				}
 				if self.plan_engaged() {
 					return Ok(self.notice(EXIT_PLAN_FIRST));
 				}
@@ -461,19 +464,24 @@ impl Presenter {
 				Some(_) => self.goal_show(),
 				None => self.notice("No active goal."),
 			},
-			GoalOp::Pause => match frame {
+			GoalOp::Pause => match frame.filter(|_| director_active(&self.replica, GOAL)) {
 				Some(_) => {
 					let _ = self.commands.send(engage(vec![Str::new_static("pause")]));
 					self.notice("Goal paused.")
 				},
-				None => self.notice("No active goal."),
+				None => self.notice("No active goal to pause."),
 			},
-			GoalOp::Resume => match frame {
+			GoalOp::Resume => match frame.filter(|handle| {
+				self
+					.replica
+					.get(*handle)
+					.is_some_and(|node| custom(node, "status") == Some("paused"))
+			}) {
 				Some(_) => {
 					let _ = self.commands.send(engage(vec![Str::new_static("resume")]));
 					self.notice("Goal resumed.")
 				},
-				None => self.notice("No active goal."),
+				None => self.notice("No paused goal to resume."),
 			},
 			GoalOp::Drop => match frame {
 				Some(_) => {
@@ -482,12 +490,15 @@ impl Presenter {
 						engage: false,
 						args:   Vec::new(),
 					});
-					self.notice("Goal mode disabled.")
+					self.notice("Goal dropped.")
 				},
 				None => self.notice("No goal to drop."),
 			},
 			GoalOp::Budget(budget) => match frame {
 				None => self.notice("No active goal."),
+				Some(_) if !director_active(&self.replica, GOAL) => {
+					self.notice("Resume the goal before adjusting the budget.")
+				},
 				Some(_) => {
 					let mut args = vec![Str::new_static("budget")];
 					if let Some(budget) = budget {
@@ -517,14 +528,19 @@ impl Presenter {
 			Some(Value::Int(value)) => Some(*value),
 			_ => None,
 		};
-		let used = int("tokens_used").unwrap_or(0);
-		let budget = int("token_budget");
+		let used = int("tokens_used").unwrap_or(0).max(0);
+		let budget = int("token_budget").filter(|budget| *budget >= 0);
 		let done = matches!(state(node, "done"), Some(Value::Bool(true)));
-		let paused = matches!(state(node, "paused"), Some(Value::Bool(true)));
-		let status = if done {
+		let dropped = matches!(state(node, "dropped"), Some(Value::Bool(true)));
+		let paused = custom(node, "status") == Some("paused");
+		let status = if dropped {
+			"dropped"
+		} else if done {
 			"complete"
 		} else if paused {
 			"paused"
+		} else if budget.is_some_and(|budget| used >= budget) {
+			"budget-limited"
 		} else {
 			"active"
 		};
@@ -913,53 +929,65 @@ fn jobs_report(dom: &Dom) -> Option<Str> {
 	Some(out.freeze())
 }
 
-/// `<meta><todo>` as the Markdown checklist pi's `/todo copy|export`
-/// writes: one `## phase` heading per phase, `- [ ]`/`- [x]`/`- [-]` rows.
+/// `<meta><todo>` as the complete editable Markdown checklist shown by the
+/// `/todo` report overlay and written by `copy`/`export`.
 #[must_use]
 pub fn todo_markdown(dom: &Dom) -> Str {
+	use omp_tools::todo::{Phase, Status, Task};
+
 	let Some(todo) = dom.children(dom.meta()).iter().copied().find(|handle| {
 		dom.get(*handle)
 			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Todo))
 	}) else {
 		return Str::new_static("");
 	};
-	let mut out = StrMut::new("");
-	let mut phase = None::<Str>;
+	let mut phases = dom
+		.get(todo)
+		.and_then(|node| node.prop(&PropKey::Custom(Str::new_static("phase-order"))))
+		.and_then(|value| match value {
+			Value::Json(raw) => serde_json::from_str::<Vec<Str>>(raw.get()).ok(),
+			_ => None,
+		})
+		.unwrap_or_default()
+		.into_iter()
+		.map(|name| Phase { name, tasks: Vec::new() })
+		.collect::<Vec<_>>();
 	for handle in dom.children(todo) {
 		let Some(node) = dom.get(*handle) else {
 			continue;
 		};
-		let item_phase = custom(node, "phase").unwrap_or_default();
-		if phase.as_deref() != Some(item_phase) {
-			if !out.is_empty() {
-				out.push('\n');
-			}
-			let _ = writeln!(
-				out,
-				"## {}",
-				if item_phase.is_empty() {
-					"Tasks"
-				} else {
-					item_phase
-				}
-			);
-			phase = Some(Str::new(item_phase));
+		if node.tag != Tag::Known(KnownTag::Item) {
+			continue;
 		}
-		let label = node
+		let phase_name = custom(node, "phase")
+			.filter(|name| !name.is_empty())
+			.unwrap_or("Tasks");
+		let phase_index = phases
+			.iter()
+			.position(|phase| phase.name == phase_name)
+			.unwrap_or_else(|| {
+				let index = phases.len();
+				phases.push(Phase { name: Str::new(phase_name), tasks: Vec::new() });
+				index
+			});
+		let content = node
 			.prop(&PropId::Label.into())
 			.and_then(Value::as_str)
-			.unwrap_or_default();
-		let mark = match node
+			.map_or_else(Str::default, Str::new);
+		let status = node
 			.prop(&PropId::Status.into())
 			.and_then(Value::as_str)
-			.unwrap_or("pending")
-		{
-			"completed" => "x",
-			"abandoned" => "-",
-			"in_progress" => ">",
-			_ => " ",
-		};
-		let _ = writeln!(out, "- [{mark}] {label}");
+			.and_then(|status| status.parse::<Status>().ok())
+			.unwrap_or_default();
+		let blocker = node
+			.prop(&PropId::Detail.into())
+			.and_then(Value::as_str)
+			.map(Str::new);
+		phases[phase_index].tasks.push(Task { content, status, blocker });
 	}
-	out.freeze()
+	if phases.is_empty() {
+		Str::default()
+	} else {
+		Str::from(omp_tools::todo::render(&phases))
+	}
 }

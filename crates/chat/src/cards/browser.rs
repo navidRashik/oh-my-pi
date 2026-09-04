@@ -1,4 +1,4 @@
-//! Typed card for `browser@1`.
+//! Typed card for `browser@3`.
 
 use omp_core::Str;
 use omp_tui::{IntoComponent as _, UiContext, dom};
@@ -58,15 +58,40 @@ impl Card for BrowserCard {
 			.and_then(Value::as_str)
 			.unwrap_or_default()
 			.to_owned();
-		let artifacts = result
+		let artifact_values = result
 			.as_ref()
 			.and_then(|value| value.get("artifacts"))
 			.and_then(Value::as_array)
-			.into_iter()
-			.flatten()
-			.filter_map(Value::as_str)
-			.map(|artifact| result_image(&Str::new(artifact), "image/png", None, ui))
+			.cloned()
+			.unwrap_or_default();
+		let artifacts = artifact_values
+			.iter()
+			.filter(|artifact| {
+				artifact.get("kind").and_then(Value::as_str) == Some("screenshot")
+					&& artifact.get("visible").and_then(Value::as_bool).unwrap_or(true)
+			})
+			.filter_map(|artifact| {
+				Some(result_image(
+					&Str::new(artifact.get("uri")?.as_str()?),
+					artifact
+						.get("mime")
+						.and_then(Value::as_str)
+						.unwrap_or("image/png"),
+					None,
+					ui,
+				))
+			})
 			.collect::<Vec<_>>();
+		let downloads = artifact_values
+			.iter()
+			.filter(|artifact| {
+				artifact.get("kind").and_then(Value::as_str) == Some("download")
+					&& artifact.get("visible").and_then(Value::as_bool).unwrap_or(true)
+			})
+			.filter_map(|artifact| artifact.get("uri").and_then(Value::as_str))
+			.map(Str::new)
+			.collect::<Vec<_>>();
+		let artifact_count = artifact_values.len();
 		let code = if expanded {
 			Str::new(code)
 		} else {
@@ -124,7 +149,13 @@ impl Card for BrowserCard {
 					} else {
 						for displayed in displayed { <pre fg=ok>{displayed}</pre> }
 						if let Some(returned) = returned { <pre fg=output>{returned}</pre> }
-						if expanded { {artifacts} }
+						if artifact_count > 0 {
+							if expanded {
+								{artifacts}
+								for download in downloads { <a href={download.clone()}>{format!("download: {download}")}</a> }
+							}
+							else { <text fg=muted>{format!("{artifact_count} retained artifact{}", if artifact_count == 1 { "" } else { "s" })}</text> }
+						}
 					}
 				}
 			</box>

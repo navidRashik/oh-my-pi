@@ -1,4 +1,4 @@
-//! Typed card for `computer@1`.
+//! Typed card for `computer@3`.
 
 use omp_core::Str;
 use omp_tui::{IntoComponent as _, UiContext, dom};
@@ -28,16 +28,24 @@ impl Card for ComputerCard {
 	fn render(&self, view: &CardView<'_>, expanded: bool, ui: &UiContext) -> Component {
 		let input = typed_input::<omp_tools::computer::Params>(view);
 		let result = typed_result::<omp_tools::computer::Payload>(view);
+		let action = result
+			.as_ref()
+			.and_then(|value| value.get("action"))
+			.and_then(Value::as_str)
+			.or_else(|| input.as_ref()?.get("action")?.as_str())
+			.unwrap_or("run");
 		let code = result
 			.as_ref()
 			.and_then(|value| value.get("code"))
 			.and_then(Value::as_str)
 			.or_else(|| input.as_ref()?.get("code")?.as_str())
 			.unwrap_or_default();
-		let output = result
-			.as_ref()
-			.and_then(|value| value.get("results"))
-			.filter(|value| !value.as_array().is_some_and(Vec::is_empty))
+		let output = result.as_ref().and_then(|value| {
+			value
+				.get("results")
+				.filter(|results| !results.as_array().is_some_and(Vec::is_empty))
+				.or_else(|| value.get("capabilities").filter(|capabilities| !capabilities.is_null()))
+		})
 			.map(|value| serde_json::to_string_pretty(value).unwrap_or_default());
 		let artifacts = result
 			.as_ref()
@@ -45,8 +53,22 @@ impl Card for ComputerCard {
 			.and_then(Value::as_array)
 			.into_iter()
 			.flatten()
-			.filter_map(Value::as_str)
-			.map(|artifact| result_image(&Str::new(artifact), "image/png", None, ui))
+			.filter(|artifact| {
+				artifact
+					.get("visible")
+					.and_then(Value::as_bool)
+					.unwrap_or(true)
+			})
+			.filter_map(|artifact| {
+				let uri = artifact
+					.as_str()
+					.or_else(|| artifact.get("uri").and_then(Value::as_str))?;
+				let mime = artifact
+					.get("mime")
+					.and_then(Value::as_str)
+					.unwrap_or("image/png");
+				Some(result_image(&Str::new(uri), mime, None, ui))
+			})
 			.collect::<Vec<_>>();
 		let fault = typed_fault::<omp_tools::computer::Fault>(view).or_else(|| {
 			view
@@ -68,8 +90,7 @@ impl Card for ComputerCard {
 		// pi `statusSuffix`: the header names the error state.
 		let failed = view.status == CardStatus::Failed;
 		// pi shows a bounded script and output preview in both states; only
-		// the bounds change with `@expanded`. A call without a script (old
-		// persisted `{window, actions}` calls) stays a bare header.
+		// the bounds change with `@expanded`.
 		let code = (!code.is_empty()).then(|| {
 			if expanded {
 				Str::new(code)
@@ -87,9 +108,11 @@ impl Card for ComputerCard {
 				},
 			)
 		});
-		// pi: `if (code === undefined) return new Text(header)` — no body at
-		// all, the error section included.
-		let fault = fault.filter(|_| code.is_some());
+		let action_suffix = match action {
+			"capabilities" => Some(": capabilities"),
+			"close" => Some(": closed"),
+			_ => None,
+		};
 		dom! {
 			<col>
 				<row gap=1 kind=title>
@@ -100,7 +123,11 @@ impl Card for ComputerCard {
 					}
 					<row>
 						<text fg=accent>{"Computer"}</text>
-						if failed { <text fg=output>{": error"}</text> }
+						if failed {
+							<text fg=output>{": error"}</text>
+						} else if let Some(suffix) = action_suffix {
+							<text fg=muted>{suffix}</text>
+						}
 					</row>
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>

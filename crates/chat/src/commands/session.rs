@@ -150,7 +150,7 @@ omp_con::cmd! {
 	};
 
 	/// Opens the rewind selector to roll the session back to an earlier turn.
-	branch() = |ctx, _args| post(ctx, CommandAction::Select(Selector::Rewind));
+	branch() = |ctx, _args| post(ctx, CommandAction::Select(Selector::Tree));
 
 	/// Opens the rewind selector (alias of `branch`); `rewind <entry> [text]` rewinds directly.
 	rewind(?entry: Str, ?text: Str) = |ctx, args| match args.opt::<Str>(0)? {
@@ -158,7 +158,7 @@ omp_con::cmd! {
 			target: entry_id(entry.as_str())?,
 			recall: rest(args, 1),
 		}),
-		None => post(ctx, CommandAction::Select(Selector::Rewind)),
+		None => post(ctx, CommandAction::Select(Selector::Tree)),
 	};
 
 	/// Renames a stored session in the index (session picker Ctrl+R).

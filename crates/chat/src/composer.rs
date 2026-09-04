@@ -1,7 +1,7 @@
 //! Observer-local composer: a retained editor tree whose draft never enters
 //! the session DOM until submission.
 
-use std::{cell::Cell, fmt::Write as _, path::Path, rc::Rc, time::Duration};
+use std::{cell::Cell, fmt::Write as _, ops::Range, path::Path, rc::Rc, time::Duration};
 
 use omp_core::Str;
 use omp_tui::{
@@ -1027,6 +1027,21 @@ impl Composer {
 		self.ui.resize(self.width);
 	}
 
+	/// Shows or replaces native-IME marked text and its byte-indexed
+	/// selection without adding an undo entry.
+	pub fn set_volatile_text_selection(
+		&mut self,
+		text: &str,
+		selection: Option<Range<usize>>,
+	) {
+		self
+			.ui
+			.with_component_mut::<EditorPane, _>(COMPOSER_ID, |pane| {
+				pane.set_volatile_text_selection(text, selection)
+			});
+		self.ui.resize(self.width);
+	}
+
 	/// Discards the streaming recognizer's current volatile preview.
 	pub fn clear_volatile_text(&mut self) {
 		self
@@ -1128,6 +1143,14 @@ impl Composer {
 			UiEvent::Copied(text) => ComposerAction::Copy(text),
 			_ => ComposerAction::Changed,
 		}
+	}
+
+	/// Reports whether text or attachment atoms currently form a submittable
+	/// user draft. Interactive Goal continuation uses this observer-local fact
+	/// to let typing win the idle boundary.
+	#[must_use]
+	pub fn has_pending_submission(&self) -> bool {
+		self.prepared_submission().is_some()
 	}
 
 	/// Classifies the current draft without mutating it.
@@ -1400,6 +1423,40 @@ mod tests {
 		composer.clear_volatile_text();
 		assert_eq!(composer.text(), "note: hellotail");
 		assert_eq!(composer.frame().cursor(), Some((14, 2)));
+	}
+
+	#[test]
+	fn native_ime_preedit_tracks_its_byte_cursor_and_commits_once() {
+		let mut composer = composer();
+		composer.set_volatile_text_selection("a界b", Some(1..1));
+		assert_eq!(composer.text(), "a界b");
+		assert_eq!(
+			composer.frame().cursor(),
+			Some((4, 2)),
+			"candidate area follows the IME's byte cursor inside marked text",
+		);
+
+		composer.set_volatile_text_selection("a界b", Some(1..4));
+		assert_eq!(
+			composer.frame().cursor(),
+			Some((6, 2)),
+			"a marked selection still anchors candidates at its trailing caret",
+		);
+
+		composer.set_volatile_text_selection("啊不", None);
+		assert_eq!(composer.frame().cursor(), None, "None hides the marked-text caret");
+		composer.commit_volatile_text("啊不");
+		assert_eq!(composer.text(), "啊不", "commit replaces rather than duplicates preedit");
+		assert_eq!(composer.frame().cursor(), Some((7, 2)));
+
+		composer.clear();
+		composer.set_volatile_text_selection("e\u{301}", Some(3..3));
+		assert_eq!(composer.text(), "é", "native marked text follows the shared NFC input policy");
+		assert_eq!(
+			composer.frame().cursor(),
+			Some((4, 2)),
+			"pre-normalization byte offsets remain bounded by the retained span",
+		);
 	}
 
 	#[test]

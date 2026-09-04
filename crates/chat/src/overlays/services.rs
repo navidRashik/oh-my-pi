@@ -1184,7 +1184,11 @@ pub trait Services: Send + Sync {
 
 	/// Exports the live session; `None` picks the default path beside the
 	/// journal. Returns the written path.
-	fn export(&self, _path: Option<&std::path::Path>) -> ServiceResult<PathBuf> {
+	fn export(
+		&self,
+		_dom: &omp_dom::Dom,
+		_path: Option<&std::path::Path>,
+	) -> ServiceResult<PathBuf> {
 		Err(ServiceError::Unavailable("export"))
 	}
 
@@ -1372,7 +1376,7 @@ pub trait Services: Send + Sync {
 
 	/// `/dump`: writes the next LLM request as JSON to a temp file and
 	/// returns its path (pi `dumpLlmRequestToTmpDir`).
-	fn dump_request(&self) -> ServiceResult<PathBuf> {
+	fn dump_request(&self, _dom: &omp_dom::Dom) -> ServiceResult<PathBuf> {
 		Err(ServiceError::Unavailable("request dump"))
 	}
 

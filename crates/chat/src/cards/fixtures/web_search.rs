@@ -1,8 +1,8 @@
 use super::{CardFixture, FixtureState};
 
 const ARGS: &str = r#"{"query":"Bun vs Node.js performance benchmarks 2026","recency":"month","limit":4,"provider":"perplexity"}"#;
-const RESULT: &str = r#"{
-	"provider":"perplexity","model":"sonar-pro","auth_mode":"api_key","request_id":"req_a1b2c3d4e5f6",
+const RESULT: &str = r#"{"response":{
+	"engine":"perplexity","auth_mode":"api_key",
 	"answer":"Bun continues to outperform Node.js on raw HTTP throughput and cold-start<br>\ntime thanks to its JavaScriptCore engine and native-Zig runtime, while<br>\nNode.js retains an edge in ecosystem maturity and long-term stability.<br>\nFor script-heavy workflows Bun's faster startup is the decisive factor.",
 	"search_queries":["bun vs node.js performance benchmarks 2026","bun http throughput vs node"],
 	"sources":[
@@ -12,9 +12,10 @@ const RESULT: &str = r#"{
 		{"title":"Why we migrated our CLI tooling from Node to Bun","url":"https://engineering.example.com/posts/bun-cli-migration","snippet":"Startup dropped from 180ms to 22ms, shaving seconds off every developer command invocation.","age_seconds":2332800,"author":"Dana Whitfield"}
 	],
 	"citations":[{"url":"https://bun.sh/blog/bun-v1.2-benchmarks","title":"Bun 1.2 Benchmarks","cited_text":"Bun serves roughly 2.5x the requests per second of Node.js"}],
-	"usage":{"input_tokens":312,"output_tokens":248,"total_tokens":560,"search_requests":2}
-}"#;
-const ERROR: &str = r#"{"provider":"perplexity","sources":[],"error":"Provider returned HTTP 429 (rate limited). Retry after 30s."}"#;
+	"usage":{"input_tokens":312,"output_tokens":248,"total_tokens":560,"server_tools":{"web_search_requests":2}}
+}}"#;
+const ERROR: &str =
+	r#"{"kind":"search","provider":"perplexity","category":"rate_limited","code":"resource_exhausted","status":429}"#;
 
 pub(super) const FIXTURES: &[CardFixture] = &[CardFixture {
 	tool:   "web_search",

@@ -2002,6 +2002,17 @@ impl Panel for SettingsPanel {
 		PanelAnchor::Full
 	}
 
+	fn set_context(&mut self, ctx: &UiContext) {
+		self.ctx = ctx.clone();
+		self.ui.set_context(ctx.clone());
+		let has_image_protocol = !matches!(ctx.graphics, omp_tui::Graphics::Cells);
+		if self.has_image_protocol != has_image_protocol {
+			self.has_image_protocol = has_image_protocol;
+			self.reflow_items();
+			self.rebuild();
+		}
+	}
+
 	fn key(&mut self, key: Key) -> PanelEvent {
 		if self.editor.is_some() {
 			return self.editor_key(key);

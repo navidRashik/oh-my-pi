@@ -71,25 +71,35 @@ fn render_done(view: &CardView<'_>) -> Component {
 	let state = goal
 		.and_then(|value| string_at(value, "status"))
 		.map(Str::new);
-	let detail = goal.and_then(|goal| {
-		let budget = goal.get("token_budget")?.as_u64()?;
+	let state_color = state.as_deref().map(|state| match state {
+		"complete" => "ok",
+		"budget_limited" | "budget-limited" => "warn",
+		"paused" | "dropped" => "muted",
+		_ => "accent",
+	});
+	let detail = goal.map(|goal| {
 		let used = goal.get("tokens_used").and_then(Value::as_u64).unwrap_or(0);
-		let left = result
-			.get("remaining_tokens")
-			.and_then(Value::as_u64)
-			.unwrap_or_else(|| budget.saturating_sub(used));
-		let mut detail = sf!(
-			"{} / {} tokens ({} left)",
-			compact_tokens(used),
-			compact_tokens(budget),
-			compact_tokens(left)
-		);
+		let mut detail = match goal.get("token_budget").and_then(Value::as_u64) {
+			Some(budget) => {
+				let left = result
+					.get("remaining_tokens")
+					.and_then(Value::as_u64)
+					.unwrap_or_else(|| budget.saturating_sub(used));
+				sf!(
+					"{} / {} tokens ({} left)",
+					compact_tokens(used),
+					compact_tokens(budget),
+					compact_tokens(left)
+				)
+			},
+			None => sf!("{} tokens", compact_tokens(used)),
+		};
 		if let Some(seconds) = goal.get("time_used_secs").and_then(Value::as_u64)
 			&& seconds > 0
 		{
 			detail = sf!("{detail} · {}m elapsed", seconds / 60);
 		}
-		Some(detail)
+		detail
 	});
 	let report = result
 		.get("completion_report")
@@ -100,7 +110,7 @@ fn render_done(view: &CardView<'_>) -> Component {
 		<box border=round bc=border bg=panel bleed title_pad=3 pad="0 1">
 			<row kind=title gap=0><i:goal-tool fg=accent/><text>{" "}</text><text fg=accent>{"Goal"}</text><text>{":"}</text>
 				<text fg=output wrap=pre>{format!(" {verb}")}</text>
-				if let Some(state) = state { <text fg=accent wrap=pre>{sf!(" ⟨{state}⟩")}</text> }
+				if let (Some(state), Some(color)) = (state, state_color) { <text fg={color} wrap=pre>{sf!(" ⟨{state}⟩")}</text> }
 				<text>{" "}</text>
 			</row>
 			if let Some(objective) = objective { <text fg=output>{sf!("\"{objective}\"")}</text> }

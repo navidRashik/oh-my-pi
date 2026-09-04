@@ -46,16 +46,30 @@ fn render_live(view: &CardView<'_>) -> Component {
 /// same total on the shared clock.
 const TODO_STRIKE_FRAME_MS: u64 = 65;
 
-/// The task a settled `done` op just completed (pi `completedTasks`):
-/// `(phase, item)` from the call's own arguments, so only that row sweeps.
-fn newly_completed(view: &CardView<'_>) -> Option<(Option<Str>, Str)> {
-	let args = typed_input::<omp_tools::todo::Params>(view)?;
-	if args.get("op").and_then(Value::as_str) != Some("done") {
-		return None;
+/// Whether one completed row belongs to this settlement. Current payloads
+/// carry the authoritative transition list; historical payloads did not, so
+/// a single-task `done` call falls back to its exact verbatim identity.
+fn completion_sweeps(
+	view: &CardView<'_>,
+	completed: &[CompletionTransition],
+	phase: &str,
+	content: &str,
+) -> bool {
+	if completed
+		.iter()
+		.any(|transition| transition.phase == phase && transition.content == content)
+	{
+		return true;
 	}
-	let item = args.get("task").and_then(Value::as_str).map(Str::new)?;
-	let phase = args.get("phase").and_then(Value::as_str).map(Str::new);
-	Some((phase, item))
+	let Some(args) = typed_input::<omp_tools::todo::Params>(view) else {
+		return false;
+	};
+	args.get("op").and_then(Value::as_str) == Some("done")
+		&& args.get("task").and_then(Value::as_str) == Some(content)
+		&& args
+			.get("phase")
+			.and_then(Value::as_str)
+			.is_none_or(|named| named == phase)
 }
 
 /// Collapsed phases show at most this many task rows (pi
@@ -183,13 +197,31 @@ fn touched_phases(
 }
 
 fn render_checklist(view: &CardView<'_>, expanded: bool) -> Component {
-	let completed_now = newly_completed(view);
 	let sweep = sf!("{}ms", TODO_STRIKE_FRAME_MS * u64::from(STRIKE_TOTAL_FRAMES));
 	let (phases, completed) = view
 		.result::<omp_tools::todo::Payload>()
 		.map(|payload| (payload.phases, payload.completed_tasks))
 		.unwrap_or_default();
 	let total: usize = phases.iter().map(|phase| phase.tasks.len()).sum();
+	if total == 0 {
+		let empty = if typed_input::<omp_tools::todo::Params>(view)
+			.as_ref()
+			.and_then(|args| args.get("op"))
+			.and_then(Value::as_str)
+			== Some("view")
+		{
+			"Todo list is empty."
+		} else {
+			"Todo list cleared."
+		};
+		return dom! {
+			<box border=round bc=border title_pad=3 pad="0 1">
+				<row kind=title gap=1><i:todo fg=accent/><text fg=accent>{"Todo"}</text><text fg=muted>{"0 tasks"}</text></row>
+				<text fg=muted>{empty}</text>
+			</box>
+		}
+		.into_component();
+	}
 	// Collapsed multi-phase lists fold the phases this update did not touch
 	// to a one-line summary; a single phase or the manual expand shows all.
 	let touched = if expanded || phases.len() < 2 {
@@ -225,23 +257,38 @@ fn render_checklist(view: &CardView<'_>, expanded: bool) -> Component {
 		let row_count = shown.len();
 		for (task_index, task) in shown.into_iter().enumerate() {
 			let text = task.content.clone();
-			let completed = task.status == Status::Completed;
-			let blocker = task.blocker.clone().filter(|text| !text.is_empty());
+			let is_completed = task.status == Status::Completed;
 			let last = task_index + 1 == row_count && summary.is_none();
-			let sweeping = completed
-				&& completed_now.as_ref().is_some_and(|(phase, item)| {
-					*item == text && phase.as_ref().is_none_or(|phase| phase == title)
-				});
+			let sweeping =
+				is_completed && completion_sweeps(view, &completed, phase.name.as_str(), text.as_str());
+			let blocked_note = (task.status == Status::Blocked).then(|| {
+				task.blocker.as_ref().filter(|text| !text.is_empty()).map_or_else(
+					|| Str::new_static("(blocked)"),
+					|blocker| sf!("(blocked: {blocker})"),
+				)
+			});
 			phase_rows.push(
 				dom! {
 					<row gap=1 pad-x=2>
 						if last { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
-						if completed { <i:checked fg=ok/> } else if last { <i:unchecked fg=accent/> } else { <i:unchecked fg=muted/> }
+						match task.status {
+							Status::Completed => <i:checked fg=ok/>,
+							Status::InProgress => <i:unchecked fg=accent/>,
+							Status::Abandoned => <i:unchecked fg=err/>,
+							Status::Blocked => <i:unchecked fg=warn/>,
+							Status::Pending => <i:unchecked fg=muted/>,
+						}
 						if sweeping { <strike reveal={sweep.clone()} fg=ok>{text}</strike> }
-						else if completed { <text strike fg=muted>{text}</text> }
-						else if last { <text fg=accent>{text}</text> }
-						else { <text fg=muted>{text}</text> }
-						if let Some(blocker) = blocker { <text fg=muted>{sf!("— {blocker}")}</text> }
+						else {
+							match task.status {
+								Status::Completed => <text strike fg=ok>{text}</text>,
+								Status::InProgress => <text fg=accent>{text}</text>,
+								Status::Abandoned => <text strike fg=err>{text}</text>,
+								Status::Blocked => <text fg=warn>{text}</text>,
+								Status::Pending => <text fg=muted>{text}</text>,
+							}
+						}
+						if let Some(note) = blocked_note { <text fg=warn>{note}</text> }
 					</row>
 				}
 				.into_component(),
@@ -391,6 +438,47 @@ mod tests {
 		assert!(struck(&ui, 2, at, len).iter().all(|s| *s));
 		assert_eq!(ui.next_wake(), None, "settled sweeps stop waking");
 		assert_eq!(frame_row_text(ui.frame(), 2), row, "the text itself never changes");
+	}
+
+	#[test]
+	fn phase_completion_animates_every_reported_transition() {
+		let input = text_node(KnownTag::Input, r#"{"op":"done","phase":"Foundation"}"#);
+		let result = text_node(
+			KnownTag::Result,
+			r#"{"op":"done","phases":[{"name":"Foundation","tasks":[{"content":"Scaffold crate","status":"completed"},{"content":"Wire workspace","status":"completed"}]}],"completed_tasks":[{"phase":"Foundation","content":"Scaffold crate"},{"phase":"Foundation","content":"Wire workspace"}]}"#,
+		);
+		let view = CardView {
+			input:   &input,
+			result:  Some(&result),
+			diag:    None,
+			notices: smallvec::SmallVec::new(),
+			usage:   None,
+			status:  CardStatus::Done,
+			output:  None,
+			started: None,
+		};
+		let mut ui = Ui::from_root(
+			TodoCard.render(&view, true, &UiContext::default()),
+			40,
+			UiContext::default(),
+		);
+		for (row, label) in [(2, "Scaffold crate"), (3, "Wire workspace")] {
+			let at = column_of(&frame_row_text(ui.frame(), row), label);
+			assert!(
+				struck(&ui, row, at, u16::try_from(label.len()).unwrap())
+					.iter()
+					.all(|value| !*value)
+			);
+		}
+		ui.tick(Duration::from_millis(910));
+		for (row, label) in [(2, "Scaffold crate"), (3, "Wire workspace")] {
+			let at = column_of(&frame_row_text(ui.frame(), row), label);
+			assert!(
+				struck(&ui, row, at, u16::try_from(label.len()).unwrap())
+					.iter()
+					.all(|value| *value)
+			);
+		}
 	}
 
 	#[test]

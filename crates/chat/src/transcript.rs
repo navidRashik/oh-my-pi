@@ -381,6 +381,22 @@ impl Projection {
 		Mounted { view: block.view, id, ui, retired: false, stream: block.stream }
 	}
 
+	/// Atomically restyles every retained live surface with a new ambient
+	/// context. Slot roots and their mirror trees keep their identities,
+	/// committed prefixes, and reveal state while [`Ui::set_context`] advances
+	/// cache revisions and invalidates context-derived geometry and paint.
+	pub(crate) fn set_context(&mut self, ctx: &UiContext) -> bool {
+		if self.ctx == *ctx {
+			return false;
+		}
+		self.ctx = ctx.clone();
+		self.slots.set_context(ctx.clone());
+		for mounted in &mut self.blocks {
+			mounted.ui.set_context(ctx.clone());
+		}
+		true
+	}
+
 	/// Applies a fresh projection. A block whose streamed text merely grew is
 	/// extended in place so its reveal cursor and animation phase survive;
 	/// a live block that vanished (a displaced card) is discarded from the
@@ -652,7 +668,11 @@ impl Projection {
 #[cfg(test)]
 mod tests {
 	use omp_dom::PropId;
-	use omp_tui::{IntoComponent as _, UiContext, slots::Delivered};
+	use omp_tui::{
+		Color, IntoComponent as _, Prop, Style, UiContext,
+		components::TextLeaf,
+		slots::Delivered,
+	};
 
 	use super::*;
 	use crate::{cards::CardRegistry, project::project};
@@ -893,6 +913,116 @@ mod tests {
 			.receipt(omp_journal::data::TurnReceipt::tokens(10, 5, 0))
 			.expect("receipt");
 		check(&session, &mut projection, "receipt");
+	}
+
+	#[test]
+	fn context_swap_restyles_retained_blocks_without_reopening_them() {
+		let mut projection = fixture(20, &[true, false]);
+		let identities = projection
+			.blocks
+			.iter()
+			.map(|mounted| mounted.id)
+			.collect::<Vec<_>>();
+		let mut light = UiContext::default();
+		assert!(light.apply_appearance(omp_tui::Appearance::Light));
+		assert!(projection.set_context(&light));
+		assert_eq!(
+			projection
+				.blocks
+				.iter()
+				.map(|mounted| mounted.id)
+				.collect::<Vec<_>>(),
+			identities,
+			"restyling must preserve slot identity and history position",
+		);
+		assert!(
+			projection
+				.blocks
+				.iter()
+				.all(|mounted| mounted.ui.context().appearance == omp_tui::Appearance::Light),
+			"every cached mirror observes the atomic context swap",
+		);
+		assert!(!projection.set_context(&light), "an identical context is a no-op");
+	}
+
+	#[test]
+	fn committed_message_tool_and_update_rows_keep_their_styles_after_resize() {
+		const CASES: [(BlockKind, &str, Color); 4] = [
+			(BlockKind::User, "user-colored", Color::Rgb(0x11, 0x22, 0x33)),
+			(BlockKind::Assistant, "assistant-colored", Color::Rgb(0x22, 0x44, 0x66)),
+			(BlockKind::Tool, "tool-colored", Color::Rgb(0x33, 0x66, 0x99)),
+			(BlockKind::Notice, "update-colored", Color::Rgb(0x44, 0x88, 0xcc)),
+		];
+		let blocks = || {
+			CASES
+				.iter()
+				.enumerate()
+				.map(|(index, &(kind, text, color))| RenderedBlock {
+					view:      BlockView {
+						key: index as u64 + 1,
+						kind,
+						text: Str::new_static(text),
+						mode: Mode::Mutable,
+						finalized: true,
+					},
+					component: TextLeaf::new()
+						.text(text)
+						.with(Prop::Fg, color)
+						.with(Prop::Bold, true)
+						.with(Prop::Href, "https://example.test/row")
+						.into_component(),
+					stream:    None,
+				})
+				.collect::<Vec<_>>()
+		};
+		let mut projection = Projection::new(
+			Size::new(24, 1),
+			ResizePolicy::Rebuild,
+			&UiContext::default(),
+			blocks(),
+			blocks(),
+			Duration::ZERO,
+		);
+		projection.retire_under_pressure(1, 1);
+		let initial = projection.slots.plan();
+		for &(_, text, color) in &CASES {
+			let row = initial
+				.rows()
+				.iter()
+				.find(|row| row.logical().text().contains(text))
+				.expect("semantic transcript row staged");
+			assert_eq!(
+				row.frame().cell(0, 0).style(),
+				Style::new()
+					.fg(color)
+					.bold()
+					.link("https://example.test/row"),
+			);
+		}
+		projection.slots.commit(initial, Delivered::All);
+
+		projection.resize(Size::new(40, 1));
+		let replay = projection.slots.plan();
+		assert!(replay.rebuild());
+		for &(_, text, color) in &CASES {
+			let row = replay
+				.rows()
+				.iter()
+				.find(|row| row.logical().text().contains(text))
+				.expect("styled transcript row survives scrollback rebuild");
+			assert_eq!(
+				row.frame().cell(0, 0).style(),
+				Style::new()
+					.fg(color)
+					.bold()
+					.link("https://example.test/row"),
+			);
+		}
+		projection.slots.commit(replay, Delivered::All);
+		assert!(
+			projection.slots.plan().rows().is_empty(),
+			"repeated presentation never duplicates styled history",
+		);
 	}
 
 	#[test]

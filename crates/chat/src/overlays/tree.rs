@@ -4,9 +4,9 @@
 //! fold into the nearest message row so the tree shows turns rather than raw
 //! entries, and Enter asks the console to `rewind` to the row (ADR 0014).
 //!
-//! Left out of the port on purpose: type-to-search, `Shift+L` labels,
-//! `Ctrl+O` / `Alt+D/T/U/L/A` filter modes, and `Shift+Enter` summarize
-//! (no console command backs them); `Alt+↑/↓` turn jumps (the host decodes
+//! The shared filterable select owns type-to-search. Left out of the port on
+//! purpose: `Shift+L` labels, `Ctrl+O` / `Alt+D/T/U/L/A` filter modes, and
+//! `Shift+Enter` summarize (no console command backs them); `Alt+↑/↓` turn jumps (the host decodes
 //! `Alt+Up` as `RestoreQueue` and drops `Alt+Down`). Added: `Ctrl/Alt+←/→`
 //! fold and unfold from [`PanelAction`].
 
@@ -14,21 +14,24 @@ use std::collections::HashMap;
 
 use omp_core::{Str, StrMut, sf};
 use omp_journal::{EntryId, kind};
-use omp_tui::{Border, Frame, Icon, IntoComponent as _, Key, Size, Ui, UiContext, cell_width, dom};
+use omp_tui::{
+	Border, Frame, Icon, Key, MouseReport, Size, Ui, UiContext, UiEvent, dom,
+};
 
 use super::{Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent, services::TreeEntry};
-use crate::cards::Component;
 
 /// pi `tree-selector.ts:1113` panel title.
 const TITLE: &str = "Session Tree";
 /// pi `tree-selector.ts:1137`, restricted to the chords this port
 /// implements, plus the fold chord.
 const HINT: &str = "Enter: switch. PgUp/PgDn (←/→): page. Home/End: first/last item. Ctrl+←/→: \
-                    fold/unfold. Esc: close";
+                    fold/unfold. Type to search. Esc: close";
 /// pi `tree-selector.ts:578` empty-tree row.
 const EMPTY: &str = "No entries found";
 /// Top and bottom borders, the rule, and the hint row.
 const CHROME_ROWS: u16 = 4;
+/// The shared filterable select's search row.
+const SELECT_HEADER_ROWS: u16 = 1;
 /// Border plus `pad-x=1` on both sides.
 const INSET: u16 = 4;
 /// pi `tree-selector.ts:613-614`: content budget guarding deep gutters.
@@ -83,6 +86,7 @@ pub struct TreePanel {
 	multiple_roots: bool,
 	ui:             Ui,
 	ctx:            UiContext,
+	query:          Str,
 	width:          u16,
 	list_rows:      u16,
 	dirty:          bool,
@@ -122,6 +126,7 @@ impl TreePanel {
 			multiple_roots,
 			ui: Ui::from_root(dom! { <col/> }, viewport.width, ctx.clone()),
 			ctx: ctx.clone(),
+			query: Str::default(),
 			width: viewport.width,
 			list_rows: Self::rows_for(viewport.height),
 			dirty: true,
@@ -131,11 +136,11 @@ impl TreePanel {
 	}
 
 	/// pi `tree-selector.ts:1116-1120`: at least five rows, half the
-	/// viewport, never past the chrome.
+	/// viewport, never past the shared select header and panel chrome.
 	fn rows_for(height: u16) -> u16 {
 		(height / 2)
 			.max(5)
-			.min(height.saturating_sub(CHROME_ROWS))
+			.min(height.saturating_sub(CHROME_ROWS + SELECT_HEADER_ROWS))
 			.max(1)
 	}
 
@@ -219,41 +224,72 @@ impl TreePanel {
 	fn rebuild(&mut self) {
 		self.dirty = false;
 		let width = self.width.saturating_sub(INSET);
-		let total = self.visible.len();
-		let list_rows = usize::from(self.list_rows);
-		// pi `centeredWindow` (`selector-helpers.ts:40-47`).
-		let start = self
-			.cursor
-			.saturating_sub(list_rows / 2)
-			.min(total.saturating_sub(list_rows));
-		let end = (start + list_rows).min(total);
-		let overflow = total > list_rows;
-		let row_width = width.saturating_sub(u16::from(overflow));
+		let list_rows = self.list_rows.saturating_add(SELECT_HEADER_ROWS);
 		let content_reserve = MIN_CONTENT_COLS.max(width / 2);
 		let max_indent_levels = (width
 			.saturating_sub(content_reserve)
 			.saturating_sub(OVERHEAD_COLS)
 			/ 3)
 			.max(1);
-		let (thumb_start, thumb_end) = scrollbar_thumb(start, end - start, total);
-		let (track, thumb) = self.ctx.charset.scrollbar();
-		let lines: Vec<Component> = (start..end)
-			.map(|index| {
-				let selected = index == self.cursor;
-				let bar = if !overflow {
-					("", "muted")
-				} else if (thumb_start..thumb_end).contains(&index) {
-					(thumb, "accent")
-				} else {
-					(track, "muted")
-				};
-				self.row_component(self.visible[index], selected, row_width, max_indent_levels, bar)
-			})
-			.collect();
+
+		let options = self.visible.iter().enumerate().map(|(index, &row_idx)| {
+			let row = &self.rows[row_idx];
+			let node = &self.nodes[row.node];
+			let charset = self.ctx.charset;
+			let prefix = self.gutter_prefix(row, max_indent_levels);
+			let marker = if node.live {
+				sf!("{} ", Icon::MarkdownBullet.glyph(charset))
+			} else {
+				Str::default()
+			};
+			let fold = if self.folded[row.node] {
+				charset.expander(false)
+			} else {
+				""
+			};
+			let (label_fg, label, content) = entry_display(node);
+			let content_fg = if node.live && !node.text.is_empty() {
+				"fg"
+			} else {
+				"muted"
+			};
+			let head = if node.head { HEAD_MARK } else { "" };
+			let label_fg = if node.live { label_fg } else { "muted" };
+			let search_label = sf!("{label} {content}");
+			let value = sf!("{row_idx}");
+			let selected = index == self.cursor;
+			let icon = sf!("{marker}{fold}");
+
+			(
+				value,
+				search_label,
+				selected,
+				prefix,
+				icon,
+				label_fg,
+				label,
+				content_fg,
+				content,
+				head,
+			)
+		}).collect::<Vec<_>>();
+
 		let tree = dom! {
 			<box border=round title={TITLE} pad-x=1>
 				<col>
-					<col>{lines}</col>
+					<select id="tree" filter={self.query.clone()} h={list_rows}>
+						for (value, search_label, selected, prefix, icon, label_fg, label, content_fg, content, head) in options {
+							<option value={value} label={search_label} selected={selected}>
+								<td truncate grow>
+									<pre fg=muted>{prefix}</pre>
+									<pre fg=accent>{icon}</pre>
+									<pre fg={label_fg}>{label}</pre>
+									<pre fg={content_fg}>{content}</pre>
+									<pre fg=accent>{head}</pre>
+								</td>
+							</option>
+						}
+					</select>
 					<hr border=round/>
 					<text fg=muted truncate>{HINT}</text>
 				</col>
@@ -262,66 +298,38 @@ impl TreePanel {
 		self.ui = Ui::from_root(tree, self.width, self.ctx.clone());
 	}
 
-	/// pi `tree-selector.ts:626-693`: `cursor + prefix + path marker +
-	/// content`, truncated to `row_width`, then the scrollbar cell.
-	fn row_component(
-		&self,
-		row: usize,
-		selected: bool,
-		row_width: u16,
-		max_indent_levels: u16,
-		(bar, bar_fg): (&'static str, &'static str),
-	) -> Component {
-		let row = &self.rows[row];
-		let node = &self.nodes[row.node];
-		let charset = self.ctx.charset;
-		let cursor = if selected { charset.cursor() } else { "  " };
-		let prefix = self.gutter_prefix(row, max_indent_levels);
-		let marker = if node.live {
-			sf!("{} ", Icon::MarkdownBullet.glyph(charset))
-		} else {
-			Str::default()
-		};
-		let fold = if self.folded[row.node] {
-			charset.expander(false)
-		} else {
-			""
-		};
-		let (label_fg, label, content) = entry_display(node);
-		let head = if node.head { HEAD_MARK } else { "" };
-		let used = cell_width(cursor)
-			.saturating_add(cell_width(&prefix))
-			.saturating_add(cell_width(&marker))
-			.saturating_add(cell_width(fold))
-			.saturating_add(cell_width(&label))
-			.saturating_add(cell_width(head));
-		let content = clip(&content, row_width.saturating_sub(used));
-		let pad = row_width
-			.saturating_sub(used)
-			.saturating_sub(cell_width(&content));
-		let pad = " ".repeat(usize::from(pad));
-		let label_fg = if node.live { label_fg } else { "muted" };
-		let content_fg = if node.live && !node.text.is_empty() {
-			"fg"
-		} else {
-			"muted"
-		};
-		let bg = if selected { "selection" } else { "transparent" };
-		// An empty `<pre>` still claims a cell, so blank segments are skipped.
-		dom! {
-			<row bg={bg}>
-				<pre fg=accent>{cursor}</pre>
-				if !prefix.is_empty() { <pre fg=muted>{prefix}</pre> }
-				if !marker.is_empty() { <pre fg=accent>{marker}</pre> }
-				if !fold.is_empty() { <pre fg=accent>{fold}</pre> }
-				<pre fg={label_fg} bold={selected}>{label}</pre>
-				if !content.is_empty() { <pre fg={content_fg} bold={selected}>{content}</pre> }
-				if !head.is_empty() { <pre fg=accent bold={selected}>{head}</pre> }
-				if !pad.is_empty() { <pre>{pad}</pre> }
-				if !bar.is_empty() { <pre fg={bar_fg}>{bar}</pre> }
-			</row>
+	fn cursor_to(&mut self, value: &str) {
+		if let Ok(row_idx) = value.parse::<usize>() {
+			if let Ok(pos) = self.visible.binary_search(&row_idx) {
+				self.cursor = pos;
+			} else if let Some(pos) = self.visible.iter().position(|&r| r == row_idx) {
+				self.cursor = pos;
+			}
 		}
-		.into_component()
+	}
+
+	fn route(&mut self, event: UiEvent) -> PanelEvent {
+		match event {
+			UiEvent::Cancel => PanelEvent::Close,
+			UiEvent::Changed { id, value } if id.as_str() == "tree" => {
+				self.cursor_to(&value);
+				self.selected()
+					.map_or(PanelEvent::Close, |id| PanelEvent::Finish(sf!("rewind {id}")))
+			},
+			UiEvent::Highlighted { id, value } if id.as_str() == "tree" => {
+				self.cursor_to(&value);
+				PanelEvent::Consumed
+			},
+			UiEvent::Filtered { id, query, value } if id.as_str() == "tree" => {
+				self.query = query;
+				if let Some(value) = value.as_deref() {
+					self.cursor_to(value);
+				}
+				self.dirty = true;
+				PanelEvent::Consumed
+			},
+			_ => PanelEvent::Consumed,
+		}
 	}
 
 	/// pi `tree-selector.ts:641-673`: three cells per indent level with
@@ -401,20 +409,31 @@ impl Panel for TreePanel {
 	}
 
 	fn key(&mut self, key: Key) -> PanelEvent {
-		let page = usize::from(self.list_rows);
-		match key {
-			Key::Esc => PanelEvent::Close,
-			Key::Up => self.move_cursor(self.cursor.saturating_sub(1)),
-			Key::Down => self.move_cursor(self.cursor + 1),
-			Key::Home => self.move_cursor(0),
-			Key::End => self.move_cursor(usize::MAX),
-			Key::PageUp | Key::Left => self.move_cursor(self.cursor.saturating_sub(page)),
-			Key::PageDown | Key::Right => self.move_cursor(self.cursor + page),
-			Key::Enter => self
-				.selected()
-				.map_or(PanelEvent::Close, |id| PanelEvent::Finish(sf!("rewind {id}"))),
-			_ => PanelEvent::Ignored,
+		let key = match key {
+			Key::Left => Key::Up,
+			Key::Right => Key::Down,
+			other => other,
+		};
+		if self.query.is_empty()
+			&& ((key == Key::Up && self.cursor == 0)
+				|| (key == Key::Down && self.cursor + 1 == self.visible.len()))
+		{
+			return PanelEvent::Consumed;
 		}
+		let event = self.ui.handle_key(key);
+		self.route(event)
+	}
+
+	fn paste(&mut self, text: &str) -> PanelEvent {
+		let event = self.ui.handle_paste(text);
+		self.route(event)
+	}
+
+	fn mouse(&mut self, report: MouseReport) -> PanelEvent {
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		self.route(event)
 	}
 
 	fn frame(&mut self, viewport: Size) -> &Frame {
@@ -606,48 +625,13 @@ fn normalize(text: &str) -> Str {
 	Str::new(out.as_str().trim())
 }
 
-/// Truncates to `width` cells with a trailing ellipsis.
-fn clip(text: &str, width: u16) -> Str {
-	if cell_width(text) <= width {
-		return Str::new(text);
-	}
-	if width == 0 {
-		return Str::default();
-	}
-	let budget = usize::from(width - 1);
-	let mut used = 0;
-	let mut end = 0;
-	for (offset, ch) in text.char_indices() {
-		let mut buffer = [0_u8; 4];
-		let cells = usize::from(cell_width(ch.encode_utf8(&mut buffer)));
-		if used + cells > budget {
-			break;
-		}
-		used += cells;
-		end = offset + ch.len_utf8();
-	}
-	sf!("{}…", &text[..end])
-}
-
-/// Thumb row span `[start, end)` in list coordinates for a window of
-/// `shown` rows starting at `start` over `total` rows.
-fn scrollbar_thumb(start: usize, shown: usize, total: usize) -> (usize, usize) {
-	if total <= shown || shown == 0 {
-		return (0, 0);
-	}
-	let length = (shown * shown / total).max(1);
-	let travel = shown - length;
-	let offset = start * travel / (total - shown);
-	(start + offset, start + offset + length)
-}
-
 #[cfg(test)]
 mod tests {
 	use std::sync::Arc;
 
 	use omp_con::Ctx;
 	use omp_dom::Dom;
-	use omp_tui::frame_text;
+	use omp_tui::{cell_width, frame_text};
 
 	use super::*;
 	use crate::overlays::services::{NoServices, ServiceResult, Services};
@@ -769,8 +753,9 @@ mod tests {
 		let text = lines(&mut panel, Size::new(60, 20));
 		assert!(text[0].contains("Session Tree"), "title missing:\n{}", text.join("\n"));
 		let body = text.join("\n");
-		assert!(body.contains("  • user: hello world"), "{body}");
-		assert!(body.contains("  • assistant: hi there"), "{body}");
+		assert!(body.contains("6/6"), "standard select search row missing:\n{body}");
+		assert!(body.contains("• user: hello world"), "{body}");
+		assert!(body.contains("• assistant: hi there"), "{body}");
 		assert!(body.contains("├─ • user: second question"), "{body}");
 		assert!(body.contains("│  • assistant: second answer (head)"), "{body}");
 		assert!(body.contains("└─ user: abandoned question"), "{body}");
@@ -804,8 +789,11 @@ mod tests {
 		assert_eq!(panel.key(Key::PageUp), PanelEvent::Consumed);
 		assert_eq!(panel.cursor, 0);
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Finish(sf!("rewind {}", id(3))));
-		assert_eq!(panel.key(Key::Esc), PanelEvent::Close);
-		assert_eq!(panel.key(Key::Char('x')), PanelEvent::Ignored);
+		assert_eq!(panel.key(Key::Char('x')), PanelEvent::Consumed);
+		assert_eq!(panel.query.as_str(), "x", "typing belongs to the shared filterable select");
+		assert_eq!(panel.key(Key::Esc), PanelEvent::Consumed, "first Esc clears the filter");
+		assert!(panel.query.is_empty());
+		assert_eq!(panel.key(Key::Esc), PanelEvent::Close, "second Esc closes the overlay");
 	}
 
 	#[test]
@@ -849,7 +837,7 @@ mod tests {
 		let text = lines(&mut panel, Size::new(60, 12)).join("\n");
 		assert!(text.contains("message 20 (head)"), "head row missing:\n{text}");
 		assert!(!text.contains("message 2 "), "window did not scroll:\n{text}");
-		assert!(text.contains('█'), "scrollbar thumb missing:\n{text}");
+		assert!(text.contains("19/19"), "shared select count missing:\n{text}");
 		panel.key(Key::Home);
 		let text = lines(&mut panel, Size::new(60, 12)).join("\n");
 		assert!(text.contains("message 2 "), "{text}");
