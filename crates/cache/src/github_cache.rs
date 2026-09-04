@@ -96,15 +96,31 @@ pub enum GithubCacheError {
 	Database(#[from] rusqlite::Error),
 }
 
+/// Runtime policy for the rebuildable GitHub response cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GithubCachePolicy {
+	enabled:   bool,
+	soft_ttl:  Duration,
+	hard_ttl:  Duration,
+}
+
+impl GithubCachePolicy {
+	/// Creates a cache policy with independent freshness and retention windows.
+	#[must_use]
+	pub const fn new(enabled: bool, soft_ttl: Duration, hard_ttl: Duration) -> Self {
+		Self { enabled, soft_ttl, hard_ttl }
+	}
+}
+
 /// Thread-safe rebuildable GitHub response cache.
 pub struct GithubCache {
 	connection: Mutex<Connection>,
-	freshness:  Duration,
+	policy:     GithubCachePolicy,
 }
 
 impl GithubCache {
 	/// Opens a cache database and creates its schema when absent.
-	pub fn open(path: impl AsRef<Path>, freshness: Duration) -> Result<Self, GithubCacheError> {
+	pub fn open(path: impl AsRef<Path>, policy: GithubCachePolicy) -> Result<Self, GithubCacheError> {
 		let connection = Connection::open(path)?;
 		connection.execute_batch(
 			"PRAGMA journal_mode=WAL;
@@ -122,15 +138,21 @@ impl GithubCache {
 			 CREATE INDEX IF NOT EXISTS github_cache_repo
 			   ON github_cache(repo);",
 		)?;
-		Ok(Self { connection: Mutex::new(connection), freshness })
+		Ok(Self { connection: Mutex::new(connection), policy })
 	}
 
-	/// Returns an entry, retaining stale bytes for refresh-failure fallback.
+	/// Returns an entry, retaining soft-expired bytes for refresh-failure fallback.
+	///
+	/// Disabled caches always miss. Entries older than the hard TTL are deleted
+	/// before returning a miss, even when the soft TTL is longer.
 	pub fn get(
 		&self,
 		key: &GithubCacheKey,
 		now_ms: u64,
 	) -> Result<Option<GithubCacheEntry>, GithubCacheError> {
+		if !self.policy.enabled {
+			return Ok(None);
+		}
 		let number = key.number.map(sql_integer).transpose()?;
 		let connection = self.connection.lock();
 		let row = connection
@@ -152,7 +174,16 @@ impl GithubCache {
 		};
 		let fetched_at_ms = u64::try_from(fetched_at_ms).unwrap_or_default();
 		let age = now_ms.saturating_sub(fetched_at_ms);
-		let fresh_ms = u64::try_from(self.freshness.as_millis()).unwrap_or(u64::MAX);
+		let hard_ms = u64::try_from(self.policy.hard_ttl.as_millis()).unwrap_or(u64::MAX);
+		if age > hard_ms {
+			connection.execute(
+				"DELETE FROM github_cache
+				 WHERE kind = ?1 AND repo = ?2 AND number IS ?3 AND view = ?4",
+				params![kind_text(key.kind), key.repo.as_str(), number, key.view.as_str()],
+			)?;
+			return Ok(None);
+		}
+		let fresh_ms = u64::try_from(self.policy.soft_ttl.as_millis()).unwrap_or(u64::MAX);
 		Ok(Some(GithubCacheEntry {
 			body: Bytes::from(body),
 			etag: etag.map(Str::new),
@@ -173,6 +204,9 @@ impl GithubCache {
 		etag: Option<&str>,
 		fetched_at_ms: u64,
 	) -> Result<(), GithubCacheError> {
+		if !self.policy.enabled {
+			return Ok(());
+		}
 		let number = key.number.map(sql_integer).transpose()?;
 		let fetched_at_ms = sql_integer(fetched_at_ms)?;
 		self.connection.lock().execute(
@@ -197,6 +231,9 @@ impl GithubCache {
 
 	/// Refreshes freshness after a direct API `304 Not Modified` response.
 	pub fn touch(&self, key: &GithubCacheKey, fetched_at_ms: u64) -> Result<bool, GithubCacheError> {
+		if !self.policy.enabled {
+			return Ok(false);
+		}
 		let number = key.number.map(sql_integer).transpose()?;
 		let fetched_at_ms = sql_integer(fetched_at_ms)?;
 		let changed = self.connection.lock().execute(
@@ -222,7 +259,7 @@ impl fmt::Debug for GithubCache {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		formatter
 			.debug_struct("GithubCache")
-			.field("freshness", &self.freshness)
+			.field("policy", &self.policy)
 			.finish_non_exhaustive()
 	}
 }
@@ -281,12 +318,22 @@ fn kind_text(kind: GithubResourceKind) -> &'static str {
 mod tests {
 	use super::*;
 
+	fn policy(enabled: bool, soft_secs: u64, hard_secs: u64) -> GithubCachePolicy {
+		GithubCachePolicy::new(
+			enabled,
+			Duration::from_secs(soft_secs),
+			Duration::from_secs(hard_secs),
+		)
+	}
+
 	#[test]
 	fn cache_tracks_fresh_stale_conditional_refresh_and_repo_invalidation() {
 		let directory = tempfile::tempdir().expect("cache directory");
-		let cache =
-			GithubCache::open(directory.path().join("github.sqlite3"), Duration::from_secs(60))
-				.expect("cache");
+		let cache = GithubCache::open(
+			directory.path().join("github.sqlite3"),
+			policy(true, 60, 600),
+		)
+		.expect("cache");
 		let key = GithubCacheKey::new(
 			GithubResourceKind::PullRequest,
 			"Owner/Repo",
@@ -350,9 +397,11 @@ mod tests {
 	#[test]
 	fn list_filters_and_comment_modes_have_distinct_keys() {
 		let directory = tempfile::tempdir().expect("cache directory");
-		let cache =
-			GithubCache::open(directory.path().join("github.sqlite3"), Duration::from_secs(60))
-				.expect("cache");
+		let cache = GithubCache::open(
+			directory.path().join("github.sqlite3"),
+			policy(true, 60, 600),
+		)
+		.expect("cache");
 		let open = GithubCacheKey::new(
 			GithubResourceKind::Issue,
 			"owner/repo",
@@ -378,5 +427,31 @@ mod tests {
 		assert_eq!(cache.get(&open, 1).unwrap().unwrap().body.as_ref(), b"open");
 		assert_eq!(cache.get(&closed, 1).unwrap().unwrap().body.as_ref(), b"closed");
 		assert_eq!(cache.get(&comments, 1).unwrap().unwrap().body.as_ref(), b"detail");
+	}
+
+	#[test]
+	fn policy_bypasses_disabled_cache_and_hard_ttl_dominates_soft_ttl() {
+		let directory = tempfile::tempdir().expect("cache directory");
+		let key =
+			GithubCacheKey::new(GithubResourceKind::Issue, "owner/repo", Some(9), "detail")
+				.expect("key");
+		let enabled_path = directory.path().join("enabled.sqlite3");
+		let cache = GithubCache::open(&enabled_path, policy(true, 300, 10)).expect("enabled cache");
+		cache.put(&key, b"expired", None, 1_000).expect("put");
+		assert!(cache.get(&key, 11_001).expect("hard-expired read").is_none());
+		assert!(
+			cache
+				.get(&key, 1_000)
+				.expect("deleted-row read")
+				.is_none(),
+			"hard-expired rows are removed from storage"
+		);
+
+		let disabled =
+			GithubCache::open(directory.path().join("disabled.sqlite3"), policy(false, 300, 600))
+				.expect("disabled cache");
+		disabled.put(&key, b"ignored", None, 1_000).expect("disabled put");
+		assert!(disabled.get(&key, 1_000).expect("disabled get").is_none());
+		assert!(!disabled.touch(&key, 2_000).expect("disabled touch"));
 	}
 }

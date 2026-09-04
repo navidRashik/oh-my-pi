@@ -107,7 +107,7 @@ pub async fn drive_window(binary: PathBuf, config: WindowConfig, ctx: DriverCtx)
 /// Shared driver body: launch, set up, signal readiness, then pump until a
 /// shutdown condition and terminate the browser.
 async fn drive(binary: PathBuf, surface: Surface, ctx: DriverCtx) -> Result<()> {
-	let DriverCtx { commands, events, state, page, ready } = ctx;
+	let DriverCtx { commands, cancelled: _, events, state, page, ready } = ctx;
 	// `_profile` lives past the child so an ephemeral dir outlasts the process.
 	let (_profile, mut child, mut link, mut driver) =
 		match setup(binary, &surface, page, events, state).await {

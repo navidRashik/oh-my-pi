@@ -21,6 +21,7 @@ const ACTION_TIMEOUT: Duration = Duration::from_secs(8);
 const ZERO_MATCH_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_AX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EXTRACT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SCREENSHOT_BYTES: usize = 32 * 1024 * 1024;
 
 const HELPERS: &str = r#"
@@ -465,11 +466,14 @@ impl<'view> TabHandle<'view> {
 				"document.documentElement ? document.documentElement.outerHTML : ''"
 			},
 		};
-		self
-			.eval_value(expression, QUICK_TIMEOUT)?
+		let value = self.eval_value(expression, QUICK_TIMEOUT)?;
+		let text = value
 			.as_str()
-			.map(Str::new)
-			.ok_or_else(|| Error::Protocol("document extraction returned a non-string".to_str()))
+			.ok_or_else(|| Error::Protocol("document extraction returned a non-string".to_str()))?;
+		if text.len() > MAX_EXTRACT_BYTES {
+			return Err(Error::Protocol("document extraction exceeds byte limit".to_str()));
+		}
+		Ok(Str::new(text))
 	}
 
 	/// Return native Chromium AX or injected ARIA YAML on other engines.

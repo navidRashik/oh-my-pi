@@ -10,7 +10,8 @@
 //! - **system** — the platform webview, in-process (`WKWebView` on macOS).
 //! - **chromium** — any installed Chromium-family browser (Chrome, Edge, Brave,
 //!   Chromium, Vivaldi, ...), spawned and driven over the Chrome `DevTools`
-//!   Protocol.
+//!   Protocol, or a non-owned browser/relay attached through an existing CDP
+//!   discovery or websocket endpoint.
 //! - **firefox** — any installed Gecko-family browser (Firefox, `LibreWolf`,
 //!   ...), spawned and driven over `WebDriver` `BiDi`.
 //!
@@ -51,11 +52,12 @@
 //!
 //! # Remote-engine profiles
 //!
-//! Remote engines never touch the user's daily browsing profile: modern
+//! Owned remote engines never touch the user's daily browsing profile: modern
 //! Chrome refuses automation on the default profile, and clobbering user
-//! state would be hostile anyway. By default each view gets an ephemeral
+//! state would be hostile anyway. By default each owned view gets an ephemeral
 //! profile deleted on close; pass [`WebViewBuilder::profile`] for a
-//! persistent one (cookies and logins survive across views).
+//! persistent one (cookies and logins survive across views). Attached CDP
+//! views adopt exactly one caller-selected page and detach without closing it.
 //!
 //! The `OMP_WEBVIEW_BROWSER` environment variable (path to a browser binary)
 //! overrides [`Engine::find`]'s discovery for remote surfaces.
@@ -133,6 +135,14 @@ pub enum Engine {
 		/// Path to the browser binary.
 		binary: PathBuf,
 	},
+	/// An existing Chromium-compatible CDP endpoint. Dropping a view detaches
+	/// from its target but never closes the foreign browser or page.
+	ChromiumCdp {
+		/// Browser HTTP discovery URL or browser websocket URL.
+		endpoint: Str,
+		/// Optional URL/title substring selecting an existing page target.
+		target:   Option<Str>,
+	},
 	/// An installed Gecko-family browser, driven over `WebDriver` `BiDi`.
 	Firefox {
 		/// Path to the browser binary.
@@ -150,6 +160,11 @@ impl Engine {
 	/// A Chromium-family browser at `binary`.
 	pub fn chromium(binary: impl Into<PathBuf>) -> Self {
 		Self::Chromium { binary: binary.into() }
+	}
+
+	/// Attach to an existing Chromium-compatible CDP endpoint.
+	pub fn chromium_cdp(endpoint: impl IntoStr, target: Option<Str>) -> Self {
+		Self::ChromiumCdp { endpoint: endpoint.to_str(), target }
 	}
 
 	/// A Gecko-family browser at `binary`.
@@ -209,7 +224,7 @@ impl Engine {
 		match self {
 			#[cfg(target_os = "macos")]
 			Self::System => EngineKind::System,
-			Self::Chromium { .. } => EngineKind::Chromium,
+			Self::Chromium { .. } | Self::ChromiumCdp { .. } => EngineKind::Chromium,
 			Self::Firefox { .. } => EngineKind::Firefox,
 		}
 	}
@@ -295,6 +310,30 @@ impl WebViewBuilder {
 		self
 	}
 
+	/// Add one argument to an owned remote browser process.
+	///
+	/// Attached CDP endpoints ignore process arguments because the host does
+	/// not own that process.
+	pub fn argument(mut self, argument: impl IntoStr) -> Self {
+		self.page.arguments.push(argument.to_str());
+		self
+	}
+
+	/// Add arguments to an owned remote browser process.
+	pub fn arguments(mut self, arguments: impl IntoIterator<Item = impl IntoStr>) -> Self {
+		self
+			.page
+			.arguments
+			.extend(arguments.into_iter().map(|argument| argument.to_str()));
+		self
+	}
+
+	/// Bound connection and readiness work for an attached automation endpoint.
+	pub const fn connect_timeout(mut self, timeout: std::time::Duration) -> Self {
+		self.page.connect_timeout = Some(timeout);
+		self
+	}
+
 	/// Embed as a native child view of `parent` at `bounds` (system engine).
 	///
 	/// # Errors
@@ -371,6 +410,19 @@ impl WebViewBuilder {
 						);
 					})?
 			},
+			Engine::ChromiumCdp { endpoint, target } => {
+				remote::spawn(self.page, move |ctx| {
+					chromium::drive_attached(endpoint, target, config, ctx)
+				})
+				.inspect_err(|error| {
+					tracing::warn!(
+						engine = %engine,
+						surface = "frames",
+						error = error.kind(),
+						"attached webview initialization failed"
+					);
+				})?
+			},
 			Engine::Firefox { binary } => {
 				remote::spawn(self.page, move |ctx| firefox::drive_frames(binary, config, ctx))
 					.inspect_err(|error| {
@@ -439,6 +491,23 @@ impl WebViewBuilder {
 							"webview initialization failed"
 						);
 					})?
+			},
+			Engine::ChromiumCdp { endpoint, target } => {
+				remote::spawn(self.page, move |ctx| {
+					chromium::drive_attached(endpoint, target, FrameConfig {
+						width: config.width,
+						height: config.height,
+						..FrameConfig::default()
+					}, ctx)
+				})
+				.inspect_err(|error| {
+					tracing::warn!(
+						engine = %engine,
+						surface = "window",
+						error = error.kind(),
+						"attached webview initialization failed"
+					);
+				})?
 			},
 			Engine::Firefox { binary } => {
 				remote::spawn(self.page, move |ctx| firefox::drive_window(binary, config, ctx))

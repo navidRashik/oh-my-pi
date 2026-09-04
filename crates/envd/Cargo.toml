@@ -16,6 +16,7 @@ local-tts = ["omp-inference/local-tts"]
 [dependencies]
 async-stream.workspace = true
 async-trait.workspace = true
+arboard.workspace = true
 bytes.workspace = true
 flume.workspace = true
 futures.workspace = true

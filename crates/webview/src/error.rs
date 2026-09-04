@@ -32,6 +32,11 @@ pub enum Error {
 	#[error("engine connection closed")]
 	Closed,
 
+	/// Discovery of an existing CDP endpoint failed. The URL is intentionally
+	/// omitted from Display because it may carry relay credentials.
+	#[error("CDP endpoint discovery failed")]
+	CdpDiscovery(#[source] reqwest::Error),
+
 	/// The engine sent traffic the driver could not interpret, or answered a
 	/// command with an error.
 	#[error("protocol error: {0}")]
@@ -99,6 +104,7 @@ impl Error {
 			Self::NoEngine(_) => "no_engine",
 			Self::Launch { .. } => "launch",
 			Self::Closed => "closed",
+			Self::CdpDiscovery(_) => "cdp_discovery",
 			Self::Protocol(_) => "protocol",
 			Self::ScreencastFrameBase64 { .. } => "screencast_frame_base64",
 			Self::ScreenshotBase64 { .. } => "screenshot_base64",

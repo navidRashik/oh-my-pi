@@ -80,7 +80,9 @@ impl omp_tools::ask::AskVocalizer for AskVocalizer {
 				});
 			},
 			audio = self.backend.speak(request) => audio.map_err(|error| {
-				omp_tools::ask::Fault::Presenter { message: error.message }
+				omp_tools::ask::Fault::Presenter {
+					message: sf!("ask speech backend failed ({})", error.kind),
+				}
 			})?,
 		};
 		if audio.len() % 2 != 0 {
@@ -1416,7 +1418,7 @@ fn image_backend_fault(
 	MediaFault {
 		code:    error.code,
 		backend: Str::new(<&'static str>::from(provider)),
-		message: error.message,
+		message: sf!("the inference media request failed"),
 	}
 }
 

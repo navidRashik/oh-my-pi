@@ -1,6 +1,6 @@
 //! Builder option payloads shared across engine backends.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use omp_core::Str;
 
@@ -54,6 +54,10 @@ pub struct PageOptions {
 	pub profile:      Option<PathBuf>,
 	/// Allow opening the engine's devtools.
 	pub devtools:     bool,
+	/// Extra arguments for an owned remote browser process.
+	pub arguments:    Vec<Str>,
+	/// Upper bound for attaching to an existing automation endpoint.
+	pub connect_timeout: Option<Duration>,
 }
 
 /// Wire encoding for captured frames.

@@ -21,7 +21,10 @@ use std::{
 	fs,
 	io::Cursor,
 	path::{Path, PathBuf},
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	thread::{self, JoinHandle},
 	time::Duration,
 };
@@ -103,6 +106,9 @@ pub enum Command {
 pub struct DriverCtx {
 	/// Commands from the public handle; disconnect means shut down.
 	pub commands: Receiver<Command>,
+	/// Out-of-band forced-close signal observed even while a protocol call is
+	/// waiting for its reply.
+	pub cancelled: Arc<AtomicBool>,
 	/// Event sink towards the host.
 	pub events:   flume::Sender<WebViewEvent>,
 	/// Shared url/title cache to keep current.
@@ -116,19 +122,22 @@ pub struct DriverCtx {
 
 /// Handle side of a remote driver: command sender plus the driver thread.
 pub struct RemoteView {
-	commands: flume::Sender<Command>,
-	thread:   Option<JoinHandle<()>>,
+	commands:  flume::Sender<Command>,
+	cancelled: Arc<AtomicBool>,
+	thread:    Option<JoinHandle<()>>,
 }
 
 /// Cross-thread cancellation handle for a remote browser surface.
 #[derive(Clone)]
 pub struct CloseHandle {
-	commands: flume::Sender<Command>,
+	commands:  flume::Sender<Command>,
+	cancelled: Arc<AtomicBool>,
 }
 
 impl CloseHandle {
 	/// Request immediate bounded browser shutdown.
 	pub fn close(&self) -> Result<()> {
+		self.cancelled.store(true, Ordering::Release);
 		self
 			.commands
 			.send(Command::Close)
@@ -144,7 +153,10 @@ impl RemoteView {
 
 	/// Clone a cancellation-only handle.
 	pub fn close_handle(&self) -> CloseHandle {
-		CloseHandle { commands: self.commands.clone() }
+		CloseHandle {
+			commands:  self.commands.clone(),
+			cancelled: Arc::clone(&self.cancelled),
+		}
 	}
 }
 
@@ -170,13 +182,16 @@ where
 	F: FnOnce(DriverCtx) -> Fut + Send + 'static,
 	Fut: Future<Output = Result<()>>,
 {
+	let launch_timeout = page.connect_timeout.unwrap_or(LAUNCH_TIMEOUT);
 	let (cmd_tx, cmd_rx) = flume::unbounded();
+	let cancelled = Arc::new(AtomicBool::new(false));
 	let (evt_tx, evt_rx) = flume::unbounded();
 	let (ready_tx, ready_rx) = flume::bounded(1);
 	let state = SharedState::default();
 
 	let ctx = DriverCtx {
 		commands: cmd_rx,
+		cancelled: Arc::clone(&cancelled),
 		events: evt_tx.clone(),
 		state: Arc::clone(&state),
 		page,
@@ -205,8 +220,12 @@ where
 		})
 		.map_err(Error::Io)?;
 
-	match ready_rx.recv_timeout(LAUNCH_TIMEOUT) {
-		Ok(Ok(())) => Ok((RemoteView { commands: cmd_tx, thread: Some(thread) }, evt_rx, state)),
+	match ready_rx.recv_timeout(launch_timeout) {
+		Ok(Ok(())) => Ok((
+			RemoteView { commands: cmd_tx, cancelled, thread: Some(thread) },
+			evt_rx,
+			state,
+		)),
 		Ok(Err(err)) => {
 			let _ = thread.join();
 			Err(err)

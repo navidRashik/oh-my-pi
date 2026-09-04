@@ -12,6 +12,10 @@ use std::{
 	fs,
 	path::{Path, PathBuf},
 	process::Stdio,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::{Duration, Instant},
 };
 
@@ -60,8 +64,8 @@ const IPC_SHIM: &str = "window.ipc={postMessage:m=>window.__ompIpc(String(m))}";
 
 /// Drive a headless pixel-stream session; see the module docs.
 pub async fn drive_frames(binary: PathBuf, config: FrameConfig, ctx: DriverCtx) -> Result<()> {
-	let DriverCtx { commands, events, state, page, ready } = ctx;
-	match connect_frames(&binary, config, &page, events, state).await {
+	let DriverCtx { commands, cancelled, events, state, page, ready } = ctx;
+	match connect_frames(&binary, config, &page, events, state, cancelled).await {
 		Ok((cdp, child, profile)) => {
 			let _ = ready.send(Ok(()));
 			let result = cdp.run(commands, child).await;
@@ -77,8 +81,8 @@ pub async fn drive_frames(binary: PathBuf, config: FrameConfig, ctx: DriverCtx) 
 
 /// Drive a visible `--app` window session; see the module docs.
 pub async fn drive_window(binary: PathBuf, config: WindowConfig, ctx: DriverCtx) -> Result<()> {
-	let DriverCtx { commands, events, state, page, ready } = ctx;
-	match connect_window(&binary, config, &page, events, state).await {
+	let DriverCtx { commands, cancelled, events, state, page, ready } = ctx;
+	match connect_window(&binary, config, &page, events, state, cancelled).await {
 		Ok((cdp, child, profile)) => {
 			let _ = ready.send(Ok(()));
 			let result = cdp.run(commands, child).await;
@@ -92,6 +96,110 @@ pub async fn drive_window(binary: PathBuf, config: WindowConfig, ctx: DriverCtx)
 	}
 }
 
+/// Attach to one existing Chromium-compatible CDP page without taking
+/// ownership of either the browser process or the target.
+pub async fn drive_attached(
+	endpoint: Str,
+	target: Option<Str>,
+	config: FrameConfig,
+	ctx: DriverCtx,
+) -> Result<()> {
+	let DriverCtx { commands, cancelled, events, state, page, ready } = ctx;
+	match connect_attached(
+		&endpoint,
+		target.as_deref(),
+		config,
+		&page,
+		events,
+		state,
+		cancelled,
+	)
+	.await
+	{
+		Ok(cdp) => {
+			let _ = ready.send(Ok(()));
+			cdp.run_attached(commands).await
+		},
+		Err(err) => {
+			let _ = ready.send(Err(err));
+			Ok(())
+		},
+	}
+}
+
+async fn connect_attached(
+	endpoint: &str,
+	target_matcher: Option<&str>,
+	config: FrameConfig,
+	page: &PageOptions,
+	events: flume::Sender<WebViewEvent>,
+	state: SharedState,
+	cancelled: Arc<AtomicBool>,
+) -> Result<Cdp> {
+	let websocket = resolve_cdp_websocket(
+		endpoint,
+		page.connect_timeout.unwrap_or(Duration::from_secs(35)),
+	)
+	.await?;
+	let link = timeout(
+		page.connect_timeout.unwrap_or(Duration::from_secs(35)),
+		WsLink::connect(&websocket),
+	)
+	.await
+	.map_err(|_| Error::Timeout("connecting to the CDP endpoint"))??;
+	let mut cdp = Cdp::new(link, events, state, None, cancelled);
+	wire_attached(&mut cdp, target_matcher, config, page).await?;
+	Ok(cdp)
+}
+
+async fn resolve_cdp_websocket(endpoint: &str, connect_timeout: Duration) -> Result<Str> {
+	let endpoint = endpoint.trim().trim_end_matches('/');
+	if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+		return Ok(endpoint.to_str());
+	}
+	if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+		return Err(Error::Protocol(
+			"CDP endpoint must use http, https, ws, or wss".to_str(),
+		));
+	}
+	let mut discovery = url::Url::parse(endpoint)
+		.map_err(|_| Error::Protocol("invalid CDP endpoint URL".to_str()))?;
+	let base = discovery.path().trim_end_matches('/').to_owned();
+	discovery.set_path(&format!("{base}/json/version"));
+	let client = reqwest::Client::builder()
+		.timeout(connect_timeout.max(Duration::from_millis(1)))
+		.build()
+		.map_err(Error::CdpDiscovery)?;
+	let deadline = Instant::now() + connect_timeout;
+	loop {
+		if Instant::now() >= deadline {
+			return Err(Error::Timeout("waiting for the CDP endpoint"));
+		}
+		let response = client
+			.get(discovery.clone())
+			.send()
+			.await
+			.map_err(Error::CdpDiscovery)?;
+		if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+			&& Instant::now() < deadline
+		{
+			sleep(Duration::from_millis(250)).await;
+			continue;
+		}
+		let value = response
+			.error_for_status()
+			.map_err(Error::CdpDiscovery)?
+			.json::<Value>()
+			.await
+			.map_err(Error::CdpDiscovery)?;
+		return value
+			.get("webSocketDebuggerUrl")
+			.and_then(Value::as_str)
+			.map(Str::new)
+			.ok_or_else(|| Error::Protocol("CDP discovery omitted webSocketDebuggerUrl".to_str()));
+	}
+}
+
 /// Launch the browser, wire a headless screencast target, and hand back the
 /// live session with the child and its profile directory.
 async fn connect_frames(
@@ -100,11 +208,12 @@ async fn connect_frames(
 	page: &PageOptions,
 	events: flume::Sender<WebViewEvent>,
 	state: SharedState,
+	cancelled: Arc<AtomicBool>,
 ) -> Result<(Cdp, Child, ProfileDir)> {
 	let profile = resolve_profile(page)?;
 	let extra = ["--headless=new".to_str(), "about:blank".to_str()];
 	let (link, mut child) = connect(binary, profile.path(), page, &extra).await?;
-	let mut cdp = Cdp::new(link, events, state, Some(config));
+	let mut cdp = Cdp::new(link, events, state, Some(config), cancelled);
 	if let Err(err) = wire_frames(&mut cdp, config, page).await {
 		let _ = child.start_kill();
 		return Err(err);
@@ -120,6 +229,7 @@ async fn connect_window(
 	page: &PageOptions,
 	events: flume::Sender<WebViewEvent>,
 	state: SharedState,
+	cancelled: Arc<AtomicBool>,
 ) -> Result<(Cdp, Child, ProfileDir)> {
 	let profile = resolve_profile(page)?;
 	let initial = match (&page.url, &page.html) {
@@ -134,7 +244,7 @@ async fn connect_window(
 	extra.push(sf!("--window-size={},{}", config.width, config.height));
 	extra.push(sf!("--app={initial}"));
 	let (link, mut child) = connect(binary, profile.path(), page, &extra).await?;
-	let mut cdp = Cdp::new(link, events, state, None);
+	let mut cdp = Cdp::new(link, events, state, None, cancelled);
 	if let Err(err) = wire_window(&mut cdp, page).await {
 		let _ = child.start_kill();
 		return Err(err);
@@ -154,8 +264,11 @@ async fn connect(
 	let _ = fs::remove_file(profile.join("DevToolsActivePort"));
 	let mut child = spawn_browser(binary, profile, page, extra)?;
 	let connected = async {
-		let url = wait_devtools_port(profile).await?;
-		WsLink::connect(&url).await
+		let startup_timeout = page.connect_timeout.unwrap_or(STARTUP_TIMEOUT);
+		let url = wait_devtools_port(profile, startup_timeout).await?;
+		timeout(startup_timeout, WsLink::connect(&url))
+			.await
+			.map_err(|_| Error::Timeout("connecting to the owned browser"))?
 	}
 	.await;
 	match connected {
@@ -189,6 +302,9 @@ fn spawn_browser(
 	if let Some(ua) = &page.user_agent {
 		cmd.arg(&*sf!("--user-agent={ua}"));
 	}
+	for arg in &page.arguments {
+		cmd.arg(&**arg);
+	}
 	for arg in extra {
 		cmd.arg(&**arg);
 	}
@@ -202,9 +318,9 @@ fn spawn_browser(
 
 /// Poll `<profile>/DevToolsActivePort` until the browser publishes its
 /// debugging endpoint; line 1 is the port, line 2 the websocket path.
-async fn wait_devtools_port(profile: &Path) -> Result<Str> {
+async fn wait_devtools_port(profile: &Path, startup_timeout: Duration) -> Result<Str> {
 	let file = profile.join("DevToolsActivePort");
-	let deadline = Instant::now() + STARTUP_TIMEOUT;
+	let deadline = Instant::now() + startup_timeout;
 	loop {
 		if let Ok(text) = fs::read_to_string(&file) {
 			let mut lines = text.lines();
@@ -265,6 +381,68 @@ async fn wire_frames(cdp: &mut Cdp, config: FrameConfig, page: &PageOptions) -> 
 		}
 	}
 	last
+}
+
+/// Attach to the best existing page target. A matcher is compared against both
+/// title and URL; without one, the endpoint's first eligible page is adopted.
+async fn wire_attached(
+	cdp: &mut Cdp,
+	target_matcher: Option<&str>,
+	config: FrameConfig,
+	page: &PageOptions,
+) -> Result<()> {
+	let targets = cdp.browser("Target.getTargets", json!({})).await?;
+	let infos = targets
+		.get("targetInfos")
+		.and_then(Value::as_array)
+		.ok_or_else(|| Error::Protocol("getTargets: missing targetInfos".to_str()))?;
+	let eligible = |info: &&Value| {
+		if info.get("type").and_then(Value::as_str) != Some("page") {
+			return false;
+		}
+		let url = info.get("url").and_then(Value::as_str).unwrap_or_default();
+		if url.starts_with("devtools:") || url.starts_with("chrome-extension:") {
+			return false;
+		}
+		target_matcher.is_none_or(|matcher| {
+			url.contains(matcher)
+				|| info
+					.get("title")
+					.and_then(Value::as_str)
+					.is_some_and(|title| title.contains(matcher))
+		})
+	};
+	let info = infos
+		.iter()
+		.find(eligible)
+		.ok_or_else(|| Error::Protocol("no eligible CDP page matched the requested target".to_str()))?;
+	let target = info
+		.get("targetId")
+		.and_then(Value::as_str)
+		.ok_or_else(|| Error::Protocol("getTargets: missing targetId".to_str()))?
+		.to_str();
+	let url = info
+		.get("url")
+		.and_then(Value::as_str)
+		.unwrap_or_default()
+		.to_str();
+	let title = info
+		.get("title")
+		.and_then(Value::as_str)
+		.unwrap_or_default()
+		.to_str();
+	cdp.attach(target).await?;
+	wire_page(cdp, page).await?;
+	cdp.set_metrics(&config).await?;
+	{
+		let mut state = cdp.state.lock();
+		state.url = url;
+		state.title = title;
+	}
+	if let Some(url) = page.url.as_ref() {
+		cdp.cmd("Page.navigate", json!({ "url": &**url })).await?;
+	}
+	Ok(())
 }
 
 /// Find the `--app` window's page target, attach, and configure it.
@@ -384,6 +562,8 @@ struct Cdp {
 	closed:         bool,
 	/// A load finished; the main loop should re-read `document.title`.
 	title_dirty:    bool,
+	/// Out-of-band forced close observed while protocol calls are pending.
+	cancelled:      Arc<AtomicBool>,
 }
 
 impl Cdp {
@@ -393,6 +573,7 @@ impl Cdp {
 		events: flume::Sender<WebViewEvent>,
 		state: SharedState,
 		frame_cfg: Option<FrameConfig>,
+		cancelled: Arc<AtomicBool>,
 	) -> Self {
 		let frame_interval = frame_cfg
 			.and_then(|cfg| cfg.fps_cap)
@@ -413,6 +594,7 @@ impl Cdp {
 			last_pixels: None,
 			closed: false,
 			title_dirty: false,
+			cancelled,
 		}
 	}
 
@@ -455,10 +637,20 @@ impl Cdp {
 			msg["sessionId"] = json!(&*self.session);
 		}
 		self.link.send_json(&msg).await?;
+		let deadline = Instant::now() + CALL_TIMEOUT;
 		loop {
-			let reply = timeout(CALL_TIMEOUT, self.link.recv_json())
-				.await
-				.map_err(|_| Error::Timeout("waiting for a CDP reply"))??;
+			if self.cancelled.load(Ordering::Acquire) {
+				self.closed = true;
+				return Err(Error::Closed);
+			}
+			let remaining = deadline.saturating_duration_since(Instant::now());
+			if remaining.is_zero() {
+				return Err(Error::Timeout("waiting for a CDP reply"));
+			}
+			let reply = match timeout(remaining.min(Duration::from_millis(25)), self.link.recv_json()).await {
+				Ok(reply) => reply?,
+				Err(_) => continue,
+			};
 			let Some(reply) = reply else {
 				self.closed = true;
 				return Err(Error::Closed);
@@ -493,6 +685,9 @@ impl Cdp {
 	/// Pump commands and protocol traffic until the session ends.
 	async fn run(mut self, commands: Receiver<Command>, child: Child) -> Result<()> {
 		loop {
+			if self.cancelled.load(Ordering::Acquire) {
+				self.closed = true;
+			}
 			if self.closed {
 				// Target destroyed or socket gone: reap without protocol.
 				return self.shutdown(child).await;
@@ -512,6 +707,46 @@ impl Cdp {
 				},
 			}
 		}
+	}
+
+	/// Pump an attached target until the handle closes, then detach without
+	/// closing the foreign page or browser.
+	async fn run_attached(mut self, commands: Receiver<Command>) -> Result<()> {
+		loop {
+			if self.cancelled.load(Ordering::Acquire) {
+				self.closed = true;
+			}
+			if self.closed {
+				return Ok(());
+			}
+			if self.title_dirty {
+				self.refresh_title().await?;
+				continue;
+			}
+			tokio::select! {
+				cmd = commands.recv_async() => match cmd {
+					Ok(Command::Close) | Err(_) => return self.detach().await,
+					Ok(cmd) => self.handle_command(cmd).await?,
+				},
+				msg = self.link.recv_json() => match msg? {
+					Some(msg) => self.handle_event(&msg).await?,
+					None => self.closed = true,
+				},
+			}
+		}
+	}
+
+	async fn detach(&mut self) -> Result<()> {
+		if self.closed || self.session.is_empty() {
+			return Ok(());
+		}
+		let session = self.session.clone();
+		let _ = timeout(
+			CLOSE_TIMEOUT,
+			self.browser("Target.detachFromTarget", json!({ "sessionId": &*session })),
+		)
+		.await;
+		Ok(())
 	}
 
 	/// Politely close the browser, then reap the child within a bounded grace.

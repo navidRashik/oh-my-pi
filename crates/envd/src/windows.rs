@@ -19,6 +19,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
+	exec::ExecHost,
 	host_settings,
 	server::{ConnectionPolicy, EnvServer, EnvdError, ExtensionDataBinding},
 	workspace::WorkspaceHost,
@@ -204,7 +205,13 @@ pub(crate) async fn run(
 		});
 	}
 	let idle_timeout = Duration::from_secs(args.idle_timeout);
-	let idle = wait_idle(env_connection_rx, doc_connection_rx, 1, idle_timeout);
+	let idle = wait_idle(
+		env_connection_rx,
+		doc_connection_rx,
+		1,
+		idle_timeout,
+		server.process_host(),
+	);
 	tokio::pin!(idle);
 	tokio::select! {
 		() = process_shutdown.cancelled() => {
@@ -237,6 +244,7 @@ async fn wait_idle(
 	mut docs: Receiver<usize>,
 	reserved_docs: usize,
 	timeout: Duration,
+	processes: ExecHost,
 ) {
 	if timeout.is_zero() {
 		future::pending::<()>().await;
@@ -245,11 +253,14 @@ async fn wait_idle(
 	let mut env_open = true;
 	let mut docs_open = true;
 	loop {
-		while *env.borrow() != 0 || *docs.borrow() > reserved_docs {
+		while *env.borrow() != 0
+			|| *docs.borrow() > reserved_docs
+			|| processes.has_live_persistent_processes()
+		{
 			tokio::select! {
 				result = env.changed(), if env_open => env_open = result.is_ok(),
 				result = docs.changed(), if docs_open => docs_open = result.is_ok(),
-				else => std::future::pending::<()>().await,
+				() = time::sleep(Duration::from_millis(50)) => {},
 			}
 		}
 		let idle = time::sleep(timeout);
@@ -266,6 +277,11 @@ async fn wait_idle(
 				result = docs.changed(), if docs_open => {
 					docs_open = result.is_ok();
 					if *env.borrow() != 0 || *docs.borrow() > reserved_docs {
+						break;
+					}
+				},
+				() = time::sleep(Duration::from_millis(50)) => {
+					if processes.has_live_persistent_processes() {
 						break;
 					}
 				},

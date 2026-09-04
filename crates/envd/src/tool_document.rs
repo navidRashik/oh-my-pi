@@ -1,7 +1,7 @@
 //! `omp-tools` adapters over the app-owned document and blob hosts.
 
 use std::{
-	collections::{BTreeSet, HashSet},
+	collections::{BTreeMap, BTreeSet, HashSet},
 	fs::{self as std_fs, OpenOptions},
 	future::{Future, ready},
 	io, iter,
@@ -1573,15 +1573,21 @@ impl WriteDocuments for DocumentHost {
 		&self,
 		request: ResourceMutationRequest,
 	) -> Result<Option<ResourceMutationReceipt>, WriteCommitError> {
-		use super::tool_url::{host::write, vault::parse_resource};
+		use super::{
+			tool_url::{
+				host::write,
+				vault::{parse_resource, vault_fault, vault_url_fault},
+			},
+			vault::ObsidianOperation,
+		};
 		let Some(services) = self.resource_mutations() else {
 			return Ok(None);
 		};
 		let byte_len = request.content.len() as u64;
-		match request.capability {
+		let revision = match request.capability {
 			MutationCapability::Ssh => {
 				let Some(resource) = request.uri.strip_prefix("ssh://") else {
-					return Err(write_rejected("invalid SSH mutation URI".to_owned()));
+					return Err(write_rejected("invalid SSH mutation URI"));
 				};
 				let (alias, path) = ssh::parse_resource(resource.as_str())
 					.map_err(|fault| write_rejected(fault.message().clone()))?;
@@ -1589,32 +1595,132 @@ impl WriteDocuments for DocumentHost {
 					.ssh
 					.write(&alias, &path, request.content.as_bytes())
 					.await
-					.map_err(|error| write_rejected(error.to_string()))?;
+					.map_err(|error| write_rejected(Str::new(error.to_string())))?;
+				NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed)
 			},
 			MutationCapability::Vault => {
 				let Some(resource) = request.uri.strip_prefix("vault://") else {
-					return Err(write_rejected("invalid vault mutation URI".to_owned()));
+					return Err(write_rejected("invalid vault mutation URI"));
 				};
-				let resource = resource.as_str();
-				let resource = resource.split_once('?').map_or(resource, |(path, _)| path);
-				let (vault, path) =
-					parse_resource(resource).map_err(|fault| write_rejected(fault.message().clone()))?;
-				services
-					.vault
-					.write(&vault, &path, request.content.as_bytes(), 8 * 1024 * 1024)
-					.map_err(|error| write_rejected(error.to_string()))?;
+				let (resource, query) = resource
+					.split_once('?')
+					.map_or((resource.as_str(), None), |(resource, query)| (resource, Some(query)));
+				let parsed = parse_resource(resource)
+					.map_err(|error| write_rejected(vault_url_fault(error).message().clone()))?;
+				if parsed.directory {
+					return Err(write_rejected(
+						"vault:// writes require a file path without a trailing slash",
+					));
+				}
+				let operation = query
+					.map(|query| {
+						let params = url::form_urlencoded::parse(query.as_bytes())
+							.into_owned()
+							.collect::<BTreeMap<_, _>>();
+						let operation = params
+							.get("op")
+							.filter(|operation| !operation.is_empty())
+							.ok_or_else(|| write_rejected("vault:// query writes require an 'op' parameter"))?
+							.parse::<ObsidianOperation>()
+							.map_err(|_| write_rejected("unsupported vault:// write operation"))?;
+						Ok::<_, WriteCommitError>((operation, params))
+					})
+					.transpose()?;
+				match operation {
+					None => {
+						services
+							.vault
+							.write(
+								&parsed.vault,
+								&parsed.path,
+								request.content.as_bytes(),
+								8 * 1024 * 1024,
+							)
+							.await
+							.map_err(|error| write_rejected(vault_fault(error).message().clone()))?
+					},
+					Some((ObsidianOperation::Create, params)) => {
+						services
+							.vault
+							.obsidian_create(
+								&parsed.vault,
+								&parsed.path,
+								&request.content,
+								params.contains_key("overwrite"),
+							)
+							.await
+							.map_err(|error| write_rejected(vault_fault(error).message().clone()))?
+					},
+					Some((ObsidianOperation::Move, params)) => {
+						if !request.content.is_empty() {
+							return Err(write_rejected(
+								"vault://?op=move requires empty write content",
+							));
+						}
+						let destination = params
+							.get("to")
+							.filter(|value| !value.is_empty())
+							.ok_or_else(|| write_rejected("vault://?op=move requires a non-empty 'to' parameter"))?;
+						services
+							.vault
+							.obsidian_move(&parsed.vault, &parsed.path, destination)
+							.await
+							.map_err(|error| write_rejected(vault_fault(error).message().clone()))?
+					},
+					Some((ObsidianOperation::Delete, params)) => {
+						if !request.content.is_empty() {
+							return Err(write_rejected(
+								"vault://?op=delete requires empty write content",
+							));
+						}
+						services
+							.vault
+							.obsidian_delete(
+								&parsed.vault,
+								&parsed.path,
+								params.contains_key("permanent"),
+							)
+							.await
+							.map_err(|error| write_rejected(vault_fault(error).message().clone()))?
+					},
+					Some((ObsidianOperation::Open, params)) => {
+						if !request.content.is_empty() {
+							return Err(write_rejected(
+								"vault://?op=open requires empty write content",
+							));
+						}
+						services
+							.vault
+							.obsidian_open(
+								&parsed.vault,
+								&parsed.path,
+								params.contains_key("newtab"),
+							)
+							.await
+							.map_err(|error| write_rejected(vault_fault(error).message().clone()))?
+					},
+					Some((ObsidianOperation::Read | ObsidianOperation::Search, _)) => {
+						return Err(write_rejected(
+							"read-only Obsidian operations use Read, not Write",
+						));
+					},
+					Some((ObsidianOperation::Discover, _)) => {
+						return Err(write_rejected("unsupported vault:// write operation"));
+					},
+				}
 			},
 			MutationCapability::Attachment => return Ok(None),
 			MutationCapability::Host => {
 				write(&request.uri, request.content.to_string())
 					.await
-					.map_err(|error| write_rejected(error.to_string()))?;
+					.map_err(|error| write_rejected(Str::new(error.to_string())))?;
+				NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed)
 			},
-		}
+		};
 		Ok(Some(ResourceMutationReceipt {
 			canonical_uri: request.uri,
 			byte_len,
-			revision: NEXT_TRANSACTION.fetch_add(1, Ordering::Relaxed),
+			revision,
 		}))
 	}
 
@@ -2199,8 +2305,8 @@ async fn commit_conflict_content(
 	})
 }
 
-fn write_rejected(message: impl Into<String>) -> WriteCommitError {
-	WriteCommitError::Rejected(WriteFault::Document { message: Str::from(message.into()) })
+fn write_rejected(message: impl Into<Str>) -> WriteCommitError {
+	WriteCommitError::Rejected(WriteFault::Document { message: message.into() })
 }
 
 #[cfg(unix)]

@@ -2,6 +2,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
+use omp_cache::github_cache::GithubCachePolicy;
 use omp_con::{Ctx, Kv, Span, Value};
 use omp_core::{Duration, Str};
 use omp_tool::Effects;
@@ -156,6 +157,56 @@ omp_con::var! {
 		min: 1,
 		flags: archive,
 	};
+	/// Enables the persistent cache for rendered GitHub issue and pull-request views.
+	pub static SV_GITHUB_CACHE_ENABLED = sv_github_cache_enabled: bool {
+		default: true,
+		flags: archive,
+	};
+	/// Seconds during which a cached GitHub view is returned without a network refresh.
+	pub static SV_GITHUB_CACHE_SOFT_TTL_SEC = sv_github_cache_soft_ttl_sec: i64 {
+		default: 300,
+		min: 0,
+		flags: archive,
+	};
+	/// Seconds after which a cached GitHub view is discarded instead of used as stale fallback.
+	pub static SV_GITHUB_CACHE_HARD_TTL_SEC = sv_github_cache_hard_ttl_sec: i64 {
+		default: 604800,
+		min: 0,
+		flags: archive,
+	};
+}
+
+/// Typed GitHub cache policy resolved from the control context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GithubCacheSettings {
+	/// Whether reads and writes may use the persistent cache.
+	pub enabled:      bool,
+	/// Fresh-hit window in seconds.
+	pub soft_ttl_sec: u64,
+	/// Absolute retention window in seconds.
+	pub hard_ttl_sec: u64,
+}
+
+impl GithubCacheSettings {
+	/// Resolves the GitHub cache policy from archived convars.
+	#[must_use]
+	pub fn from_con(ctx: &Ctx) -> Self {
+		Self {
+			enabled:      SV_GITHUB_CACHE_ENABLED.get(ctx),
+			soft_ttl_sec: SV_GITHUB_CACHE_SOFT_TTL_SEC.get(ctx) as u64,
+			hard_ttl_sec: SV_GITHUB_CACHE_HARD_TTL_SEC.get(ctx) as u64,
+		}
+	}
+
+	/// Converts the resolved settings into the cache engine's typed policy.
+	#[must_use]
+	pub fn policy(self) -> GithubCachePolicy {
+		GithubCachePolicy::new(
+			self.enabled,
+			std::time::Duration::from_secs(self.soft_ttl_sec),
+			std::time::Duration::from_secs(self.hard_ttl_sec),
+		)
+	}
 }
 
 /// Tool exposure, timeout, and approval policy resolved from the control
@@ -236,7 +287,10 @@ pub struct ToolSettings {
 impl Default for ToolSettings {
 	fn default() -> Self {
 		Self {
-			enabled: BTreeMap::from([(Str::new_static("ast_grep"), false)]),
+			enabled: BTreeMap::from([
+				(Str::new_static("ast_grep"), false),
+				(Str::new_static("computer"), false),
+			]),
 			max_timeout: None,
 			edit_dialect: None,
 			edit_blackbox_path: None,
@@ -282,6 +336,9 @@ impl ToolSettings {
 		}
 		if !omp_tools::pi_settings::SV_AST_GREP_ENABLED.get(ctx) {
 			enabled.insert(Str::new_static("ast_grep"), false);
+		}
+		if !omp_tools::pi_settings::SV_COMPUTER_ENABLED.get(ctx) {
+			enabled.entry(Str::new_static("computer")).or_insert(false);
 		}
 		Self {
 			enabled,
@@ -504,8 +561,40 @@ mod tests {
 			enabled: BTreeMap::from([
 				(Str::new_static("eval"), false),
 				(Str::new_static("ast_grep"), false),
+				(Str::new_static("computer"), false),
 			]),
 			..ToolSettings::default()
+		});
+	}
+
+	#[test]
+	fn computer_is_disabled_by_default_and_can_be_enabled_per_session() {
+		let ctx = Ctx::new();
+		assert!(!ToolSettings::from_con(&ctx).enabled("computer"));
+		omp_tools::pi_settings::SV_COMPUTER_ENABLED
+			.set(&ctx, true)
+			.expect("enable computer");
+		assert!(ToolSettings::from_con(&ctx).enabled("computer"));
+	}
+
+	#[test]
+	fn github_cache_group_convars_reach_the_runtime_projection() {
+		let ctx = Ctx::new();
+		assert_eq!(GithubCacheSettings::from_con(&ctx), GithubCacheSettings {
+			enabled:      true,
+			soft_ttl_sec: 300,
+			hard_ttl_sec: 604_800,
+		});
+		ctx.run("sv_github_cache_enabled false")
+			.expect("cache enablement");
+		ctx.run("sv_github_cache_soft_ttl_sec 15")
+			.expect("soft TTL");
+		ctx.run("sv_github_cache_hard_ttl_sec 90")
+			.expect("hard TTL");
+		assert_eq!(GithubCacheSettings::from_con(&ctx), GithubCacheSettings {
+			enabled:      false,
+			soft_ttl_sec: 15,
+			hard_ttl_sec: 90,
 		});
 	}
 

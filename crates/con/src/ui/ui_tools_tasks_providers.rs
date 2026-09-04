@@ -97,8 +97,8 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Tools,
 		"Available Tools",
 		"Generate Image",
-		"Enable the generate_image tool (text-to-image generation and editing). Exposed as an xd:// \
-		 device when tools.xdev is on.",
+		"Enable the generate_image tool (text-to-image generation and editing). Exposed through dyn \
+		 when tools.dyn is on.",
 		UiWidget::Boolean,
 		None,
 		Identity
@@ -126,7 +126,7 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Tools,
 		"Available Tools",
 		"Computer",
-		"Enable the scriptable host-desktop control tool (screenshots, input, accessibility)",
+		"Enable the scriptable host-desktop eval prelude (screenshots, input, accessibility)",
 		UiWidget::Boolean,
 		None,
 		Identity
@@ -218,7 +218,7 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		Tools,
 		"Available Tools",
 		"Browser",
-		"Enable the browser tool for scripted Chromium automation (puppeteer)",
+		"Enable the browser eval prelude for scripted Chromium automation (Puppeteer)",
 		UiWidget::Boolean,
 		None,
 		Identity
@@ -343,7 +343,7 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		"Grep & Browser",
 		"Browser Relay",
 		"Drive your own Chrome tabs through the omp browser relay. Install the extension once (`omp \
-		 browser-relay install`); the relay server auto-starts when the browser tool needs it. \
+		 browser-relay install`); the relay server auto-starts when the browser prelude needs it. \
 		 Takes precedence over Browser CDP URL; set OMP_BROWSER_RELAY=0 or OMP_BROWSER_RELAY=1 to \
 		 override.",
 		UiWidget::Boolean,
@@ -425,6 +425,42 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		"Computer",
 		"Computer Screenshot Height",
 		"Maximum composite screenshot height in pixels",
+		UiWidget::ConfigOnly,
+		None,
+		Identity
+	),
+	ui!(
+		"github.cache.enabled",
+		"sv_github_cache_enabled",
+		Tools,
+		"GitHub",
+		"GitHub View Cache",
+		"Cache rendered issue/PR view output in ~/.omp/cache/github-cache.db so repeated reads are \
+		 free",
+		UiWidget::Boolean,
+		None,
+		Identity
+	),
+	ui!(
+		"github.cache.softTtlSec",
+		"sv_github_cache_soft_ttl_sec",
+		Tools,
+		"GitHub",
+		"GitHub Cache Soft TTL",
+		"Within this window, cached issue/PR view rows are returned directly (seconds; default 5 \
+		 minutes)",
+		UiWidget::ConfigOnly,
+		None,
+		Identity
+	),
+	ui!(
+		"github.cache.hardTtlSec",
+		"sv_github_cache_hard_ttl_sec",
+		Tools,
+		"GitHub",
+		"GitHub Cache Hard TTL",
+		"Past the soft TTL the cached row is returned and refreshed in the background; past the \
+		 hard TTL it is dropped (seconds; default 7 days)",
 		UiWidget::ConfigOnly,
 		None,
 		Identity
@@ -534,6 +570,25 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		]),
 		None,
 		Identity
+	),
+	ui!(
+		"inspect_image.timeoutMs",
+		"sv_inspect_image_timeout_ms",
+		Tools,
+		"Execution",
+		"Inspect Image Timeout",
+		"Per-request timeout for the inspect_image vision-model call, in milliseconds. A stalled \
+		 provider fails fast with a timeout error instead of blocking until manual abort. Set to 0 \
+		 to disable the timeout.",
+		UiWidget::Submenu(&[
+			UiOption::new("0", "Disabled", ""),
+			UiOption::new("60000", "1 minute", ""),
+			UiOption::new("120000", "2 minutes", ""),
+			UiOption::new("180000", "3 minutes", ""),
+			UiOption::new("300000", "5 minutes", "")
+		]),
+		None,
+		MillisecondsDuration
 	),
 	ui!(
 		"tools.intentTracing",
@@ -668,6 +723,18 @@ pub(super) const ENTRIES: &[UiSpec] = &[
 		"MCP Notification Debounce",
 		"Debounce window in milliseconds for MCP resource updates before injecting them into the \
 		 conversation",
+		UiWidget::ConfigOnly,
+		None,
+		Identity
+	),
+	ui!(
+		"extensionHandlers.toolCallTimeoutMs",
+		"ai_extension_handlers_tool_call_timeout_ms",
+		Tools,
+		"Extensions",
+		"Tool Call Handler Timeout (ms)",
+		"Positive finite active-work timeout for extension tool_call handlers; invalid values use \
+		 30000ms, and time awaiting OMP-owned dialogs does not count",
 		UiWidget::ConfigOnly,
 		None,
 		Identity
