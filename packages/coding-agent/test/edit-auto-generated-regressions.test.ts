@@ -417,7 +417,9 @@ function streamEditPreviewCall(filePath: string, diff: string): Agent["streamFn"
 			const finalMessage = createAssistantMessage([finalCall], "toolUse");
 			stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: finalCall, partial: finalMessage });
 			if (signal && !signal.aborted) {
-				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				const { promise, resolve } = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => resolve(), { once: true });
+				await promise;
 			}
 			// If the guard did not abort (e.g. streamingAbort off), complete normally.
 			stream.push({ type: "done", reason: "toolUse", message: finalMessage });
