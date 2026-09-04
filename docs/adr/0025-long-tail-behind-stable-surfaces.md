@@ -74,7 +74,10 @@ surface.** Neither MUST change the permanent roster after discovery.
 ## Status in omp
 
 **Partial.** Primary implementation: `crates/shell-builtins/src/dyn.rs`. `dyn` lists, documents,
-validates, and calls long-tail devices. The `image_gen@4` device in
+validates, and calls long-tail devices. `crates/envd/src/mcp/discovery.rs` composes native,
+Claude, Agent Plugins, Codex, Gemini, OpenCode, Cursor, Windsurf, VS Code, and standalone MCP
+sources with deterministic provider/scope precedence; reload re-runs discovery without changing
+the permanent model-facing roster. The `image_gen@4` device in
 `crates/envd/src/media_devices.rs` is mounted only through this surface and implements pi's
 structured generation/edit schema, configured/active/automatic provider ordering, bounded image
 inputs and outputs, typed provider-attempt updates and faults, cancellation, a three-minute
@@ -85,7 +88,12 @@ The `security_scan@2` device in `crates/tools/src/security_scan.rs` and
 `crates/envd/src/security_scan{.rs,/}` provides durable local and cloud scan lineage, exact
 credential selection, recursive public-export redaction, validated evidence, bounded cloud
 responses, cancellable operations, SARIF interchange, and isolated remediation worktrees through
-the generated `dyn` schema. Gap: Eval binding and terminal graphics passthrough remain unproved.
+the generated `dyn` schema. MCP mounts in `crates/envd/src/mcp/manager.rs` publish generation-fenced
+live tool/resource/prompt diffs into the same `dyn` catalog, recover failed startup and disconnected
+servers through bounded shared reconnects, persist and invalidate config-keyed tool definitions,
+buffer startup notifications, and expose setting-gated URI-debounced resource updates. MCP text
+results retain their Markdown presentation semantic while the shell writes identical source bytes
+for composition. Gap: Eval binding and terminal graphics passthrough remain unproved.
 
 ## References
 

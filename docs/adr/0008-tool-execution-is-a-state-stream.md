@@ -87,7 +87,12 @@ The element shape:
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/agent/src/dispatch.rs`. Tool calls stream through one versioned element and settle through the journal-first session API.
+**Implemented.** Primary implementation: `crates/agent/src/dispatch.rs`. Tool calls stream through one
+versioned element and settle through the journal-first session API. Authorization (committed args on
+`tool.call`, or `kernel=ready` after streaming), execution start (`kernel=started`), and the terminal
+result are separate ordered journal entries;
+the start marker replays as `execution-started=true`, so skipped sibling placeholders never claim
+effects while a forcibly terminated started call records uncertainty.
 
 ## References
 

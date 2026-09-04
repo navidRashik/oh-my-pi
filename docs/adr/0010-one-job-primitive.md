@@ -54,7 +54,16 @@ features independently or lack them.
 
 `crates/driver/src/subagent/workpool.rs` implements the work-pool observation producer without
 adding a second settlement path: real worker transitions are topology-authenticated, display-only
-events, while the aggregate result continues through the job board's atomic delivered marker.
+events. `crates/driver/src/subagent/{workpool_scheduler.rs,workpool_runtime.rs}` owns persistent
+worker selection, queueing, batches, dead-worker requeue, fresh-worker policy, and cancellation.
+Its aggregate is a normal `JobBoard` entry whose result keeps the atomic delivered marker;
+worker-job results remain internal while authenticated per-batch replies use the ordinary session
+mailbox. Each worker turn installs a child-local, batch-specific `yield@2` roster: one strict
+numbered key per stable item id, one incremental result per item, duplicate/unknown rejection, and
+journal-replayed assembly in authored item order before aggregate settlement. Eval-defined `@tool`
+registrations are sealed at that authenticated bridge boundary and installed into each worker's
+child-local registry; calls still flow through the ordinary tool dispatch, result, CAS spill, and
+cancellation path rather than a workpool-specific executor.
 
 ## References
 

@@ -66,7 +66,7 @@ extensions.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/inference/src/provider`. Provider infrastructure owns auth, codecs, routing, streaming, and typed errors.
+**Implemented.** Primary implementation: `crates/inference/src/provider`. Provider infrastructure owns auth, codecs, routing, streaming, and typed errors. Local and configured model discovery is implemented by `crates/inference/src/discovery`, the bounded `crates/envd/src/model_discovery.rs` HTTP authority, and driver-owned cache/catalog composition.
 
 ## References
 

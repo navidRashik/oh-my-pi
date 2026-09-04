@@ -94,7 +94,7 @@ capabilities, NEVER on model or provider names.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/catalog/src/compat/axes.rs`. The closed compatibility vocabulary is compiled with explicit precedence and conformance coverage.
+**Implemented.** Primary implementation: `crates/catalog/src/compat/axes.rs`. The closed compatibility vocabulary is compiled with explicit precedence and conformance coverage. Runtime rows from local and configured provider discovery pass through `omp_catalog::DiscoveryNormalizer`; endpoint protocol selection is typed configuration rather than URL/model-name inference.
 
 ## References
 

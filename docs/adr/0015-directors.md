@@ -104,7 +104,7 @@ MUST run on this public surface so holes in it cannot be ignored.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/agent/src/director.rs`. Director stacks, verdicts, slot arbitration, binds, and journal-derived state are implemented and covered by the ported acceptance suite.
+**Implemented.** Primary implementation: `crates/agent/src/director.rs`. Director stacks, verdicts, slot arbitration, binds, and journal-derived state are implemented and covered by the ported acceptance suite. Goal's Director retains ownership but yields on a prose-only candidate; `crates/app/src/chat_control.rs` revalidates the live session pause, Plan, and continuation-mode gates after pi's 800 ms idle boundary, then submits at most one hidden continuation as a distinct session turn. A continuation that itself yields prose without a tool call holds at idle until genuine user input or renewed Goal control re-arms it. Separately, `crates/agent/src/loop.rs` treats canonical `pause_turn` completions as non-terminal only at the mailbox-safe boundary, caps consecutive pause-only re-samples at eight, re-arms the cap after tool progress, yields to queued user input, and journals the eligibility decision on the originating assistant node for replay.
 
 ## References
 

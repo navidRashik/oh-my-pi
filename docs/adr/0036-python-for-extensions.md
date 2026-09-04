@@ -82,7 +82,32 @@ can actually terminate.
 
 ## Status in omp
 
-**Partial.** Primary implementation: `crates/py/src/lib.rs`. Embedded free-threaded CPython, Eval, Directors, and Components are implemented. Gap: complete `@remote` placement, scoped env handles, and spill diversion remain unproved.
+**Partial.** Primary implementation: `crates/py/src/lib.rs`. Embedded free-threaded CPython, Eval,
+Directors, Components, and manifest-sealed custom-message renderer callbacks are implemented.
+`crates/ext` and `crates/app/src/ext_cli` implement signed-index resolution, target-evaluated
+dependency markers, reproducible lock identity, TOFU/operator key decisions, exact capability
+grants, offline admission, integrity doctor checks, and kill-on-drop resolver/installer children;
+renderer results retain their exact extension/declaration/generation identity in the session tree.
+The supervised Eval child retains one owner-scoped namespace and asyncio runner, supports top-level
+await and typed MIME/display bundles, and resolves `output()` through authenticated
+journal-derived `agent://`/job projections plus the shared `artifact://sha256/` CAS; no session
+sidecar path enters the Python environment.
+`crates/driver/src/discovery/native.rs` admits only Python manifests and contained entry modules,
+contains package-local discovery/load errors, and projects manifest-sealed generated skills into
+the ordinary skill resolver. Portable Agent Plugins 1.0 packages are admitted only as contained,
+data-only skill/MCP resources by `crates/driver/src/discovery/skills.rs` and
+`crates/envd/src/mcp/discovery.rs`; their JavaScript/TypeScript hooks and tools are never executed.
+`crates/envd/src/exthost/{lifecycle.rs,extensions.rs}` and
+`crates/envd/src/worker.rs` own declaration freeze, activation, command/tool/hook/convar/
+Director/Component registration, and atomically retarget retained Python callbacks when a
+supervised child advances generation during crash recovery or hot reload. The authenticated eval bridge in
+`crates/envd/src/eval/bridge.rs` capability-gates `__workpool__`; the Python prelude exposes
+`workpool()`/`WorkPool` only while a live parent scheduler is bound, and binding retirement cancels
+its process-local pools. Eval cells can define typed, revisioned `@tool` handlers; an authenticated
+workpool creation seals their schema, opaque handler identity, namespace generation, and reset
+epoch, then worker calls execute in the owning retained eval process through the ordinary registry
+and cancellation/CAS path. No process-global tool roster exists. Gap: complete `@remote` placement,
+scoped env handles, and spill diversion remain unproved.
 
 ## References
 

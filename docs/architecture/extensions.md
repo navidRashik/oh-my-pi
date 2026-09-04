@@ -37,7 +37,13 @@ Dependency resolution is explicit and reproducible:
 4. `LockFile` version 2 records Python `==3.14.*`, ABI `cp314t`, targets, first-index order, exact extension roots, dependency closure, and frozen runtime distributions (`crates/ext/src/lock.rs`). `LockFile::validate_for` rejects a wrong layer, newer lock version, Python/ABI drift, non-first-index locks, duplicate ids, noncanonical features, and incomplete digest sets.
 5. `InstalledRecord` is local state and may contain development links. `omp.lock` is portable and never contains link sources. `package_snapshot` emits the verified site-tree and distribution envelope consumed before extension code starts; development sources deliberately return no reproducible package snapshot (`crates/ext/src/lock.rs`).
 
-A signed native install uses `materialize_signed_wheel` and `materialize_and_commit_generation` (`crates/app/src/ext_cli/mod.rs`, `crates/app/src/ext_cli/materialize.rs`). The wheel is fetched with a 256 MiB ceiling, checked again by byte length and both digests, unpacked by `uv --no-deps --no-index`, rejected if it contains symlinks or non-regular files, placed into the environment blob store, and committed as a generation.
+A signed native install uses `materialize_signed_wheel` and one batch-level
+`commit_generation` transaction (`crates/app/src/ext_cli/mod.rs`). The wheel is fetched into the
+configured cache with a 256 MiB ceiling, checked again by byte length and both digests, promoted
+atomically into the configured immutable store, unpacked by `uv --no-deps --no-index`, rejected if
+it contains symlinks or non-regular files, placed into the environment blob store, and committed as
+a generation only after every requested extension is prepared. Resolver and unpacker children are
+kill-on-drop, so Ctrl+C cannot leave an executing installer behind.
 
 ## Registry integrity and trust
 

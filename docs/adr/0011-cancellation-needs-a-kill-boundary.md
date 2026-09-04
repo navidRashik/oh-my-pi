@@ -65,9 +65,23 @@ unit's own verdict, then forcibly terminates and journals `Abort::EffectsUnknown
 `tool.result@1`. A cancelled turn is recorded in the tree (`msg.assistant.end@1 cancelled` when an
 assistant is open, then `<notice kind=warn>`), so the chat host derives "turn over" from the DOM.
 The pause hold in `crates/agent/src/loop.rs` continues servicing interrupt, session cancellation,
-rewind lifecycle, and job settlement instead of becoming an uncancellable wait.
+rewind lifecycle, and job settlement instead of becoming an uncancellable wait. Workpool-forwarded
+eval handlers execute back inside the retained killable eval process; the child's tool cancellation
+token interrupts that IPC request, and reset epochs plus namespace generations fence stale handlers.
+MCP transport execution in `crates/envd/src/mcp/{stdio,http,legacy_sse,timeout}.rs` applies the same
+contract: request and connection deadlines cover framing and body reads, transport shutdown cancels
+in-flight HTTP/SSE work, and stdio drop/close terminates and reaps the process tree with bounded
+TERM-to-KILL escalation. Tool-scoped aborts cancel only matching call scopes: calls that never
+crossed the journaled execution-start boundary settle as skipped placeholders, started calls that
+ignore the grace settle effects-unknown, and unrelated siblings continue. Inference-time scoped
+aborts label each retained call separately and commit placeholders in provider call order.
 Proof: `crates/agent/tests/dispatch.rs::interrupt_kills_a_running_shell_tool_and_settles_aborted`,
-`crates/agent/tests/cancel.rs`, `crates/e2e/tests/p7_tui.rs` (real PTY ctrl+c over a `sleep 30`).
+`crates/agent/tests/dispatch.rs::tool_scoped_abort_forces_only_the_selected_sibling_and_replays`,
+`crates/agent/tests/turn.rs::scoped_stream_abort_labels_siblings_in_call_order_and_replays`,
+`crates/agent/tests/cancel.rs`,
+`crates/envd/src/mcp/http.rs::tests::close_cancels_an_in_flight_http_exchange`,
+`crates/envd/src/mcp/stdio.rs::tests::close_terminates_descendant_process_group`, and
+`crates/e2e/tests/p7_tui.rs` (real PTY ctrl+c over a `sleep 30`).
 
 ## References
 

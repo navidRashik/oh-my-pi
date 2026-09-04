@@ -56,7 +56,7 @@ Everything between the wire and that turn is inference's job.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/inference/src/recovery`. Recovery and codec stages normalize vendor behavior into canonical `ChatEvent` turns.
+**Implemented.** Primary implementation: `crates/inference/src/recovery`. Recovery and codec stages normalize vendor behavior into canonical `ChatEvent` turns. Catalog-selected Harmony mitigation keeps the attempt behind the whole-attempt gate, repairs only exactly framed `analysis`/`final` channels, rejects provable unframed leakage with a bounded semantic retry, and carries typed recovery evidence through `turn.receipt@1` so replay observes the same audit record.
 
 ## References
 

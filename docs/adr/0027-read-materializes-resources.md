@@ -75,7 +75,7 @@ New resource kinds are added as projections behind `Read`, NEVER as new roster t
 
 ## Status in omp
 
-**Partial.** Primary implementation: `crates/tools/src/read.rs`. Read materializes local, internal, web, archive, SQLite, notebook, image, and structural resources. Device discovery is not a Read scheme: `dyn` owns it (0025).
+**Partial.** Primary implementation: `crates/tools/src/read.rs`. Read materializes local, internal, web, archive, SQLite, notebook, image, and structural resources. Focused image inspection is the optional `Read.question` path: local, archive-member, internal-URL, and HTTP(S) images become bounded blob parts plus a typed vision request for the active route, with metadata fallback when media is unavailable. `crates/tools/src/read/image.rs` bounds encoded bytes, decoded pixels, raster dimensions, and cached normalized output; `crates/chat/src/cards/read.rs` owns the combined Read/Inspect card. Device discovery is not a Read scheme: `dyn` owns it (0025).
 
 ## References
 
