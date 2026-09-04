@@ -134,7 +134,19 @@ interface ProjectDirClassification {
 	readonly stripped: string;
 }
 
-const PROJECT_DIR_CLASSIFICATIONS = new LRUCache<string, ProjectDirClassification>({ max: 32 });
+/**
+ * Freshness bound for cached path classifications. The status line paints
+ * many times per second, so caching collapses the per-frame `realpathSync`
+ * storm (issue #10826); the TTL lets a retargeted symlink/bind mount at the
+ * same path re-canonicalize within a few seconds instead of sticking until
+ * LRU eviction. Mirrors the short VCS-cache TTLs in `component.ts`.
+ */
+const PROJECT_DIR_CLASSIFICATION_TTL_MS = 5000;
+
+const PROJECT_DIR_CLASSIFICATIONS = new LRUCache<string, ProjectDirClassification>({
+	max: 32,
+	ttl: PROJECT_DIR_CLASSIFICATION_TTL_MS,
+});
 
 function classifyProjectDir(pwd: string): ProjectDirClassification {
 	const cached = PROJECT_DIR_CLASSIFICATIONS.get(pwd);
