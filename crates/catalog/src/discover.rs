@@ -11,14 +11,14 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	Availability, CatalogAlias, CatalogOverlay, CatalogOverlayBuilder, ChatCapabilities, ClassId,
-	ClassificationEvidence, ClassificationInput, ClassificationPhase, ContextStrategy,
-	DiscoveryPagination, DiscoverySpec, DiscoverySpecId, EffortTier, EvidenceConfidence,
-	ExactSelector, ExtendedContextMode, ModelAvailability, ModelCapabilities, ModelKey, ModelLimits,
-	ModelOverlay, ModelPatch, ModelProvenance, ModelSpec, OperationBits, OperationKind, Price,
-	PriceUnit, Pricing, ProvenanceKind, ProvenanceSource, ProviderDef, ProviderId, RouteDef,
-	RouteId, ScopedAlias, ThinkingEffort, ThinkingPolicyId, ThinkingRouting, WireModelId,
-	WirePolicyId, classify,
+	Availability, CatalogAlias, CatalogModelMetrics, CatalogOverlay, CatalogOverlayBuilder,
+	ChatCapabilities, ClassId, ClassificationEvidence, ClassificationInput, ClassificationPhase,
+	ContextStrategy, DiscoveryPagination, DiscoverySpec, DiscoverySpecId, EffortTier,
+	EvidenceConfidence, ExactSelector, ExtendedContextMode, ModelAvailability, ModelCapabilities,
+	ModelKey, ModelLimits, ModelOverlay, ModelPatch, ModelProvenance, ModelSpec, OperationBits,
+	OperationKind, Price, PriceUnit, Pricing, ProvenanceKind, ProvenanceSource, ProviderDef,
+	ProviderId, RouteDef, RouteId, ScopedAlias, ThinkingEffort, ThinkingPolicyId, ThinkingRouting,
+	WireModelId, WirePolicyId, classify,
 	classify::{strip_effort_lane, supports_dynamic_effort_siblings},
 };
 
@@ -526,6 +526,7 @@ impl DiscoveryNormalizer {
 				wire_policy,
 				context: self.defaults.context,
 				pricing: merge_declared_pricing(&self.defaults.pricing, &row.declared_pricing),
+				catalog_metrics: CatalogModelMetrics::default(),
 				availability: row.availability.unwrap_or(ModelAvailability::Unspecified),
 				provenance: ModelProvenance {
 					sources:          Box::new([declared, classified]),
@@ -1014,6 +1015,7 @@ mod tests {
 		let provider = ProviderDef {
 			id:                 ProviderId::from("provider"),
 			name:               sf!("Provider"),
+			default_model:      None,
 			auth:               Box::new([AuthSpecId::from("auth")]),
 			management:         ManagementCapabilities {
 				operations:        OperationBits::empty(),

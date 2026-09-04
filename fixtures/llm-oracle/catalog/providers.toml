@@ -901,6 +901,8 @@ auth = { type = "bearer", env = ["OMP_MINIMAX_CN_API_KEY"] }
 facets = ["chat"]
 
 [providers."amazon-bedrock"]
+name = "Amazon Bedrock"
+default_model = "us.anthropic.claude-opus-4-8"
 transport = "bedrock-converse"
 base_url = "https://bedrock-runtime.{region}.amazonaws.com"
 auth = { type = "aws-sig-v4" }
@@ -910,6 +912,8 @@ facets = ["chat"]
 compat = { "multiple_system_messages" = false, "max_tokens_field" = "max_tokens", "tool_strict_mode" = "none", "reasoning_wire_format" = "anthropic", "cache_control_format" = "anthropic", "image_encoding_format" = "anthropic_source", "tool_schema_flavor" = "anthropic", "stream_protocol" = "sse_events" }
 
 [providers."bedrock-mantle"]
+name = "Amazon Bedrock Mantle"
+default_model = "openai.gpt-5.6-terra"
 transport = "open-ai-responses"
 codec = "bedrock-mantle"
 base_url = "https://bedrock-mantle.{region}.api.aws/openai/v1"

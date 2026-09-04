@@ -11,8 +11,8 @@ use crate::{
 	capability::{OperationBits, OperationKind},
 	discover::DiscoveryDefaults,
 	id::{
-		AuthSpecId, CodecId, DiscoverySpecId, HeaderProfileId, OAuthSpecId, ProviderId, RouteId,
-		WirePolicyId,
+		AuthSpecId, CodecId, DiscoverySpecId, HeaderProfileId, ModelKey, OAuthSpecId, ProviderId,
+		RouteId, WirePolicyId,
 	},
 };
 
@@ -699,6 +699,8 @@ pub struct ProviderDef {
 	pub id:                 ProviderId,
 	/// Human-readable provider name.
 	pub name:               Str,
+	/// Provider-recommended default model selector.
+	pub default_model:      Option<ModelKey>,
 	/// Eligible authentication specifications in preference order.
 	pub auth:               Box<[AuthSpecId]>,
 	/// Provider account and management capabilities.

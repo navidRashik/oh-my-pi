@@ -1497,9 +1497,10 @@ pub fn bundled_source(origin: impl IntoStr, revision: Option<CatalogRevision>) -
 mod tests {
 	use super::*;
 	use crate::{
-		ChatCapabilities, CodecProfile, CodexTransportPreference, EndpointSpec, HeaderProfileId,
-		ManagementCapabilities, ModelProvenance, OperationBits, ReasoningCapabilities, RedirectTrust,
-		RegistryMapping, StructuredOutputBits, ToolCapabilities, TransportKind,
+		CatalogModelMetrics, ChatCapabilities, CodecProfile, CodexTransportPreference, EndpointSpec,
+		HeaderProfileId, ManagementCapabilities, ModelProvenance, OperationBits,
+		ReasoningCapabilities, RedirectTrust, RegistryMapping, StructuredOutputBits,
+		ToolCapabilities, TransportKind,
 	};
 
 	fn source(kind: ProvenanceKind, origin: &str) -> ProvenanceSource {
@@ -1516,6 +1517,7 @@ mod tests {
 		ProviderDef {
 			id:                 id.into(),
 			name:               id.into_str(),
+			default_model:      None,
 			auth:               Box::new([AuthSpecId::from("auth")]),
 			management:         ManagementCapabilities {
 				operations:        OperationBits::empty(),
@@ -1622,6 +1624,7 @@ mod tests {
 			wire_policy: WirePolicyId::from("wire"),
 			context: ContextStrategy::Replay,
 			pricing: Pricing::default(),
+			catalog_metrics: CatalogModelMetrics::default(),
 			availability: ModelAvailability::Available,
 			provenance: ModelProvenance {
 				sources:          Box::new([source(ProvenanceKind::Bundled, "base")]),

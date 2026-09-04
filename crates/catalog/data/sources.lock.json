@@ -1,11 +1,11 @@
 {
-  "schema_version": 1,
-  "source_digest": "550d2cf2aeb0a8ea234d800e1c14a05cd924e1c5478ee9d7c1c07cfd076e1095",
+  "schema_version": 2,
+  "source_digest": "f6c24b11d18bf036557645be6908f8838b64d54f14420aef36bcd20172ac2321",
   "inputs": [
     {
       "id": "catalog.models.compressed.v1",
       "path": "fixtures/llm-oracle/catalog/models.json.zst",
-      "sha256": "01b86b65c640016d1ffca87eb81716801ee40b1c0f9da5e0c8136f0bd42ad5cd",
+      "sha256": "7773227493fd11ffa3d33946735084321cfa87064f48ec6a8c8e10b9804dc3f0",
       "source": "oracle:catalog.models.compressed.v1"
     },
     {
@@ -71,7 +71,7 @@
     {
       "id": "catalog.providers.source.v1",
       "path": "fixtures/llm-oracle/catalog/providers.toml",
-      "sha256": "8313d9efda0ac9a11a0304fec7767d3530ff44bc62815afd1ec0ce30b610ac7b",
+      "sha256": "fdaf688fe55ca76297c550d43504b597bb7f944f82bb641f64cd8a819f012c31",
       "source": "oracle:catalog.providers.source.v1"
     },
     {

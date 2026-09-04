@@ -28,10 +28,10 @@ use crate::{
 };
 
 const MAGIC: &[u8; 8] = b"OMPLLCAT";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const HEADER_LEN: usize = 8 + 4 + 32 + 32 + 32;
 const EMBEDDED_BYTES: &[u8] = include_bytes!("../data/catalog.postcard");
-const OVERLAY_CACHE_SCHEMA: u32 = 1;
+const OVERLAY_CACHE_SCHEMA: u32 = 2;
 const BUNDLED_PROVIDERS: &str = include_str!("../../../fixtures/llm-oracle/catalog/providers.toml");
 const BUNDLED_OAUTH: &str = include_str!("../../../fixtures/llm-oracle/catalog/oauth.toml");
 
@@ -810,6 +810,20 @@ fn validate_catalog(catalog: &CompiledCatalog) -> Result<(), SnapshotError> {
 		|record| &record.id,
 		"discovery specs are not uniquely sorted",
 	)?;
+	for provider in &catalog.providers {
+		if let Some(default_model) = &provider.default_model
+			&& !catalog
+				.models
+				.iter()
+				.any(|model| &model.key == default_model)
+			&& !catalog
+				.aliases
+				.iter()
+				.any(|alias| alias.alias.as_str() == default_model.as_str())
+		{
+			return Err(SnapshotError::Invariant("provider default references an unknown model"));
+		}
+	}
 	for auth in &catalog.auth_specs {
 		if let Some(oauth) = &auth.oauth
 			&& catalog

@@ -35,8 +35,8 @@ use crate::{
 		OAuthSpecId, ProviderId, RouteId, ThinkingPolicyId, WireModelId, WirePolicyId,
 	},
 	model::{
-		ContextStrategy, EvidenceConfidence, ModelAvailability, ModelLimits, ModelProvenance,
-		ModelRemoteCompaction, ModelSpec, ProvenanceKind, ProvenanceSource,
+		CatalogModelMetrics, ContextStrategy, EvidenceConfidence, ModelAvailability, ModelLimits,
+		ModelProvenance, ModelRemoteCompaction, ModelSpec, ProvenanceKind, ProvenanceSource,
 	},
 	policy::{
 		ApplyPatchWireKind, CacheControlFormat, ComputerUseConfigSupport, ComputerUseWireSupport,
@@ -57,7 +57,7 @@ use crate::{
 	thinking::{ReasoningMode, ThinkingEffort, ThinkingMode, ThinkingPolicy, ThinkingRouting},
 };
 /// Schema version of reviewable normalized compiler output.
-pub const COMPILED_SCHEMA_VERSION: u32 = 1;
+pub const COMPILED_SCHEMA_VERSION: u32 = 2;
 /// An explicit opaque source-model property boundary.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -269,6 +269,12 @@ pub struct SourceModelRecord {
 	/// Typed pricing.
 	#[serde(default)]
 	pub cost: SourceCost,
+	/// Catalog-estimated intelligence score.
+	#[serde(default)]
+	pub int: Option<Number>,
+	/// Catalog-estimated output tokens per second.
+	#[serde(default)]
+	pub tps: Option<Number>,
 	/// Context window.
 	#[serde(default)]
 	pub context_window: Option<u64>,
@@ -878,6 +884,12 @@ pub enum SourceFacet {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceProviderRecord {
+	/// Human-readable provider name when identifier humanization is not exact.
+	#[serde(default)]
+	pub name:                  Option<Str>,
+	/// Provider-recommended default wire-model selector.
+	#[serde(default)]
+	pub default_model:         Option<Str>,
 	/// Source transport.
 	pub transport:             SourceTransport,
 	/// Additional wire protocols exposed at the primary base URL.
@@ -3143,6 +3155,10 @@ fn compile_providers(
 	let mut provider_policies = BTreeMap::new();
 	for (provider_key, source) in providers {
 		let provider_id = ProviderId::new(provider_key.clone());
+		let provider_name = source
+			.name
+			.clone()
+			.unwrap_or_else(|| humanize(&provider_key));
 		let auth = compile_auth(&source.auth, oauth_ids, None)?;
 		let auth_id = auth.id.clone();
 		auth_by_id.entry(auth_id.clone()).or_insert(auth);
@@ -3367,7 +3383,14 @@ fn compile_providers(
 		});
 		output.push(ProviderDef {
 			id: provider_id,
-			name: humanize(&provider_key),
+			name: provider_name,
+			default_model: source.default_model.as_ref().map(|model| {
+				ModelKey::new(if model.contains('/') {
+					model.clone()
+				} else {
+					Str::from(format!("{provider_key}/{model}"))
+				})
+			}),
 			auth: provider_auth_ids.into_boxed_slice(),
 			management: ManagementCapabilities {
 				operations: management_operations,
@@ -3961,6 +3984,20 @@ fn compile_models(
 				wire_policy: wire_policy_id,
 				context: ContextStrategy::Replay,
 				pricing,
+				catalog_metrics: CatalogModelMetrics {
+					intelligence_millionths:             first
+						.1
+						.int
+						.as_ref()
+						.map(decimal_metric_millionths)
+						.transpose()?,
+					output_tokens_per_second_millionths: first
+						.1
+						.tps
+						.as_ref()
+						.map(decimal_metric_millionths)
+						.transpose()?,
+				},
 				availability: ModelAvailability::Unspecified,
 				provenance: ModelProvenance {
 					sources:          provenance_sources.into_boxed_slice(),
@@ -5478,6 +5515,10 @@ fn decimal_nanos(number: &Number) -> Result<u64, CompileError> {
 fn decimal_millionths(number: &Number) -> Result<u64, CompileError> {
 	decimal_scaled(number, 6)
 }
+fn decimal_metric_millionths(number: &Number) -> Result<u32, CompileError> {
+	u32::try_from(decimal_millionths(number)?)
+		.map_err(|_| CompileError::Invariant(sf!("catalog metric is out of range")))
+}
 fn decimal_scaled(number: &Number, scale: usize) -> Result<u64, CompileError> {
 	let text = number.to_string();
 	if text.starts_with('-') {
@@ -6668,6 +6709,135 @@ facets = ["chat"]
 			mantle_route.endpoint.base_url.as_str(),
 			"https://bedrock-mantle.{region}.api.aws/openai/v1",
 		);
+	}
+
+	#[test]
+	fn aws_provider_inventory_and_accounting_matches_pi() {
+		let providers = include_str!("../../../fixtures/llm-oracle/catalog/providers.toml");
+		let models = include_bytes!("../../../fixtures/llm-oracle/catalog/models.json.zst");
+		let source = parse_oracle(providers, models).expect("AWS source inventory parses");
+		assert_eq!(source.models["amazon-bedrock"].len(), 149);
+		assert_eq!(source.models["bedrock-mantle"].len(), 5);
+
+		let bedrock_source = &source.providers["amazon-bedrock"];
+		assert_eq!(bedrock_source.facets, [SourceFacet::Chat]);
+		assert!(!bedrock_source.usage);
+		let bedrock_discovery = bedrock_source
+			.discovery
+			.as_ref()
+			.expect("Bedrock discovery source");
+		assert_eq!(bedrock_discovery.label.as_str(), "Amazon Bedrock");
+		assert!(!bedrock_discovery.authoritative);
+
+		let mantle_source = &source.providers["bedrock-mantle"];
+		assert_eq!(mantle_source.facets, [SourceFacet::Chat]);
+		assert!(!mantle_source.usage);
+		let mantle_discovery = mantle_source
+			.discovery
+			.as_ref()
+			.expect("Mantle discovery source");
+		assert_eq!(mantle_discovery.label.as_str(), "Amazon Bedrock Mantle");
+		assert!(mantle_discovery.authoritative);
+
+		let compiled = compile(source).expect("AWS source inventory compiles");
+		for (provider_id, name, default_model, auth_kinds, authoritative) in [
+			(
+				"amazon-bedrock",
+				"Amazon Bedrock",
+				"amazon-bedrock/us.anthropic.claude-opus-4-8",
+				[AuthSpecKind::AwsSigv4, AuthSpecKind::Bearer],
+				false,
+			),
+			(
+				"bedrock-mantle",
+				"Amazon Bedrock Mantle",
+				"bedrock-mantle/openai.gpt-5.6-terra",
+				[AuthSpecKind::Bearer, AuthSpecKind::AwsSigv4],
+				true,
+			),
+		] {
+			let provider = compiled
+				.providers
+				.iter()
+				.find(|candidate| candidate.id.as_str() == provider_id)
+				.expect("AWS provider");
+			assert_eq!(provider.name.as_str(), name);
+			assert_eq!(provider.default_model.as_ref().map(ModelKey::as_str), Some(default_model));
+			let actual_auth_kinds = provider
+				.auth
+				.iter()
+				.map(|id| {
+					compiled
+						.auth_specs
+						.iter()
+						.find(|auth| &auth.id == id)
+						.expect("AWS auth record")
+						.kind
+				})
+				.collect::<Vec<_>>();
+			assert_eq!(actual_auth_kinds, auth_kinds);
+			assert!(provider.management.supports(OperationKind::Auth));
+			assert!(provider.management.supports(OperationKind::DiscoverModels));
+			assert!(!provider.management.supports(OperationKind::Usage));
+			let route = compiled
+				.routes
+				.iter()
+				.find(|candidate| candidate.id == provider.routes[0])
+				.expect("AWS primary route");
+			let operations = route
+				.capability_limits
+				.operations
+				.expect("AWS route operations");
+			assert!(operations.contains_kind(OperationKind::Chat));
+			assert!(operations.contains_kind(OperationKind::Auth));
+			assert!(operations.contains_kind(OperationKind::DiscoverModels));
+			assert!(!operations.contains_kind(OperationKind::Usage));
+			let discovery = compiled
+				.discovery_specs
+				.iter()
+				.find(|discovery| Some(&discovery.id) == route.discovery.as_ref())
+				.expect("AWS discovery record");
+			assert_eq!(discovery.authoritative, authoritative);
+		}
+
+		for (model_id, prices) in [
+			("openai.gpt-5.4", [2_750_000_000, 16_500_000_000, 275_000_000, 0]),
+			("openai.gpt-5.5", [5_500_000_000, 33_000_000_000, 550_000_000, 0]),
+			("openai.gpt-5.6-luna", [220_000_000, 1_320_000_000, 22_000_000, 275_000_000]),
+			("openai.gpt-5.6-sol", [5_500_000_000, 33_000_000_000, 550_000_000, 6_880_000_000]),
+			("openai.gpt-5.6-terra", [2_200_000_000, 13_200_000_000, 220_000_000, 2_750_000_000]),
+		] {
+			let model_key = format!("bedrock-mantle/{model_id}");
+			let model = compiled
+				.models
+				.iter()
+				.find(|model| model.key.as_str() == model_key.as_str())
+				.expect("Mantle static model");
+			assert_eq!(model.availability, ModelAvailability::Unspecified);
+			assert_eq!(model.limits.context_window, Some(272_000));
+			assert_eq!(model.limits.maximum_output_tokens, Some(128_000));
+			assert_eq!(model.pricing.components.as_ref(), &[
+				Price { unit: PriceUnit::MtokInput, nanos_usd: prices[0] },
+				Price { unit: PriceUnit::MtokOutput, nanos_usd: prices[1] },
+				Price { unit: PriceUnit::MtokCacheRead, nanos_usd: prices[2] },
+				Price { unit: PriceUnit::MtokCacheWrite, nanos_usd: prices[3] },
+			]);
+		}
+
+		let deepseek = compiled
+			.models
+			.iter()
+			.find(|model| model.key.as_str() == "amazon-bedrock/deepseek.v3.2")
+			.expect("Bedrock DeepSeek model");
+		assert_eq!(deepseek.catalog_metrics.intelligence_millionths, Some(25_100_000));
+		assert_eq!(deepseek.catalog_metrics.output_tokens_per_second_millionths, None);
+		let nemotron = compiled
+			.models
+			.iter()
+			.find(|model| model.key.as_str() == "amazon-bedrock/nvidia.nemotron-nano-9b-v2")
+			.expect("Bedrock Nemotron model");
+		assert_eq!(nemotron.catalog_metrics.intelligence_millionths, Some(7_200_000));
+		assert_eq!(nemotron.catalog_metrics.output_tokens_per_second_millionths, Some(159_900_000));
 	}
 
 	#[test]
