@@ -30,6 +30,7 @@ from _omp import (
     LifecyclePhase,
     _interrupt,
     _principal_from_host,
+    _resource_receipt_from_host,
     _thread_id,
 )
 
@@ -43,6 +44,13 @@ from .limits import (
 )
 
 _MAX_PENDING = MAX_PENDING_EFFECTS
+_MAX_DISPATCH_PROGRESS_EVENTS = 1024
+_MAX_DISPATCH_PROGRESS_FRAME_BYTES = 1024 * 1024
+_MAX_DISPATCH_RESULT_BYTES = 256 * 1024 * 1024
+_DISPATCH_RESULT_CHUNK_BYTES = 512 * 1024
+_dispatch_progress: contextvars.ContextVar[Callable[[object], None] | None] = (
+    contextvars.ContextVar("omp_dispatch_progress", default=None)
+)
 _effects: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "omp_effects", default=None
 )
@@ -218,12 +226,17 @@ class Host:
             raise FrameTooLarge(size, MAX_FRAME_BYTES)
         return self._decode(self._read_exact(size))
 
-    def _write(self, value: dict[str, Any]) -> None:
+    def _write(
+        self,
+        value: dict[str, Any],
+        *,
+        limit: int = MAX_FRAME_BYTES,
+    ) -> None:
         raw = json.dumps(
             _json_value(value), separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
-        if len(raw) > MAX_FRAME_BYTES:
-            raise FrameTooLarge(len(raw), MAX_FRAME_BYTES)
+        if len(raw) > limit:
+            raise FrameTooLarge(len(raw), limit)
         framed = struct.pack("!I", len(raw)) + raw
         with self._lock:
             if self._closed:
@@ -240,6 +253,13 @@ class Host:
                     raise HostDisconnected("CONTROL channel disconnected")
                 offset += written
 
+    def _dispatch_authority(self, invocation: str) -> dict[str, Any]:
+        return {
+            "host_generation": self._host_generation,
+            "session_generation": self._session_generation,
+            "invocation": invocation,
+        }
+
     def _authority(self) -> dict[str, Any]:
         try:
             scope = _scope.current()
@@ -248,11 +268,7 @@ class Host:
                 "host_generation": self._host_generation,
                 "session_generation": self._session_generation,
             }
-        return {
-            "host_generation": self._host_generation,
-            "session_generation": self._session_generation,
-            "invocation": scope.invocation,
-        }
+        return self._dispatch_authority(scope.invocation)
 
     def effect(self, effect: dict[str, Any]) -> None:
         """Write one generation-fenced, non-correlated UI effect frame."""
@@ -283,6 +299,104 @@ class Host:
             {
                 "kind": "Instrument",
                 "body": {"event": event, "authority": self._authority()},
+            }
+        )
+
+    def _dispatch_progress_sink(
+        self,
+        correlation: int,
+        invocation: str,
+    ) -> Callable[[object], None]:
+        emitted = 0
+
+        def emit(update: object) -> None:
+            nonlocal emitted
+            if emitted >= _MAX_DISPATCH_PROGRESS_EVENTS:
+                raise ControlProtocolError(
+                    "progress_overflow",
+                    "dispatch emitted too many progress updates",
+                )
+            emitted += 1
+            self._write(
+                {
+                    "kind": "DispatchProgress",
+                    "correlation": correlation,
+                    "body": {
+                        "authority": self._dispatch_authority(invocation),
+                        "update": update,
+                    },
+                },
+                limit=_MAX_DISPATCH_PROGRESS_FRAME_BYTES,
+            )
+
+        return emit
+
+    def _write_dispatch_response(
+        self,
+        correlation: int,
+        invocation: str,
+        body: dict[str, Any],
+    ) -> None:
+        envelope = {
+            "kind": "DispatchResponse",
+            "correlation": correlation,
+            "body": body,
+        }
+        raw_envelope = json.dumps(
+            _json_value(envelope), separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        if len(raw_envelope) <= MAX_FRAME_BYTES:
+            self._write(envelope)
+            return
+        raw_body = json.dumps(
+            _json_value(body), separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        if len(raw_body) > _MAX_DISPATCH_RESULT_BYTES:
+            self._write(
+                {
+                    "kind": "DispatchResponse",
+                    "correlation": correlation,
+                    "body": {
+                        "error": {
+                            "code": "frame_too_large",
+                            "message": (
+                                f"dispatch result is {len(raw_body)} bytes; "
+                                f"limit is {_MAX_DISPATCH_RESULT_BYTES}"
+                            ),
+                            "retryable": False,
+                        }
+                    },
+                }
+            )
+            return
+        chunks = 0
+        for chunks, offset in enumerate(
+            range(0, len(raw_body), _DISPATCH_RESULT_CHUNK_BYTES),
+            start=1,
+        ):
+            self._write(
+                {
+                    "kind": "DispatchResultChunk",
+                    "correlation": correlation,
+                    "body": {
+                        "authority": self._dispatch_authority(invocation),
+                        "index": chunks - 1,
+                        "data": raw_body[
+                            offset : offset + _DISPATCH_RESULT_CHUNK_BYTES
+                        ],
+                    },
+                }
+            )
+        self._write(
+            {
+                "kind": "DispatchResponse",
+                "correlation": correlation,
+                "body": {
+                    "chunked": {
+                        "chunks": chunks,
+                        "bytes": len(raw_body),
+                    }
+                },
             }
         )
 
@@ -319,11 +433,17 @@ class Host:
             raise HostDisconnected("missing or invalid extension manifest bootstrap") from error
         if (
             not isinstance(modules_value, list)
+            or not modules_value
             or any(not isinstance(module, str) or not module for module in modules_value)
         ):
             raise HostDisconnected("declaration modules must be non-empty strings")
+        entry_path = os.environ.get("OMP_EXT_ENTRY_PATH")
         registry = importlib.import_module("omp._registry")
-        registry.bootstrap_extension_registry(manifest_json, modules_value)
+        registry.bootstrap_extension_registry(
+            manifest_json,
+            modules_value,
+            entry_path=entry_path,
+        )
 
     def current_session(self) -> Any:
         """Return the immutable Core-issued current-session snapshot."""
@@ -505,45 +625,9 @@ class Host:
                 or frame.body.get("session_generation") != self._session_generation
             ):
                 raise HostDisconnected("invalid or stale CONTROL resource receipt")
-            receipt = frame.body.get("receipt")
-            if not isinstance(receipt, dict):
-                raise HostDisconnected("CONTROL resource receipt must be an object")
-            quotas = receipt.get("quotas")
-            dropped = receipt.get("dropped")
-            if not isinstance(quotas, dict) or not isinstance(dropped, dict):
-                raise HostDisconnected("CONTROL resource receipt tables are malformed")
-            quota_rows: list[tuple[str, int, int, str | None]] = []
-            for name, status in quotas.items():
-                if (
-                    not isinstance(name, str)
-                    or not name
-                    or not isinstance(status, dict)
-                    or isinstance(status.get("limit"), bool)
-                    or not isinstance(status.get("limit"), int)
-                    or status["limit"] < 0
-                    or isinstance(status.get("used"), bool)
-                    or not isinstance(status.get("used"), int)
-                    or status["used"] < 0
-                    or (
-                        status.get("window") is not None
-                        and not isinstance(status.get("window"), str)
-                    )
-                ):
-                    raise HostDisconnected("CONTROL resource quota row is malformed")
-                quota_rows.append(
-                    (name, status["limit"], status["used"], status.get("window"))
-                )
-            dropped_rows: list[tuple[str, int]] = []
-            for name, count in dropped.items():
-                if (
-                    not isinstance(name, str)
-                    or not name
-                    or isinstance(count, bool)
-                    or not isinstance(count, int)
-                    or count < 0
-                ):
-                    raise HostDisconnected("CONTROL resource drop row is malformed")
-                dropped_rows.append((name, count))
+            quota_rows, dropped_rows = _resource_receipt_rows(
+                frame.body.get("receipt")
+            )
             native = importlib.import_module("_omp")
             native._set_resource_receipt(quota_rows, dropped_rows)
             return
@@ -634,6 +718,9 @@ class Host:
     ) -> None:
         invocation = str(authority.get("invocation") or f"dispatch:{correlation}")
         token = _scope.install(scope)
+        progress_token = _dispatch_progress.set(
+            self._dispatch_progress_sink(correlation, invocation)
+        )
         data_tokens: object | None = None
         try:
             if authority.get("data") is not None:
@@ -683,11 +770,10 @@ class Host:
             if data_tokens is not None:
                 env = importlib.import_module("omp.env")
                 env._reset_backend(data_tokens)
+            _dispatch_progress.reset(progress_token)
             _scope.reset(token)
         try:
-            self._write(
-                {"kind": "DispatchResponse", "correlation": correlation, "body": body}
-            )
+            self._write_dispatch_response(correlation, invocation, body)
         except HostDisconnected:
             pass
 
@@ -807,6 +893,70 @@ class Host:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def dispatch_update_sink() -> Callable[[object], None]:
+    """Return the live correlated update sink for the current device dispatch."""
+
+    sink = _dispatch_progress.get()
+    if sink is None:
+        raise RuntimeError("no live CONTROL device update sink")
+    return sink
+
+
+def emit_dispatch_update(value: object) -> None:
+    """Emit one bounded update before the current dispatch completion."""
+
+    dispatch_update_sink()(value)
+
+
+def _resource_receipt_rows(
+    receipt: object,
+) -> tuple[list[tuple[str, int, int, str | None]], list[tuple[str, int]]]:
+    if not isinstance(receipt, Mapping):
+        raise HostDisconnected("CONTROL resource receipt must be an object")
+    quotas = receipt.get("quotas")
+    dropped = receipt.get("dropped")
+    if not isinstance(quotas, Mapping) or not isinstance(dropped, Mapping):
+        raise HostDisconnected("CONTROL resource receipt tables are malformed")
+    quota_rows: list[tuple[str, int, int, str | None]] = []
+    for name, status in quotas.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(status, Mapping)
+            or isinstance(status.get("limit"), bool)
+            or not isinstance(status.get("limit"), int)
+            or status["limit"] < 0
+            or isinstance(status.get("used"), bool)
+            or not isinstance(status.get("used"), int)
+            or status["used"] < 0
+            or (
+                status.get("window") is not None
+                and not isinstance(status.get("window"), str)
+            )
+        ):
+            raise HostDisconnected("CONTROL resource quota row is malformed")
+        quota_rows.append(
+            (name, status["limit"], status["used"], status.get("window"))
+        )
+    dropped_rows: list[tuple[str, int]] = []
+    for name, count in dropped.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+        ):
+            raise HostDisconnected("CONTROL resource drop row is malformed")
+        dropped_rows.append((name, count))
+    return quota_rows, dropped_rows
+
+
+def _resource_receipt(receipt: object) -> object:
+    quota_rows, dropped_rows = _resource_receipt_rows(receipt)
+    return _resource_receipt_from_host(quota_rows, dropped_rows)
+
+
 def _generation(name: str) -> int:
     try:
         value = int(os.environ[name])
@@ -873,8 +1023,25 @@ def _freeze_registry_ack() -> dict[str, object]:
 async def _dispatch_lifecycle_activate(
     payload: Mapping[str, Any],
 ) -> None:
-    """Deliver extension_activate to every exact frozen local subscription."""
+    """Deliver activation to frozen hooks and the admitted entry callback."""
+
     payload = dict(payload)
+    cli_values = payload.get("cli_values", ())
+    if (
+        not isinstance(cli_values, Sequence)
+        or isinstance(cli_values, (str, bytes, bytearray))
+        or any(
+            not isinstance(row, Mapping)
+            or not isinstance(row.get("sink"), str)
+            or not row["sink"]
+            or "value" not in row
+            for row in cli_values
+        )
+    ):
+        raise ControlProtocolError(
+            "malformed_activation",
+            "extension activation CLI values are malformed",
+        )
     started_at_ms = payload.get("session_started_at")
     if isinstance(started_at_ms, int) and not isinstance(started_at_ms, bool):
         payload["session_started_at"] = datetime.datetime.fromtimestamp(
@@ -882,6 +1049,8 @@ async def _dispatch_lifecycle_activate(
         )
     registry = importlib.import_module("omp._registry").registry
     dispatch = importlib.import_module("omp.hooks")._dispatch_hook_callback
+    hook_payload = dict(payload)
+    hook_payload.pop("cli_values", None)
     definitions = sorted(
         (
             definition
@@ -899,8 +1068,26 @@ async def _dispatch_lifecycle_activate(
             "extension_activate",
             definition.phase,
             definition.handler.name,
-            payload,
+            hook_payload,
         )
+
+    try:
+        modules = json.loads(os.environ["OMP_EXT_DECLARATION_MODULES"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise HostDisconnected("extension activation entry module is unavailable") from error
+    if not isinstance(modules, list) or not modules or not isinstance(modules[0], str):
+        raise HostDisconnected("extension activation entry module is malformed")
+    entry = importlib.import_module(modules[0])
+    callback = getattr(entry, "extension_activate", None)
+    if callback is None:
+        return
+    if not callable(callback):
+        raise TypeError("entry extension_activate attribute is not callable")
+    from . import Context
+
+    result = callback(payload, Context.current())
+    if inspect.isawaitable(result):
+        await result
 
 
 def _builtin_dispatch(operation: str) -> DispatchHandler | None:
@@ -916,7 +1103,7 @@ def _builtin_dispatch(operation: str) -> DispatchHandler | None:
         "omp.extensions.component.apply": (
             "omp.extensions", "_dispatch_component_apply"
         ),
-        "omp.devices.call": ("omp.devices", "_dispatch_device"),
+        "omp.devices.call": ("omp._registry", "dispatch_device_control"),
         "omp.prompts.render": ("omp._registry", "dispatch_prompt_slot"),
         "omp.ui.completion": ("omp.ui", "_dispatch_completion"),
         "omp.ui.command_completion": ("omp.ui", "_dispatch_command_completion"),
@@ -1027,9 +1214,15 @@ def _remote_error(value: object) -> BaseException:
         return DeadlineExceeded(detail_map.get("deadline", message))
     if code == "QuotaExceeded":
         omp = importlib.import_module("omp")
+        receipt_value = detail_map.get("receipt")
+        receipt = (
+            _resource_receipt(receipt_value)
+            if isinstance(receipt_value, Mapping)
+            else None
+        )
         return omp.QuotaExceeded(
             str(detail_map.get("quota", message)),
-            omp.resources(),
+            receipt,
         )
     if code == "permission_denied":
         from . import PermissionDenied

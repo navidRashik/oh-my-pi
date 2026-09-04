@@ -56,6 +56,8 @@ pub const PACKAGE_SNAPSHOT_ENV: &str = "OMP_EXT_PACKAGE_SNAPSHOT";
 pub const MANIFEST_SNAPSHOT_ENV: &str = "OMP_EXT_MANIFEST_SNAPSHOT";
 /// Environment variable carrying manifest-ordered declaration modules as JSON.
 pub const DECLARATION_MODULES_ENV: &str = "OMP_EXT_DECLARATION_MODULES";
+/// Environment variable carrying the operator-admitted exact entry file.
+pub const ENTRY_PATH_ENV: &str = "OMP_EXT_ENTRY_PATH";
 
 /// One captured child output fragment.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,8 +87,12 @@ pub struct SpawnSpec {
 	pub executable:          PathBuf,
 	/// Per-extension Python site tree.
 	pub python_site:         PathBuf,
+	/// Exact operator-admitted entry file loaded before symbolic imports.
+	pub entry_path:          Option<PathBuf>,
 	/// Scoped Environment DATA socket.
 	pub env_socket:          PathBuf,
+	/// Authoritative extension process working directory.
+	pub current_dir:         Option<PathBuf>,
 	/// Optional workspace root granted to declared local callback sinks.
 	pub workspace_root:      Option<PathBuf>,
 	/// Generation assigned to this newly spawned child.
@@ -528,6 +534,9 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 			sandbox.allow_read(&spec.executable)?;
 			allow_loaded_runtime_images(&mut sandbox, &spec.executable)?;
 			sandbox.allow_read(&spec.python_site)?;
+			if let Some(entry_path) = &spec.entry_path {
+				sandbox.allow_read(entry_path)?;
+			}
 			sandbox.set_write(WriteMode::Scoped);
 			sandbox.allow_write(&env_socket)?;
 			if let Some(root) = &spec.workspace_root {
@@ -577,7 +586,12 @@ pub async fn spawn(spec: SpawnSpec) -> Result<SpawnedHost, SpawnError> {
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
 		.kill_on_drop(true);
-	if let Some(root) = &spec.workspace_root {
+	if let Some(entry_path) = &spec.entry_path {
+		command.env(ENTRY_PATH_ENV, entry_path);
+	} else {
+		command.env_remove(ENTRY_PATH_ENV);
+	}
+	if let Some(root) = &spec.current_dir {
 		command.current_dir(root);
 	}
 	if let Some(snapshot) = &spec.package_snapshot {
@@ -781,7 +795,9 @@ mod tests {
 			key:                 HostKey::new("workspace", "unknown", "fixture"),
 			executable:          PathBuf::from("/definitely/not/an/executable"),
 			python_site:         PathBuf::from("/definitely/not/a/site"),
+			entry_path:          None,
 			env_socket:          PathBuf::from("/definitely/not/a/socket"),
+			current_dir:         None,
 			workspace_root:      None,
 			host_generation:     1,
 			session_generation:  1,

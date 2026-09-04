@@ -7,11 +7,11 @@
 use std::{
 	convert::Infallible,
 	io::{Read as _, Write as _},
-	net::{SocketAddr, TcpListener as StdTcpListener, TcpStream, ToSocketAddrs as _},
+	net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener, TcpStream},
 	path::{Path, PathBuf},
 	sync::{
 		Arc,
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicUsize, Ordering},
 	},
 	thread,
 	time::{Duration, Instant},
@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::{
+	io::AsyncReadExt as _,
 	net::TcpListener,
 	sync::{Semaphore, oneshot},
 	time,
@@ -53,12 +54,20 @@ const MAX_PARALLEL_SOCKET_RPCS: usize = 16;
 const DEFAULT_GROUP_TITLE: &str = "omp";
 const DEFAULT_GROUP_COLOR: &str = "cyan";
 const DEFAULT_PORT: u16 = 9224;
+const LEASE_PATH: &str = "/__omp/browser-relay/lease";
+const LEASE_PROTOCOL: &str = "omp-browser-relay-lease";
 
 /// Native relay startup and extension-installation failure.
 #[derive(Debug, Error)]
 pub enum RelayError {
+	/// A non-loopback bind address was rejected.
+	#[error("browser relay bind address must be loopback, got {address}")]
+	NonLoopbackBind {
+		/// Rejected bind address.
+		address: IpAddr,
+	},
 	/// The loopback listener could not be created.
-	#[error("browser relay could not bind 127.0.0.1:{port}")]
+	#[error("browser relay could not bind loopback port {port}")]
 	Bind {
 		/// Requested loopback port.
 		port:   u16,
@@ -116,6 +125,8 @@ impl RelayError {
 /// Relay server configuration.
 #[derive(Clone, Debug)]
 pub struct RelayOptions {
+	/// Loopback address accepting relay connections.
+	pub bind:    IpAddr,
 	/// Loopback TCP port.
 	pub port:    u16,
 	/// Optional shared secret required by `/ext`.
@@ -124,11 +135,20 @@ pub struct RelayOptions {
 	pub group:   bool,
 	/// Emits protocol lifecycle diagnostics through tracing.
 	pub verbose: bool,
+	/// Exits the server after its last machine-global consumer lease closes.
+	pub managed: bool,
 }
 
 impl Default for RelayOptions {
 	fn default() -> Self {
-		Self { port: DEFAULT_PORT, token: None, group: true, verbose: false }
+		Self {
+			bind:    IpAddr::V4(Ipv4Addr::LOCALHOST),
+			port:    DEFAULT_PORT,
+			token:   None,
+			group:   true,
+			verbose: false,
+			managed: false,
+		}
 	}
 }
 
@@ -136,6 +156,7 @@ impl Default for RelayOptions {
 pub struct RelayServer {
 	port:     u16,
 	bridge:   Arc<RelayBridge>,
+	leases:   Arc<RelayLeaseState>,
 	shutdown: CancellationToken,
 	thread:   Option<thread::JoinHandle<()>>,
 }
@@ -143,12 +164,19 @@ pub struct RelayServer {
 impl RelayServer {
 	/// Binds and starts a native relay service on the loopback interface.
 	pub fn start(options: RelayOptions) -> Result<Self, RelayError> {
-		let address = SocketAddr::from(([127, 0, 0, 1], options.port));
+		if !options.bind.is_loopback() {
+			return Err(RelayError::NonLoopbackBind { address: options.bind });
+		}
+		let address = SocketAddr::new(options.bind, options.port);
 		let listener = StdTcpListener::bind(address)
 			.map_err(|source| RelayError::Bind { port: options.port, source })?;
+		let port = listener
+			.local_addr()
+			.map_err(|source| RelayError::Bind { port: options.port, source })?
+			.port();
 		listener
 			.set_nonblocking(true)
-			.map_err(|source| RelayError::Bind { port: options.port, source })?;
+			.map_err(|source| RelayError::Bind { port, source })?;
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_all()
 			.build()
@@ -159,17 +187,25 @@ impl RelayServer {
 		};
 		let bridge = Arc::new(RelayBridge::new(options.group, options.verbose));
 		let shutdown = CancellationToken::new();
+		let leases = Arc::new(RelayLeaseState::new(options.managed, shutdown.clone()));
 		let service_bridge = Arc::clone(&bridge);
+		let service_leases = Arc::clone(&leases);
 		let service_shutdown = shutdown.clone();
 		let token = options.token.filter(|token| !token.is_empty());
-		let port = options.port;
 		let thread = thread::Builder::new()
 			.name("omp-browser-relay".to_owned())
 			.spawn(move || {
-				runtime.block_on(serve(listener, port, token, service_bridge, service_shutdown));
+				runtime.block_on(serve(
+					listener,
+					port,
+					token,
+					service_bridge,
+					service_leases,
+					service_shutdown,
+				));
 			})
 			.map_err(RelayError::Thread)?;
-		Ok(Self { port, bridge, shutdown, thread: Some(thread) })
+		Ok(Self { port, bridge, leases, shutdown, thread: Some(thread) })
 	}
 
 	/// Bound loopback port.
@@ -182,6 +218,23 @@ impl RelayServer {
 	#[must_use]
 	pub fn ready(&self) -> bool {
 		self.bridge.ready.load(Ordering::Acquire)
+	}
+
+	/// True while at least one machine-global consumer lease is connected.
+	#[must_use]
+	pub fn has_consumer_lease(&self) -> bool {
+		self.leases.active.load(Ordering::Acquire) > 0
+	}
+
+	/// True after the final managed consumer lease requested shutdown.
+	#[must_use]
+	pub fn managed_shutdown_requested(&self) -> bool {
+		self.leases.managed_shutdown_requested()
+	}
+
+	/// Waits until the final managed consumer lease closes.
+	pub async fn wait_for_managed_shutdown(&self) {
+		self.shutdown.cancelled().await;
 	}
 
 	/// Stops the listener and all websocket connections.
@@ -219,6 +272,148 @@ impl Drop for RelayServer {
 	}
 }
 
+struct RelayLeaseState {
+	managed:  bool,
+	active:   AtomicUsize,
+	acquired: AtomicBool,
+	shutdown: CancellationToken,
+}
+
+impl RelayLeaseState {
+	fn new(managed: bool, shutdown: CancellationToken) -> Self {
+		Self { managed, active: AtomicUsize::new(0), acquired: AtomicBool::new(false), shutdown }
+	}
+
+	fn acquire(self: &Arc<Self>) -> RelayLeaseGuard {
+		self.active.fetch_add(1, Ordering::AcqRel);
+		self.acquired.store(true, Ordering::Release);
+		RelayLeaseGuard { state: Arc::clone(self) }
+	}
+
+	fn managed_shutdown_requested(&self) -> bool {
+		self.managed
+			&& self.acquired.load(Ordering::Acquire)
+			&& self.active.load(Ordering::Acquire) == 0
+	}
+}
+
+struct RelayLeaseGuard {
+	state: Arc<RelayLeaseState>,
+}
+
+impl Drop for RelayLeaseGuard {
+	fn drop(&mut self) {
+		if self.state.active.fetch_sub(1, Ordering::AcqRel) == 1 && self.state.managed {
+			self.state.shutdown.cancel();
+		}
+	}
+}
+
+/// A machine-global relay consumer lease.
+///
+/// Dropping the lease only closes its private loopback connection. It never
+/// signals or kills the relay process.
+#[derive(Debug)]
+pub struct RelayLease {
+	_stream: TcpStream,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RelayEndpoint {
+	pub(crate) host:      String,
+	pub(crate) port:      u16,
+	pub(crate) base_path: String,
+	pub(crate) addresses: Vec<SocketAddr>,
+	pub(crate) auto_bind: Option<IpAddr>,
+	pub(crate) token:     Option<String>,
+}
+
+pub(crate) fn parse_relay_endpoint(endpoint: &str) -> Option<RelayEndpoint> {
+	let url = url::Url::parse(endpoint).ok()?;
+	if url.scheme() != "http" {
+		return None;
+	}
+	let port = url.port_or_known_default()?;
+	let (host, auto_bind) = match url.host()? {
+		url::Host::Domain(host) => (
+			host.to_owned(),
+			host
+				.eq_ignore_ascii_case("localhost")
+				.then_some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+		),
+		url::Host::Ipv4(address) => {
+			(address.to_string(), address.is_loopback().then_some(IpAddr::V4(address)))
+		},
+		url::Host::Ipv6(address) => {
+			(address.to_string(), address.is_loopback().then_some(IpAddr::V6(address)))
+		},
+	};
+	let addresses = url.socket_addrs(|| None).ok()?;
+	if addresses.is_empty() {
+		return None;
+	}
+	let base_path = url.path().trim_end_matches('/').to_owned();
+	let token = url
+		.query_pairs()
+		.find_map(|(key, value)| (key == "token").then(|| value.into_owned()));
+	Some(RelayEndpoint { host, port, base_path, addresses, auto_bind, token })
+}
+
+/// Acquires and holds a machine-global consumer lease from a native relay.
+///
+/// `None` means the endpoint was unreachable or is not an OMP native relay.
+#[must_use]
+pub fn acquire_relay_lease(endpoint: &str, timeout: Duration) -> Option<RelayLease> {
+	let endpoint = parse_relay_endpoint(endpoint)?;
+	endpoint.addresses.iter().find_map(|address| {
+		acquire_relay_lease_address(
+			*address,
+			&endpoint.host,
+			endpoint.port,
+			&endpoint.base_path,
+			timeout,
+		)
+	})
+}
+
+pub(crate) fn acquire_relay_lease_address(
+	address: SocketAddr,
+	host: &str,
+	port: u16,
+	base_path: &str,
+	timeout: Duration,
+) -> Option<RelayLease> {
+	let mut stream = TcpStream::connect_timeout(&address, timeout).ok()?;
+	stream.set_read_timeout(Some(timeout)).ok()?;
+	stream.set_write_timeout(Some(timeout)).ok()?;
+	let authority = relay_authority(host, port);
+	let request = format!(
+		"GET {base_path}{LEASE_PATH} HTTP/1.1\r\nHost: {authority}\r\nConnection: \
+		 Upgrade\r\nUpgrade: {LEASE_PROTOCOL}\r\n\r\n"
+	);
+	stream.write_all(request.as_bytes()).ok()?;
+	let mut response = [0_u8; 1024];
+	let mut read = 0;
+	while read < response.len()
+		&& !response[..read]
+			.windows(4)
+			.any(|bytes| bytes == b"\r\n\r\n")
+	{
+		let count = stream.read(&mut response[read..]).ok()?;
+		if count == 0 {
+			return None;
+		}
+		read += count;
+	}
+	let response = &response[..read];
+	if !response.starts_with(b"HTTP/1.1 101") && !response.starts_with(b"HTTP/1.0 101") {
+		return None;
+	}
+	stream.set_read_timeout(None).ok()?;
+	stream.set_write_timeout(None).ok()?;
+	Some(RelayLease { _stream: stream })
+}
+
 /// Writes the four embedded Chrome extension assets and returns their
 /// directory.
 pub fn install_extension(dir: Option<&Path>) -> Result<PathBuf, RelayError> {
@@ -248,60 +443,85 @@ pub fn install_extension(dir: Option<&Path>) -> Result<PathBuf, RelayError> {
 /// variables.
 #[must_use]
 pub fn probe_relay_server(endpoint: &str) -> bool {
-	let Ok(url) = url::Url::parse(endpoint) else {
+	let Some(endpoint) = parse_relay_endpoint(endpoint) else {
 		return false;
 	};
-	let Some(host) = url.host_str() else {
-		return false;
-	};
-	let Some(port) = url.port_or_known_default() else {
-		return false;
-	};
-	let Ok(mut addresses) = (host, port).to_socket_addrs() else {
-		return false;
-	};
-	addresses.any(|address| probe_relay_address(address, host, port))
+	endpoint.addresses.iter().any(|address| {
+		matches!(
+			probe_relay_status_with_timeout(
+				*address,
+				&endpoint.host,
+				endpoint.port,
+				&endpoint.base_path,
+				Duration::from_millis(1_500),
+			),
+			Some(200 | 503)
+		)
+	})
 }
 
-pub(crate) fn probe_relay_address(address: SocketAddr, host: &str, port: u16) -> bool {
-	probe_relay_address_with_timeout(address, host, port, Duration::from_millis(1_500))
-}
-
-pub(crate) fn probe_relay_address_with_timeout(
+pub(crate) fn probe_relay_ready_address_with_timeout(
 	address: SocketAddr,
 	host: &str,
 	port: u16,
+	base_path: &str,
 	timeout: Duration,
 ) -> bool {
-	let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
-		return false;
-	};
-	let _ = stream.set_read_timeout(Some(timeout));
-	let _ = stream.set_write_timeout(Some(timeout));
-	let authority = if host.contains(':') {
-		format!("[{host}]:{port}")
-	} else {
-		format!("{host}:{port}")
-	};
-	let request =
-		format!("GET /json/version HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
-	if stream.write_all(request.as_bytes()).is_err() {
-		return false;
-	}
+	probe_relay_status_with_timeout(address, host, port, base_path, timeout) == Some(200)
+}
+
+pub(crate) fn probe_relay_serving_address_with_timeout(
+	address: SocketAddr,
+	host: &str,
+	port: u16,
+	base_path: &str,
+	timeout: Duration,
+) -> bool {
+	matches!(
+		probe_relay_status_with_timeout(address, host, port, base_path, timeout),
+		Some(200 | 503)
+	)
+}
+
+fn probe_relay_status_with_timeout(
+	address: SocketAddr,
+	host: &str,
+	port: u16,
+	base_path: &str,
+	timeout: Duration,
+) -> Option<u16> {
+	let mut stream = TcpStream::connect_timeout(&address, timeout).ok()?;
+	stream.set_read_timeout(Some(timeout)).ok()?;
+	stream.set_write_timeout(Some(timeout)).ok()?;
+	let authority = relay_authority(host, port);
+	let request = format!(
+		"GET {base_path}/json/version HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+	);
+	stream.write_all(request.as_bytes()).ok()?;
 	let mut prefix = [0_u8; 32];
 	let mut read = 0;
 	while read < prefix.len() && !prefix[..read].contains(&b'\n') {
-		match stream.read(&mut prefix[read..]) {
-			Ok(0) => break,
-			Ok(count) => read += count,
-			Err(_) => return false,
+		let count = stream.read(&mut prefix[read..]).ok()?;
+		if count == 0 {
+			break;
 		}
+		read += count;
 	}
-	let response = &prefix[..read];
-	response.starts_with(b"HTTP/1.1 200")
-		|| response.starts_with(b"HTTP/1.1 503")
-		|| response.starts_with(b"HTTP/1.0 200")
-		|| response.starts_with(b"HTTP/1.0 503")
+	let status = std::str::from_utf8(&prefix[..read])
+		.ok()?
+		.split_whitespace()
+		.nth(1)?
+		.parse()
+		.ok()?;
+	Some(status)
+}
+
+fn relay_authority(host: &str, port: u16) -> String {
+	if host.contains(':') {
+		format!("[{host}]:{port}")
+	} else {
+		format!("{host}:{port}")
+	}
 }
 
 async fn serve(
@@ -309,19 +529,29 @@ async fn serve(
 	port: u16,
 	token: Option<Str>,
 	bridge: Arc<RelayBridge>,
+	leases: Arc<RelayLeaseState>,
 	shutdown: CancellationToken,
 ) {
 	loop {
 		tokio::select! {
 			_ = shutdown.cancelled() => break,
 			accepted = listener.accept() => {
-				let Ok((stream, _)) = accepted else { continue };
+				let Ok((stream, peer)) = accepted else { continue };
 				let bridge = Arc::clone(&bridge);
+				let leases = Arc::clone(&leases);
 				let token = token.clone();
 				let shutdown = shutdown.clone();
 				tokio::spawn(async move {
 					let service = service_fn(move |request| {
-						handle_http(request, port, token.clone(), Arc::clone(&bridge), shutdown.clone())
+						handle_http(
+							request,
+							port,
+							token.clone(),
+							Arc::clone(&bridge),
+							Arc::clone(&leases),
+							shutdown.clone(),
+							peer.ip().is_loopback(),
+						)
 					});
 					let _ = http1::Builder::new()
 						.serve_connection(TokioIo::new(stream), service)
@@ -338,10 +568,46 @@ async fn handle_http(
 	port: u16,
 	token: Option<Str>,
 	bridge: Arc<RelayBridge>,
+	leases: Arc<RelayLeaseState>,
 	shutdown: CancellationToken,
+	peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
 	let path = request.uri().path().trim_end_matches('/');
 	let path = if path.is_empty() { "/" } else { path };
+	if path == LEASE_PATH {
+		if request.method() != Method::GET
+			|| !peer_is_loopback
+			|| !is_lease_upgrade(request.headers())
+		{
+			return Ok(text_response(StatusCode::NOT_FOUND, "Not found"));
+		}
+		let upgrade = hyper::upgrade::on(&mut request);
+		let lease = leases.acquire();
+		tokio::spawn(async move {
+			let _lease = lease;
+			let Ok(upgraded) = upgrade.await else {
+				return;
+			};
+			let mut upgraded = TokioIo::new(upgraded);
+			let mut byte = [0_u8; 1];
+			loop {
+				tokio::select! {
+					_ = shutdown.cancelled() => break,
+					read = upgraded.read(&mut byte) => {
+						if !matches!(read, Ok(1)) {
+							break;
+						}
+					},
+				}
+			}
+		});
+		return Ok(Response::builder()
+			.status(StatusCode::SWITCHING_PROTOCOLS)
+			.header(header::CONNECTION, "Upgrade")
+			.header(header::UPGRADE, LEASE_PROTOCOL)
+			.body(Full::new(Bytes::new()))
+			.expect("static lease response"));
+	}
 	if path == "/cdp" || path == "/ext" {
 		let role = if path == "/ext" {
 			SocketRole::Extension
@@ -412,6 +678,20 @@ async fn handle_http(
 		"/json" | "/json/list" => Ok(json_response(StatusCode::OK, &bridge.list_targets())),
 		_ => Ok(text_response(StatusCode::NOT_FOUND, "Not found")),
 	}
+}
+
+fn is_lease_upgrade(headers: &HeaderMap) -> bool {
+	headers
+		.get(header::CONNECTION)
+		.and_then(|value| value.to_str().ok())
+		.is_some_and(|value| {
+			value
+				.split(',')
+				.any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+		}) && headers
+		.get(header::UPGRADE)
+		.and_then(|value| value.to_str().ok())
+		.is_some_and(|value| value.eq_ignore_ascii_case(LEASE_PROTOCOL))
 }
 
 fn websocket_key(headers: &HeaderMap) -> Option<&str> {
@@ -2778,6 +3058,123 @@ mod tests {
 	}
 
 	#[test]
+	fn relay_endpoint_classification_supports_loopback_ipv4_localhost_ipv6_and_remote() {
+		let ipv4 = parse_relay_endpoint("http://127.0.0.1:9224").expect("IPv4 endpoint");
+		assert_eq!(ipv4.auto_bind, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+		let localhost = parse_relay_endpoint("http://localhost:9224").expect("localhost endpoint");
+		assert_eq!(localhost.auto_bind, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+		assert!(!localhost.addresses.is_empty());
+		let ipv6 = parse_relay_endpoint("http://[::1]:9224").expect("IPv6 endpoint");
+		assert_eq!(ipv6.auto_bind, Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+		assert!(ipv6.addresses.iter().any(SocketAddr::is_ipv6));
+		let remote = parse_relay_endpoint("http://192.0.2.1:9224").expect("remote endpoint");
+		assert_eq!(remote.auto_bind, None);
+	}
+
+	#[test]
+	fn relay_server_rejects_non_loopback_binds() {
+		let error = RelayServer::start(RelayOptions {
+			bind: IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+			..RelayOptions::default()
+		})
+		.err()
+		.expect("remote bind must be rejected");
+		assert!(matches!(error, RelayError::NonLoopbackBind { .. }));
+	}
+
+	#[test]
+	fn ipv6_loopback_relay_accepts_probes_and_consumer_leases() {
+		let relay = match RelayServer::start(RelayOptions {
+			bind: IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+			port: 0,
+			..RelayOptions::default()
+		}) {
+			Ok(relay) => relay,
+			Err(RelayError::Bind { source, .. })
+				if source.kind() == std::io::ErrorKind::AddrNotAvailable =>
+			{
+				return;
+			},
+			Err(error) => panic!("IPv6 loopback relay: {error}"),
+		};
+		let endpoint = format!("http://[::1]:{}", relay.port());
+		assert!(probe_relay_server(&endpoint));
+		let _lease =
+			acquire_relay_lease(&endpoint, Duration::from_secs(1)).expect("IPv6 consumer lease");
+	}
+
+	#[test]
+	fn managed_relay_stays_up_until_its_last_consumer_lease_closes() {
+		let relay = RelayServer::start(RelayOptions {
+			port: 0,
+			managed: true,
+			..RelayOptions::default()
+		})
+		.expect("managed relay");
+		let endpoint = format!("http://127.0.0.1:{}", relay.port());
+		let first =
+			acquire_relay_lease(&endpoint, Duration::from_secs(1)).expect("first consumer lease");
+		let second =
+			acquire_relay_lease(&endpoint, Duration::from_secs(1)).expect("second consumer lease");
+		let count_deadline = Instant::now() + Duration::from_secs(1);
+		while relay.leases.active.load(Ordering::Acquire) != 2 && Instant::now() < count_deadline {
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(relay.leases.active.load(Ordering::Acquire), 2);
+		drop(first);
+		thread::sleep(Duration::from_millis(20));
+		assert!(!relay.managed_shutdown_requested());
+		drop(second);
+		let shutdown_deadline = Instant::now() + Duration::from_secs(1);
+		while !relay.managed_shutdown_requested() && Instant::now() < shutdown_deadline {
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(relay.managed_shutdown_requested());
+	}
+
+	#[test]
+	fn manual_relay_remains_signal_owned_after_leases_close() {
+		let relay =
+			RelayServer::start(RelayOptions { port: 0, ..RelayOptions::default() })
+				.expect("manual relay");
+		let endpoint = format!("http://127.0.0.1:{}", relay.port());
+		let lease =
+			acquire_relay_lease(&endpoint, Duration::from_secs(1)).expect("consumer lease");
+		drop(lease);
+		thread::sleep(Duration::from_millis(20));
+		assert!(!relay.managed_shutdown_requested());
+		assert!(probe_relay_server(&endpoint));
+	}
+
+	#[test]
+	fn relay_probe_subprocess_helper() {
+		let Ok(endpoint) = std::env::var("OMP_RELAY_PROBE_HELPER_URL") else {
+			return;
+		};
+		assert!(probe_relay_server(&endpoint));
+	}
+
+	#[test]
+	fn relay_probe_bypasses_proxy_environment() {
+		let relay =
+			RelayServer::start(RelayOptions { port: 0, ..RelayOptions::default() })
+				.expect("relay");
+		let endpoint = format!("http://127.0.0.1:{}", relay.port());
+		let proxy = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("unused proxy listener");
+		let proxy_url = format!("http://{}", proxy.local_addr().expect("proxy address"));
+		let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+			.args(["relay_probe_subprocess_helper", "--nocapture"])
+			.env("OMP_RELAY_PROBE_HELPER_URL", endpoint)
+			.env("HTTP_PROXY", &proxy_url)
+			.env("http_proxy", &proxy_url)
+			.env("NO_PROXY", "")
+			.env("no_proxy", "")
+			.status()
+			.expect("probe helper");
+		assert!(status.success());
+	}
+
+	#[test]
 	fn validates_discovery_host_authority() {
 		let mut headers = HeaderMap::new();
 		headers.insert(header::HOST, "100.100.92.97:12803".parse().unwrap());
@@ -3066,7 +3463,10 @@ mod tests {
 				.unwrap()
 				.runtime_contexts
 				.insert(17, params);
-			let session = state.connections[&connection]
+			let session = state
+				.connections
+				.get_mut(&connection)
+				.unwrap()
 				.sessions
 				.get_mut(&session)
 				.unwrap();

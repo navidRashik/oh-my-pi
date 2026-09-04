@@ -16,7 +16,9 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use flume::Receiver;
 use futures::StreamExt as _;
-use omp_agent::{ApprovalBook, ApprovalRoute, ApprovalSpec, HookGate, KernelSender, TicketState};
+use omp_agent::{
+	ApprovalBook, ApprovalRoute, ApprovalSpec, HookGate, KernelSender, SessionRole, TicketState,
+};
 use omp_cache::{github_cache::GithubCache, telemetry_cache::TelemetryIndex};
 use omp_con::Ctx;
 use omp_core::{Hash32, Str, Ulid, sf};
@@ -95,7 +97,7 @@ use super::{
 	host_info::HostInfoHost,
 	host_settings::HostSettings,
 	http_egress::{HttpEgressError, HttpEgressHost},
-	journal_runtime::{ExternalJournalActor, PersistenceControlFactory},
+	journal_runtime::DurableScheduleActor,
 	lsp_settings::LspSettings,
 	mcp::{
 		McpConfigPaths, McpService, McpServiceError, ServiceSubscription, SubscriptionEvent,
@@ -130,7 +132,7 @@ use super::{
 		DEFAULT_MAX_FRAME_BYTES, DomainControlSlot, ExtHostCompletion, ExtHostConfig, ExtHostError,
 		ExtHostEvent, ExtHostInvocation, ExtHostOutcomeKind, ExtHostSpec, ExtHostSupervisor,
 		ExtHostToolCall, ExternalControlAuthorityBinding, ExternalDomainControlBinding,
-		ExternalDomainControlFactories, HostKey, JournalRuntime,
+		ExternalDomainControlFactories, HostKey,
 	},
 	worker_pool::{
 		DEFAULT_MAX_CONCURRENT_SPAWNS, DEFAULT_WORKER_LAYER_CEILING, WorkerKey, WorkerRoute,
@@ -157,7 +159,7 @@ use crate::{
 		ProviderControlAuthorities, RegistryAvailabilitySink, RegistryControlAuthorities,
 		control::{
 			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlProtocolError,
-			ControlRequestContext,
+			ControlRequestContext, FixedControlAuthorityFactory,
 		},
 		dispatch::{CallbackDispatcher, CallbackDispatcherSlot, UiCallbackDispatch},
 		extensions::SealedRegistryEvidence,
@@ -687,7 +689,7 @@ impl DeviceInvoker for WorkerDeviceInvoker {
 						yield Err(RegistryError::VerdictShape(abort.reason));
 						return;
 					},
-					ExtHostEvent::Pull(_) | ExtHostEvent::ProtocolError(_) => {
+					ExtHostEvent::ProtocolError(_) => {
 						yield Err(RegistryError::VerdictShape(sf!(
 							"extension-host device protocol rejected final invocation"
 						)));
@@ -812,11 +814,6 @@ impl PreludeInvoker for PreludeBridgeInvoker {
 						"prelude helper invocation aborted: {}",
 						abort.reason
 					)));
-				},
-				ExtHostEvent::Pull(_) => {
-					return Err(BridgeHostError::message(
-						"prelude helper protocol requested an unsupported argument pull",
-					));
 				},
 				ExtHostEvent::ProtocolError(error) => {
 					return Err(BridgeHostError::message(sf!(
@@ -1755,6 +1752,67 @@ fn same_control_connection(
 		&& expected.capabilities == actual.capabilities
 }
 
+fn bind_live_session_authority_snapshot(
+	config: &mut ExtHostConfig,
+	root: &Path,
+	authority: Option<&Arc<dyn omp_agent::SessionAuthority>>,
+) {
+	let Some(authority) = authority else {
+		return;
+	};
+	let Some(endpoint) = authority.lookup(config.session_id.as_str()) else {
+		return;
+	};
+	let mut depth = 0_u32;
+	let mut cursor = endpoint.topology.parent_id.clone();
+	let mut seen = BTreeSet::new();
+	while let Some(parent) = cursor {
+		if !seen.insert(parent.clone()) {
+			break;
+		}
+		depth = depth.saturating_add(1);
+		if depth == 64 {
+			break;
+		}
+		cursor = authority
+			.lookup(parent.as_str())
+			.and_then(|parent| parent.topology.parent_id);
+	}
+	let root = Url::from_file_path(root)
+		.map_or_else(|_| String::from("file:///"), |root| root.to_string());
+	let started_at_ms = config
+		.session_started_at
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX);
+	config.bind_session_authority_snapshot(
+		serde_json::json!({
+			"id": endpoint.id.as_str(),
+			"title": (!endpoint.name.is_empty()).then(|| endpoint.name.as_str()),
+			"title_source": "system",
+			"cwd": root.clone(),
+			"project": root,
+			"created_ms": started_at_ms,
+			"updated_ms": started_at_ms,
+			"status": "pending",
+			"kind": match endpoint.topology.role {
+				SessionRole::Main => "interactive",
+				SessionRole::Child => "subagent",
+			},
+			"parent": endpoint.topology.parent_id.as_deref(),
+			"entries": 0,
+			"turns": 0,
+			"usage": {},
+			"cost": {"nanos_usd": 0, "estimated": true},
+			"models": [],
+			"remote": false,
+		}),
+		depth,
+	);
+}
+
 fn register_extension_convars(con: &Ctx, extensions: &[ExtHostSpec]) -> Result<(), EnvdError> {
 	for extension in extensions {
 		crate::exthost::register_extension_setting_convars(
@@ -1773,7 +1831,6 @@ fn production_control_authorities(
 	telemetry: &Arc<TelemetryIndex>,
 	mcp: &Arc<McpService>,
 	extensions: &[ExtHostSpec],
-	journal_external: &ExternalJournalActor,
 	domain_control: Arc<DomainControlSlot>,
 	convars: Arc<dyn ControlAuthorityFactory>,
 	quota_runtime: ControlQuotaRuntime,
@@ -1833,23 +1890,6 @@ fn production_control_authorities(
 		resources:  Arc::clone(&resources),
 	});
 	let registry = RegistryControlAuthorities::new(devices, hooks_factory);
-	let provenances = Arc::new(
-		extensions
-			.iter()
-			.map(|extension| {
-				(
-					(
-						extension.key.layer().clone(),
-						extension.key.tier().clone(),
-						extension.key.extension().clone(),
-					),
-					extension.manifest.provenance.clone(),
-				)
-			})
-			.collect(),
-	);
-	let persistent: Arc<dyn ControlAuthorityFactory> =
-		Arc::new(PersistenceControlFactory::new(journal_external.clone(), provenances));
 	let gated = |domain| -> Arc<dyn ControlAuthorityFactory> {
 		Arc::new(ManifestGatedControlFactory {
 			domain,
@@ -1873,7 +1913,10 @@ fn production_control_authorities(
 		owners: vec![Arc::clone(&envd), parameters, workers, direct_filesystem, convars]
 			.into_boxed_slice(),
 	});
-	let persistence = PersistenceControlAuthorities::new(sessions, persistent, credentials);
+	let artifacts: Arc<dyn ControlAuthorityFactory> = Arc::new(
+		FixedControlAuthorityFactory::new(Arc::new(UndeclaredControlAuthority)),
+	);
+	let persistence = PersistenceControlAuthorities::new(sessions, artifacts, credentials);
 	let policy = PolicyControlAuthorities::new(policy_owner, prompts);
 	let presentation = PresentationControlAuthorities::new(ui, telemetry_owner, jobs);
 	let provider = ProviderControlAuthorities::new(provider_owner, services);
@@ -1942,7 +1985,7 @@ pub struct EnvServer {
 	admission_gate:          Arc<HookGate>,
 	checkpoint_control:      AgentCheckpointControl,
 	previews:                StagedProposalRegistry,
-	journal_external:        ExternalJournalActor,
+	schedules:               DurableScheduleActor,
 	workers:                 Arc<WorkerSupervisor>,
 	authority:               Arc<AuthorityTable>,
 	repository_revision:     AtomicU64,
@@ -2298,7 +2341,7 @@ impl EnvServer {
 		admission_gate: Arc<HookGate>,
 		checkpoint_control: AgentCheckpointControl,
 		previews: StagedProposalRegistry,
-		journal_external: ExternalJournalActor,
+		schedules: DurableScheduleActor,
 		authority: Arc<AuthorityTable>,
 		state_dir: &Path,
 	) -> Self {
@@ -2337,7 +2380,7 @@ impl EnvServer {
 			admission_gate,
 			checkpoint_control,
 			previews,
-			journal_external,
+			schedules,
 			workers: Arc::new(WorkerSupervisor::new(
 				DEFAULT_WORKER_LAYER_CEILING,
 				DEFAULT_MAX_CONCURRENT_SPAWNS,
@@ -2400,6 +2443,11 @@ impl EnvServer {
 		let authority = Arc::new(AuthorityTable::default());
 		ext_host_config.bind_workspace_root(workspace.root());
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
+		bind_live_session_authority_snapshot(
+			&mut ext_host_config,
+			workspace.root(),
+			bridges.session_authority.as_ref(),
+		);
 		let github_cache = Arc::new(
 			GithubCache::open(
 				state_dir.join("github-cache.sqlite3"),
@@ -2408,6 +2456,7 @@ impl EnvServer {
 			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
 		let blobs = BlobHost::open_managed(state_dir.join("blobs"), state_dir.join("sessions"))?;
+		ext_host_config.bind_result_store(blobs.clone());
 		let exec = ExecHost::new()
 			.with_process_store(ProcessStore::new(state_dir.join("processes").join("meta.json")))?
 			.with_github_cache(Arc::clone(&github_cache))
@@ -2427,14 +2476,13 @@ impl EnvServer {
 		mcp.bind_manager(&mcp_manager);
 		mcp_manager.bind_runtime_settings(con);
 		register_extension_convars(con, &ext_host_config.extensions)?;
-		let journal_external = ExternalJournalActor::spawn(state_dir)?;
+		let schedules = DurableScheduleActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
 			state_dir,
 			&session_id,
 			&telemetry,
 			&mcp,
 			&ext_host_config.extensions,
-			&journal_external,
 			ext_host_config.domain_control_factories(),
 			Arc::clone(&convars),
 			ext_host_config.quota_runtime(),
@@ -2523,7 +2571,6 @@ impl EnvServer {
 			.resources
 			.set(Arc::clone(&resources))
 			.map_err(|_| EnvdError::State(sf!("CONTROL URL resolver owner was already bound")))?;
-		ext_hosts.bind_journal_runtime(0, JournalRuntime { external: journal_external.sender() })?;
 		ext_hosts.activate_control_hosts().await?;
 		let identity = ServerIdentity {
 			workspace_id:   hello.workspace_id,
@@ -2569,7 +2616,7 @@ impl EnvServer {
 			admission_gate,
 			checkpoint_control,
 			previews,
-			journal_external,
+			schedules,
 			authority,
 			state_dir,
 		))
@@ -2676,6 +2723,11 @@ impl EnvServer {
 		let authority = Arc::new(AuthorityTable::default());
 		ext_host_config.bind_workspace_root(&root);
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
+		bind_live_session_authority_snapshot(
+			&mut ext_host_config,
+			&root,
+			bridges.session_authority.as_ref(),
+		);
 		let github_cache = Arc::new(
 			GithubCache::open(
 				state_dir.join("github-cache.sqlite3"),
@@ -2684,6 +2736,7 @@ impl EnvServer {
 			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
 		let blobs = BlobHost::open_managed(state_dir.join("blobs"), state_dir.join("sessions"))?;
+		ext_host_config.bind_result_store(blobs.clone());
 		let exec = if doc_connections.is_some() {
 			ExecHost::new()
 				.with_process_store(ProcessStore::new(state_dir.join("processes").join("meta.json")))?
@@ -2707,14 +2760,13 @@ impl EnvServer {
 		mcp.bind_manager(&mcp_manager);
 		mcp_manager.bind_runtime_settings(con);
 		register_extension_convars(con, &ext_host_config.extensions)?;
-		let journal_external = ExternalJournalActor::spawn(state_dir)?;
+		let schedules = DurableScheduleActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
 			state_dir,
 			&session_id,
 			&telemetry,
 			&mcp,
 			&ext_host_config.extensions,
-			&journal_external,
 			ext_host_config.domain_control_factories(),
 			Arc::clone(&convars),
 			ext_host_config.quota_runtime(),
@@ -2806,7 +2858,6 @@ impl EnvServer {
 			.resources
 			.set(Arc::clone(&resources))
 			.map_err(|_| EnvdError::State(sf!("CONTROL URL resolver owner was already bound")))?;
-		ext_hosts.bind_journal_runtime(0, JournalRuntime { external: journal_external.sender() })?;
 		ext_hosts.activate_control_hosts().await?;
 		let identity = ServerIdentity {
 			workspace_id:   hello.workspace_id,
@@ -2852,7 +2903,7 @@ impl EnvServer {
 			admission_gate,
 			checkpoint_control,
 			previews,
-			journal_external,
+			schedules,
 			authority,
 			state_dir,
 		))
@@ -2885,6 +2936,11 @@ impl EnvServer {
 		let authority = Arc::new(AuthorityTable::default());
 		ext_host_config.bind_workspace_root(&root);
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
+		bind_live_session_authority_snapshot(
+			&mut ext_host_config,
+			&root,
+			bridges.session_authority.as_ref(),
+		);
 
 		let mcp = McpService::open(state_dir.join("mcp-cache.sqlite3"))
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
@@ -2900,6 +2956,7 @@ impl EnvServer {
 			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
 		let blobs = BlobHost::open_managed(state_dir.join("blobs"), state_dir.join("sessions"))?;
+		ext_host_config.bind_result_store(blobs.clone());
 		let exec = ExecHost::new()
 			.with_github_cache(Arc::clone(&github_cache))
 			.with_output_store(blobs.store().clone());
@@ -2925,14 +2982,13 @@ impl EnvServer {
 			.map_err(|error| EnvdError::State(Str::from(error.to_string())))?;
 
 		register_extension_convars(con, &ext_host_config.extensions)?;
-		let journal_external = ExternalJournalActor::spawn(state_dir)?;
+		let schedules = DurableScheduleActor::spawn(state_dir)?;
 		let control_bindings = production_control_authorities(
 			state_dir,
 			&session_id,
 			&telemetry,
 			&mcp,
 			&ext_host_config.extensions,
-			&journal_external,
 			ext_host_config.domain_control_factories(),
 			Arc::clone(&convars),
 			ext_host_config.quota_runtime(),
@@ -3024,7 +3080,6 @@ impl EnvServer {
 			.resources
 			.set(Arc::clone(&resources))
 			.map_err(|_| EnvdError::State(sf!("CONTROL URL resolver owner was already bound")))?;
-		ext_hosts.bind_journal_runtime(0, JournalRuntime { external: journal_external.sender() })?;
 		ext_hosts.activate_control_hosts().await?;
 		let identity = ServerIdentity {
 			workspace_id:   owner_info.workspace_id,
@@ -3064,7 +3119,7 @@ impl EnvServer {
 			admission_gate,
 			session.checkpoint_control,
 			StagedProposalRegistry::new(),
-			journal_external,
+			schedules,
 			authority,
 			state_dir,
 		))
@@ -3436,7 +3491,7 @@ impl EnvServer {
 		&self,
 		backend: Arc<dyn ScheduleDeliveryBackend>,
 	) -> Result<(), EnvdError> {
-		self.journal_external.bind_schedule_delivery(backend).await
+		self.schedules.bind_schedule_delivery(backend).await
 	}
 
 	fn release_agent_control(&self, id: u64) {
@@ -9468,17 +9523,6 @@ fn spawn_worker_invocation(
 						cancel_requested = true;
 					}
 				},
-				Some(ExtHostEvent::Pull(_)) => {
-					let _ = send_invocation_error(
-						&responses,
-						request_id,
-						pb::ProtocolErrorCode::Unsupported,
-						"worker cursor pulls are unsupported on env/v1",
-					)
-					.await;
-					invocation.cancel("worker requested an unsupported cursor pull");
-					break;
-				},
 				Some(ExtHostEvent::ProtocolError(error)) => {
 					let _ = send_invocation_error(
 						&responses,
@@ -12524,8 +12568,8 @@ mod tests {
 		let hello = documents.hello().clone();
 		let exec = ExecHost::new();
 		let blobs = BlobHost::open(state.path().join("blobs")).expect("blob host");
-		let journal_external =
-			ExternalJournalActor::spawn(state.path()).expect("external journal actor");
+		let schedules =
+			DurableScheduleActor::spawn(state.path()).expect("durable schedule actor");
 		let workspace_ops = WorkspaceOperations::open(
 			workspace.clone(),
 			documents.clone(),
@@ -12602,7 +12646,7 @@ mod tests {
 			Arc::new(HookGate::channel().0),
 			AgentCheckpointControl::default(),
 			StagedProposalRegistry::new(),
-			journal_external,
+			schedules,
 			Arc::new(AuthorityTable::default()),
 			state.path(),
 		));

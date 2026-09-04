@@ -1,17 +1,26 @@
 //! Native extension-host process contract tests.
 
-use std::{collections::BTreeMap, fs, path::Path, sync::Arc, time::Duration};
+use std::{
+	collections::BTreeMap,
+	fs,
+	path::Path,
+	sync::{Arc, Mutex},
+	time::Duration,
+};
 
 use bytes::Bytes;
 use omp_core::{ArtifactDigest, Principal, Provenance, Str, sf};
 use omp_envd::{
 	DeviceCatalogObserver, DeviceControlFactory, DeviceInvocationAdmission,
 	DynamicDeviceCatalogEntry, RegistryControlFactory,
+	blobs::BlobHost,
 	exthost::{
-		ActivationTrigger, DeclarationSet, ExtensionManifest, ServiceManifest, ToolDeclarationKey,
+		ActivationTrigger, AvailabilityBatch, AvailabilitySink, DeclarationSet, ExtensionManifest,
+		ServiceManifest, ToolDeclarationKey,
 		control::{
-			ControlAuthority, ControlAuthorityFactory, ControlEffect, ControlProtocolError,
-			ControlRequestContext, EnvdControlAuthorities, ExternalControlAuthorities,
+			ControlAuthority, ControlAuthorityFactory, ControlAuthoritySnapshot, ControlEffect,
+			ControlProtocolError, ControlRequestContext, EnvdControlAuthorities,
+			ExternalControlAuthorities,
 			FixedControlAuthorityFactory, HostControlAuthorityFactory, PersistenceControlAuthorities,
 			PolicyControlAuthorities, PresentationControlAuthorities, ProviderControlAuthorities,
 			RegistryControlAuthorities,
@@ -24,7 +33,10 @@ use omp_envd::{
 		HostKey,
 	},
 };
-use omp_ext::config::{StaticDeclaration, StaticDeclarations};
+use omp_ext::config::{
+	CliContribution, CliContributionSet, CliValueKind, CliValueSink, ContributedCliValue,
+	ContributedValue, StaticDeclaration, StaticDeclarations,
+};
 use omp_proto::env::v1::ArgsCommitted;
 use serde_json::{Value, json};
 use tokio::time;
@@ -63,10 +75,41 @@ def control_sibling(message: str) -> dict:
     return {"message": message, "pid": os.getpid()}
 "#;
 
+const CONTROL_FEATURES_EXTENSION: &str = r#"
+import asyncio
+import omp
+
+_active = 0
+_overlap = asyncio.Event()
+
+@omp.tool("control_progress", kind="soft")
+async def control_progress(value: str, ctx: omp.Context) -> dict:
+    ctx.update({"stage": "running", "value": value})
+    await asyncio.sleep(0.01)
+    return {"value": value}
+
+@omp.tool("control_overlap", kind="soft")
+async def control_overlap(value: str) -> dict:
+    global _active
+    _active += 1
+    if _active == 2:
+        _overlap.set()
+    await asyncio.wait_for(_overlap.wait(), timeout=1.0)
+    return {"value": value, "active": _active}
+
+@omp.tool("control_large", kind="soft")
+async def control_large(size: int) -> str:
+    return "x" * size
+
+@omp.device("control_unavailable", available=lambda: False)
+async def control_unavailable() -> str:
+    return "unreachable"
+"#;
+
 #[tokio::test]
 async fn trusted_cli_module_activates_from_its_exact_file() {
 	let scratch = tempfile::tempdir().expect("trusted module scratch");
-	let module = scratch.path().join("trusted_policy.py");
+	let module = scratch.path().join("json.py");
 	let marker = scratch.path().join("activated");
 	let marker_json =
 		serde_json::to_string(marker.to_string_lossy().as_ref()).expect("encode marker path");
@@ -120,6 +163,242 @@ async fn trusted_cli_module_activates_from_its_exact_file() {
 	supervisor.shutdown().await;
 }
 
+#[derive(Default)]
+struct CapturedAvailability(Mutex<Vec<AvailabilityBatch>>);
+
+impl AvailabilitySink for CapturedAvailability {
+	fn set_availability(&self, batch: AvailabilityBatch) {
+		self.0.lock().expect("availability capture").push(batch);
+	}
+}
+
+#[tokio::test]
+async fn control_progress_parallelism_availability_and_result_spill_are_preserved() {
+	let site = tempfile::tempdir().expect("Python site scratch directory");
+	fs::write(site.path().join("control_features.py"), CONTROL_FEATURES_EXTENSION)
+		.expect("write CONTROL feature extension");
+
+	let key = HostKey::new("workspace", "trusted", "control-features");
+	let mut extension = ExtHostSpec::new(
+		key.clone(),
+		test_manifest(
+			&key,
+			"control_features",
+			[
+				"control_progress",
+				"control_overlap",
+				"control_large",
+				"control_unavailable",
+			],
+		),
+	);
+	extension.python_site = Some(site.path().to_owned());
+	extension.data_socket = Some(site.path().join("features-data.sock"));
+
+	let mut config = test_config();
+	config.bind_result_store(
+		BlobHost::open(site.path().join("result-cas")).expect("open result CAS"),
+	);
+	config.extensions.push(extension);
+	let callbacks = bind_test_control(&mut config);
+	let supervisor = Arc::new(
+		time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
+			.await
+			.expect("extension registry timed out")
+			.expect("spawn CONTROL feature host"),
+	);
+	callbacks.bind(supervisor.clone());
+	let availability = Arc::new(CapturedAvailability::default());
+	supervisor.bind_availability_sink(availability.clone());
+	supervisor
+		.activate_control_hosts()
+		.await
+		.expect("activate CONTROL feature host");
+
+	let batches = availability.0.lock().expect("availability capture");
+	assert!(batches.iter().flat_map(|batch| batch.deltas.iter()).any(|delta| {
+		delta.name == "control_unavailable" && !delta.mounted
+	}));
+	drop(batches);
+
+	let mut progress = open_committed(
+		&supervisor,
+		"progress",
+		"control_progress",
+		json!({"value": "visible"}),
+		Duration::from_secs(5),
+	)
+	.expect("dispatch progress invocation");
+	let update = match time::timeout(Duration::from_secs(2), progress.next())
+		.await
+		.expect("progress update timed out")
+		.expect("progress event channel closed")
+	{
+		ExtHostEvent::Update(update) => {
+			serde_json::from_slice::<Value>(&update.json).expect("progress JSON")
+		},
+		event => panic!("expected progress before terminal response, got {event:?}"),
+	};
+	assert_eq!(update, json!({"stage": "running", "value": "visible"}));
+	assert!(matches!(
+		progress.next().await.expect("progress terminal"),
+		ExtHostEvent::Complete(_)
+	));
+
+	let overlap = time::timeout(Duration::from_secs(3), async {
+		tokio::join!(
+			invoke(
+				&supervisor,
+				"overlap-a",
+				"control_overlap",
+				json!({"value": "a"}),
+				Duration::from_secs(2),
+			),
+			invoke(
+				&supervisor,
+				"overlap-b",
+				"control_overlap",
+				json!({"value": "b"}),
+				Duration::from_secs(2),
+			),
+		)
+	})
+	.await
+	.expect("parallel CONTROL declarations were serialized");
+	assert_eq!(completion_value(&overlap.0)["active"], 2);
+	assert_eq!(completion_value(&overlap.1)["active"], 2);
+
+	let large = invoke(
+		&supervisor,
+		"large",
+		"control_large",
+		json!({"size": 70_000}),
+		Duration::from_secs(5),
+	)
+	.await;
+	assert!(large.details_json.is_none());
+	assert_eq!(large.details_blob.as_ref().map(|blob| blob.size), Some(70_002));
+
+	supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn activation_receives_validated_cli_values_and_session_authority() {
+	let site = tempfile::tempdir().expect("Python site scratch directory");
+	let module = site.path().join("activation_contract.py");
+	let marker = site.path().join("activation-contract.json");
+	let marker_json =
+		serde_json::to_string(marker.to_string_lossy().as_ref()).expect("encode marker path");
+	fs::write(
+		&module,
+		format!(
+			r#"import json
+import omp
+
+@omp.tool("activation_echo", kind="soft")
+async def activation_echo(value: str) -> str:
+    return value
+
+def extension_activate(event, _context):
+    current = omp.sessions.current()
+    with open({marker_json}, "w", encoding="utf-8") as marker:
+        json.dump({{"cli_values": event["cli_values"], "session": current.id, "depth": omp.agents.depth, "generation": event["generation"]}}, marker)
+"#,
+		),
+	)
+	.expect("write activation extension");
+
+	let key = HostKey::new("workspace", "trusted", "test/activation");
+	let mut extension =
+		ExtHostSpec::new(key.clone(), test_manifest(&key, "activation_contract", ["activation_echo"]));
+	extension.python_site = Some(site.path().to_owned());
+	extension.entry_path = Some(module);
+	extension.data_socket = Some(site.path().join("activation-data.sock"));
+	let contribution = CliContribution {
+		publisher: sf!("test"),
+		extension: sf!("activation"),
+		name: sf!("mode"),
+		description: sf!("Activation mode"),
+		kind: CliValueKind::String,
+		default: None,
+		shadow_builtin: false,
+		sink: CliValueSink { key: sf!("mode") },
+	};
+	let owner = contribution.qualified_name();
+	extension.cli_contributions = CliContributionSet::build(
+		[contribution],
+		std::iter::empty::<Str>(),
+	)
+	.expect("valid CLI contribution");
+
+	let mut config = test_config();
+	config.contributed_values.push(ContributedCliValue {
+		owner,
+		sink: sf!("mode"),
+		value: ContributedValue::String(sf!("strict")),
+	});
+	config.bind_authority_snapshot(ControlAuthoritySnapshot {
+		current_session: Some(json!({
+			"id": "authoritative-session",
+			"title": null,
+			"title_source": "system",
+			"cwd": "file:///",
+			"project": "file:///",
+			"created_ms": 1,
+			"updated_ms": 1,
+			"status": "pending",
+			"kind": "interactive",
+			"parent": null,
+			"entries": 0,
+			"turns": 0,
+			"usage": {},
+			"cost": {"nanos_usd": 0, "estimated": false},
+			"models": [],
+			"remote": false,
+		})),
+		agent_depth: 2,
+		..ControlAuthoritySnapshot::default()
+	});
+	config.extensions.push(extension);
+	let callbacks = bind_test_control(&mut config);
+	let supervisor = Arc::new(
+		time::timeout(Duration::from_secs(60), ExtHostSupervisor::spawn(config))
+			.await
+			.expect("extension registry timed out")
+			.expect("spawn activation host"),
+	);
+	callbacks.bind(supervisor.clone());
+	supervisor
+		.activate_control_hosts()
+		.await
+		.expect("activate extension entry callback");
+
+	let activation: Value = serde_json::from_slice(
+		&fs::read(&marker).expect("activation callback marker"),
+	)
+	.expect("activation callback JSON");
+	assert_eq!(activation["cli_values"], json!([{"sink": "mode", "value": "strict"}]));
+	assert_eq!(activation["session"], "authoritative-session");
+	assert_eq!(activation["depth"], 2);
+	assert_eq!(activation["generation"], 1);
+	assert_eq!(
+		supervisor
+			.reload_extension("test/activation")
+			.await
+			.expect("reload activation host"),
+		2,
+	);
+	let restarted: Value = serde_json::from_slice(
+		&fs::read(&marker).expect("restart activation callback marker"),
+	)
+	.expect("restart activation callback JSON");
+	assert_eq!(restarted["cli_values"], json!([{"sink": "mode", "value": "strict"}]));
+	assert_eq!(restarted["session"], "authoritative-session");
+	assert_eq!(restarted["depth"], 2);
+	assert_eq!(restarted["generation"], 2);
+	supervisor.shutdown().await;
+}
+
 #[tokio::test]
 async fn control_cancellation_restarts_only_the_owning_extension_host() {
 	let site = tempfile::tempdir().expect("Python site scratch directory");
@@ -156,6 +435,8 @@ async fn control_cancellation_restarts_only_the_owning_extension_host() {
 			.expect("spawn CONTROL extension hosts"),
 	);
 	callbacks.bind(supervisor.clone());
+	let availability = Arc::new(CapturedAvailability::default());
+	supervisor.bind_availability_sink(availability.clone());
 	supervisor
 		.activate_control_hosts()
 		.await
@@ -252,6 +533,18 @@ async fn control_cancellation_restarts_only_the_owning_extension_host() {
 		Some(i64::from(sibling_pid)),
 		"cancelling one extension restarted its independent sibling",
 	);
+	let availability = availability.0.lock().expect("availability capture");
+	let transitions = availability
+		.iter()
+		.flat_map(|batch| batch.deltas.iter())
+		.filter(|delta| delta.name == "control_echo")
+		.map(|delta| delta.mounted)
+		.collect::<Vec<_>>();
+	assert!(
+		transitions.windows(2).any(|window| window == [false, true]),
+		"replacement host did not publish down/restored availability: {transitions:?}",
+	);
+	drop(availability);
 	supervisor.shutdown().await;
 }
 

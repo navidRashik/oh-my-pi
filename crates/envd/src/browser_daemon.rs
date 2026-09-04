@@ -2,9 +2,9 @@
 
 use std::{
 	collections::HashMap,
-	net::{SocketAddr, ToSocketAddrs as _},
+	io::Read as _,
 	path::PathBuf,
-	process::{Child, Command, Stdio},
+	process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio},
 	sync::{
 		Arc, LazyLock, Weak,
 		atomic::{AtomicBool, Ordering},
@@ -28,16 +28,29 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SV_BROWSER_CDP_URL, SV_BROWSER_RELAY, SV_BROWSER_RELAY_URL, blobs::BlobHost};
+use crate::{
+	SV_BROWSER_CDP_URL, SV_BROWSER_RELAY, SV_BROWSER_RELAY_URL,
+	blobs::BlobHost,
+	browser_relay::{
+		RelayEndpoint, RelayLease, acquire_relay_lease_address, parse_relay_endpoint,
+		probe_relay_ready_address_with_timeout, probe_relay_serving_address_with_timeout,
+	},
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TIMEOUT: Duration = Duration::from_mins(5);
 const POLL: Duration = Duration::from_millis(25);
 const DEFAULT_RELAY_URL: &str = "http://127.0.0.1:9224";
+/// Covers one complete 30-second MV3 extension alarm cycle plus reconnection.
+const RELAY_EXTENSION_TIMEOUT: Duration = Duration::from_secs(35);
+const RELAY_START_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAY_ADOPTION_TIMEOUT: Duration = Duration::from_secs(1);
+const RELAY_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+const MAX_RELAY_STDERR_BYTES: usize = 64 * 1024;
 const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
 
-/// Process cache only: weak leases prevent one session from tearing down a
-/// relay still used by another; no browser/session state lives here.
+/// Process cache only: weak protocol leases prevent redundant connections.
+/// Each strong lease is also counted by the machine-global relay process.
 static RELAYS: LazyLock<Mutex<HashMap<Str, Weak<RelayLease>>>> =
 	LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -85,13 +98,43 @@ impl BrowserSettings {
 	/// Resolves browser policy from the process control context.
 	#[must_use]
 	pub fn from_con(ctx: &Ctx) -> Self {
-		Self {
+		let mut settings = Self {
 			enabled:   SV_BROWSER_ENABLED.get(ctx),
 			headless:  SV_BROWSER_HEADLESS.get(ctx),
 			cdp_url:   SV_BROWSER_CDP_URL.get(ctx),
 			relay:     SV_BROWSER_RELAY.get(ctx),
 			relay_url: SV_BROWSER_RELAY_URL.get(ctx),
+		};
+		let environment = std::env::var("OMP_BROWSER_RELAY").ok();
+		let resolved = resolve_relay(&settings, environment.as_deref());
+		settings.relay = resolved.is_some();
+		if let Some(endpoint) = resolved {
+			settings.relay_url = endpoint;
 		}
+		settings
+	}
+}
+
+/// Resolves relay enablement and its normalized endpoint.
+///
+/// An exact `0` or `1` environment value is the final override in either
+/// direction. Other values defer to the typed setting.
+#[must_use]
+pub fn resolve_relay(settings: &BrowserSettings, env_override: Option<&str>) -> Option<Str> {
+	let enabled = match env_override.map(str::trim) {
+		Some("0") => false,
+		Some("1") => true,
+		_ => settings.relay,
+	};
+	enabled.then(|| normalize_relay_url(&settings.relay_url))
+}
+
+fn normalize_relay_url(configured: &str) -> Str {
+	let configured = configured.trim().trim_end_matches('/');
+	if configured.is_empty() {
+		Str::new_static(DEFAULT_RELAY_URL)
+	} else {
+		Str::new(configured)
 	}
 }
 
@@ -130,6 +173,25 @@ mod settings_tests {
 			relay:     true,
 			relay_url: sf!("http://127.0.0.1:9444"),
 		});
+	}
+
+	#[test]
+	fn relay_kind_resolution_honors_both_override_directions() {
+		let disabled = BrowserSettings::default();
+		assert_eq!(resolve_relay(&disabled, None), None);
+		assert_eq!(resolve_relay(&disabled, Some("1")), Some(Str::new_static(DEFAULT_RELAY_URL)));
+
+		let enabled = BrowserSettings {
+			relay: true,
+			relay_url: sf!("http://127.0.0.1:9333///"),
+			..BrowserSettings::default()
+		};
+		assert_eq!(resolve_relay(&enabled, Some("0")), None);
+		assert_eq!(resolve_relay(&enabled, None), Some(sf!("http://127.0.0.1:9333")));
+		assert_eq!(
+			resolve_relay(&BrowserSettings { relay_url: sf!("  "), ..enabled }, None),
+			Some(Str::new_static(DEFAULT_RELAY_URL))
+		);
 	}
 }
 
@@ -290,16 +352,12 @@ fn open(
 	cancellation: &CancellationToken,
 	updates: &flume::Sender<Update>,
 ) -> Result<Payload, Fault> {
-	let deadline = Instant::now() + timeout(&params);
 	let (engine, surface, backend) = resolve_backend(settings, &params)?;
 	if backend == "relay" {
-		let endpoint = if settings.relay_url.trim().is_empty() {
-			DEFAULT_RELAY_URL
-		} else {
-			&settings.relay_url
-		};
-		ensure_relay(endpoint, relay, cancellation, deadline)?;
+		let endpoint = normalize_relay_url(&settings.relay_url);
+		ensure_relay(&endpoint, relay, cancellation)?;
 	}
+	let deadline = Instant::now() + timeout(&params);
 	let _ = updates.send(Update::Started {
 		name:    key.name.clone(),
 		action:  Action::Open,
@@ -307,6 +365,7 @@ fn open(
 	});
 	let mut builder = WebViewBuilder::new(engine)
 		.incognito(true)
+		.viewport_explicit(params.viewport.is_some())
 		.connect_timeout(deadline.saturating_duration_since(Instant::now()));
 	if let Some(url) = params.url.as_ref() {
 		builder = builder.url(url.clone());
@@ -425,37 +484,102 @@ fn close(
 	})
 }
 
-struct RelayLease {
-	process: Mutex<RelayChild>,
+struct SpawnedRelay {
+	child:     Child,
+	bootstrap: Option<ChildStdin>,
+	stderr:    Arc<Mutex<Vec<u8>>>,
+	reader:    Option<thread::JoinHandle<()>>,
 }
 
-struct RelayChild {
-	child: Child,
-	pid:   u32,
-}
-
-impl Drop for RelayChild {
-	fn drop(&mut self) {
-		if self.child.try_wait().ok().flatten().is_some() {
-			return;
+impl SpawnedRelay {
+	fn start(endpoint: &RelayEndpoint) -> Result<Self, Fault> {
+		let executable = std::env::current_exe()
+			.map_err(|error| relay_fault_owned(sf!("could not locate the omp executable: {error}")))?;
+		let bind = endpoint
+			.auto_bind
+			.expect("managed relay spawn is restricted to loopback");
+		let mut arguments = vec![
+			"browser-relay".to_owned(),
+			"serve".to_owned(),
+			"--managed".to_owned(),
+			"--bind".to_owned(),
+			bind.to_string(),
+			"--port".to_owned(),
+			endpoint.port.to_string(),
+		];
+		if let Some(token) = &endpoint.token {
+			arguments.extend(["--token".to_owned(), token.clone()]);
 		}
+		let mut command = Command::new(executable);
+		command
+			.args(arguments)
+			.stdin(Stdio::piped())
+			.stdout(Stdio::null())
+			.stderr(Stdio::piped());
 		#[cfg(unix)]
 		{
-			use nix::{
-				sys::signal::{Signal, killpg},
-				unistd::Pid,
-			};
-			let group = Pid::from_raw(self.pid.cast_signed());
-			let _ = killpg(group, Signal::SIGTERM);
-			thread::sleep(Duration::from_millis(250));
-			let _ = killpg(group, Signal::SIGKILL);
+			use std::os::unix::process::CommandExt as _;
+			command.process_group(0);
 		}
-		#[cfg(not(unix))]
-		{
-			let _ = self.pid;
-			let _ = self.child.kill();
+		let child = command
+			.spawn()
+			.map_err(|error| relay_fault_owned(sf!("browser relay failed to start: {error}")))?;
+		Self::observe(child)
+	}
+
+	fn observe(mut child: Child) -> Result<Self, Fault> {
+		let bootstrap = child.stdin.take();
+		let stderr = child
+			.stderr
+			.take()
+			.ok_or_else(|| relay_fault("browser relay stderr was not captured"))?;
+		let captured = Arc::new(Mutex::new(Vec::new()));
+		let reader_capture = Arc::clone(&captured);
+		let reader = thread::Builder::new()
+			.name("omp-relay-stderr".to_owned())
+			.spawn(move || capture_relay_stderr(stderr, &reader_capture))
+			.map_err(|error| relay_fault_owned(sf!("could not observe browser relay: {error}")))?;
+		Ok(Self { child, bootstrap, stderr: captured, reader: Some(reader) })
+	}
+
+	fn release_bootstrap(&mut self) {
+		self.bootstrap = None;
+	}
+
+	fn poll_exit(&mut self) -> Result<Option<ExitStatus>, Fault> {
+		self
+			.child
+			.try_wait()
+			.map_err(|error| relay_fault_owned(sf!("could not observe browser relay: {error}")))
+	}
+
+	fn exit_fault(&mut self, status: ExitStatus) -> Fault {
+		if let Some(reader) = self.reader.take() {
+			let _ = reader.join();
 		}
-		let _ = self.child.wait();
+		let stderr = String::from_utf8_lossy(&self.stderr.lock())
+			.trim()
+			.to_owned();
+		if stderr.is_empty() {
+			relay_fault_owned(sf!("browser relay exited during startup ({status})"))
+		} else {
+			relay_fault_owned(sf!(
+				"browser relay exited during startup ({status}): {}",
+				redact(&stderr)
+			))
+		}
+	}
+}
+
+fn capture_relay_stderr(mut stderr: ChildStderr, captured: &Mutex<Vec<u8>>) {
+	let mut buffer = [0_u8; 4096];
+	while let Ok(count) = stderr.read(&mut buffer) {
+		if count == 0 {
+			break;
+		}
+		let mut captured = captured.lock();
+		let available = MAX_RELAY_STDERR_BYTES.saturating_sub(captured.len());
+		captured.extend_from_slice(&buffer[..count.min(available)]);
 	}
 }
 
@@ -463,93 +587,211 @@ fn ensure_relay(
 	endpoint: &str,
 	relay: &mut Option<Arc<RelayLease>>,
 	cancellation: &CancellationToken,
-	deadline: Instant,
 ) -> Result<(), Fault> {
-	let url = url::Url::parse(endpoint).map_err(|_| invalid("browser relay URL is invalid"))?;
-	let host = url
-		.host_str()
-		.filter(|host| matches!(*host, "127.0.0.1" | "localhost" | "::1"))
-		.ok_or_else(|| invalid("browser relay auto-start requires a loopback URL"))?;
-	let port = url
-		.port_or_known_default()
-		.ok_or_else(|| invalid("browser relay URL has no port"))?;
-	let address = (host, port)
-		.to_socket_addrs()
-		.map_err(|_| invalid("browser relay address is invalid"))?
-		.next()
-		.ok_or_else(|| invalid("browser relay address did not resolve"))?;
-	if let Some(existing) = RELAYS.lock().get(endpoint).and_then(Weak::upgrade) {
-		let exited = existing
-			.process
-			.lock()
-			.child
-			.try_wait()
-			.ok()
-			.flatten()
-			.is_some();
-		if !exited {
-			*relay = Some(existing);
-			return wait_for_relay(address, cancellation, deadline);
+	let endpoint =
+		parse_relay_endpoint(endpoint).ok_or_else(|| invalid("browser relay URL is invalid"))?;
+	let cache_key = relay_cache_key(&endpoint);
+	if let Some(existing) = RELAYS.lock().get(&cache_key).and_then(Weak::upgrade) {
+		*relay = Some(existing);
+		let result = wait_for_relay(&endpoint, cancellation, None);
+		if result.is_err() {
+			*relay = None;
+			RELAYS.lock().remove(&cache_key);
 		}
-		RELAYS.lock().remove(endpoint);
+		return result;
 	}
-	if crate::browser_relay::probe_relay_address_with_timeout(
-		address,
-		host,
-		port,
-		Duration::from_millis(150),
-	) {
-		return Ok(());
-	}
-	let executable =
-		std::env::current_exe().map_err(|_| relay_fault("could not locate the omp executable"))?;
-	let mut arguments =
-		vec!["browser-relay".to_owned(), "serve".to_owned(), "--port".to_owned(), port.to_string()];
-	if let Some((_, token)) = url.query_pairs().find(|(key, _)| key == "token") {
-		arguments.extend(["--token".to_owned(), token.into_owned()]);
-	}
-	let mut command = Command::new(executable);
-	command
-		.args(arguments)
-		.stdin(Stdio::null())
-		.stdout(Stdio::null())
-		.stderr(Stdio::null());
-	#[cfg(unix)]
-	{
-		use std::os::unix::process::CommandExt as _;
-		command.process_group(0);
-	}
-	let child = command
-		.spawn()
-		.map_err(|_| relay_fault("browser relay failed to start"))?;
-	let pid = child.id();
-	let lease = Arc::new(RelayLease { process: Mutex::new(RelayChild { child, pid }) });
-	RELAYS
-		.lock()
-		.insert(endpoint.to_str(), Arc::downgrade(&lease));
-	*relay = Some(lease);
-	wait_for_relay(address, cancellation, deadline)
-}
+	RELAYS.lock().remove(&cache_key);
 
-fn wait_for_relay(
-	address: SocketAddr,
-	cancellation: &CancellationToken,
-	deadline: Instant,
-) -> Result<(), Fault> {
+	if let Some(acquired) = try_acquire_relay(&endpoint) {
+		return hold_relay_lease(&endpoint, relay, acquired, cancellation, None);
+	}
+	let serving = endpoint.addresses.iter().any(|address| {
+		probe_relay_serving_address_with_timeout(
+			*address,
+			&endpoint.host,
+			endpoint.port,
+			&endpoint.base_path,
+			RELAY_PROBE_TIMEOUT,
+		)
+	});
+	if endpoint.auto_bind.is_none() {
+		return wait_for_relay(&endpoint, cancellation, None);
+	}
+	if serving {
+		if let Some(acquired) = wait_for_relay_lease(
+			&endpoint,
+			cancellation,
+			Instant::now() + RELAY_ADOPTION_TIMEOUT,
+		)? {
+			return hold_relay_lease(&endpoint, relay, acquired, cancellation, None);
+		}
+		return Err(relay_fault(
+			"the loopback relay does not expose the required machine-global lease channel",
+		));
+	}
+
+	let mut spawned = SpawnedRelay::start(&endpoint)?;
+	let startup_deadline = Instant::now() + RELAY_START_TIMEOUT;
 	loop {
 		if cancellation.is_cancelled() {
 			return Err(cancelled("starting browser relay"));
 		}
-		if crate::browser_relay::probe_relay_address_with_timeout(
-			address,
-			&address.ip().to_string(),
-			address.port(),
-			Duration::from_millis(150),
-		) {
-			return Ok(());
+		if let Some(acquired) = try_acquire_relay(&endpoint) {
+			spawned.release_bootstrap();
+			return hold_relay_lease(
+				&endpoint,
+				relay,
+				acquired,
+				cancellation,
+				Some(&mut spawned),
+			);
+		}
+		if let Some(status) = spawned.poll_exit()? {
+			// A concurrent launcher may have won the bind after our last
+			// attempt. Adopt its lease before surfacing this child's failure.
+			if let Some(acquired) = try_acquire_relay(&endpoint) {
+				return hold_relay_lease(&endpoint, relay, acquired, cancellation, None);
+			}
+			if endpoint.addresses.iter().any(|address| {
+				probe_relay_serving_address_with_timeout(
+					*address,
+					&endpoint.host,
+					endpoint.port,
+					&endpoint.base_path,
+					RELAY_PROBE_TIMEOUT,
+				)
+			}) {
+				if let Some(acquired) = wait_for_relay_lease(
+					&endpoint,
+					cancellation,
+					Instant::now() + RELAY_ADOPTION_TIMEOUT,
+				)? {
+					return hold_relay_lease(&endpoint, relay, acquired, cancellation, None);
+				}
+				return Err(relay_fault(
+					"a concurrent loopback relay won the port but did not expose a managed lease",
+				));
+			}
+			return Err(spawned.exit_fault(status));
+		}
+		if Instant::now() >= startup_deadline {
+			return Err(relay_fault("browser relay did not open its lease channel"));
+		}
+		thread::sleep(Duration::from_millis(100));
+	}
+}
+
+fn hold_relay_lease(
+	endpoint: &RelayEndpoint,
+	relay: &mut Option<Arc<RelayLease>>,
+	acquired: RelayLease,
+	cancellation: &CancellationToken,
+	spawned: Option<&mut SpawnedRelay>,
+) -> Result<(), Fault> {
+	let acquired = Arc::new(acquired);
+	let key = relay_cache_key(endpoint);
+	RELAYS.lock().insert(key.clone(), Arc::downgrade(&acquired));
+	*relay = Some(acquired);
+	let result = wait_for_relay(endpoint, cancellation, spawned);
+	if result.is_err() {
+		*relay = None;
+		RELAYS.lock().remove(&key);
+	}
+	result
+}
+
+fn relay_cache_key(endpoint: &RelayEndpoint) -> Str {
+	sf!("{}:{}{}", endpoint.host, endpoint.port, endpoint.base_path)
+}
+
+fn try_acquire_relay(endpoint: &RelayEndpoint) -> Option<RelayLease> {
+	endpoint.addresses.iter().find_map(|address| {
+		acquire_relay_lease_address(
+			*address,
+			&endpoint.host,
+			endpoint.port,
+			&endpoint.base_path,
+			RELAY_PROBE_TIMEOUT,
+		)
+	})
+}
+
+fn wait_for_relay_lease(
+	endpoint: &RelayEndpoint,
+	cancellation: &CancellationToken,
+	deadline: Instant,
+) -> Result<Option<RelayLease>, Fault> {
+	loop {
+		if cancellation.is_cancelled() {
+			return Err(cancelled("starting browser relay"));
+		}
+		if let Some(lease) = try_acquire_relay(endpoint) {
+			return Ok(Some(lease));
 		}
 		if Instant::now() >= deadline {
-			return Err(relay_fault("browser relay did not become ready"));
+			return Ok(None);
+		}
+		thread::sleep(Duration::from_millis(50));
+	}
+}
+
+fn wait_for_relay(
+	endpoint: &RelayEndpoint,
+	cancellation: &CancellationToken,
+	mut spawned: Option<&mut SpawnedRelay>,
+) -> Result<(), Fault> {
+	let deadline = Instant::now() + RELAY_EXTENSION_TIMEOUT;
+	let mut serving = false;
+	loop {
+		if cancellation.is_cancelled() {
+			return Err(cancelled("starting browser relay"));
+		}
+		if endpoint.addresses.iter().any(|address| {
+			probe_relay_ready_address_with_timeout(
+				*address,
+				&endpoint.host,
+				endpoint.port,
+				&endpoint.base_path,
+				RELAY_PROBE_TIMEOUT,
+			)
+		}) {
+			return Ok(());
+		}
+		if !serving {
+			serving = endpoint.addresses.iter().any(|address| {
+				probe_relay_serving_address_with_timeout(
+					*address,
+					&endpoint.host,
+					endpoint.port,
+					&endpoint.base_path,
+					RELAY_PROBE_TIMEOUT,
+				)
+			});
+		}
+		if let Some(child) = spawned.as_deref_mut()
+			&& let Some(status) = child.poll_exit()?
+		{
+			if endpoint.addresses.iter().any(|address| {
+				probe_relay_ready_address_with_timeout(
+					*address,
+					&endpoint.host,
+					endpoint.port,
+					&endpoint.base_path,
+					RELAY_PROBE_TIMEOUT,
+				)
+			}) {
+				return Ok(());
+			}
+			return Err(child.exit_fault(status));
+		}
+		if Instant::now() >= deadline {
+			return Err(if serving {
+				relay_fault(
+					"browser relay is serving but its extension did not connect within 35 seconds",
+				)
+			} else {
+				relay_fault("browser relay endpoint was not reachable within 35 seconds")
+			});
 		}
 		thread::sleep(Duration::from_millis(100));
 	}
@@ -629,13 +871,9 @@ fn resolve_backend(
 	}
 	let explicit_relay = app.and_then(|value| value.relay);
 	if explicit_relay == Some(true) || (explicit_relay != Some(false) && settings.relay) {
-		let endpoint = if settings.relay_url.trim().is_empty() {
-			Str::new_static(DEFAULT_RELAY_URL)
-		} else {
-			settings.relay_url.clone()
-		};
+		let endpoint = normalize_relay_url(&settings.relay_url);
 		return Ok((
-			Engine::chromium_cdp(endpoint, app.and_then(|value| value.target.clone())),
+			Engine::chromium_relay(endpoint, app.and_then(|value| value.target.clone())),
 			SurfaceKind::Frames,
 			sf!("relay"),
 		));
@@ -1522,13 +1760,17 @@ fn artifact_fault() -> Fault {
 }
 
 fn relay_fault(message: &'static str) -> Fault {
+	relay_fault_owned(Str::new_static(message))
+}
+
+fn relay_fault_owned(message: Str) -> Fault {
 	Fault {
-		code:      sf!("browser_relay_failed"),
-		message:   Str::new_static(message),
-		name:      None,
-		url:       None,
-		title:     None,
-		browser:   Some(sf!("relay")),
+		code: sf!("browser_relay_failed"),
+		message,
+		name: None,
+		url: None,
+		title: None,
+		browser: Some(sf!("relay")),
 		operation: Some(sf!("open")),
 	}
 }
@@ -1693,6 +1935,38 @@ mod tests {
 			kill: false,
 			restart_for_mode_change: None,
 		}
+	}
+
+	#[test]
+	fn relay_failure_subprocess_helper() {
+		if std::env::var_os("OMP_RELAY_FAILURE_HELPER").is_some() {
+			eprintln!("synthetic relay startup failure");
+			std::process::exit(17);
+		}
+	}
+
+	#[test]
+	fn spawned_relay_surfaces_bounded_early_stderr() {
+		let child = Command::new(std::env::current_exe().expect("test executable"))
+			.args(["relay_failure_subprocess_helper", "--nocapture"])
+			.env("OMP_RELAY_FAILURE_HELPER", "1")
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::piped())
+			.spawn()
+			.expect("failure helper");
+		let mut observed = SpawnedRelay::observe(child).expect("observe child");
+		let deadline = Instant::now() + Duration::from_secs(2);
+		let status = loop {
+			if let Some(status) = observed.poll_exit().expect("poll helper") {
+				break status;
+			}
+			assert!(Instant::now() < deadline, "helper did not exit");
+			thread::sleep(Duration::from_millis(5));
+		};
+		let fault = observed.exit_fault(status);
+		assert!(fault.message.contains("synthetic relay startup failure"));
+		assert!(fault.message.len() <= MAX_RELAY_STDERR_BYTES + 256);
 	}
 
 	#[test]

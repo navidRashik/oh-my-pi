@@ -1105,6 +1105,12 @@ pub struct BrowserRelayArgs {
 	/// Loopback port.
 	#[arg(long, default_value_t = 9224)]
 	pub port:     u16,
+	/// Loopback bind address used by the internal managed launcher.
+	#[arg(long, default_value = "127.0.0.1", hide = true)]
+	pub bind:     std::net::IpAddr,
+	/// Run under machine-global consumer lease ownership.
+	#[arg(long, hide = true)]
+	pub managed:  bool,
 	/// Optional extension authentication token.
 	#[arg(long)]
 	pub token:    Option<Str>,
@@ -3650,6 +3656,33 @@ mod tests {
 
 	fn parse(arguments: &[&str]) -> OmpCli {
 		OmpCli::try_parse_from(arguments).expect("valid command")
+	}
+
+	#[test]
+	fn parses_hidden_managed_relay_mode_and_ipv6_bind() {
+		let Some(Command::BrowserRelay(args)) = parse(&[
+			"omp",
+			"browser-relay",
+			"serve",
+			"--managed",
+			"--bind",
+			"::1",
+			"--port",
+			"9333",
+		])
+		.command
+		else {
+			panic!("browser relay command");
+		};
+		assert!(args.managed);
+		assert_eq!(args.bind, std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+		assert_eq!(args.port, 9333);
+		let help = omp_command(false)
+			.try_get_matches_from(["omp", "browser-relay", "--help"])
+			.expect_err("help exits before parsing")
+			.to_string();
+		assert!(!help.contains("--managed"));
+		assert!(!help.contains("--bind"));
 	}
 
 	#[test]

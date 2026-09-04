@@ -1031,6 +1031,16 @@ fn fuse_rows<T: Default>(
 
 /// Maximum length of one JSON CONTROL frame.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum encoded size of one correlated dispatch progress frame.
+pub const MAX_DISPATCH_PROGRESS_FRAME_BYTES: usize = 1024 * 1024;
+/// Maximum progress events accepted from one invocation.
+pub const MAX_DISPATCH_PROGRESS_EVENTS: usize = 1024;
+/// Maximum aggregate bytes accepted across one invocation's progress frames.
+pub const MAX_DISPATCH_PROGRESS_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum reassembled terminal dispatch body accepted before result spilling.
+pub const MAX_DISPATCH_RESULT_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum decoded bytes accepted in one terminal-result chunk.
+pub const MAX_DISPATCH_RESULT_CHUNK_BYTES: usize = 512 * 1024;
 
 /// Core-authenticated identity for one extension-host CONTROL connection.
 ///
@@ -2234,6 +2244,7 @@ fn quota_protocol_error(error: QuotaError) -> ControlProtocolError {
 						super::quota::QuotaScope::Extension => "extension",
 						super::quota::QuotaScope::Session => "session",
 					},
+					"receipt": resource_receipt_json(&exceeded.receipt),
 				}))
 		},
 		_ => ControlProtocolError::new(
@@ -2241,6 +2252,24 @@ fn quota_protocol_error(error: QuotaError) -> ControlProtocolError {
 			"extension CONTROL resource accounting is unavailable",
 		),
 	}
+}
+
+fn resource_receipt_json(receipt: &ResourceReceipt) -> Value {
+	json!({
+		"quotas": receipt.quotas.iter().map(|(name, status)| {
+			(
+				name.to_string(),
+				json!({
+					"limit": status.limit,
+					"used": status.used,
+					"window": status.window.map(|window| window.to_string()),
+				}),
+			)
+		}).collect::<serde_json::Map<_, _>>(),
+		"dropped": receipt.dropped.iter().map(|(name, count)| {
+			(name.to_string(), Value::from(*count))
+		}).collect::<serde_json::Map<_, _>>(),
+	})
 }
 
 struct DomainEffectAuthority {
@@ -2496,15 +2525,108 @@ struct JsonControlFrame {
 	body:        serde_json::Map<String, Value>,
 }
 
+struct DispatchProgressState {
+	invocation: Str,
+	sender:     Option<flume::Sender<Value>>,
+	events:     usize,
+	bytes:      usize,
+}
+
+struct DispatchChunkState {
+	invocation: Str,
+	next_index: u64,
+	body:       Vec<u8>,
+}
+
+fn dispatch_frame_invocation_for_identity<'a>(
+	identity: &ControlConnectionIdentity,
+	authority: &'a serde_json::Map<String, Value>,
+) -> Result<&'a str, ControlProtocolError> {
+	let host_generation = wire_u64(authority, "host_generation")?;
+	if host_generation != identity.host_generation {
+		return Err(ControlProtocolError::stale_generation(
+			identity.host_generation,
+			host_generation,
+			"host_generation",
+		));
+	}
+	let session_generation = wire_u64(authority, "session_generation")?;
+	if session_generation != identity.session_generation {
+		return Err(ControlProtocolError::stale_generation(
+			identity.session_generation,
+			session_generation,
+			"session_generation",
+		));
+	}
+	authority
+		.get("invocation")
+		.and_then(Value::as_str)
+		.filter(|invocation| !invocation.is_empty())
+		.ok_or_else(|| ControlProtocolError::malformed("dispatch frame invocation is missing"))
+}
+
+fn checked_progress_bytes(
+	state: &DispatchProgressState,
+	encoded: usize,
+) -> Result<usize, ControlProtocolError> {
+	if state.events >= MAX_DISPATCH_PROGRESS_EVENTS {
+		return Err(ControlProtocolError::new(
+			"progress_overflow",
+			format!("dispatch progress exceeds {MAX_DISPATCH_PROGRESS_EVENTS} events"),
+		));
+	}
+	let bytes = state.bytes.checked_add(encoded).ok_or_else(|| {
+		ControlProtocolError::new("progress_overflow", "dispatch progress byte count overflow")
+	})?;
+	if bytes > MAX_DISPATCH_PROGRESS_BYTES {
+		return Err(ControlProtocolError::new(
+			"progress_overflow",
+			format!("dispatch progress exceeds {MAX_DISPATCH_PROGRESS_BYTES} bytes"),
+		));
+	}
+	Ok(bytes)
+}
+
+fn append_dispatch_result_chunk(
+	state: &mut DispatchChunkState,
+	invocation: &Str,
+	index: u64,
+	data: &[u8],
+) -> Result<(), ControlProtocolError> {
+	if state.invocation.as_str() != invocation.as_str() || state.next_index != index {
+		return Err(ControlProtocolError::new(
+			"result_chunk_order",
+			format!(
+				"dispatch result chunk index {index} does not follow {}",
+				state.next_index
+			),
+		));
+	}
+	let length = state.body.len().checked_add(data.len()).ok_or_else(|| {
+		ControlProtocolError::new("result_too_large", "dispatch result length overflow")
+	})?;
+	if length > MAX_DISPATCH_RESULT_BYTES {
+		return Err(ControlProtocolError::new(
+			"result_too_large",
+			format!("dispatch result exceeds {MAX_DISPATCH_RESULT_BYTES} bytes"),
+		));
+	}
+	state.body.extend_from_slice(data);
+	state.next_index += 1;
+	Ok(())
+}
+
 struct ControlShared {
-	writer:           AsyncMutex<OwnedWriteHalf>,
-	identity:         Arc<ControlConnectionIdentity>,
-	authority:        Arc<dyn ControlAuthority>,
-	router:           Mutex<DispatchRouter>,
-	invocations:      Mutex<BTreeMap<Str, ControlInvocationAuthority>>,
-	dispatch_by_id:   Mutex<BTreeMap<u64, Str>>,
-	child_requests:   Mutex<BTreeMap<u64, AbortHandle>>,
-	next_dispatch_id: AtomicU64,
+	writer:            AsyncMutex<OwnedWriteHalf>,
+	identity:          Arc<ControlConnectionIdentity>,
+	authority:         Arc<dyn ControlAuthority>,
+	router:            Mutex<DispatchRouter>,
+	invocations:       Mutex<BTreeMap<Str, ControlInvocationAuthority>>,
+	dispatch_by_id:    Mutex<BTreeMap<u64, Str>>,
+	dispatch_progress: Mutex<BTreeMap<u64, DispatchProgressState>>,
+	dispatch_chunks:   Mutex<BTreeMap<u64, DispatchChunkState>>,
+	child_requests:    Mutex<BTreeMap<u64, AbortHandle>>,
+	next_dispatch_id:  AtomicU64,
 }
 
 /// Parent-side pump for the dedicated, multiplexed CONTROL descriptor.
@@ -2545,6 +2667,8 @@ impl Drop for LiveDispatchGuard {
 		if queued {
 			self.shared.invocations.lock().remove(&self.invocation);
 			self.shared.dispatch_by_id.lock().remove(&self.id);
+			self.shared.dispatch_progress.lock().remove(&self.id);
+			self.shared.dispatch_chunks.lock().remove(&self.id);
 			return;
 		}
 		if let Ok(runtime) = runtime::Handle::try_current() {
@@ -2648,6 +2772,8 @@ impl ControlRuntime {
 			router: Mutex::new(DispatchRouter::new(host, generation)),
 			invocations: Mutex::new(BTreeMap::new()),
 			dispatch_by_id: Mutex::new(BTreeMap::new()),
+			dispatch_progress: Mutex::new(BTreeMap::new()),
+			dispatch_chunks: Mutex::new(BTreeMap::new()),
 			child_requests: Mutex::new(BTreeMap::new()),
 			next_dispatch_id: AtomicU64::new(1),
 		});
@@ -2659,6 +2785,10 @@ impl ControlRuntime {
 		loop {
 			let Some(frame) = read_json_control_frame(&mut self.reader).await? else {
 				self.shared.router.lock().disconnect();
+				self.shared.invocations.lock().clear();
+				self.shared.dispatch_by_id.lock().clear();
+				self.shared.dispatch_progress.lock().clear();
+				self.shared.dispatch_chunks.lock().clear();
 				for (_, request) in mem::take(&mut *self.shared.child_requests.lock()) {
 					request.abort();
 				}
@@ -2667,6 +2797,8 @@ impl ControlRuntime {
 			match frame.kind.as_str() {
 				"Request" => self.accept_request(frame).await?,
 				"CancelRequest" => self.accept_request_cancel(frame)?,
+				"DispatchProgress" => self.accept_dispatch_progress(frame)?,
+				"DispatchResultChunk" => self.accept_dispatch_result_chunk(frame)?,
 				"DispatchResponse" => self.accept_dispatch_response(frame).await?,
 				"IntentEffect" => {
 					if let Err(error) = self.accept_effect(frame, ControlEffectKind::Intent).await {
@@ -2777,9 +2909,174 @@ impl ControlRuntime {
 		Ok(())
 	}
 
+	fn dispatch_frame_invocation(
+		&self,
+		correlation: u64,
+		body: &serde_json::Map<String, Value>,
+	) -> Result<Str, ControlProtocolError> {
+		let authority = body
+			.get("authority")
+			.and_then(Value::as_object)
+			.ok_or_else(|| ControlProtocolError::malformed("dispatch frame authority is missing"))?;
+		let invocation =
+			dispatch_frame_invocation_for_identity(&self.shared.identity, authority)?;
+		let expected = self
+			.shared
+			.dispatch_by_id
+			.lock()
+			.get(&correlation)
+			.cloned()
+			.ok_or_else(|| {
+				ControlProtocolError::new(
+					"stale_correlation",
+					format!("unknown dispatch frame correlation {correlation}"),
+				)
+			})?;
+		if invocation != expected.as_str() {
+			return Err(ControlProtocolError::new(
+				"stale_invocation",
+				format!(
+					"dispatch frame invocation {invocation} does not own correlation {correlation}"
+				),
+			));
+		}
+		Ok(expected)
+	}
+
+	fn accept_dispatch_progress(&self, mut frame: JsonControlFrame) -> Result<(), ControlRuntimeError> {
+		let Some(correlation) = frame.correlation.filter(|id| *id != 0) else {
+			return Err(
+				ControlProtocolError::malformed("dispatch progress has no correlation").into(),
+			);
+		};
+		let encoded = serde_json::to_vec(&frame.body)?;
+		if encoded.len() > MAX_DISPATCH_PROGRESS_FRAME_BYTES {
+			return Err(
+				ControlProtocolError::new(
+					"progress_too_large",
+					format!(
+						"dispatch progress is {} bytes; limit is {MAX_DISPATCH_PROGRESS_FRAME_BYTES}",
+						encoded.len()
+					),
+				)
+				.into(),
+			);
+		}
+		let invocation = self.dispatch_frame_invocation(correlation, &frame.body)?;
+		let update = frame
+			.body
+			.remove("update")
+			.ok_or_else(|| ControlProtocolError::malformed("dispatch progress update is missing"))?;
+		if frame.body.len() != 1 || !frame.body.contains_key("authority") {
+			return Err(
+				ControlProtocolError::malformed("dispatch progress has unexpected fields").into(),
+			);
+		}
+		let mut progress = self.shared.dispatch_progress.lock();
+		let state = progress.get_mut(&correlation).ok_or_else(|| {
+			ControlProtocolError::new(
+				"progress_unhandled",
+				format!("dispatch {correlation} has no progress owner"),
+			)
+		})?;
+		if state.invocation != invocation {
+			return Err(ControlProtocolError::new(
+				"stale_invocation",
+				"dispatch progress state belongs to another invocation",
+			)
+			.into());
+		}
+		let bytes = checked_progress_bytes(state, encoded.len())?;
+		let sender = state.sender.as_ref().ok_or_else(|| {
+			ControlProtocolError::new(
+				"progress_unhandled",
+				format!("dispatch {correlation} did not install a progress sink"),
+			)
+		})?;
+		sender.try_send(update).map_err(|error| {
+			ControlProtocolError::new(
+				"progress_overflow",
+				format!("dispatch progress owner rejected an update: {error}"),
+			)
+		})?;
+		state.events += 1;
+		state.bytes = bytes;
+		Ok(())
+	}
+
+	fn accept_dispatch_result_chunk(
+		&self,
+		mut frame: JsonControlFrame,
+	) -> Result<(), ControlRuntimeError> {
+		let Some(correlation) = frame.correlation.filter(|id| *id != 0) else {
+			return Err(
+				ControlProtocolError::malformed("dispatch result chunk has no correlation").into(),
+			);
+		};
+		let invocation = self.dispatch_frame_invocation(correlation, &frame.body)?;
+		let index = frame
+			.body
+			.remove("index")
+			.and_then(|value| value.as_u64())
+			.ok_or_else(|| ControlProtocolError::malformed("dispatch chunk index is missing"))?;
+		let encoded = frame
+			.body
+			.remove("data")
+			.and_then(|value| value.as_object().cloned())
+			.and_then(|mut value| {
+				(value.len() == 1)
+					.then(|| value.remove("$bytes"))
+					.flatten()
+					.and_then(|value| value.as_str().map(ToOwned::to_owned))
+			})
+			.ok_or_else(|| ControlProtocolError::malformed("dispatch chunk data is malformed"))?;
+		if frame.body.len() != 1 || !frame.body.contains_key("authority") {
+			return Err(
+				ControlProtocolError::malformed("dispatch chunk has unexpected fields").into(),
+			);
+		}
+		let maximum_encoded = MAX_DISPATCH_RESULT_CHUNK_BYTES
+			.saturating_add(2)
+			.saturating_div(3)
+			.saturating_mul(4);
+		if encoded.len() > maximum_encoded {
+			return Err(
+				ControlProtocolError::new(
+					"result_chunk_too_large",
+					"dispatch result chunk encoding exceeds its bound",
+				)
+				.into(),
+			);
+		}
+		let data = omp_core::base64::decode(encoded.as_bytes())
+			.into_vec()
+			.map_err(|_| ControlProtocolError::malformed("dispatch chunk base64 is invalid"))?;
+		if data.len() > MAX_DISPATCH_RESULT_CHUNK_BYTES {
+			return Err(
+				ControlProtocolError::new(
+					"result_chunk_too_large",
+					format!(
+						"dispatch result chunk is {} bytes; limit is \
+						 {MAX_DISPATCH_RESULT_CHUNK_BYTES}",
+						data.len()
+					),
+				)
+				.into(),
+			);
+		}
+		let mut chunks = self.shared.dispatch_chunks.lock();
+		let state = chunks.entry(correlation).or_insert_with(|| DispatchChunkState {
+			invocation: invocation.clone(),
+			next_index: 0,
+			body: Vec::new(),
+		});
+		append_dispatch_result_chunk(state, &invocation, index, &data)?;
+		Ok(())
+	}
+
 	async fn accept_dispatch_response(
 		&self,
-		frame: JsonControlFrame,
+		mut frame: JsonControlFrame,
 	) -> Result<(), ControlRuntimeError> {
 		let Some(correlation) = frame.correlation.filter(|id| *id != 0) else {
 			return Err(
@@ -2797,7 +3094,55 @@ impl ControlRuntime {
 					format!("unknown dispatch response correlation {correlation}"),
 				)
 			})?;
-		let payload = serde_json::to_vec(&Value::Object(frame.body))?;
+		let body = if let Some(chunked) = frame.body.remove("chunked") {
+			if !frame.body.is_empty() {
+				return Err(
+					ControlProtocolError::malformed(
+						"chunked dispatch response has unexpected fields",
+					)
+					.into(),
+				);
+			}
+			let chunked = chunked.as_object().ok_or_else(|| {
+				ControlProtocolError::malformed("chunked dispatch response metadata is malformed")
+			})?;
+			let expected_chunks = wire_u64(chunked, "chunks")?;
+			let expected_bytes = wire_u64(chunked, "bytes")?;
+			let state = self
+				.shared
+				.dispatch_chunks
+				.lock()
+				.remove(&correlation)
+				.ok_or_else(|| {
+					ControlProtocolError::malformed("chunked dispatch response has no chunks")
+				})?;
+			if state.invocation != invocation
+				|| state.next_index != expected_chunks
+				|| u64::try_from(state.body.len()).ok() != Some(expected_bytes)
+			{
+				return Err(
+					ControlProtocolError::new(
+						"result_chunk_mismatch",
+						"chunked dispatch response metadata does not match received bytes",
+					)
+					.into(),
+				);
+			}
+			serde_json::from_slice::<serde_json::Map<String, Value>>(&state.body)?
+		} else {
+			if self.shared.dispatch_chunks.lock().remove(&correlation).is_some() {
+				return Err(
+					ControlProtocolError::new(
+						"result_chunk_incomplete",
+						"dispatch response omitted chunk completion metadata",
+					)
+					.into(),
+				);
+			}
+			frame.body
+		};
+		self.shared.dispatch_progress.lock().remove(&correlation);
+		let payload = serde_json::to_vec(&Value::Object(body))?;
 		let extension = self.shared.identity.extension.clone();
 		let next = self.shared.router.lock().complete(
 			extension.as_str(),
@@ -2909,24 +3254,7 @@ impl ControlHandle {
 			String::from("session_generation"),
 			Value::from(self.shared.identity.session_generation),
 		);
-		body.insert(
-			String::from("receipt"),
-			json!({
-				"quotas": receipt.quotas.iter().map(|(name, status)| {
-					(
-						name.to_string(),
-						json!({
-							"limit": status.limit,
-							"used": status.used,
-							"window": status.window.map(|window| window.to_string()),
-						}),
-					)
-				}).collect::<serde_json::Map<_, _>>(),
-				"dropped": receipt.dropped.iter().map(|(name, count)| {
-					(name.to_string(), Value::from(*count))
-				}).collect::<serde_json::Map<_, _>>(),
-			}),
-		);
+		body.insert(String::from("receipt"), resource_receipt_json(receipt));
 		write_json_control_frame(&self.shared, JsonControlFrame {
 			kind: String::from("ResourceReceipt"),
 			correlation: None,
@@ -2938,6 +3266,24 @@ impl ControlHandle {
 	/// Dispatches one callback and waits for its exactly correlated Python
 	/// reply.
 	pub async fn dispatch(&self, dispatch: ControlDispatch) -> Result<Value, ControlRuntimeError> {
+		self.dispatch_inner(dispatch, None).await
+	}
+
+	/// Dispatches one callback while forwarding bounded correlated progress to
+	/// the invocation owner before returning its terminal reply.
+	pub async fn dispatch_with_progress(
+		&self,
+		dispatch: ControlDispatch,
+		progress: flume::Sender<Value>,
+	) -> Result<Value, ControlRuntimeError> {
+		self.dispatch_inner(dispatch, Some(progress)).await
+	}
+
+	async fn dispatch_inner(
+		&self,
+		dispatch: ControlDispatch,
+		progress: Option<flume::Sender<Value>>,
+	) -> Result<Value, ControlRuntimeError> {
 		if !dispatch.operation.as_str().starts_with("omp.") {
 			return Err(
 				ControlProtocolError::new(
@@ -3000,6 +3346,12 @@ impl ControlHandle {
 			.dispatch_by_id
 			.lock()
 			.insert(id, invocation.clone());
+		self.shared.dispatch_progress.lock().insert(id, DispatchProgressState {
+			invocation: invocation.clone(),
+			sender: progress,
+			events: 0,
+			bytes: 0,
+		});
 		let mut guard = LiveDispatchGuard {
 			shared: Arc::clone(&self.shared),
 			id,
@@ -3010,6 +3362,8 @@ impl ControlHandle {
 			if let Err(error) = write_dispatch_request(&self.shared, ready).await {
 				self.shared.invocations.lock().remove(&invocation);
 				self.shared.dispatch_by_id.lock().remove(&id);
+				self.shared.dispatch_progress.lock().remove(&id);
+				self.shared.dispatch_chunks.lock().remove(&id);
 				guard.disarm();
 				let _ = self.shared.router.lock().complete(
 					self.shared.identity.extension.as_str(),
@@ -3022,7 +3376,16 @@ impl ControlHandle {
 		}
 		let response = pending.response().await;
 		guard.disarm();
-		let payload = response?;
+		let payload = match response {
+			Ok(payload) => payload,
+			Err(error) => {
+				self.shared.invocations.lock().remove(&invocation);
+				self.shared.dispatch_by_id.lock().remove(&id);
+				self.shared.dispatch_progress.lock().remove(&id);
+				self.shared.dispatch_chunks.lock().remove(&id);
+				return Err(error.into());
+			},
+		};
 		let body: Value = serde_json::from_slice(payload.as_ref())?;
 		let object = body
 			.as_object()
@@ -3316,7 +3679,10 @@ async fn write_json_control_frame(
 
 #[cfg(test)]
 mod convar_tests {
-	use std::{collections::BTreeSet, sync::Arc};
+	use std::{
+		collections::{BTreeMap, BTreeSet},
+		sync::Arc,
+	};
 
 	use omp_con::{Ctx, Origin, Value as ConValue};
 	use omp_core::{Principal, sf};
@@ -3325,6 +3691,12 @@ mod convar_tests {
 	use super::{
 		CompositeControlAuthority, ControlAuthority, ControlAuthorityFactory,
 		ControlConnectionIdentity, ControlRequestContext, ConvarControlFactory,
+		DispatchChunkState, DispatchProgressState, MAX_DISPATCH_PROGRESS_BYTES,
+		MAX_DISPATCH_PROGRESS_EVENTS, append_dispatch_result_chunk, checked_progress_bytes,
+		dispatch_frame_invocation_for_identity, quota_protocol_error,
+	};
+	use crate::exthost::{
+		QuotaError, QuotaExceeded, QuotaScope, QuotaStatus, ResourceReceipt,
 	};
 
 	fn identity() -> Arc<ControlConnectionIdentity> {
@@ -3351,6 +3723,73 @@ mod convar_tests {
 	) -> Arc<dyn ControlAuthority> {
 		let convars = factory.bind(identity).expect("bind convar authority");
 		Arc::new(CompositeControlAuthority::new([Arc::clone(&convars)], convars))
+	}
+
+	#[test]
+	fn dispatch_progress_is_generation_fenced_and_bounded() {
+		let identity = identity();
+		let stale = json!({
+			"host_generation": 2,
+			"session_generation": 1,
+			"invocation": "call",
+		});
+		let error = dispatch_frame_invocation_for_identity(
+			&identity,
+			stale.as_object().expect("authority"),
+		)
+		.expect_err("stale generation");
+		assert_eq!(error.code.as_str(), "StaleGeneration");
+
+		let state = DispatchProgressState {
+			invocation: sf!("call"),
+			sender: None,
+			events: MAX_DISPATCH_PROGRESS_EVENTS,
+			bytes: 0,
+		};
+		let error = checked_progress_bytes(&state, 1).expect_err("progress count overflow");
+		assert_eq!(error.code.as_str(), "progress_overflow");
+		let oversized = DispatchProgressState {
+			invocation: sf!("call"),
+			sender: None,
+			events: 0,
+			bytes: MAX_DISPATCH_PROGRESS_BYTES,
+		};
+		let error = checked_progress_bytes(&oversized, 1).expect_err("progress byte overflow");
+		assert_eq!(error.code.as_str(), "progress_overflow");
+	}
+
+	#[test]
+	fn dispatch_result_chunks_require_contiguous_order() {
+		let invocation = sf!("call");
+		let mut state = DispatchChunkState {
+			invocation: invocation.clone(),
+			next_index: 0,
+			body: Vec::new(),
+		};
+		append_dispatch_result_chunk(&mut state, &invocation, 0, b"one")
+			.expect("first result chunk");
+		let error = append_dispatch_result_chunk(&mut state, &invocation, 2, b"three")
+			.expect_err("out-of-order result chunk");
+		assert_eq!(error.code.as_str(), "result_chunk_order");
+		assert_eq!(state.body, b"one");
+	}
+
+	#[test]
+	fn hard_quota_error_carries_the_current_receipt() {
+		let receipt = ResourceReceipt {
+			quotas: BTreeMap::from([(
+				sf!("ui.updates"),
+				QuotaStatus { limit: 3, used: 3, window: None },
+			)]),
+			dropped: BTreeMap::from([(sf!("ui.updates"), 1)]),
+		};
+		let error = quota_protocol_error(QuotaError::Exceeded(QuotaExceeded {
+			quota: sf!("ui.updates"),
+			scope: QuotaScope::Extension,
+			receipt,
+		}));
+		assert_eq!(error.details["receipt"]["quotas"]["ui.updates"]["used"], 3);
+		assert_eq!(error.details["receipt"]["dropped"]["ui.updates"], 1);
 	}
 
 	#[tokio::test]

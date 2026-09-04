@@ -4755,52 +4755,46 @@ pub(crate) fn production_registry<
 	let eval_host = Arc::new(SessionBridgeHost::new());
 	let mut eval_control = EvalSessionControl::default();
 	if tool_settings.enabled("eval") || py_eval {
-		match ProcessEvalExec::production(
-			exec.clone(),
-			Arc::clone(&eval_host),
-			interrupt_grace,
-			blobs.clone(),
-			tool_settings
-				.eval_interpreters
-				.get("py")
-				.map(|path| PathBuf::from(path.as_str())),
-		) {
-			Ok(eval_exec) => {
-				let mut task_snapshot = TaskDescriptionSnapshot {
-					helpers: &helper_docs,
-					..TaskDescriptionSnapshot::standard()
-				};
-				if !tool_settings.enabled("task") {
-					task_snapshot.agents = &[];
-				}
-				let (eval_tool, control) = omp_tools::eval::eval_controlled_with_task_snapshot(
-					eval_exec.clone(),
-					task_snapshot,
-				);
-				eval_control = control;
-				if tool_settings.enabled("eval") {
-					environment_registry(
-						&mut registry,
-						eval_tool,
-						long_tail_presentation(policy),
-						long_tail_claims(policy),
-					)?;
-				}
-				if py_eval {
-					environment_registry(
-						&mut registry,
-						omp_tools::eval::py_eval(eval_exec),
-						long_tail_presentation(policy),
-						long_tail_claims(policy),
-					)?;
-				}
-			},
-			Err(error) => {
-				tracing::warn!(
-					error = %error,
-					"Python tools omitted because the eval child configuration is unavailable"
-				);
-			},
+		let eval_exec = compose_eval_executor(
+			ProcessEvalExec::production(
+				exec.clone(),
+				Arc::clone(&eval_host),
+				interrupt_grace,
+				blobs.clone(),
+				tool_settings
+					.eval_interpreters
+					.get("py")
+					.map(|path| PathBuf::from(path.as_str())),
+			),
+			py_eval,
+		)?;
+		if let Some(eval_exec) = eval_exec {
+			let mut task_snapshot = TaskDescriptionSnapshot {
+				helpers: &helper_docs,
+				..TaskDescriptionSnapshot::standard()
+			};
+			if !tool_settings.enabled("task") {
+				task_snapshot.agents = &[];
+			}
+			let (eval_tool, control) =
+				omp_tools::eval::eval_controlled_with_task_snapshot(eval_exec.clone(), task_snapshot);
+			eval_control = control;
+			if tool_settings.enabled("eval") {
+				environment_registry(
+					&mut registry,
+					eval_tool,
+					long_tail_presentation(policy),
+					long_tail_claims(policy),
+				)?;
+			}
+			if py_eval {
+				environment_registry(
+					&mut registry,
+					omp_tools::eval::py_eval(eval_exec),
+					long_tail_presentation(policy),
+					long_tail_claims(policy),
+				)?;
+			}
 		}
 	}
 	let dyn_installed = tool_settings.enabled("dyn") && dyn_enabled(policy);
@@ -4886,6 +4880,27 @@ pub(crate) fn production_registry<
 		ask_presenter,
 	))
 }
+
+fn compose_eval_executor<T>(
+	executor: Result<T, std::io::Error>,
+	py_eval_explicit: bool,
+) -> Result<Option<T>, EnvdError> {
+	match executor {
+		Ok(executor) => Ok(Some(executor)),
+		Err(error) if py_eval_explicit => Err(EnvdError::Eval(Str::from(format!(
+			"environment composition could not construct the explicitly requested py_eval executor: \
+			 {error}"
+		)))),
+		Err(error) => {
+			tracing::warn!(
+				error = %error,
+				"Python tools omitted because the eval child configuration is unavailable"
+			);
+			Ok(None)
+		},
+	}
+}
+
 #[derive(Clone)]
 struct GoalControlAdapter(Arc<dyn GoalAuthority>);
 
@@ -5874,6 +5889,81 @@ const fn worker_declaration_error(message: &'static str) -> EnvdError {
 mod tests {
 	use super::*;
 
+	static EVAL_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+	struct EvalEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+	impl EvalEnvRestore {
+		fn set(values: &[(&'static str, &std::ffi::OsStr)]) -> Self {
+			let previous = values
+				.iter()
+				.map(|(name, _)| (*name, env::var_os(name)))
+				.collect();
+			for (name, value) in values {
+				// SAFETY: every mutation of these eval-specific variables in this
+				// module is serialized by EVAL_ENV_LOCK and restored on drop.
+				unsafe { env::set_var(name, value) };
+			}
+			Self(previous)
+		}
+	}
+
+	impl Drop for EvalEnvRestore {
+		fn drop(&mut self) {
+			for (name, value) in self.0.drain(..).rev() {
+				// SAFETY: EVAL_ENV_LOCK remains held until after this guard drops.
+				unsafe {
+					if let Some(value) = value {
+						env::set_var(name, value);
+					} else {
+						env::remove_var(name);
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn explicit_py_eval_failure_is_typed_and_environment_override_has_precedence() {
+		let _lock = EVAL_ENV_LOCK.lock();
+		let scratch = tempfile::tempdir().expect("eval scratch");
+		let current_exe = env::current_exe().expect("current test executable");
+		let invalid_override = scratch.path().join("missing-python");
+		let _restore = EvalEnvRestore::set(&[
+			("CARGO_BIN_EXE_omp", current_exe.as_os_str()),
+			("OMP_PYTHON_INTERPRETER", invalid_override.as_os_str()),
+		]);
+		let blobs = BlobHost::open(scratch.path().join("blobs")).expect("blob host");
+		let constructed = ProcessEvalExec::production(
+			ExecHost::new(),
+			Arc::new(SessionBridgeHost::new()),
+			"1s".parse().expect("interrupt grace"),
+			blobs,
+			Some(current_exe),
+		);
+		let error = match compose_eval_executor(constructed, true) {
+			Err(error) => error,
+			Ok(_) => panic!("explicit py_eval must reject an invalid environment override"),
+		};
+		let EnvdError::Eval(message) = error else {
+			panic!("explicit py_eval failure must use the typed eval composition error");
+		};
+		assert!(message.contains("explicitly requested py_eval"));
+		assert!(
+			message.contains(invalid_override.to_string_lossy().as_ref()),
+			"the environment override must win over the valid configured interpreter"
+		);
+	}
+
+	#[test]
+	fn incidental_eval_executor_failure_remains_an_omission() {
+		let unavailable = std::io::Error::new(
+			std::io::ErrorKind::NotFound,
+			"configured Python interpreter is unavailable",
+		);
+		assert!(matches!(compose_eval_executor::<()>(Err(unavailable), false), Ok(None)));
+	}
+
 	#[test]
 	fn extension_tool_call_timeout_caps_only_tool_call_handlers() {
 		let configured = time::Duration::from_millis(125);
@@ -6111,6 +6201,12 @@ mod tests {
 			&inputs,
 			false,
 			ToolsPolicy::Auto,
+		);
+		assert!(
+			declarations
+				.iter()
+				.all(|declaration| declaration.spec.name != "py_eval"),
+			"py_eval must remain absent unless explicitly requested"
 		);
 		let slots = declarations
 			.iter()

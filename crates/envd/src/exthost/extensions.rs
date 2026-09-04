@@ -22,8 +22,8 @@ use omp_proto::{
 	inference::v1::{Fallback, ToolDef, tool_def},
 	policy::v1::EffectEnvelope,
 	toolhost::v1::{
-		GrammarConstraint, GrammarSyntax, SchemaConstraint, ToolConstraint, ToolDecl, ToolExample,
-		ToolExecutionMode, tool_constraint,
+		GrammarConstraint, GrammarSyntax, PreludeParam, PreludeParamKind, SchemaConstraint,
+		ToolConstraint, ToolDecl, ToolExample, ToolExecutionMode, tool_constraint,
 	},
 	ui::v1::{CommandArgDecl, CommandDecl, RegisterUi, ShortcutDecl, TriggerDecl},
 };
@@ -267,6 +267,21 @@ pub struct SealedHookRegistration {
 	pub composition:      BTreeMap<Str, HookFieldComposition>,
 }
 
+/// One manifest-authenticated initial device availability fact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedToolAvailability {
+	/// Exact declared device name.
+	pub name:    Str,
+	/// Exact compatibility family.
+	pub family:  Str,
+	/// Exact declaration revision.
+	pub rev:     u16,
+	/// Whether the route starts mounted in this generation.
+	pub mounted: bool,
+	/// Typed human-readable reason for an unavailable route.
+	pub reason:  Option<Str>,
+}
+
 /// Exact sealed registry publication accepted from one authenticated host.
 #[derive(Clone, Debug)]
 pub struct SealedRegistryEvidence {
@@ -288,6 +303,8 @@ pub struct SealedRegistryEvidence {
 	pub ui_registration: RegisterUi,
 	/// Manifest-verified UI roster.
 	pub ui:              VerifiedUiRoster,
+	/// Initial root-device availability, sealed separately from identity.
+	pub availability:    Arc<[SealedToolAvailability]>,
 	/// Full frozen provider declaration documents.
 	pub providers:       Arc<[JsonValue]>,
 	/// Python lifecycle declarations registered as Directors.
@@ -353,7 +370,7 @@ struct FrozenDeclarationKey {
 	key:  Str,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 struct FrozenCallback {
 	#[serde(rename = "$omp.callable")]
 	callable: String,
@@ -403,6 +420,41 @@ struct FrozenToolCallback {
 	rev:       u16,
 }
 
+#[derive(Deserialize)]
+struct FrozenPrelude {
+	name:          String,
+	rev:           u16,
+	#[serde(default)]
+	doc:           String,
+	#[serde(default)]
+	summary:       String,
+	source_module: String,
+	#[serde(default)]
+	params:        Vec<FrozenPreludeParam>,
+	callback:      FrozenToolCallback,
+}
+
+#[derive(Deserialize)]
+struct FrozenPreludeParam {
+	name:         String,
+	kind:         String,
+	#[serde(default)]
+	default_json: Option<String>,
+	#[serde(default)]
+	annotation:   Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct FrozenAvailability {
+	name:    String,
+	#[serde(default)]
+	family:  String,
+	rev:     u16,
+	mounted: bool,
+	#[serde(default)]
+	reason:  Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 struct FrozenHook {
 	event:            Str,
@@ -413,6 +465,7 @@ struct FrozenHook {
 	timeout:          Option<Str>,
 	concurrency:      usize,
 	threadsafe:       bool,
+	callback:         FrozenCallback,
 	#[serde(default)]
 	when:             Option<FrozenHookWhen>,
 	event_rev:        u16,
@@ -451,6 +504,10 @@ struct FrozenOperationCallback {
 struct FrozenRegistry {
 	declaration_keys:      Vec<FrozenDeclarationKey>,
 	tools:                 Vec<FrozenTool>,
+	#[serde(default)]
+	preludes:              Vec<FrozenPrelude>,
+	#[serde(default)]
+	availability:          Vec<FrozenAvailability>,
 	hooks:                 Vec<FrozenHook>,
 	services:              Vec<FrozenService>,
 	prompt_slots:          Vec<JsonValue>,
@@ -605,7 +662,9 @@ pub fn seal_registry_evidence(
 	}
 	validate_declaration_keys(manifest, &frozen.declaration_keys)?;
 
-	let tools = seal_tools(manifest, frozen.tools)?;
+	let availability = seal_availability(&frozen.tools, frozen.availability)?;
+	let mut tools = seal_tools(manifest, frozen.tools)?;
+	tools.extend(seal_preludes(manifest, frozen.preludes)?);
 	let prompts = seal_prompts(manifest, &identity, frozen.prompt_slots)?;
 	let services = seal_services(manifest, frozen.services)?;
 	let hooks = seal_hooks(manifest, frozen.hooks)?;
@@ -633,6 +692,7 @@ pub fn seal_registry_evidence(
 		hooks: hooks.into(),
 		ui_registration,
 		ui,
+		availability: availability.into(),
 		providers: providers.into(),
 		directors: frozen.directors.into(),
 		components: frozen.components.into(),
@@ -643,7 +703,7 @@ fn validate_declaration_keys(
 	manifest: &ExtensionManifest,
 	actual: &[FrozenDeclarationKey],
 ) -> Result<(), SealedRegistryEvidenceError> {
-	if manifest.has_uniform_declarations() {
+	if manifest.has_uniform_declarations() && !manifest.runtime_declarations_trusted() {
 		let executable =
 			|kind: &str| {
 				matches!(
@@ -684,18 +744,159 @@ fn seal_tools(
 	let expected = manifest
 		.declarations
 		.tools()
+		.filter(|tool| tool.family.as_str() != "prelude")
 		.map(|tool| (tool.name.as_str(), tool.family.as_str(), tool.rev))
 		.collect::<BTreeSet<_>>();
 	let actual = rows
 		.iter()
 		.map(|tool| (tool.name.as_str(), tool.family.as_str(), tool.rev))
 		.collect::<BTreeSet<_>>();
-	if expected != actual || actual.len() != rows.len() {
+	if actual.len() != rows.len() {
+		return Err(SealedRegistryEvidenceError::Duplicate);
+	}
+	if !manifest.runtime_declarations_trusted() && expected != actual {
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	rows
 		.into_iter()
 		.map(|row| seal_tool(manifest, row))
+		.collect()
+}
+
+fn seal_preludes(
+	manifest: &ExtensionManifest,
+	rows: Vec<FrozenPrelude>,
+) -> Result<Vec<ToolDecl>, SealedRegistryEvidenceError> {
+	let expected = manifest
+		.declarations
+		.tools()
+		.filter(|tool| tool.family.as_str() == "prelude")
+		.map(|tool| (tool.name.as_str(), tool.rev))
+		.collect::<BTreeSet<_>>();
+	let actual = rows
+		.iter()
+		.map(|row| (row.name.as_str(), row.rev))
+		.collect::<BTreeSet<_>>();
+	if actual.len() != rows.len() {
+		return Err(SealedRegistryEvidenceError::Duplicate);
+	}
+	if !manifest.runtime_declarations_trusted() && expected != actual {
+		return Err(SealedRegistryEvidenceError::ManifestDrift);
+	}
+	rows
+		.into_iter()
+		.map(|row| {
+			if row.name.is_empty()
+				|| row.rev == 0
+				|| row.source_module.is_empty()
+				|| row.callback.operation != "omp.devices.call"
+				|| row.callback.path != row.name
+				|| row.callback.family != "prelude"
+				|| row.callback.rev != row.rev
+				|| manifest_module_for_callback(manifest, &row.source_module)? != row.source_module
+			{
+				return Err(SealedRegistryEvidenceError::Malformed);
+			}
+			let mut names = BTreeSet::new();
+			let mut keyword_only = false;
+			let mut positional_default = false;
+			let params = row
+				.params
+				.into_iter()
+				.map(|param| {
+					if param.name.is_empty() || !names.insert(param.name.clone()) {
+						return Err(SealedRegistryEvidenceError::Duplicate);
+					}
+					let kind = match param.kind.as_str() {
+						"positional_or_keyword" if !keyword_only => {
+							if param.default_json.is_some() {
+								positional_default = true;
+							} else if positional_default {
+								return Err(SealedRegistryEvidenceError::Malformed);
+							}
+							PreludeParamKind::PositionalOrKeyword
+						},
+						"keyword_only" => {
+							keyword_only = true;
+							PreludeParamKind::KeywordOnly
+						},
+						_ => return Err(SealedRegistryEvidenceError::Malformed),
+					};
+					let default_json = param
+						.default_json
+						.map(|raw| {
+							serde_json::from_str::<JsonValue>(&raw)
+								.map_err(|_| SealedRegistryEvidenceError::Malformed)?;
+							Ok::<Bytes, SealedRegistryEvidenceError>(Bytes::from(raw.into_bytes()))
+						})
+						.transpose()?;
+					Ok(PreludeParam {
+						name: param.name,
+						kind: kind as i32,
+						default_json,
+						annotation: param.annotation,
+						..Default::default()
+					})
+				})
+				.collect::<Result<Vec<_>, _>>()?;
+			Ok(ToolDecl {
+				definition: Some(ToolDef {
+					name:        row.name,
+					description: row.summary.clone(),
+					input:       Some(tool_def::Input::JsonSchema(tool_def::JsonSchema {
+						schema_json: Bytes::from_static(
+							br#"{"type":"object","additionalProperties":true}"#,
+						),
+						strict:      None,
+					})),
+				}),
+				rev: format!("prelude.{}", row.rev),
+				extension_id: row.source_module,
+				summary: row.summary,
+				docs: row.doc,
+				prelude_params: params,
+				kind: String::from("soft"),
+				execution_mode: ToolExecutionMode::Parallel as i32,
+				place: String::from("host"),
+				..Default::default()
+			})
+		})
+		.collect()
+}
+
+fn seal_availability(
+	tools: &[FrozenTool],
+	rows: Vec<FrozenAvailability>,
+) -> Result<Vec<SealedToolAvailability>, SealedRegistryEvidenceError> {
+	let expected = tools
+		.iter()
+		.filter(|tool| matches!(tool.kind.as_str(), "soft" | "hard"))
+		.map(|tool| (tool.name.clone(), tool.family.clone(), tool.rev))
+		.collect::<BTreeSet<_>>();
+	let actual = rows
+		.iter()
+		.map(|row| (row.name.clone(), row.family.clone(), row.rev))
+		.collect::<BTreeSet<_>>();
+	if actual.len() != rows.len() {
+		return Err(SealedRegistryEvidenceError::Duplicate);
+	}
+	if expected != actual {
+		return Err(SealedRegistryEvidenceError::ManifestDrift);
+	}
+	rows
+		.into_iter()
+		.map(|row| {
+			if row.name.is_empty() || row.rev == 0 || row.mounted && row.reason.is_some() {
+				return Err(SealedRegistryEvidenceError::Malformed);
+			}
+			Ok(SealedToolAvailability {
+				name:    Str::from(row.name),
+				family:  Str::from(row.family),
+				rev:     row.rev,
+				mounted: row.mounted,
+				reason:  row.reason.map(Str::from),
+			})
+		})
 		.collect()
 }
 
@@ -705,7 +906,7 @@ fn seal_tool(
 ) -> Result<ToolDecl, SealedRegistryEvidenceError> {
 	if row.name.is_empty()
 		|| row.source_module.is_empty()
-		|| row.kind.is_empty()
+		|| !matches!(row.kind.as_str(), "soft" | "hard" | "legacy")
 		|| row.place.is_empty()
 		|| row.callback.operation != "omp.devices.call"
 		|| row.callback.path != row.name
@@ -718,7 +919,7 @@ fn seal_tool(
 	if module != row.source_module {
 		return Err(SealedRegistryEvidenceError::SourceModule);
 	}
-	if manifest.has_uniform_declarations() {
+	if manifest.has_uniform_declarations() && !manifest.runtime_declarations_trusted() {
 		let key = format!("{}@{}.{}", row.name, row.family, row.rev);
 		let declaration = manifest
 			.static_declarations()
@@ -881,20 +1082,24 @@ fn seal_prompts(
 			.and_then(|callback| callback.get("$omp.callable"))
 			.and_then(JsonValue::as_str)
 			.ok_or(SealedRegistryEvidenceError::Malformed)?;
-		let declaration = manifest
-			.static_declarations()
-			.prompt_slots
-			.iter()
-			.find(|declaration| declaration.key.as_str() == slot)
-			.ok_or(SealedRegistryEvidenceError::ManifestDrift)?;
-		if manifest_module_for_callback(manifest, callback)? != declaration.module.as_str()
-			|| !actual.insert(Str::new(slot))
-		{
-			return Err(SealedRegistryEvidenceError::ManifestDrift);
+		let module = manifest_module_for_callback(manifest, callback)?;
+		if !actual.insert(Str::new(slot)) {
+			return Err(SealedRegistryEvidenceError::Duplicate);
+		}
+		if !manifest.runtime_declarations_trusted() {
+			let declaration = manifest
+				.static_declarations()
+				.prompt_slots
+				.iter()
+				.find(|declaration| declaration.key.as_str() == slot)
+				.ok_or(SealedRegistryEvidenceError::ManifestDrift)?;
+			if module != declaration.module.as_str() {
+				return Err(SealedRegistryEvidenceError::ManifestDrift);
+			}
 		}
 		prompts.push(prompt_slot_binding(identity.extension.clone(), &row)?);
 	}
-	if expected != actual {
+	if !manifest.runtime_declarations_trusted() && expected != actual {
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	Ok(prompts)
@@ -913,7 +1118,10 @@ fn seal_services(
 		.iter()
 		.map(|service| (service.name.as_str(), service.rev))
 		.collect::<BTreeSet<_>>();
-	if expected != actual || actual.len() != rows.len() {
+	if actual.len() != rows.len() {
+		return Err(SealedRegistryEvidenceError::Duplicate);
+	}
+	if !manifest.runtime_declarations_trusted() && expected != actual {
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	rows
@@ -927,7 +1135,7 @@ fn seal_services(
 			{
 				return Err(SealedRegistryEvidenceError::Malformed);
 			}
-			if manifest.has_uniform_declarations() {
+			if manifest.has_uniform_declarations() && !manifest.runtime_declarations_trusted() {
 				let declaration = manifest
 					.static_declarations()
 					.services
@@ -971,10 +1179,23 @@ fn seal_hooks(
 		.iter()
 		.map(|hook| (hook.event.as_str(), hook.phase.to_string()))
 		.collect::<BTreeSet<_>>();
-	if expected != actual {
+	if !manifest.runtime_declarations_trusted() && expected != actual {
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	for hook in &rows {
+		let module = manifest_module_for_callback(manifest, &hook.callback.callable)?;
+		if manifest.has_uniform_declarations() && !manifest.runtime_declarations_trusted() {
+			let key = format!("{}/{}", hook.event, hook.phase.to_ascii_uppercase());
+			let declaration = manifest
+				.static_declarations()
+				.hooks
+				.iter()
+				.find(|row| row.key.as_str() == key)
+				.ok_or(SealedRegistryEvidenceError::ManifestDrift)?;
+			if module != declaration.module.as_str() {
+				return Err(SealedRegistryEvidenceError::ManifestDrift);
+			}
+		}
 		if let Some(filter) = manifest
 			.static_declarations()
 			.hooks
@@ -1098,7 +1319,7 @@ fn seal_documents(
 		.map(|row| row.key.as_str())
 		.collect::<BTreeSet<_>>();
 	let actual = document_ids(&documents)?;
-	if expected != actual {
+	if !manifest.runtime_declarations_trusted() && expected != actual {
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	Ok(documents)
@@ -1132,7 +1353,7 @@ fn validate_callback_documents(
 		.map(|row| row.key.as_str())
 		.collect::<BTreeSet<_>>();
 	let actual = document_ids(documents)?;
-	if expected != actual {
+	if !manifest.runtime_declarations_trusted() && expected != actual {
 		return Err(SealedRegistryEvidenceError::ManifestDrift);
 	}
 	for document in documents {
@@ -1146,14 +1367,17 @@ fn validate_callback_documents(
 			.and_then(|callback| callback.get("$omp.callable"))
 			.and_then(JsonValue::as_str)
 			.ok_or(SealedRegistryEvidenceError::Malformed)?;
-		let declaration = manifest
-			.static_declarations()
-			.ordered
-			.iter()
-			.find(|row| row.kind.as_str() == kind && row.key.as_str() == id)
-			.ok_or(SealedRegistryEvidenceError::ManifestDrift)?;
-		if manifest_module_for_callback(manifest, callback)? != declaration.module.as_str() {
-			return Err(SealedRegistryEvidenceError::ManifestDrift);
+		let module = manifest_module_for_callback(manifest, callback)?;
+		if !manifest.runtime_declarations_trusted() {
+			let declaration = manifest
+				.static_declarations()
+				.ordered
+				.iter()
+				.find(|row| row.kind.as_str() == kind && row.key.as_str() == id)
+				.ok_or(SealedRegistryEvidenceError::ManifestDrift)?;
+			if module != declaration.module.as_str() {
+				return Err(SealedRegistryEvidenceError::ManifestDrift);
+			}
 		}
 	}
 	Ok(())
@@ -1165,12 +1389,13 @@ fn manifest_module_for_callback<'a>(
 ) -> Result<&'a str, SealedRegistryEvidenceError> {
 	std::iter::once(&manifest.entry)
 		.chain(manifest.declaration_modules.iter())
-		.find(|module| {
+		.filter(|module| {
 			callback == module.as_str()
 				|| callback
 					.strip_prefix(module.as_str())
 					.is_some_and(|suffix| suffix.starts_with('.'))
 		})
+		.max_by_key(|module| module.len())
 		.map(Str::as_str)
 		.ok_or(SealedRegistryEvidenceError::SourceModule)
 }
@@ -1999,10 +2224,13 @@ mod tests {
 	};
 
 	use super::{
-		ExtensionConvarError, ExtensionManifest, FrozenDeclarationKey, SealedRegistryEvidenceError,
-		register_extension_setting_convars, validate_declaration_keys,
+		ExtensionConvarError, ExtensionManifest, FrozenAvailability, FrozenDeclarationKey,
+		FrozenPrelude, FrozenPreludeParam, FrozenTool, FrozenToolCallback,
+		SealedRegistryEvidenceError, manifest_module_for_callback,
+		register_extension_setting_convars, seal_availability, seal_preludes, seal_tools,
+		validate_declaration_keys,
 	};
-	use crate::exthost::{DeclarationSet, ServiceManifest};
+	use crate::exthost::{DeclarationSet, ServiceManifest, ToolDeclarationKey};
 
 	#[test]
 	fn manifest_settings_register_owner_qualified_dynamic_convars() {
@@ -2089,7 +2317,7 @@ default = "warning"
 			failure: sf!("fail-closed"),
 			..Default::default()
 		};
-		let manifest = ExtensionManifest::new_with_static(
+		let mut manifest = ExtensionManifest::new_with_static(
 			Provenance::new(
 				sf!("publisher"),
 				sf!("extension"),
@@ -2123,6 +2351,234 @@ default = "warning"
 				FrozenDeclarationKey { kind: sf!("provider"), key: sf!("provider") },
 				FrozenDeclarationKey { kind: sf!("service"), key: sf!("runtime.extra") },
 			],),
+			Err(SealedRegistryEvidenceError::ManifestDrift)
+		));
+		manifest.trust_runtime_declarations();
+		assert!(
+			validate_declaration_keys(&manifest, &[
+				FrozenDeclarationKey { kind: sf!("provider"), key: sf!("provider") },
+				FrozenDeclarationKey { kind: sf!("service"), key: sf!("runtime.extra") },
+			],)
+			.is_ok()
+		);
+	}
+
+	#[test]
+	fn callback_modules_choose_exact_then_longest_admitted_prefix() {
+		let manifest = ExtensionManifest::new(
+			Provenance::new(
+				sf!("publisher"),
+				sf!("extension"),
+				sf!("1.0.0"),
+				ArtifactDigest::new([8; 32]),
+				sf!("project"),
+				sf!("trusted"),
+				1,
+			),
+			"extension",
+			[sf!("extension.tools"), sf!("extension.tools.deep")],
+			DeclarationSet::default(),
+			ServiceManifest::default(),
+			[],
+			[],
+		);
+		assert_eq!(
+			manifest_module_for_callback(&manifest, "extension.tools.deep.callback")
+				.expect("longest callback module"),
+			"extension.tools.deep"
+		);
+		assert_eq!(
+			manifest_module_for_callback(&manifest, "extension.tools")
+				.expect("exact callback module"),
+			"extension.tools"
+		);
+		assert!(matches!(
+			manifest_module_for_callback(&manifest, "extensionary.callback"),
+			Err(SealedRegistryEvidenceError::SourceModule)
+		));
+	}
+
+	#[test]
+	fn preludes_and_availability_are_sealed_as_distinct_tables() {
+		let manifest = ExtensionManifest::new(
+			Provenance::new(
+				sf!("publisher"),
+				sf!("extension"),
+				sf!("1.0.0"),
+				ArtifactDigest::new([9; 32]),
+				sf!("project"),
+				sf!("trusted"),
+				1,
+			),
+			"extension",
+			[sf!("extension.tools")],
+			DeclarationSet::new(
+				[ToolDeclarationKey::new("helper", "prelude", 1)],
+				[],
+			),
+			ServiceManifest::default(),
+			[],
+			[],
+		);
+		let preludes = seal_preludes(&manifest, vec![FrozenPrelude {
+			name: String::from("helper"),
+			rev: 1,
+			doc: String::from("Helper docs."),
+			summary: String::from("Helper summary."),
+			source_module: String::from("extension.tools"),
+			params: vec![FrozenPreludeParam {
+				name: String::from("value"),
+				kind: String::from("positional_or_keyword"),
+				default_json: Some(String::from("7")),
+				annotation: Some(String::from("int")),
+			}],
+			callback: FrozenToolCallback {
+				operation: String::from("omp.devices.call"),
+				path: String::from("helper"),
+				family: String::from("prelude"),
+				rev: 1,
+			},
+		}])
+		.expect("seal prelude");
+		assert_eq!(preludes[0].rev, "prelude.1");
+		assert_eq!(preludes[0].prelude_params.len(), 1);
+
+		let tool = FrozenTool {
+			name: String::from("device"),
+			family: String::from("extension"),
+			rev: 1,
+			description: String::new(),
+			schema: serde_json::json!({}),
+			strict: None,
+			streams_args: false,
+			source_module: String::from("extension.tools"),
+			kind: String::from("soft"),
+			place: String::from("host"),
+			effects: None,
+			constraint: None,
+			serial: false,
+			precedence: 0,
+			replaces: None,
+			summary: None,
+			docs: serde_json::Value::Null,
+			examples: Vec::new(),
+			callback: FrozenToolCallback {
+				operation: String::from("omp.devices.call"),
+				path: String::from("device"),
+				family: String::from("extension"),
+				rev: 1,
+			},
+		};
+		let availability = seal_availability(&[tool], vec![FrozenAvailability {
+			name: String::from("device"),
+			family: String::from("extension"),
+			rev: 1,
+			mounted: false,
+			reason: Some(String::from("offline")),
+		}])
+		.expect("seal availability");
+		assert!(!availability[0].mounted);
+		assert_eq!(availability[0].reason.as_deref(), Some("offline"));
+	}
+
+	#[test]
+	fn trusted_runtime_tool_from_declaration_module_is_admitted() {
+		let mut manifest = ExtensionManifest::new(
+			Provenance::new(
+				sf!("publisher"),
+				sf!("extension"),
+				sf!("1.0.0"),
+				ArtifactDigest::new([10; 32]),
+				sf!("project"),
+				sf!("trusted"),
+				1,
+			),
+			"extension",
+			[sf!("extension.tools")],
+			DeclarationSet::default(),
+			ServiceManifest::default(),
+			[],
+			[],
+		);
+		manifest.trust_runtime_declarations();
+		let tools = seal_tools(&manifest, vec![FrozenTool {
+			name: String::from("runtime_tool"),
+			family: String::from("extension"),
+			rev: 1,
+			description: String::from("Trusted runtime tool"),
+			schema: serde_json::json!({"type": "object"}),
+			strict: None,
+			streams_args: false,
+			source_module: String::from("extension.tools"),
+			kind: String::from("soft"),
+			place: String::from("host"),
+			effects: None,
+			constraint: None,
+			serial: false,
+			precedence: 0,
+			replaces: None,
+			summary: None,
+			docs: serde_json::Value::Null,
+			examples: Vec::new(),
+			callback: FrozenToolCallback {
+				operation: String::from("omp.devices.call"),
+				path: String::from("runtime_tool"),
+				family: String::from("extension"),
+				rev: 1,
+			},
+		}])
+		.expect("trusted runtime tool");
+		assert_eq!(
+			tools[0].definition.as_ref().expect("definition").name,
+			"runtime_tool"
+		);
+	}
+
+	#[test]
+	fn malformed_prelude_and_availability_fail_closed() {
+		let mut manifest = ExtensionManifest::new(
+			Provenance::new(
+				sf!("publisher"),
+				sf!("extension"),
+				sf!("1.0.0"),
+				ArtifactDigest::new([11; 32]),
+				sf!("project"),
+				sf!("trusted"),
+				1,
+			),
+			"extension",
+			[],
+			DeclarationSet::default(),
+			ServiceManifest::default(),
+			[],
+			[],
+		);
+		manifest.trust_runtime_declarations();
+		assert!(matches!(
+			seal_preludes(&manifest, vec![FrozenPrelude {
+				name: String::from("helper"),
+				rev: 1,
+				doc: String::new(),
+				summary: String::new(),
+				source_module: String::from("foreign"),
+				params: Vec::new(),
+				callback: FrozenToolCallback {
+					operation: String::from("omp.devices.call"),
+					path: String::from("helper"),
+					family: String::from("prelude"),
+					rev: 1,
+				},
+			}]),
+			Err(SealedRegistryEvidenceError::SourceModule | SealedRegistryEvidenceError::Malformed)
+		));
+		assert!(matches!(
+			seal_availability(&[], vec![FrozenAvailability {
+				name: String::from("extra"),
+				family: String::new(),
+				rev: 1,
+				mounted: true,
+				reason: None,
+			}]),
 			Err(SealedRegistryEvidenceError::ManifestDrift)
 		));
 	}

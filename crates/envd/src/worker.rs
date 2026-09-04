@@ -1,7 +1,7 @@
 //! Supervision and same-binary execution for Python extension hosts.
 
 use std::{
-	collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+	collections::{BTreeMap, BTreeSet, HashSet},
 	env, fmt, io, mem,
 	path::{Path, PathBuf},
 	str,
@@ -25,15 +25,15 @@ use omp_proto::{
 	prost::Message,
 	thread::v1::{Blob, Part, part},
 	toolhost::v1::{
-		ArgIssue, HookEventId, JournalHostEnvelope, ProtocolError, ProtocolErrorCode, PullReply,
-		PullRequest, ToolDecl, ToolUpdate, UiHostEnvelope, UiWorkerEnvelope, ui_host_envelope,
-		ui_worker_envelope,
+		ArgIssue, HookEventId, ProtocolError, ProtocolErrorCode, ToolDecl, ToolExecutionMode,
+		ToolUpdate, UiHostEnvelope, UiWorkerEnvelope, ui_host_envelope, ui_worker_envelope,
 	},
 	ui::v1::{
 		CommandDispatchResult, CompletionCandidate, RegisterUi, RenderedView, ShortcutDispatchResult,
 		Tml, UiDispatchResult, UiError, command_dispatch_result, ui_dispatch, ui_dispatch_result,
 	},
 };
+use omp_tool::AvailabilityDelta;
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 use tokio::{
@@ -45,6 +45,8 @@ use url::Url;
 
 use super::exthost::{DispatchError, control::ControlRuntimeError};
 use crate::{
+	admission::ApprovalTier,
+	blobs::BlobHost,
 	exthost::{
 		ActivationCause, ActivationEvent, ActivationTrigger, AvailabilityBatch, AvailabilitySink,
 		CallbackConcurrency, CancellationOutcome, ControlAuthority, ControlAuthorityFactory,
@@ -52,9 +54,9 @@ use crate::{
 		GenerationFence, HostControlAuthorityFactory, LifecycleHost, RunningHost, RunningHostError,
 		ServiceBroker, ServiceKey, ServiceResponse, SpawnSpec, SpawnedHost,
 		control::{
-			ControlAuthoritySnapshot, ControlConnectionIdentity, ControlDispatch, ControlEffect,
-			ControlHandle, ControlInvocationAuthority, ControlProtocolError, ControlRequestContext,
-			ExternalJournalRequest, JournalConnectionIdentity,
+			ContributedValueDelivery, ControlAuthoritySnapshot, ControlConnectionIdentity,
+			ControlDispatch, ControlEffect, ControlHandle, ControlInvocationAuthority,
+			ControlProtocolError, ControlRequestContext, ControlTierTarget,
 		},
 		dispatch::{
 			CallbackDispatcher, PromptContributionProvider, PromptContributionRecord,
@@ -175,37 +177,6 @@ impl ExtHostSpec {
 			watch_root: None,
 		}
 	}
-}
-/// One journal backend request emitted by an authenticated extension host.
-///
-/// The receiver must send exactly one fused reply sequence. Every sequence is
-/// written to the requesting host in order on its existing CONTROL stream.
-pub struct ExternalJournalCall {
-	/// Core-stamped request with no worker-supplied principal fields.
-	pub request:  ExternalJournalRequest,
-	/// Authenticated principal, provenance, and generation fences for backend
-	/// authority.
-	pub identity: JournalConnectionIdentity,
-	/// Ordered response stream; dropping the last sender fuses the host stream.
-	pub reply:    flume::Sender<Result<JournalHostEnvelope, Str>>,
-}
-
-/// External storage-backend handle installed into extension hosts.
-#[derive(Clone)]
-pub struct JournalRuntime {
-	/// Environment composition endpoint for session indexes, state, usage, and
-	/// artifacts.
-	pub external: flume::Sender<ExternalJournalCall>,
-}
-#[derive(Clone)]
-struct BoundJournalRuntime {
-	id:       u64,
-	_runtime: JournalRuntime,
-}
-
-struct JournalRuntimeSlot {
-	binding:   Option<BoundJournalRuntime>,
-	was_bound: bool,
 }
 
 struct ServiceRouter {
@@ -395,9 +366,10 @@ pub struct ExtHostConfig {
 	pub interrupt_grace:    CoreDuration,
 	/// Shared DATA authorization table owned by the Environment.
 	pub data_authority:     Option<Arc<AuthorityTable>>,
-	/// CONTROL routing to the serialized Agent Journal and external storage
-	/// backends.
-	pub journal:            Option<JournalRuntime>,
+	/// Core-issued synchronous policy and session facts installed before import.
+	authority_snapshot:     ControlAuthoritySnapshot,
+	/// Existing environment CAS used for oversized CONTROL tool results.
+	result_store:           Option<BlobHost>,
 	/// Complete authority factory for dedicated JSON CONTROL connections.
 	control_authorities:    Option<Arc<HostControlAuthorityFactory>>,
 	registry_control:       Option<Arc<RegistryControlFactory>>,
@@ -429,7 +401,8 @@ impl ExtHostConfig {
 			spawn_timeout: Duration::from_secs(30),
 			interrupt_grace: omp_tool::DEFAULT_INTERRUPT_GRACE,
 			data_authority: None,
-			journal: None,
+			authority_snapshot: ControlAuthoritySnapshot::default(),
+			result_store: None,
 			control_authorities: None,
 			registry_control: None,
 			hook_control: None,
@@ -450,9 +423,24 @@ impl ExtHostConfig {
 		self.workspace_root = Some(root.to_path_buf());
 	}
 
-	/// Installs authenticated journal and scoped-state CONTROL routing.
-	pub fn bind_journal(&mut self, runtime: JournalRuntime) {
-		self.journal = Some(runtime);
+	/// Installs the authoritative synchronous policy and current-session view.
+	pub fn bind_authority_snapshot(&mut self, snapshot: ControlAuthoritySnapshot) {
+		self.authority_snapshot = snapshot;
+	}
+
+	/// Installs the live session-authority projection without replacing policy tiers.
+	pub(crate) fn bind_session_authority_snapshot(
+		&mut self,
+		current_session: serde_json::Value,
+		agent_depth: u32,
+	) {
+		self.authority_snapshot.current_session = Some(current_session);
+		self.authority_snapshot.agent_depth = agent_depth;
+	}
+
+	/// Installs the environment result CAS before any dedicated host starts.
+	pub fn bind_result_store(&mut self, store: BlobHost) {
+		self.result_store = Some(store);
 	}
 
 	/// Installs the complete production authority factory before any dedicated
@@ -568,8 +556,8 @@ pub struct ExtHostCompletion {
 	pub parts:        Vec<Part>,
 	/// Inline structured details for in-process CONTROL completions.
 	pub details_json: Option<Bytes>,
-	/// Complete serialized [`CallOutcome`] staged by the Environment CAS for a
-	/// process-worker result stream.
+	/// Complete structured result staged by the Environment CAS when it exceeds
+	/// the bounded inline CONTROL projection.
 	pub details_blob: Option<Blob>,
 	/// Structured argument issue, present only for
 	/// [`ExtHostOutcomeKind::ArgsRejected`].
@@ -585,8 +573,6 @@ pub struct ExtHostCompletion {
 pub enum ExtHostEvent {
 	/// Typed JSON progress serialized by the extension.
 	Update(ToolUpdate),
-	/// One bounded cursor pull awaiting a host reply.
-	Pull(PullRequest),
 	/// A typed protocol error returned by the extension host.
 	ProtocolError(ProtocolError),
 	/// Normal terminal completion.
@@ -733,20 +719,6 @@ impl ExtHostInvocation {
 		self
 			.commands
 			.send(ControlHostCommand::Interrupt { id: self.id, frame })
-			.map_err(|_| ExtHostError::Unavailable)
-	}
-
-	/// Replies to the invocation's sole outstanding pull.
-	///
-	/// # Errors
-	/// Returns a typed protocol error for a stale call id or stopped actor.
-	pub fn reply_pull(&self, reply: PullReply) -> Result<(), ExtHostError> {
-		if reply.call_id != self.invocation_id.as_str() {
-			return Err(ExtHostError::Protocol(sf!("PullReply call id does not match invocation",)));
-		}
-		self
-			.commands
-			.send(ControlHostCommand::PullReply { id: self.id, reply })
 			.map_err(|_| ExtHostError::Unavailable)
 	}
 
@@ -1141,8 +1113,13 @@ struct PendingControlActivation {
 	hook_control:       Option<Arc<HookControlFactory>>,
 	quota_runtime:      ControlQuotaRuntime,
 	lifecycle_gate:     Option<Arc<HookGate>>,
-	registered_ui:      Arc<RwLock<Option<RegisterUi>>>,
-	settings:           serde_json::Map<String, serde_json::Value>,
+	registered_ui:        Arc<RwLock<Option<RegisterUi>>>,
+	availability:         Arc<RwLock<AvailabilityBatch>>,
+	availability_sink:    Arc<Mutex<Option<Arc<dyn AvailabilitySink>>>>,
+	availability_pending: Arc<Mutex<BTreeMap<Str, AvailabilityDelta>>>,
+	settings:             serde_json::Map<String, serde_json::Value>,
+	cli_contributions:  omp_ext::config::CliContributionSet,
+	contributed_values: Arc<[omp_ext::config::ContributedCliValue]>,
 	python_route:       PyCallbackRoute,
 	roots:              Box<[Str]>,
 }
@@ -1152,16 +1129,18 @@ struct LiveControlRoute {
 }
 
 struct FrozenControlLifecycleHost {
-	control:         ControlHandle,
-	extension:       Str,
-	session:         Str,
-	host_generation: u64,
-	next_invocation: u64,
-	identity:        Arc<ControlConnectionIdentity>,
-	manifest:        ExtensionManifest,
-	frozen_registry: Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
-	staged_evidence: Option<((Str, Str, Str), Arc<SealedRegistryEvidence>)>,
-	settings:        serde_json::Map<String, serde_json::Value>,
+	control:            ControlHandle,
+	extension:          Str,
+	session:            Str,
+	host_generation:    u64,
+	next_invocation:    u64,
+	identity:           Arc<ControlConnectionIdentity>,
+	manifest:           ExtensionManifest,
+	frozen_registry:    Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
+	staged_evidence:    Option<((Str, Str, Str), Arc<SealedRegistryEvidence>)>,
+	settings:           serde_json::Map<String, serde_json::Value>,
+	cli_contributions:  omp_ext::config::CliContributionSet,
+	contributed_values: Arc<[omp_ext::config::ContributedCliValue]>,
 }
 
 impl FrozenControlLifecycleHost {
@@ -1174,6 +1153,8 @@ impl FrozenControlLifecycleHost {
 		manifest: ExtensionManifest,
 		frozen_registry: Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
 		settings: serde_json::Map<String, serde_json::Value>,
+		cli_contributions: omp_ext::config::CliContributionSet,
+		contributed_values: Arc<[omp_ext::config::ContributedCliValue]>,
 	) -> Self {
 		Self {
 			control,
@@ -1186,6 +1167,8 @@ impl FrozenControlLifecycleHost {
 			frozen_registry,
 			staged_evidence: None,
 			settings,
+			cli_contributions,
+			contributed_values,
 		}
 	}
 
@@ -1271,8 +1254,7 @@ impl LifecycleHost for FrozenControlLifecycleHost {
 	) -> impl Future<Output = Result<(), Str>> + Send {
 		use std::time::Instant;
 
-		let reason: &str = event.reason.into();
-
+		let reason: &'static str = event.reason.into();
 		let trigger = match event.trigger {
 			ActivationTrigger::Static => "static",
 			ActivationTrigger::FirstReach => "first_reach",
@@ -1286,32 +1268,63 @@ impl LifecycleHost for FrozenControlLifecycleHost {
 			.as_millis()
 			.try_into()
 			.unwrap_or(u64::MAX);
-		let mut arguments = serde_json::Map::new();
-		arguments.insert(
-			String::from("payload"),
-			serde_json::json!({
-				"extension": self.extension.as_str(),
-				"reason": reason,
-				"session_started_at": started_at_ms,
-				"generation": event.generation,
-				"trigger": trigger,
-			}),
+		let generation = event.generation;
+		let cli_values = ContributedValueDelivery::new(
+			self.extension.clone(),
+			generation,
+			&self.cli_contributions,
+			&self.contributed_values,
+		)
+		.map_err(|error| Str::from(error.to_string()))
+		.and_then(|mut delivery| {
+			delivery
+				.deliver(self.extension.as_str(), generation)
+				.map_err(|error| Str::from(error.to_string()))
+		})
+		.map(|values| {
+			values
+				.into_iter()
+				.map(|entry| {
+					let value = match entry.value {
+						omp_ext::config::ContributedValue::Boolean(value) => {
+							serde_json::Value::Bool(value)
+						},
+						omp_ext::config::ContributedValue::String(value) => {
+							serde_json::Value::String(value.to_string())
+						},
+					};
+					serde_json::json!({"sink": entry.sink.as_str(), "value": value})
+				})
+				.collect::<Vec<_>>()
+		});
+		let authority = self.authority(
+			"extension_activate",
+			InvocationPhase::EffectsAuthorized,
+			LifecyclePhase::Active,
 		);
-		let dispatch = ControlDispatch {
-			operation: sf!("omp.lifecycle.activate"),
-			arguments,
-			authority: self.authority(
-				"extension_activate",
-				InvocationPhase::EffectsAuthorized,
-				LifecyclePhase::Active,
-			),
-			policy: CallbackConcurrency::Serialized,
-			deadline: EventDeadline { at: Instant::now() + Duration::from_secs(10) },
-		};
 		async move {
+			let cli_values = cli_values?;
+			let mut arguments = serde_json::Map::new();
+			arguments.insert(
+				String::from("payload"),
+				serde_json::json!({
+					"extension": self.extension.as_str(),
+					"reason": reason,
+					"session_started_at": started_at_ms,
+					"generation": generation,
+					"trigger": trigger,
+					"cli_values": cli_values,
+				}),
+			);
 			self
 				.control
-				.dispatch(dispatch)
+				.dispatch(ControlDispatch {
+					operation: sf!("omp.lifecycle.activate"),
+					arguments,
+					authority,
+					policy: CallbackConcurrency::Serialized,
+					deadline: EventDeadline { at: Instant::now() + Duration::from_secs(10) },
+				})
 				.await
 				.map_err(|error| Str::from(error.to_string()))?;
 			if let Some((key, evidence)) = self.staged_evidence.take() {
@@ -1354,6 +1367,144 @@ async fn freeze_control_registry(
 	Ok(Arc::new(evidence))
 }
 
+fn evidence_availability(evidence: &SealedRegistryEvidence) -> AvailabilityBatch {
+	AvailabilityBatch {
+		deltas: evidence
+			.availability
+			.iter()
+			.map(|row| AvailabilityDelta {
+				name: row.name.clone(),
+				mounted: row.mounted,
+				reason: row.reason.clone(),
+			})
+			.collect(),
+	}
+}
+
+fn publish_availability(
+	sink: &Mutex<Option<Arc<dyn AvailabilitySink>>>,
+	pending: &Mutex<BTreeMap<Str, AvailabilityDelta>>,
+	batch: AvailabilityBatch,
+) {
+	if batch.deltas.is_empty() {
+		return;
+	}
+	let destination = sink.lock();
+	if let Some(target) = destination.as_ref().map(Arc::clone) {
+		drop(destination);
+		target.set_availability(batch);
+		return;
+	}
+	let mut pending = pending.lock();
+	for delta in batch.deltas {
+		pending.insert(delta.name.clone(), delta);
+	}
+}
+
+fn publish_host_down(activation: &PendingControlActivation, reason: &'static str) {
+	let current = activation.availability.read();
+	let batch = AvailabilityBatch {
+		deltas: current
+			.deltas
+			.iter()
+			.map(|delta| AvailabilityDelta {
+				name: delta.name.clone(),
+				mounted: false,
+				reason: Some(Str::new_static(reason)),
+			})
+			.collect(),
+	};
+	drop(current);
+	publish_availability(
+		&activation.availability_sink,
+		&activation.availability_pending,
+		batch,
+	);
+}
+
+fn publish_host_availability(
+	activation: &PendingControlActivation,
+	evidence: &SealedRegistryEvidence,
+) {
+	let batch = evidence_availability(evidence);
+	*activation.availability.write() = batch.clone();
+	publish_availability(
+		&activation.availability_sink,
+		&activation.availability_pending,
+		batch,
+	);
+}
+
+fn initial_authority_snapshot(config: &ExtHostConfig) -> ControlAuthoritySnapshot {
+	let mut snapshot = config.authority_snapshot.clone();
+	if snapshot.current_session.is_none() {
+		let root = config
+			.workspace_root
+			.as_ref()
+			.and_then(|root| Url::from_file_path(root).ok())
+			.map_or_else(|| String::from("file:///"), |root| root.to_string());
+		let started_at_ms = config
+			.session_started_at
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_millis()
+			.try_into()
+			.unwrap_or(u64::MAX);
+		snapshot.current_session = Some(serde_json::json!({
+			"id": config.session_id.as_str(),
+			"title": null,
+			"title_source": "system",
+			"cwd": root.clone(),
+			"project": root,
+			"created_ms": started_at_ms,
+			"updated_ms": started_at_ms,
+			"status": "pending",
+			"kind": "interactive",
+			"parent": null,
+			"entries": 0,
+			"turns": 0,
+			"usage": {},
+			"cost": {"nanos_usd": 0, "estimated": true},
+			"models": [],
+			"remote": false,
+		}));
+	}
+	for extension in &config.extensions {
+		for tool in extension.manifest.declarations.tools() {
+			let row = extension
+				.manifest
+				.static_declarations()
+				.tools
+				.iter()
+				.find(|row| row.key.as_str() == format!("{}@{}.{}", tool.name, tool.family, tool.rev));
+			let tier = row
+				.and_then(|row| row.properties.get("tier"))
+				.and_then(serde_json::Value::as_str)
+				.filter(|tier| matches!(*tier, "read" | "write" | "exec" | "privileged"))
+				.map(Str::from)
+				.or_else(|| {
+					row.and_then(|row| row.properties.get("effects"))
+						.and_then(|value| {
+							serde_json::from_value::<omp_tool::Effects>(value.clone()).ok()
+						})
+						.map(|effects| {
+							Str::from(<&'static str>::from(ApprovalTier::from_effects(&effects)))
+						})
+				})
+				.unwrap_or_else(|| sf!("exec"));
+			snapshot
+				.tiers
+				.entry(ControlTierTarget::Device {
+					name: tool.name.clone(),
+					family: tool.family.clone(),
+					rev: Str::from(tool.rev.to_string()),
+				})
+				.or_insert(tier);
+		}
+	}
+	snapshot
+}
+
 fn ensure_committed_argument_tools(tools: &[ToolDecl]) -> Result<(), ExtHostError> {
 	if let Some(tool) = tools.iter().find(|tool| tool.streams_args) {
 		let name = tool
@@ -1377,10 +1528,8 @@ pub struct ExtHostSupervisor {
 	next_invocation:      AtomicU64,
 	actors:               Vec<HostActor>,
 	data_authority:       Option<Arc<AuthorityTable>>,
-	journal_runtime:      Arc<Mutex<JournalRuntimeSlot>>,
-	availability_pending: Arc<Mutex<VecDeque<AvailabilityBatch>>>,
+	availability_pending: Arc<Mutex<BTreeMap<Str, AvailabilityDelta>>>,
 	availability_sink:    Arc<Mutex<Option<Arc<dyn AvailabilitySink>>>>,
-	children_active:      AtomicBool,
 	control_authorities:  Option<Arc<HostControlAuthorityFactory>>,
 	frozen_registry:      Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
 	domain_control:       Arc<DomainControlSlot>,
@@ -1406,6 +1555,7 @@ impl ExtHostSupervisor {
 		let registry_control = config.registry_control.clone();
 		let hook_control = config.hook_control.clone();
 		let quota_runtime = config.quota_runtime();
+		let authority_snapshot = initial_authority_snapshot(&config);
 		let lifecycle_gate = hook_control.as_ref().map(|hooks| hooks.admission_gate());
 		let lifecycle_manifests = config
 			.extensions
@@ -1446,14 +1596,7 @@ impl ExtHostSupervisor {
 		let frozen_registry = Arc::new(Mutex::new(BTreeMap::new()));
 		let data_authority = config.data_authority.clone();
 		let availability_sink = Arc::clone(&config.availability_sink);
-		let availability_pending = Arc::new(Mutex::new(VecDeque::new()));
-		let journal_runtime = Arc::new(Mutex::new(JournalRuntimeSlot {
-			binding:   config
-				.journal
-				.clone()
-				.map(|runtime| BoundJournalRuntime { id: 0, _runtime: runtime }),
-			was_bound: config.journal.is_some(),
-		}));
+		let availability_pending = Arc::new(Mutex::new(BTreeMap::new()));
 		let mut identities = HashSet::with_capacity(config.extensions.len());
 		let mut routes = BTreeMap::new();
 		let mut registrations = Vec::new();
@@ -1521,7 +1664,9 @@ impl ExtHostSupervisor {
 					.clone()
 					.unwrap_or_else(|| config.executable.clone()),
 				python_site: python_site.clone(),
+				entry_path: extension.entry_path.clone(),
 				env_socket: env_socket.clone(),
+				current_dir: config.workspace_root.clone(),
 				workspace_root: extension
 					.manifest
 					.static_declarations()
@@ -1552,7 +1697,7 @@ impl ExtHostSupervisor {
 				},
 			};
 			let running = spawned
-				.start_control((*identity).clone(), authority, &ControlAuthoritySnapshot::default())
+				.start_control((*identity).clone(), authority, &authority_snapshot)
 				.await
 				.map_err(|error| ExtHostError::Protocol(Str::from(error.to_string())))?;
 			let receipt = quota_runtime
@@ -1630,7 +1775,12 @@ impl ExtHostSupervisor {
 				quota_runtime: quota_runtime.clone(),
 				lifecycle_gate: hook_control.as_ref().map(|hooks| hooks.admission_gate()),
 				registered_ui: Arc::new(RwLock::new(Some(evidence.ui_registration.clone()))),
+				availability: Arc::new(RwLock::new(evidence_availability(&evidence))),
+				availability_sink: Arc::clone(&availability_sink),
+				availability_pending: Arc::clone(&availability_pending),
 				settings: extension.settings.clone(),
+				cli_contributions: extension.cli_contributions.clone(),
+				contributed_values: Arc::from(config.contributed_values.clone()),
 				python_route,
 				roots: config
 					.workspace_root
@@ -1668,6 +1818,17 @@ impl ExtHostSupervisor {
 						commands: commands.clone(),
 						owner: extension.key.clone(),
 						maximum_effects,
+						callback_policy: match ToolExecutionMode::try_from(declaration.execution_mode) {
+							Ok(ToolExecutionMode::Sequential) => CallbackConcurrency::Serialized,
+							Ok(ToolExecutionMode::Unspecified | ToolExecutionMode::Parallel) => {
+								CallbackConcurrency::Threadsafe
+							},
+							Err(_) => {
+								return Err(ExtHostError::Protocol(sf!(
+									"registered tool execution mode is invalid"
+								)));
+							},
+						},
 						host_generation: Arc::clone(&host_generation),
 						session_generation: config.session_generation,
 					})
@@ -1723,6 +1884,7 @@ impl ExtHostSupervisor {
 				Arc::clone(&frozen_registry),
 				live_control,
 				Arc::clone(&service_router),
+				config.result_store.clone(),
 			));
 			actors.push(HostActor {
 				commands,
@@ -1787,10 +1949,8 @@ impl ExtHostSupervisor {
 			next_invocation: AtomicU64::new(1),
 			actors,
 			data_authority,
-			journal_runtime,
 			availability_sink,
 			availability_pending,
-			children_active: AtomicBool::new(false),
 			control_authorities,
 			frozen_registry,
 			domain_control,
@@ -1846,8 +2006,10 @@ impl ExtHostSupervisor {
 							activation.identity.tier.clone(),
 							activation.identity.extension.clone(),
 						));
+						publish_host_down(activation, "extension hook registry was rejected");
 						continue;
 					}
+					publish_host_availability(activation, &evidence);
 					activated.insert(activation.key.extension().clone());
 				},
 				Err(error @ ExtHostError::ExtensionLifecycle { .. }) => {
@@ -1861,6 +2023,7 @@ impl ExtHostSupervisor {
 						activation.identity.tier.clone(),
 						activation.identity.extension.clone(),
 					));
+					publish_host_down(activation, "extension activation failed");
 					continue;
 				},
 				Err(error) => return Err(error),
@@ -2302,43 +2465,6 @@ impl ExtHostSupervisor {
 		&self.registrations
 	}
 
-	/// Installs sole-owner Agent Journal CONTROL routing.
-	///
-	/// # Errors
-	/// Fails closed if a binding is already live. The initial binding must be
-	/// installed before activation; a released binding may be replaced between
-	/// agent loops without restarting extension children.
-	pub fn bind_journal_runtime(
-		&self,
-		id: u64,
-		runtime: JournalRuntime,
-	) -> Result<(), ExtHostError> {
-		let mut slot = self.journal_runtime.lock();
-		if slot.binding.is_some() {
-			return Err(ExtHostError::Protocol(sf!("journal runtime is already bound")));
-		}
-		if self.children_active.load(Ordering::Acquire) && !slot.was_bound {
-			return Err(ExtHostError::Protocol(sf!(
-				"journal runtime must be bound before the first extension child is active",
-			)));
-		}
-		slot.binding = Some(BoundJournalRuntime { id, _runtime: runtime });
-		slot.was_bound = true;
-		Ok(())
-	}
-
-	/// Releases the runtime only when it is still owned by `id`.
-	pub fn unbind_journal_runtime(&self, id: u64) {
-		let mut slot = self.journal_runtime.lock();
-		if slot
-			.binding
-			.as_ref()
-			.is_some_and(|binding| binding.id == id)
-		{
-			slot.binding = None;
-		}
-	}
-
 	/// Binds the active Agent mailbox's device availability destination.
 	pub fn bind_availability_sink(&self, sink: Arc<dyn AvailabilitySink>) {
 		let pending = {
@@ -2346,8 +2472,10 @@ impl ExtHostSupervisor {
 			*availability_sink = Some(Arc::clone(&sink));
 			mem::take(&mut *self.availability_pending.lock())
 		};
-		for batch in pending {
-			sink.set_availability(batch);
+		if !pending.is_empty() {
+			sink.set_availability(AvailabilityBatch {
+				deltas: pending.into_values().collect(),
+			});
 		}
 	}
 
@@ -2368,7 +2496,6 @@ impl ExtHostSupervisor {
 				name: call.name.clone(),
 				rev:  call.rev.clone(),
 			})?;
-		self.children_active.store(true, Ordering::Release);
 		let commands = route.commands.clone();
 		let id = self.next_invocation.fetch_add(1, Ordering::Relaxed).max(1);
 		let invocation_id = call.invocation_id.clone();
@@ -2377,7 +2504,13 @@ impl ExtHostSupervisor {
 		}
 		let (events_tx, events) = flume::unbounded();
 		if commands
-			.send(ControlHostCommand::Open { id, owner: route.owner.clone(), call, events: events_tx })
+			.send(ControlHostCommand::Open {
+				id,
+				owner: route.owner.clone(),
+				call,
+				events: events_tx,
+				callback_policy: route.callback_policy,
+			})
 			.is_err()
 		{
 			if let Some(authority) = &self.data_authority {
@@ -2711,6 +2844,7 @@ struct HostRoute {
 	commands:           flume::Sender<ControlHostCommand>,
 	owner:              HostKey,
 	maximum_effects:    omp_tool::Effects,
+	callback_policy:    CallbackConcurrency,
 	host_generation:    Arc<AtomicU64>,
 	session_generation: u64,
 }
@@ -2891,18 +3025,15 @@ pub enum ExtHostError {
 
 enum ControlHostCommand {
 	Open {
-		id:     u64,
-		owner:  HostKey,
-		call:   ExtHostToolCall,
-		events: flume::Sender<ExtHostEvent>,
+		id:              u64,
+		owner:           HostKey,
+		call:            ExtHostToolCall,
+		events:          flume::Sender<ExtHostEvent>,
+		callback_policy: CallbackConcurrency,
 	},
 	ArgsCommitted {
 		id:    u64,
 		frame: ArgsCommitted,
-	},
-	PullReply {
-		id:    u64,
-		reply: PullReply,
 	},
 	ServiceDispatch {
 		dispatch: ServiceDispatch,
@@ -2929,8 +3060,9 @@ enum ControlHostCommand {
 }
 
 struct PendingInvocation {
-	call:   ExtHostToolCall,
-	events: flume::Sender<ExtHostEvent>,
+	call:            ExtHostToolCall,
+	events:          flume::Sender<ExtHostEvent>,
+	callback_policy: CallbackConcurrency,
 }
 
 fn validate_extension_spec(spec: &ExtHostSpec) -> Result<(), ExtHostError> {
@@ -3051,6 +3183,8 @@ async fn activate_control_generation(
 		activation.manifest.clone(),
 		frozen_registry,
 		activation.settings.clone(),
+		activation.cli_contributions.clone(),
+		Arc::clone(&activation.contributed_values),
 	);
 	lifecycle
 		.activate_declared(
@@ -3105,9 +3239,31 @@ fn text_part(text: String) -> Part {
 	Part { kind: Some(part::Kind::Text(text)) }
 }
 
+const CONTROL_RESULT_INLINE_BYTES: usize = 64 * 1024;
+
+fn control_result_storage(
+	store: Option<&BlobHost>,
+	session: &str,
+	call_id: &str,
+	details: Bytes,
+) -> Result<(Option<Bytes>, Option<Blob>), ExtHostError> {
+	if details.len() <= CONTROL_RESULT_INLINE_BYTES {
+		return Ok((Some(details), None));
+	}
+	let store = store.ok_or_else(|| {
+		ExtHostError::Protocol(sf!("oversized CONTROL result has no environment result store"))
+	})?;
+	let blob = store
+		.put_verdict_bytes(Some(session), call_id, &details)
+		.map_err(|error| ExtHostError::Protocol(Str::from(error.to_string())))?;
+	Ok((None, Some(blob)))
+}
+
 fn control_completion(
 	call_id: Str,
 	result: serde_json::Value,
+	store: Option<&BlobHost>,
+	session: &str,
 ) -> Result<ExtHostCompletion, ExtHostError> {
 	if result.as_object().is_some_and(|completion| {
 		["parts", "details", "is_error", "terminate", "args_issue"]
@@ -3195,6 +3351,25 @@ fn control_completion(
 			},
 			None => false,
 		};
+		let details = Bytes::from(
+			serde_json::to_vec(&details).expect("serializing an existing JSON value cannot fail"),
+		);
+		let (details_json, details_blob) =
+			control_result_storage(store, session, call_id.as_str(), details)?;
+		let parts = if details_blob.is_some()
+			&& parts
+				.iter()
+				.map(|part| match part.kind.as_ref() {
+					Some(part::Kind::Text(text)) => text.len(),
+					_ => 0,
+				})
+				.sum::<usize>()
+				> CONTROL_RESULT_INLINE_BYTES
+		{
+			Vec::new()
+		} else {
+			parts
+		};
 		return Ok(ExtHostCompletion {
 			call_id,
 			kind: if is_error {
@@ -3203,28 +3378,35 @@ fn control_completion(
 				ExtHostOutcomeKind::Ok
 			},
 			parts,
-			details_json: Some(Bytes::from(
-				serde_json::to_vec(&details).expect("serializing an existing JSON value cannot fail"),
-			)),
-			details_blob: None,
+			details_json,
+			details_blob,
 			args_issue: None,
 			useless: false,
 			terminate,
 		});
 	}
 
-	let text = match &result {
-		serde_json::Value::String(text) => text.clone(),
-		_ => serde_json::to_string(&result).expect("serializing an existing JSON value cannot fail"),
+	let details = Bytes::from(
+		serde_json::to_vec(&result).expect("serializing an existing JSON value cannot fail"),
+	);
+	let (details_json, details_blob) =
+		control_result_storage(store, session, call_id.as_str(), details)?;
+	let parts = if details_blob.is_some() {
+		Vec::new()
+	} else {
+		let text = match result {
+			serde_json::Value::String(text) => text,
+			value => serde_json::to_string(&value)
+				.expect("serializing an existing JSON value cannot fail"),
+		};
+		vec![text_part(text)]
 	};
 	Ok(ExtHostCompletion {
 		call_id,
 		kind: ExtHostOutcomeKind::Ok,
-		parts: vec![text_part(text)],
-		details_json: Some(Bytes::from(
-			serde_json::to_vec(&result).expect("serializing an existing JSON value cannot fail"),
-		)),
-		details_blob: None,
+		parts,
+		details_json,
+		details_blob,
 		args_issue: None,
 		useless: false,
 		terminate: false,
@@ -3275,6 +3457,94 @@ fn install_control_hooks(
 	install_hook_evidence(hooks, &activation.identity, &activation.session_id, evidence)
 }
 
+const CONTROL_RESTART_INITIAL: Duration = Duration::from_secs(1);
+const CONTROL_RESTART_MAXIMUM: Duration = Duration::from_secs(30);
+const CONTROL_RESTART_HEALTHY: Duration = Duration::from_secs(30);
+const CONTROL_RESTART_FAILURE_LIMIT: u8 = 4;
+
+struct ControlRestartBreaker {
+	next:          Duration,
+	failures:      u8,
+	healthy_since: std::time::Instant,
+}
+
+impl ControlRestartBreaker {
+	fn new() -> Self {
+		Self {
+			next: CONTROL_RESTART_INITIAL,
+			failures: 0,
+			healthy_since: std::time::Instant::now(),
+		}
+	}
+
+	fn failed(&mut self) -> Option<Duration> {
+		if self.healthy_since.elapsed() >= CONTROL_RESTART_HEALTHY {
+			self.next = CONTROL_RESTART_INITIAL;
+			self.failures = 0;
+		}
+		self.failures = self.failures.saturating_add(1);
+		if self.failures > CONTROL_RESTART_FAILURE_LIMIT {
+			return None;
+		}
+		let delay = self.next;
+		self.next = self.next.saturating_mul(2).min(CONTROL_RESTART_MAXIMUM);
+		Some(delay)
+	}
+
+	fn restored(&mut self) {
+		self.healthy_since = std::time::Instant::now();
+	}
+}
+
+fn abort_control_invocation(
+	invocation: PendingInvocation,
+	reason: &'static str,
+	effects_unknown: bool,
+) {
+	let _ = invocation.events.send(ExtHostEvent::Aborted(ExtHostAbort {
+		call_id: invocation.call.invocation_id,
+		kind: ExtHostAbortKind::Crashed,
+		reason: Str::new_static(reason),
+		effects_unknown,
+	}));
+}
+
+fn reject_queued_control_commands(
+	mailbox: &Receiver<ControlHostCommand>,
+	reason: &'static str,
+) {
+	while let Ok(command) = mailbox.try_recv() {
+		match command {
+			ControlHostCommand::Open { call, events, .. } => {
+				let _ = events.send(ExtHostEvent::Aborted(ExtHostAbort {
+					call_id: call.invocation_id,
+					kind: ExtHostAbortKind::Crashed,
+					reason: Str::new_static(reason),
+					effects_unknown: false,
+				}));
+			},
+			ControlHostCommand::ServiceDispatch { reply, .. } => {
+				let _ = reply.send(Err(ExtHostError::Unavailable));
+			},
+			ControlHostCommand::PromptPull { reply, .. } => {
+				let _ = reply.send(Err(PromptDispatchError::Control(
+					ControlRuntimeError::Protocol(ControlProtocolError::new(
+						"host_disabled",
+						reason,
+					)),
+				)));
+			},
+			ControlHostCommand::Reload { reply } => {
+				let _ = reply.send(Err(ExtHostError::Unavailable));
+			},
+			ControlHostCommand::ArgsCommitted { .. }
+			| ControlHostCommand::Cancel { .. }
+			| ControlHostCommand::Interrupt { .. }
+			| ControlHostCommand::Shutdown => {},
+		}
+	}
+}
+
 async fn run_control_supervisor(
 	mut running: RunningHost,
 	owner: HostKey,
@@ -3287,6 +3557,7 @@ async fn run_control_supervisor(
 	frozen_registry: Arc<Mutex<BTreeMap<(Str, Str, Str), Arc<SealedRegistryEvidence>>>>,
 	live_control: Arc<LiveControlRoute>,
 	service_router: Arc<ServiceRouter>,
+	result_store: Option<BlobHost>,
 ) {
 	use std::time::Instant;
 
@@ -3296,7 +3567,8 @@ async fn run_control_supervisor(
 	let cancelled = Arc::new(Mutex::new(BTreeSet::<u64>::new()));
 	let mut exit_poll = time::interval(Duration::from_millis(50));
 	exit_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-	loop {
+	let mut breaker = ControlRestartBreaker::new();
+	'supervision: loop {
 		let command = tokio::select! {
 			() = shutdown.cancelled() => break,
 			command = mailbox.recv_async() => match command {
@@ -3306,52 +3578,93 @@ async fn run_control_supervisor(
 			_ = exit_poll.tick() => None,
 		};
 		let Some(command) = command else {
-			if !running.is_disabled() && running.has_exited().unwrap_or(true) {
+			if running.has_exited().unwrap_or(true) {
+				if running.is_disabled() {
+					break 'supervision;
+				}
 				if let Some(gate) = activation.lifecycle_gate.as_deref() {
 					notify_extension_unload(gate, activation.key.extension(), "error", 0);
 				}
+				publish_host_down(&activation, "extension host crashed");
+				for invocation in mem::take(&mut pending).into_values() {
+					abort_control_invocation(
+						invocation,
+						"extension host crashed before dispatch",
+						false,
+					);
+				}
 				loop {
+					reject_queued_control_commands(
+						&mailbox,
+						"CONTROL extension host is restarting",
+					);
+					let Some(delay) = breaker.failed() else {
+						tracing::error!(
+							extension_id = %activation.key.extension(),
+							failures = CONTROL_RESTART_FAILURE_LIMIT,
+							"Python extension restart breaker opened",
+						);
+						break 'supervision;
+					};
+					tokio::select! {
+						() = shutdown.cancelled() => break 'supervision,
+						() = time::sleep(delay) => {},
+					}
 					let authority = match next_control_authority(&activation, &running) {
 						Ok(authority) => authority,
-						Err(_) => {
-							time::sleep(Duration::from_millis(100)).await;
+						Err(error) => {
+							tracing::warn!(
+								extension_id = %activation.key.extension(),
+								%error,
+								"Python extension replacement authority failed",
+							);
 							continue;
 						},
 					};
+					let connected_at = Instant::now();
 					let restarted = tokio::select! {
-						() = shutdown.cancelled() => break,
+						() = shutdown.cancelled() => break 'supervision,
 						result = running.restart_with_authority(authority) => result,
 					};
-					if restarted.is_ok()
-						&& refresh_control_generation(
-							&mut activation,
-							&running,
-							&host_generation,
-							&live_control,
-							&frozen_registry,
-							&service_router,
-							ActivationCause::Restart(RestartReason::Crash),
-							false,
-							Instant::now(),
-						)
-						.await
-						.is_ok()
-					{
-						break;
-					}
-					tokio::select! {
-						() = shutdown.cancelled() => break,
-						() = time::sleep(Duration::from_millis(100)) => {},
+					let restored = match restarted {
+						Ok(()) => {
+							refresh_control_generation(
+								&mut activation,
+								&running,
+								&host_generation,
+								&live_control,
+								&frozen_registry,
+								&service_router,
+								ActivationCause::Restart(RestartReason::Crash),
+								false,
+								connected_at,
+							)
+							.await
+						},
+						Err(error) => Err(ExtHostError::Protocol(Str::from(error.to_string()))),
+					};
+					match restored {
+						Ok(()) => {
+							breaker.restored();
+							break;
+						},
+						Err(error) => {
+							tracing::warn!(
+								extension_id = %activation.key.extension(),
+								%error,
+								"Python extension replacement failed verification",
+							);
+						},
 					}
 				}
 			}
 			continue;
 		};
 		match command {
-			ControlHostCommand::Open { id, owner: request_owner, call, events, .. }
+			ControlHostCommand::Open { id, owner: request_owner, call, events, callback_policy }
 				if request_owner == owner =>
 			{
-				pending.insert(id, PendingInvocation { call, events });
+				pending.insert(id, PendingInvocation { call, events, callback_policy });
 			},
 			ControlHostCommand::ArgsCommitted { id, frame } => {
 				let Some(invocation) = pending.remove(&id) else {
@@ -3429,17 +3742,42 @@ async fn run_control_supervisor(
 						data,
 						direct_filesystem: None,
 					},
-					policy: CallbackConcurrency::Serialized,
+					policy: invocation.callback_policy,
 					deadline: EventDeadline { at: Instant::now() + invocation.call.deadline },
 				};
 				in_flight
 					.lock()
 					.insert(id, invocation.call.invocation_id.clone());
-				let route = activation.python_route.clone();
+				let control = activation.control.clone();
+				let store = result_store.clone();
+				let result_session = session_id.clone();
 				let task_in_flight = Arc::clone(&in_flight);
 				let task_cancelled = Arc::clone(&cancelled);
 				tokio::spawn(async move {
-					let result = route.dispatch(dispatch).await;
+					let (progress_tx, progress_rx) = flume::bounded(64);
+					let progress_events = invocation.events.clone();
+					let progress_call = invocation.call.invocation_id.clone();
+					let progress = tokio::spawn(async move {
+						while let Ok(update) = progress_rx.recv_async().await {
+							let json = match serde_json::to_vec(&update) {
+								Ok(json) => json,
+								Err(_) => break,
+							};
+							if progress_events
+								.send_async(ExtHostEvent::Update(ToolUpdate {
+									call_id: progress_call.to_string(),
+									json:    json.into(),
+									props:   None,
+								}))
+								.await
+								.is_err()
+							{
+								break;
+							}
+						}
+					});
+					let result = control.dispatch_with_progress(dispatch, progress_tx).await;
+					let _ = progress.await;
 					let was_cancelled = task_cancelled.lock().remove(&id);
 					if was_cancelled {
 						let _ = invocation.events.send(ExtHostEvent::Aborted(ExtHostAbort {
@@ -3450,7 +3788,9 @@ async fn run_control_supervisor(
 						}));
 					} else {
 						match result {
-							Ok(result) => send_control_result(&invocation, result),
+							Ok(result) => {
+								send_control_result(&invocation, result, store, result_session).await
+							},
 							Err(error) => {
 								let _ = invocation.events.send(ExtHostEvent::Aborted(ExtHostAbort {
 									call_id:         invocation.call.invocation_id,
@@ -3479,6 +3819,10 @@ async fn run_control_supervisor(
 						let connected_at = Instant::now();
 						match running.cancel_dispatch(invocation.as_str()).await {
 							Ok(CancellationOutcome::Killed(_)) => {
+								publish_host_down(
+									&activation,
+									"extension host restarted after cancellation",
+								);
 								let replacement = async {
 									let authority = next_control_authority(&activation, &running)?;
 									running
@@ -3509,6 +3853,7 @@ async fn run_control_supervisor(
 									);
 									break;
 								}
+								breaker.restored();
 							},
 							Ok(CancellationOutcome::Disabled(_)) | Err(_) => break,
 							Ok(
@@ -3528,7 +3873,6 @@ async fn run_control_supervisor(
 						.await;
 				}
 			},
-			ControlHostCommand::PullReply { .. } => {},
 			ControlHostCommand::ServiceDispatch { dispatch, reply } => {
 				let result = dispatch_control_service(&activation, dispatch).await;
 				let _ = reply.send(result);
@@ -3545,6 +3889,7 @@ async fn run_control_supervisor(
 				if let Some(gate) = activation.lifecycle_gate.as_deref() {
 					notify_extension_unload(gate, activation.key.extension(), "reload", 0);
 				}
+				publish_host_down(&activation, "extension host is reloading");
 				let connected_at = Instant::now();
 				let result = async {
 					let authority = next_control_authority(&activation, &running)?;
@@ -3568,6 +3913,9 @@ async fn run_control_supervisor(
 				}
 				.await;
 				let failed = result.is_err();
+				if !failed {
+					breaker.restored();
+				}
 				let _ = reply.send(result);
 				if failed {
 					break;
@@ -3584,17 +3932,18 @@ async fn run_control_supervisor(
 			},
 		}
 	}
+	publish_host_down(&activation, "extension host is unavailable");
 	if let Some(gate) = activation.lifecycle_gate.as_deref() {
 		notify_extension_unload(gate, activation.key.extension(), "shutdown", 0);
 	}
 	for invocation in pending.into_values() {
-		let _ = invocation.events.send(ExtHostEvent::Aborted(ExtHostAbort {
-			call_id:         invocation.call.invocation_id,
-			kind:            ExtHostAbortKind::Cancelled,
-			reason:          sf!("CONTROL supervisor shut down"),
-			effects_unknown: false,
-		}));
+		abort_control_invocation(
+			invocation,
+			"CONTROL supervisor stopped before dispatch",
+			false,
+		);
 	}
+	reject_queued_control_commands(&mailbox, "CONTROL extension host was disabled");
 	cancelled.lock().extend(in_flight.lock().keys().copied());
 	running.shutdown().await;
 }
@@ -3663,6 +4012,7 @@ async fn refresh_control_generation(
 			ExtHostError::Protocol(sf!("CONTROL child omitted sealed registry evidence"))
 		})?;
 	install_control_hooks(activation, &evidence)?;
+	publish_host_availability(activation, &evidence);
 	publish_python_generation(activation, running);
 	*live_control.control.write() = running.control();
 	*live_control.identity.write() = Arc::clone(&activation.identity);
@@ -3694,25 +4044,28 @@ async fn refresh_control_generation(
 	Ok(())
 }
 
-fn send_control_result(invocation: &PendingInvocation, mut result: serde_json::Value) {
-	if let Some(updates) = result
-		.as_object_mut()
-		.and_then(|result| result.remove("updates"))
-		.and_then(|updates| updates.as_array().cloned())
-	{
-		for update in updates {
-			let _ = invocation.events.send(ExtHostEvent::Update(ToolUpdate {
-				call_id: invocation.call.invocation_id.to_string(),
-				json:    serde_json::to_vec(&update)
-					.expect("serializing an existing JSON value cannot fail")
-					.into(),
-				props:   None,
-			}));
-		}
-	}
-	match control_completion(invocation.call.invocation_id.clone(), result) {
-		Ok(completion) => {
+async fn send_control_result(
+	invocation: &PendingInvocation,
+	result: serde_json::Value,
+	store: Option<BlobHost>,
+	session: Str,
+) {
+	let call_id = invocation.call.invocation_id.clone();
+	let completion = tokio::task::spawn_blocking(move || {
+		control_completion(call_id, result, store.as_ref(), session.as_str())
+	})
+	.await;
+	match completion {
+		Ok(Ok(completion)) => {
 			let _ = invocation.events.send(ExtHostEvent::Complete(completion));
+		},
+		Ok(Err(error)) => {
+			let _ = invocation.events.send(ExtHostEvent::Aborted(ExtHostAbort {
+				call_id:         invocation.call.invocation_id.clone(),
+				kind:            ExtHostAbortKind::Crashed,
+				reason:          Str::from(error.to_string()),
+				effects_unknown: true,
+			}));
 		},
 		Err(error) => {
 			let _ = invocation.events.send(ExtHostEvent::Aborted(ExtHostAbort {
@@ -3724,7 +4077,6 @@ fn send_control_result(invocation: &PendingInvocation, mut result: serde_json::V
 		},
 	}
 }
-
 async fn dispatch_control_prompt(
 	activation: &PendingControlActivation,
 	request_id: u64,
@@ -3836,6 +4188,65 @@ mod tests {
 		let error = ensure_committed_argument_tools(&[streamed])
 			.expect_err("CONTROL registration must reject streamed arguments");
 		assert!(matches!(error, ExtHostError::Protocol(_)));
+	}
+
+	#[test]
+	fn control_restart_breaker_is_bounded_and_resets_after_health() {
+		let mut breaker = ControlRestartBreaker::new();
+		let delays = (0..CONTROL_RESTART_FAILURE_LIMIT)
+			.map(|_| breaker.failed().expect("breaker remains closed within its limit"))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			delays,
+			[
+				Duration::from_secs(1),
+				Duration::from_secs(2),
+				Duration::from_secs(4),
+				Duration::from_secs(8),
+			]
+		);
+		assert!(breaker.failed().is_none());
+		breaker.healthy_since = std::time::Instant::now() - CONTROL_RESTART_HEALTHY;
+		assert_eq!(breaker.failed(), Some(CONTROL_RESTART_INITIAL));
+	}
+
+	#[test]
+	fn terminal_breaker_fails_queued_invocations() {
+		let (commands, mailbox) = flume::unbounded();
+		let (events, received) = flume::unbounded();
+		commands
+			.send(ControlHostCommand::Open {
+				id: 1,
+				owner: HostKey::new("project", "trusted", "broken"),
+				call: ExtHostToolCall {
+					invocation_id: sf!("queued"),
+					name: sf!("tool"),
+					rev: sf!("1"),
+					deadline: Duration::from_secs(1),
+				},
+				events,
+				callback_policy: CallbackConcurrency::Threadsafe,
+			})
+			.expect("queue invocation");
+		reject_queued_control_commands(&mailbox, "breaker open");
+		let ExtHostEvent::Aborted(abort) = received.recv().expect("queued terminal abort") else {
+			panic!("queued invocation did not receive terminal abort");
+		};
+		assert_eq!(abort.call_id, "queued");
+		assert_eq!(abort.kind, ExtHostAbortKind::Crashed);
+		assert!(!abort.effects_unknown);
+	}
+
+	#[test]
+	fn oversized_control_result_spills_without_inline_copy() {
+		let scratch = tempfile::tempdir().expect("result store scratch");
+		let store = BlobHost::open(scratch.path()).expect("result store");
+		let value = serde_json::Value::String("x".repeat(CONTROL_RESULT_INLINE_BYTES + 1));
+		let completion = control_completion(sf!("large"), value, Some(&store), "session")
+			.expect("spill oversized result");
+		assert!(completion.details_json.is_none());
+		let blob = completion.details_blob.expect("result blob");
+		assert!(blob.size > CONTROL_RESULT_INLINE_BYTES as u64);
 	}
 
 	#[test]

@@ -1968,7 +1968,7 @@ fn py_eval_param_event(error: ParamError) -> Ev<PyEvalUpdate, PyEvalPayload, PyE
 			path:     Vec::new(),
 			expected: sf!("one complete py_eval@1 expression object"),
 			kind:     ArgIssueKind::Protocol,
-			example:  Some(sf!(r#"{{"code":"1 + 1"}}"#)),
+			example:  Some(Str::new_static(r#"{"code":"1 + 1"}"#)),
 			found:    Some(reason),
 		}),
 	}
@@ -1984,7 +1984,7 @@ fn py_eval_commit_event(error: CommitError) -> Ev<PyEvalUpdate, PyEvalPayload, P
 			path:     Vec::new(),
 			expected: sf!("one complete py_eval@1 expression object"),
 			kind:     ArgIssueKind::Protocol,
-			example:  Some(sf!(r#"{{"code":"1 + 1"}}"#)),
+			example:  Some(Str::new_static(r#"{"code":"1 + 1"}"#)),
 			found:    Some(reason),
 		}),
 	}
@@ -2015,7 +2015,7 @@ fn protocol_issue(reason: Str) -> ArgIssue {
 		path:     Vec::new(),
 		expected: sf!("one complete eval@1 Python cell object"),
 		kind:     ArgIssueKind::Protocol,
-		example:  Some(sf!(r#"{{"language":"py","code":"1 + 1"}}"#)),
+		example:  Some(Str::new_static(r#"{"language":"py","code":"1 + 1"}"#)),
 		found:    Some(reason),
 	}
 }
@@ -2349,9 +2349,12 @@ mod tests {
 			Ok(self.start(request, disposable))
 		}
 
-		async fn dispose_session(&self, _session: &Session) -> Result<(), Fault> {
+		fn dispose_session(
+			&self,
+			_session: &Session,
+		) -> impl Future<Output = Result<(), Fault>> + Send + '_ {
 			self.disposals.fetch_add(1, Ordering::AcqRel);
-			Ok(())
+			future::ready(Ok(()))
 		}
 	}
 
@@ -2460,7 +2463,7 @@ mod tests {
 
 		let (empty_feed, empty_params) = IncomingParams::channel();
 		empty_feed
-			.args_committed(sf!(r#"{"code":""}"#))
+			.args_committed(Str::new_static(r#"{"code":""}"#))
 			.expect("empty invocation remains live");
 		assert!(matches!(tool.call(empty_params).collect::<Vec<_>>().await.as_slice(), [Ev::Done(
 			ToolTerminal::Done { result: Err(PyEvalFault::EmptyCode), .. }
@@ -2468,7 +2471,7 @@ mod tests {
 
 		let (fault_feed, fault_params) = IncomingParams::channel();
 		fault_feed
-			.args_committed(sf!(r#"{"code":"1 / 0"}"#))
+			.args_committed(Str::new_static(r#"{"code":"1 / 0"}"#))
 			.expect("failing invocation remains live");
 		assert!(matches!(
 			tool.call(fault_params).collect::<Vec<_>>().await.as_slice(),
@@ -2496,7 +2499,7 @@ mod tests {
 		let tool = py_eval(exec.clone());
 		let (feed, params) = IncomingParams::channel();
 		feed
-			.args_committed(sf!(r#"{"code":"__import__('time').sleep(30)"}"#))
+			.args_committed(Str::new_static(r#"{"code":"__import__('time').sleep(30)"}"#))
 			.expect("sleeping invocation remains live");
 		feed
 			.interrupt(Interrupt { class: sf!("user"), reason: sf!("stop py_eval") })

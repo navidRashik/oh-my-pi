@@ -16,7 +16,7 @@ use omp_env::{
 	Admitter, BlobDownloadEvent, EnvClient, ExecEvent, InvocationEvent, ProcessAttachmentEvent,
 };
 use omp_envd::{
-	AttachOptions, EnvServer, ProjectEnvironment, RegistryBridges,
+	AttachOptions, EnvServer, ExtensionDataBinding, ProjectEnvironment, RegistryBridges,
 	eval::{
 		BridgeHostError, BridgeProgressSink, EvalSessionConfig, ParentBindingLease, ParentSessionHost,
 	},
@@ -529,12 +529,14 @@ fn extension_worker(module: &str, python_site: Option<PathBuf>) -> ExtHostConfig
 }
 
 struct Harness {
-	client:       EnvClient,
-	server:       Arc<EnvServer>,
-	root:         TempDir,
-	state:        TempDir,
-	server_task:  JoinHandle<()>,
-	_eval_parent: ParentBindingLease,
+	client:                  EnvClient,
+	server:                  Arc<EnvServer>,
+	root:                    TempDir,
+	state:                   TempDir,
+	server_task:             JoinHandle<()>,
+	extension_data_shutdown: CancellationToken,
+	extension_data_tasks:    Vec<JoinHandle<()>>,
+	_eval_parent:            ParentBindingLease,
 }
 struct TestEvalParent {
 	cwd: PathBuf,
@@ -576,9 +578,24 @@ impl Harness {
 		Self::start_with_worker(registry, test_config()).await
 	}
 
-	async fn start_with_worker(registry: Registry, worker: ExtHostConfig) -> Self {
+	async fn start_with_worker(registry: Registry, mut worker: ExtHostConfig) -> Self {
 		let root = tempfile::tempdir().expect("workspace scratch directory");
 		let state = tempfile::tempdir().expect("state scratch directory");
+		let mut extension_data_bindings = Vec::with_capacity(worker.extensions.len());
+		for extension in &mut worker.extensions {
+			let mut binding = ExtensionDataBinding::scoped(
+				state.path(),
+				extension.key.clone(),
+				worker.session_id.as_str(),
+				worker.session_generation,
+				extension.data_grants.clone(),
+			);
+			extension.data_socket = Some(binding.path().to_path_buf());
+			binding
+				.prepare_endpoint()
+				.expect("prepare extension DATA endpoint");
+			extension_data_bindings.push(binding);
+		}
 		let con = Arc::new(omp_con::Ctx::new());
 		let convars = Arc::new(omp_envd::exthost::ConvarControlFactory::new(Arc::clone(&con)));
 		let server = Arc::new(
@@ -594,6 +611,20 @@ impl Harness {
 			.await
 			.expect("real local environment host"),
 		);
+		let extension_data_shutdown = CancellationToken::new();
+		let extension_data_tasks = extension_data_bindings
+			.into_iter()
+			.map(|binding| {
+				let host = Arc::clone(&server);
+				let shutdown = extension_data_shutdown.clone();
+				tokio::spawn(async move {
+					host
+						.serve_extension_uds(binding, shutdown)
+						.await
+						.expect("serve extension DATA endpoint");
+				})
+			})
+			.collect();
 		let (client, transport) = EnvClient::in_process(64);
 		client.set_admitter(AllowAdmission);
 		let host = Arc::clone(&server);
@@ -612,7 +643,16 @@ impl Harness {
 				Arc::new(TestEvalParent { cwd: env::current_dir().expect("test process cwd") }),
 			)
 			.expect("bind eval parent");
-		Self { client, server, root, state, server_task, _eval_parent: eval_parent }
+		Self {
+			client,
+			server,
+			root,
+			state,
+			server_task,
+			extension_data_shutdown,
+			extension_data_tasks,
+			_eval_parent: eval_parent,
+		}
 	}
 
 	const fn client(&self) -> &EnvClient {
@@ -638,6 +678,10 @@ impl Harness {
 
 impl Drop for Harness {
 	fn drop(&mut self) {
+		self.extension_data_shutdown.cancel();
+		for task in &self.extension_data_tasks {
+			task.abort();
+		}
 		self.server_task.abort();
 	}
 }
@@ -1885,6 +1929,12 @@ async fn opt_in_py_eval_is_environment_routed_and_uses_a_fresh_namespace() {
 	})
 	.await
 	.expect("start py_eval environment");
+	let eval_parent_lease = environment
+		.bind_eval_sdk_parent(
+			sf!("test-session"),
+			Arc::new(TestEvalParent { cwd: root.path().to_owned() }),
+		)
+		.expect("bind py_eval parent");
 	environment.client().set_admitter(AllowAdmission);
 	let registry = environment.registry();
 
@@ -1918,7 +1968,11 @@ async fn opt_in_py_eval_is_environment_routed_and_uses_a_fresh_namespace() {
 		json!({"code":"globals().get('sentinel', 'fresh')"}),
 	)
 	.await;
-	assert_eq!(ok_builtin_payload(fresh, "py_eval fresh namespace"), json!({"result": "fresh"}));
+	assert_eq!(
+		ok_builtin_payload(fresh, "py_eval fresh namespace"),
+		json!({"result": "fresh"})
+	);
+	drop(eval_parent_lease);
 }
 #[tokio::test]
 async fn extension_prelude_helper_bridges_eval_without_registering_a_tool() {
