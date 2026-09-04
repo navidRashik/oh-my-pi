@@ -452,7 +452,7 @@ async fn idle(
 					let _ = reply.send(Vec::new());
 				},
 				Ok(Up::Cancel) => return Idle::Cancelled,
-				Ok(Up::Interrupt) => {},
+				Ok(Up::Interrupt | Up::AbortTools(_)) => {},
 				Ok(
 					other @ (Up::SteerAuthored { .. }
 					| Up::Approval(_)

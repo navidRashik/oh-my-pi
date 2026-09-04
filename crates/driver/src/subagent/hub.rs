@@ -89,14 +89,28 @@ pub struct HubSessionTool {
 	env:          EnvClient,
 	project_root: PathBuf,
 	caller_id:    Str,
+	con:          Arc<omp_con::Ctx>,
 	spec:         ToolSpec,
 }
 
 impl HubSessionTool {
 	/// Creates the canonical session hub.
 	#[must_use]
-	pub fn new(env: EnvClient, project_root: PathBuf, caller_id: Str) -> Self {
-		Self { env, project_root, caller_id, spec: omp_tools::hub::spec() }
+	pub fn new(
+		env: EnvClient,
+		project_root: PathBuf,
+		caller_id: Str,
+		con: Arc<omp_con::Ctx>,
+	) -> Self {
+		Self { env, project_root, caller_id, con, spec: omp_tools::hub::spec() }
+	}
+
+	fn message_timeout_ms(&self) -> u64 {
+		crate::subagent::settings::SV_IRC_TIMEOUT
+			.get(&self.con)
+			.as_finite()
+			.and_then(|duration| duration.to_std().ok())
+			.map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 	}
 }
 
@@ -131,17 +145,25 @@ impl SessionTool for HubSessionTool {
 				},
 				HubOp::Send if params.await_reply => {
 					match send(cx.authority, self.caller_id.as_str(), &params) {
-						Ok(_) => wait_peer(cx.session, cx.control, params.timeout_ms)
-							.await
-							.map_err(fault_text),
+						Ok(_) => wait_peer(
+							cx.session,
+							cx.control,
+							params
+								.timeout_ms
+								.unwrap_or_else(|| self.message_timeout_ms()),
+						)
+						.await
+						.map_err(fault_text),
 						Err(error) => Err(fault_text(error)),
 					}
 				},
 				HubOp::Send => send(cx.authority, self.caller_id.as_str(), &params).map_err(fault_text),
 				HubOp::Inbox => inbox(cx.session, params.peek).map_err(fault_text),
-				HubOp::Wait => wait(cx.session, cx.jobs, cx.control, &self.env, &params)
-					.await
-					.map_err(fault_text),
+				HubOp::Wait => {
+					wait(cx.session, cx.jobs, cx.control, &self.env, &params, self.message_timeout_ms())
+						.await
+						.map_err(fault_text)
+				},
 				HubOp::List => list(cx.authority, params.limit).map_err(fault_text),
 				HubOp::Jobs => roster(cx.jobs).map_err(fault_text),
 				HubOp::Cancel => cancel(cx.session, cx.jobs, params.ids.as_deref().unwrap_or_default())
@@ -480,9 +502,8 @@ async fn cancel(
 async fn wait_peer(
 	session: &mut omp_session::Session,
 	control: Option<&CallControl>,
-	timeout_ms: Option<u64>,
+	timeout: u64,
 ) -> Result<Response, omp_agent::SessionToolError> {
-	let timeout = timeout_ms.unwrap_or(120_000);
 	let deadline =
 		(timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
 	loop {
@@ -523,13 +544,11 @@ async fn wait(
 	control: Option<&CallControl>,
 	env: &EnvClient,
 	params: &Params,
+	message_timeout_ms: u64,
 ) -> Result<Response, omp_agent::SessionToolError> {
 	if params.name.is_some() {
 		return process_wait(session, control, env, params).await;
 	}
-	let timeout = params.timeout_ms.unwrap_or(120_000);
-	let deadline =
-		(timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
 	let selected = params
 		.ids
 		.clone()
@@ -542,6 +561,13 @@ async fn wait(
 				.map(|job| job.id)
 				.collect()
 		});
+	let timeout = params.timeout_ms.unwrap_or(if selected.is_empty() {
+		message_timeout_ms
+	} else {
+		120_000
+	});
+	let deadline =
+		(timeout != 0).then(|| tokio::time::Instant::now() + Duration::from_millis(timeout));
 	loop {
 		jobs.poll(session)?;
 		if let Some(message) = pop_inbox_message(session)? {

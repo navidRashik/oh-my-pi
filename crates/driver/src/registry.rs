@@ -1,7 +1,7 @@
 //! Production inference and credential-service composition.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	env,
 	env::consts,
 	fs,
@@ -13,7 +13,12 @@ use std::{
 	time::Duration,
 };
 
-use omp_catalog::{provider::AuthSpecKind, snapshot};
+use omp_catalog::{
+	CatalogOverlay, ContextStrategy, DiscoveryDefaults, DiscoveryNormalizer, OverlaySource,
+	OverlayStack, Pricing, ProvenanceKind, ProvenanceSource, UnsafeTrustScope,
+	provider::AuthSpecKind,
+	snapshot,
+};
 use omp_core::{Hash32, SecretString, Str, sf};
 use omp_envd::browser_fetch::BrowserFetchAdapter;
 #[cfg(target_os = "macos")]
@@ -123,6 +128,7 @@ const ANTIGRAVITY_OS_ENV: &str = "OMP_ANTIGRAVITY_OS";
 const ANTIGRAVITY_ARCH_ENV: &str = "OMP_ANTIGRAVITY_ARCH";
 const ANTIGRAVITY_VERSION_CACHE_FILE: &str = "antigravity-version";
 const ANTIGRAVITY_VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const MODEL_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 const AZURE_BASE_URL_ENV: &str = "OMP_AZURE_OPENAI_BASE_URL";
 const AZURE_RESOURCE_NAME_ENV: &str = "OMP_AZURE_OPENAI_RESOURCE_NAME";
 const AZURE_DEPLOYMENT_ENV: &str = "OMP_AZURE_OPENAI_DEPLOYMENT";
@@ -318,16 +324,236 @@ pub fn open_credential_store_with_key_source(
 	Ok(Arc::new(CredentialStore::open(database.as_ref(), key_source)?))
 }
 
-/// Returns the immutable compiled production catalog.
-///
-/// Runtime provider discovery is owned by `omp-inference`; driver composition
-/// no longer maintains a parallel mutable catalog projection.
-pub fn production_catalog(_data_dir: &Path) -> Result<Arc<snapshot::Catalog>, RegistryError> {
-	Ok(Arc::new(
-		snapshot::Catalog::try_embedded()
-			.map_err(RegistryError::Catalog)?
-			.clone(),
-	))
+/// Returns the immutable production catalog with configured and fresh
+/// runtime-discovery layers materialized in explicit precedence order.
+pub fn production_catalog(data_dir: &Path) -> Result<Arc<snapshot::Catalog>, RegistryError> {
+	let bundled = snapshot::Catalog::try_embedded()
+		.map_err(RegistryError::Catalog)?
+		.clone();
+	let loaded = if data_dir.exists() {
+		crate::discovery::models::load_or_import_legacy(data_dir)
+			.map_err(catalog_composition)?
+	} else {
+		None
+	};
+	let user_overlay = loaded
+		.as_ref()
+		.map(|loaded| crate::discovery::models::lower_user_overlay(&loaded.config))
+		.transpose()
+		.map_err(catalog_composition)?;
+	let configured = if let Some(overlay) = &user_overlay {
+		bundled
+			.with_overlay_stack(
+				&OverlayStack::from_layers([(OverlaySource::UserConfig, overlay.clone())]),
+				UnsafeTrustScope::ALL,
+			)
+			.map_err(catalog_composition)?
+	} else {
+		bundled
+	};
+	let cache_path = data_dir.join("models.db");
+	if !cache_path.exists() {
+		return Ok(Arc::new(configured));
+	}
+	let store = omp_inference::discovery::DiscoveryStore::open(&cache_path)
+		.map_err(catalog_composition)?;
+	let now_ms = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX);
+	let probes = crate::discovery::models::discovery_probes(
+		loaded.as_ref().map(|loaded| &loaded.config),
+		&configured,
+	)
+	.map_err(catalog_composition)?;
+	let mut cache_keys = BTreeSet::new();
+	for route in configured.routes() {
+		if route.discovery.is_some() {
+			cache_keys.insert(omp_inference::discovery::DiscoveryCacheKey::provider(
+				route.provider.clone(),
+			));
+		}
+	}
+	for probe in probes {
+		cache_keys.insert(omp_inference::discovery::DiscoveryCacheKey::endpoint(
+			probe.provider,
+			&probe.endpoint,
+		));
+	}
+	let mut normalized = Vec::new();
+	for key in cache_keys {
+		let Some(cached) = store.load_fresh(&key, now_ms).map_err(catalog_composition)? else {
+			continue;
+		};
+		let Some(provider) = configured.provider(&key.provider) else {
+			continue;
+		};
+		let defaults = configured
+			.discovery_defaults(&key.provider)
+			.cloned()
+			.unwrap_or_else(|| DiscoveryDefaults {
+				wire_policy:          provider.wire_policy.clone(),
+				extended_wire_policy: None,
+				context:              ContextStrategy::Replay,
+				thinking:             None,
+				pricing:              Pricing::default(),
+			});
+		let explicit = loaded
+			.as_ref()
+			.and_then(|loaded| loaded.config.providers.get(key.provider.as_str()));
+		for record in DiscoveryNormalizer::new(defaults)
+			.normalize_batch(&cached.rows)
+			.map_err(catalog_composition)?
+		{
+			let explicitly_configured = explicit.is_some_and(|provider| {
+				provider.models.contains_key(record.model.key.as_str())
+					|| provider
+						.model_overrides
+						.contains_key(record.model.key.as_str())
+			});
+			if !explicitly_configured {
+				normalized.push(record.into_catalog_overlay());
+			}
+		}
+	}
+	if normalized.is_empty() {
+		return Ok(Arc::new(configured));
+	}
+	let overlay = CatalogOverlay::combined(
+		ProvenanceSource {
+			kind:           ProvenanceKind::Discovered,
+			origin:         Str::new_static("models.db"),
+			revision:       None,
+			confidence:     omp_catalog::EvidenceConfidence::Inferred,
+			observed_at_ms: Some(now_ms),
+		},
+		normalized,
+	);
+	let catalog = configured
+		.with_overlay_stack(
+			&OverlayStack::from_layers([(OverlaySource::DiskCache, overlay)]),
+			UnsafeTrustScope::NONE,
+		)
+		.map_err(catalog_composition)?;
+	Ok(Arc::new(catalog))
+}
+
+fn catalog_composition(
+	source: impl std::error::Error + Send + Sync + 'static,
+) -> RegistryError {
+	RegistryError::CatalogComposition(Box::new(source))
+}
+
+async fn refresh_model_discovery_cache(
+	data_dir: &Path,
+	catalog: Arc<snapshot::Catalog>,
+) -> Result<Arc<snapshot::Catalog>, RegistryError> {
+	use omp_inference::discovery::{
+		DiscoveryCacheKey, DiscoveryStore, DiscoveryStoreError, ProviderDiscoveryState,
+		ProviderLifecycle,
+	};
+
+	let loaded = crate::discovery::models::load_or_import_legacy(data_dir)
+		.map_err(catalog_composition)?;
+	let probes = crate::discovery::models::discovery_probes(
+		loaded.as_ref().map(|loaded| &loaded.config),
+		&catalog,
+	)
+	.map_err(catalog_composition)?;
+	if probes.is_empty() {
+		return Ok(catalog);
+	}
+	let store = Arc::new(
+		DiscoveryStore::open(&data_dir.join("models.db")).map_err(catalog_composition)?,
+	);
+	let now_ms = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX);
+	store.prune_expired(now_ms).map_err(catalog_composition)?;
+	let http = omp_envd::model_discovery::ModelDiscoveryHttpHost::new();
+	let mut pending = Vec::new();
+	for probe in probes {
+		let key = DiscoveryCacheKey::endpoint(probe.provider.clone(), &probe.endpoint);
+		if store
+			.load_fresh(&key, now_ms)
+			.map_err(catalog_composition)?
+			.is_some()
+		{
+			continue;
+		}
+		if store
+			.lifecycle(&key)
+			.map_err(catalog_composition)?
+			.is_some_and(|state| {
+				state.state == ProviderDiscoveryState::Failed
+					&& state.retry_at_ms.is_some_and(|retry| retry > now_ms)
+			})
+		{
+			continue;
+		}
+		store
+			.set_lifecycle(&ProviderLifecycle {
+				provider:       probe.provider.clone(),
+				cache_scope:    key.credential_scope.clone(),
+				state:          ProviderDiscoveryState::Probing,
+				error_code:     None,
+				observed_at_ms: now_ms,
+				retry_at_ms:    None,
+			})
+			.map_err(catalog_composition)?;
+		let store = Arc::clone(&store);
+		let http = http.clone();
+		pending.push(async move {
+			let provider = probe.provider.clone();
+			match probe
+				.probe(&http, tokio_util::sync::CancellationToken::new())
+				.await
+			{
+				Ok(mut rows) => {
+					crate::discovery::models::apply_runtime_discovery_overrides(
+						&probe,
+						&mut rows,
+					);
+					for row in &mut rows {
+						row.observed_at_ms = Some(now_ms);
+					}
+					store.publish(&key, &rows, now_ms, MODEL_DISCOVERY_CACHE_TTL)?;
+					Ok::<bool, DiscoveryStoreError>(true)
+				},
+				Err(error) => {
+					let error_code: &'static str = error.into();
+					tracing::debug!(
+						provider = %provider,
+						error_code,
+						"bounded model discovery probe was unavailable"
+					);
+					store.set_lifecycle(&ProviderLifecycle {
+						provider,
+						cache_scope: key.credential_scope.clone(),
+						state: ProviderDiscoveryState::Failed,
+						error_code: Some(Str::new_static(error_code)),
+						observed_at_ms: now_ms,
+						retry_at_ms: Some(now_ms.saturating_add(5 * 60 * 1000)),
+					})?;
+					Ok::<bool, DiscoveryStoreError>(false)
+				},
+			}
+		});
+	}
+	let mut changed = false;
+	for result in futures::future::join_all(pending).await {
+		changed |= result.map_err(catalog_composition)?;
+	}
+	if changed {
+		production_catalog(data_dir)
+	} else {
+		Ok(catalog)
+	}
 }
 
 /// Builds the production inference registry over durable daemon state.
@@ -680,7 +906,10 @@ async fn production_assembly_with_catalog(
 	fs::create_dir_all(data_dir).map_err(RegistryError::PrepareState)?;
 	let catalog = match catalog {
 		Some(catalog) => catalog,
-		None => production_catalog(data_dir)?,
+		None => {
+			let catalog = production_catalog(data_dir)?;
+			refresh_model_discovery_cache(data_dir, catalog).await?
+		},
 	};
 	#[cfg(feature = "local-applefm")]
 	let apple_routes = catalog

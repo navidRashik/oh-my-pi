@@ -88,6 +88,7 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("task.enableEffort", "sv_task_enable_effort"),
 	("task.prewalk", "sv_task_prewalk"),
 	("tasks.todoClearDelay", "sv_tasks_todo_clear_delay"),
+	("irc.timeoutMs", "sv_irc_timeout"),
 	("skills.enableSkillCommands", "sv_skills_enable_skill_commands"),
 	("skills.enableCodexUser", "sv_skills_enable_codex_user"),
 	("skills.enableClaudeUser", "sv_skills_enable_claude_user"),

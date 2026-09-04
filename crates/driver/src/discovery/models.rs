@@ -2,7 +2,7 @@
 
 use std::{
 	collections::BTreeMap,
-	fs, io,
+	env, fs, io,
 	path::{Path, PathBuf},
 };
 
@@ -16,6 +16,7 @@ use omp_catalog::{
 };
 use omp_core::Str;
 use serde::{Deserialize, Serialize};
+use strum::{Display, EnumString, IntoStaticStr};
 use toml::{de, ser};
 
 fn atomic_replace(path: &Path, contents: &str) -> io::Result<()> {
@@ -42,19 +43,65 @@ pub struct ModelsConfig {
 	pub providers: BTreeMap<Str, ProviderConfig>,
 }
 
+/// Closed local/configured provider discovery protocols.
+#[derive(
+	Clone, Copy, Debug, Display, EnumString, Eq, IntoStaticStr, PartialEq, Deserialize, Serialize,
+)]
+pub enum ProviderDiscoveryKind {
+	/// Ollama `/api/tags` plus per-model `/api/show`.
+	#[serde(rename = "ollama")]
+	#[strum(serialize = "ollama")]
+	Ollama,
+	/// llama.cpp native `/models` and `/props`.
+	#[serde(rename = "llama.cpp")]
+	#[strum(serialize = "llama.cpp")]
+	LlamaCpp,
+	/// LM Studio native v0 metadata.
+	#[serde(rename = "lm-studio")]
+	#[strum(serialize = "lm-studio")]
+	LmStudio,
+	/// LiteLLM rich model metadata with `/v1/models` fallback.
+	#[serde(rename = "litellm")]
+	#[strum(serialize = "litellm")]
+	LiteLlm,
+	/// Generic OpenAI-compatible model list.
+	#[serde(rename = "openai-models-list")]
+	#[strum(serialize = "openai-models-list")]
+	OpenAiModelsList,
+	/// Dual Anthropic/OpenAI compatible proxy.
+	#[serde(rename = "proxy")]
+	#[strum(serialize = "proxy")]
+	Proxy,
+}
+
+/// Typed provider discovery policy.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDiscovery {
+	/// Discovery wire protocol.
+	#[serde(rename = "type")]
+	pub kind:       ProviderDiscoveryKind,
+	/// Optional complete-probe timeout.
+	pub timeout_ms: Option<u64>,
+	/// Whether OpenAI model-list discovery injects `/v1`.
+	pub inject_v1:  Option<bool>,
+}
+
 /// Provider-level configuration facts.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
 	/// Route base URL override.
 	pub base_url:             Option<Str>,
+	/// Provider-wide wire API selector.
+	pub api:                  Option<Str>,
 	/// Static request headers.
 	#[serde(default)]
 	pub headers:              BTreeMap<Str, Str>,
 	/// Authentication mode.
 	pub auth:                 Option<Str>,
 	/// Provider model-discovery configuration.
-	pub discovery:            Option<toml::Value>,
+	pub discovery:            Option<ProviderDiscovery>,
 	/// Wire compatibility configuration.
 	pub compat:               Option<toml::Value>,
 	/// Whether strict tool schemas are disabled.
@@ -65,6 +112,23 @@ pub struct ProviderConfig {
 	/// Provider model definitions keyed by model id.
 	#[serde(default)]
 	pub models:               BTreeMap<Str, ModelConfig>,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("ProviderConfig")
+			.field("base_url", &self.base_url.as_ref().map(|_| "<configured>"))
+			.field("api", &self.api)
+			.field("header_names", &self.headers.keys().collect::<Vec<_>>())
+			.field("auth", &self.auth)
+			.field("discovery", &self.discovery)
+			.field("compat", &self.compat.as_ref().map(|_| "<configured>"))
+			.field("disable_strict_tools", &self.disable_strict_tools)
+			.field("model_override_count", &self.model_overrides.len())
+			.field("model_count", &self.models.len())
+			.finish()
+	}
 }
 
 /// Declarative configured header value source.
@@ -141,7 +205,9 @@ pub struct ModelConfig {
 /// Decodes a native configured-model file.
 pub fn load_models_config(path: &Path) -> Result<ModelsConfig, ModelsConfigError> {
 	let source = fs::read_to_string(path)?;
-	Ok(toml::from_str(&source)?)
+	let config = toml::from_str(&source)?;
+	validate_discovery(&config)?;
+	Ok(config)
 }
 
 /// Source label for a native model configuration or one-time legacy import.
@@ -233,6 +299,7 @@ pub fn load_or_import_legacy(
 /// declarative in the configuration authority and are never copied into model
 /// records.
 pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, ModelsConfigError> {
+	validate_discovery(config)?;
 	let source = ProvenanceSource {
 		kind:           ProvenanceKind::Configured,
 		origin:         "models.toml".into(),
@@ -265,19 +332,13 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 						region:      route.endpoint.region.clone(),
 						api_version: route.endpoint.api_version.clone(),
 					});
-				let discovery = definition.discovery.as_ref().and_then(|value| {
-					value
-						.get("id")
-						.and_then(toml::Value::as_str)
-						.map(omp_catalog::DiscoverySpecId::from)
-				});
 				builder = builder.with_route(RouteOverlay {
 					route: route_id.clone(),
 					added: None,
 					patch: RoutePatch {
 						endpoint,
 						auth: configured_auth.as_ref().map(|spec| spec.id.clone()),
-						discovery: definition.discovery.as_ref().map(|_| discovery),
+						discovery: None,
 						disable_strict_tools: definition.disable_strict_tools,
 						..RoutePatch::default()
 					},
@@ -291,19 +352,22 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 			let mut added_provider: ProviderDef = template_provider.clone();
 			added_provider.id = ProviderId::from(provider.as_str());
 			added_provider.name = provider.clone();
-			added_provider.routes = Box::new([route_id.clone()]);
 			if let Some(auth) = &configured_auth {
 				added_provider.auth = Box::new([auth.id.clone()]);
 			}
-			builder = builder.with_provider(added_provider);
 			let mut added_route: RouteDef = template_route.clone();
 			added_route.id = route_id.clone();
 			added_route.provider = ProviderId::from(provider.as_str());
 			if let Some((codec, transport)) = definition
-				.models
-				.values()
-				.chain(definition.model_overrides.values())
-				.find_map(|model| model.api.as_deref())
+				.api
+				.as_deref()
+				.or_else(|| {
+					definition
+						.models
+						.values()
+						.chain(definition.model_overrides.values())
+						.find_map(|model| model.api.as_deref())
+				})
 				.and_then(omp_catalog::resolve_source_transport)
 			{
 				added_route.codec = codec;
@@ -326,20 +390,49 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 			if let Some(auth) = &configured_auth {
 				added_route.auth = auth.id.clone();
 			}
-			added_route.discovery = definition
-				.discovery
-				.as_ref()
-				.and_then(|value| value.get("id"))
-				.and_then(toml::Value::as_str)
-				.map(omp_catalog::DiscoverySpecId::from);
+			if definition.discovery.is_none() {
+				added_route.discovery = None;
+			}
 			if let Some(disabled) = definition.disable_strict_tools {
 				added_route.capability_limits.disable_strict_tools = disabled;
 			}
-			builder = builder.with_route(RouteOverlay {
+			let alternate_route = definition
+				.discovery
+				.as_ref()
+				.is_some_and(|discovery| discovery.kind == ProviderDiscoveryKind::Proxy)
+				.then(|| {
+					let alternate_api = if added_route.codec.as_str().contains("anthropic") {
+						"openai-completions"
+					} else {
+						"anthropic-messages"
+					};
+					let (codec, transport) = omp_catalog::resolve_source_transport(alternate_api)
+						.expect("built-in proxy transports exist");
+					let alternate_id = RouteId::from(format!("{provider}-configured-alternate"));
+					let mut alternate = added_route.clone();
+					alternate.id = alternate_id.clone();
+					alternate.codec = codec;
+					alternate.transport = transport;
+					(alternate_id, alternate)
+				});
+			added_provider.routes = match &alternate_route {
+				Some((alternate, _)) => {
+					vec![route_id.clone(), alternate.clone()].into_boxed_slice()
+				},
+				None => Box::new([route_id.clone()]),
+			};
+			builder = builder.with_provider(added_provider).with_route(RouteOverlay {
 				route: route_id.clone(),
 				added: Some(added_route),
 				patch: RoutePatch::default(),
 			});
+			if let Some((alternate_id, alternate)) = alternate_route {
+				builder = builder.with_route(RouteOverlay {
+					route: alternate_id,
+					added: Some(alternate),
+					patch: RoutePatch::default(),
+				});
+			}
 			Some(route_id)
 		};
 		for (name, model) in definition
@@ -502,15 +595,37 @@ pub fn lower_user_overlay(config: &ModelsConfig) -> Result<CatalogOverlay, Model
 	Ok(builder.build())
 }
 
+fn validate_discovery(config: &ModelsConfig) -> Result<(), ModelsConfigError> {
+	for (provider, definition) in &config.providers {
+		let Some(discovery) = &definition.discovery else {
+			continue;
+		};
+		if discovery.timeout_ms == Some(0)
+			|| (discovery.inject_v1.is_some()
+				&& discovery.kind != ProviderDiscoveryKind::OpenAiModelsList)
+		{
+			return Err(ModelsConfigError::InvalidProviderDiscovery {
+				provider: provider.clone(),
+			});
+		}
+	}
+	Ok(())
+}
+
 fn configured_provider_template<'a>(
 	catalog: &'a omp_catalog::Catalog,
 	definition: &ProviderConfig,
 ) -> (&'a ProviderDef, &'a RouteDef) {
 	let api = definition
-		.models
-		.values()
-		.chain(definition.model_overrides.values())
-		.find_map(|model| model.api.as_deref())
+		.api
+		.as_deref()
+		.or_else(|| {
+			definition
+				.models
+				.values()
+				.chain(definition.model_overrides.values())
+				.find_map(|model| model.api.as_deref())
+		})
 		.unwrap_or_default();
 	let preferred = if api.contains("anthropic") {
 		"anthropic"
@@ -661,6 +776,7 @@ fn configured_model_record(
 		wire_policy: template.wire_policy.clone(),
 		context: ContextStrategy::Replay,
 		pricing: Pricing::default(),
+		catalog_metrics: Default::default(),
 		availability: ModelAvailability::Available,
 		provenance: ModelProvenance {
 			sources:          Box::new([source.clone()]),
@@ -739,6 +855,338 @@ fn parse_multiplier(value: &str) -> Option<u64> {
 		.checked_add(fractional)
 }
 
+/// Resolves implicit loopback and explicitly configured provider probes.
+///
+/// Explicit configuration replaces the implicit endpoint for the same provider.
+/// Header values are resolved only here, never copied into catalog or cache
+/// records.
+pub fn discovery_probes(
+	config: Option<&ModelsConfig>,
+	catalog: &omp_catalog::Catalog,
+) -> Result<Vec<omp_inference::discovery::DiscoveryProbe>, ModelsConfigError> {
+	use omp_inference::discovery::{
+		DiscoveryEndpointKind, DiscoveryProbe, ProxyDiscoveryRoutes, configured_endpoint_with_options,
+		known_loopback_endpoints,
+	};
+
+	let mut probes = BTreeMap::<ProviderId, DiscoveryProbe>::new();
+	for endpoint in known_loopback_endpoints() {
+		let endpoint = environment_discovery_endpoint(endpoint)?;
+		let provider = match endpoint.kind {
+			DiscoveryEndpointKind::Ollama => ProviderId::from("ollama"),
+			DiscoveryEndpointKind::LlamaCpp => ProviderId::from("llama.cpp"),
+			DiscoveryEndpointKind::LmStudio => ProviderId::from("lm-studio"),
+			DiscoveryEndpointKind::LiteLlm
+			| DiscoveryEndpointKind::OpenAi
+			| DiscoveryEndpointKind::Proxy => continue,
+		};
+		let Some(route) = catalog
+			.provider(&provider)
+			.and_then(|provider| provider.routes.first())
+			.cloned()
+		else {
+			continue;
+		};
+		let headers = catalog_route_headers(catalog, &route);
+		probes.insert(provider.clone(), DiscoveryProbe {
+			provider,
+			route,
+			proxy_routes: None,
+			headers,
+			endpoint,
+		});
+	}
+	let Some(config) = config else {
+		return Ok(probes.into_values().collect());
+	};
+	validate_discovery(config)?;
+	for (provider_name, definition) in &config.providers {
+		let provider = ProviderId::from(provider_name.as_str());
+		let implicit = probes.get(&provider);
+		let kind = definition
+			.discovery
+			.as_ref()
+			.map(|discovery| match discovery.kind {
+				ProviderDiscoveryKind::Ollama => DiscoveryEndpointKind::Ollama,
+				ProviderDiscoveryKind::LlamaCpp => DiscoveryEndpointKind::LlamaCpp,
+				ProviderDiscoveryKind::LmStudio => DiscoveryEndpointKind::LmStudio,
+				ProviderDiscoveryKind::LiteLlm => DiscoveryEndpointKind::LiteLlm,
+				ProviderDiscoveryKind::OpenAiModelsList => DiscoveryEndpointKind::OpenAi,
+				ProviderDiscoveryKind::Proxy => DiscoveryEndpointKind::Proxy,
+			})
+			.or_else(|| implicit.map(|probe| probe.endpoint.kind));
+		let Some(kind) = kind else {
+			continue;
+		};
+		if definition.discovery.is_none() && definition.base_url.is_none() {
+			continue;
+		}
+		let base_url = definition
+			.base_url
+			.as_deref()
+			.or_else(|| implicit.map(|probe| probe.endpoint.base_url.as_str()))
+			.or_else(|| match kind {
+				DiscoveryEndpointKind::Ollama => Some("http://127.0.0.1:11434"),
+				DiscoveryEndpointKind::LlamaCpp => Some("http://127.0.0.1:8080"),
+				DiscoveryEndpointKind::LmStudio => Some("http://127.0.0.1:1234"),
+				DiscoveryEndpointKind::LiteLlm => Some("http://127.0.0.1:4000/v1"),
+				DiscoveryEndpointKind::OpenAi | DiscoveryEndpointKind::Proxy => None,
+			})
+			.ok_or_else(|| ModelsConfigError::MissingDiscoveryBaseUrl {
+				provider: provider_name.clone(),
+			})?;
+		let timeout_ms = definition
+			.discovery
+			.as_ref()
+			.and_then(|discovery| discovery.timeout_ms);
+		let inject_v1 = definition
+			.discovery
+			.as_ref()
+			.and_then(|discovery| discovery.inject_v1);
+		let endpoint = configured_endpoint_with_options(kind, base_url, timeout_ms, inject_v1)
+			.map_err(|source| ModelsConfigError::DiscoveryEndpoint {
+				provider: provider_name.clone(),
+				source,
+			})?;
+		let provider_definition = catalog
+			.provider(&provider)
+			.ok_or_else(|| ModelsConfigError::DiscoveryProviderMissing {
+				provider: provider_name.clone(),
+			})?;
+		let route = provider_definition
+			.routes
+			.first()
+			.cloned()
+			.ok_or_else(|| ModelsConfigError::DiscoveryRouteMissing {
+				provider: provider_name.clone(),
+			})?;
+		let proxy_routes = (kind == DiscoveryEndpointKind::Proxy).then(|| {
+			let mut routes = ProxyDiscoveryRoutes { openai: route.clone(), anthropic: route.clone() };
+			for route_id in &provider_definition.routes {
+				let Some(candidate) = catalog.route(route_id) else {
+					continue;
+				};
+				if candidate.codec.as_str().contains("anthropic") {
+					routes.anthropic = route_id.clone();
+				} else if candidate.codec.as_str().contains("openai") {
+					routes.openai = route_id.clone();
+				}
+			}
+			routes
+		});
+		let mut headers = catalog_route_headers(catalog, &route);
+		headers.extend(discovery_headers(provider_name, definition)?);
+		probes.insert(provider.clone(), DiscoveryProbe {
+			provider,
+			route,
+			proxy_routes,
+			headers,
+			endpoint,
+		});
+	}
+	Ok(probes.into_values().collect())
+}
+
+/// Applies process-level runtime metadata overrides after native probes.
+///
+/// Ollama's `OLLAMA_CONTEXT_LENGTH` is the served context selected by its
+/// Responses compatibility layer and therefore outranks `/api/show`.
+pub fn apply_runtime_discovery_overrides(
+	probe: &omp_inference::discovery::DiscoveryProbe,
+	rows: &mut [omp_catalog::DiscoveredModel],
+) {
+	if probe.endpoint.kind != omp_inference::discovery::DiscoveryEndpointKind::Ollama {
+		return;
+	}
+	let Some(context) = env::var("OLLAMA_CONTEXT_LENGTH")
+		.ok()
+		.and_then(|value| value.trim().parse::<u64>().ok())
+		.filter(|value| *value > 0)
+	else {
+		return;
+	};
+	for row in rows {
+		let limits = row.declared_limits.get_or_insert(ModelLimits {
+			context_window:        None,
+			maximum_input_tokens:  None,
+			maximum_output_tokens: None,
+			maximum_batch:         None,
+		});
+		limits.context_window = Some(context);
+		limits.maximum_output_tokens = Some(
+			limits
+				.maximum_output_tokens
+				.unwrap_or(32_768)
+				.min(context),
+		);
+	}
+}
+
+fn environment_discovery_endpoint(
+	endpoint: omp_inference::discovery::DiscoveryEndpoint,
+) -> Result<omp_inference::discovery::DiscoveryEndpoint, ModelsConfigError> {
+	use omp_inference::discovery::{
+		DiscoveryEndpointKind, configured_endpoint_with_options,
+	};
+
+	let base_url = match endpoint.kind {
+		DiscoveryEndpointKind::Ollama => env::var("OLLAMA_BASE_URL")
+			.ok()
+			.filter(|value| !value.trim().is_empty())
+			.or_else(|| {
+				env::var("OLLAMA_HOST")
+					.ok()
+					.filter(|value| !value.trim().is_empty())
+					.map(normalize_ollama_host)
+			}),
+		DiscoveryEndpointKind::LlamaCpp => env::var("LLAMA_CPP_BASE_URL")
+			.ok()
+			.filter(|value| !value.trim().is_empty()),
+		DiscoveryEndpointKind::LmStudio => env::var("LM_STUDIO_BASE_URL")
+			.ok()
+			.filter(|value| !value.trim().is_empty()),
+		DiscoveryEndpointKind::LiteLlm
+		| DiscoveryEndpointKind::OpenAi
+		| DiscoveryEndpointKind::Proxy => None,
+	};
+	let Some(base_url) = base_url else {
+		return Ok(endpoint);
+	};
+	configured_endpoint_with_options(endpoint.kind, base_url.trim(), None, None).map_err(|source| {
+		ModelsConfigError::DiscoveryEndpoint {
+			provider: Str::new_static(<&'static str>::from(endpoint.kind)),
+			source,
+		}
+	})
+}
+
+fn normalize_ollama_host(value: String) -> String {
+	let value = value.trim();
+	let candidate = if value.contains("://") {
+		value.to_owned()
+	} else if value.starts_with("//") {
+		format!("http:{value}")
+	} else if value.starts_with(':') {
+		format!("http://127.0.0.1{value}")
+	} else {
+		format!("http://{value}")
+	};
+	let Ok(mut url) = url::Url::parse(&candidate) else {
+		return candidate;
+	};
+	if url.scheme() == "http" && url.port().is_none() {
+		let _ = url.set_port(Some(11434));
+	}
+	url.as_str().trim_end_matches('/').to_owned()
+}
+
+fn catalog_route_headers(
+	catalog: &omp_catalog::Catalog,
+	route: &RouteId<str>,
+) -> http::HeaderMap {
+	let mut headers = http::HeaderMap::new();
+	let Some(route) = catalog.route(route) else {
+		return headers;
+	};
+	let Some(auth) = catalog.auth_spec(&route.auth) else {
+		return headers;
+	};
+	let credential = auth.credential_sources.iter().find_map(|source| {
+		let CredentialSourceSpec::Environment { ordered_names } = source else {
+			return None;
+		};
+		ordered_names.iter().find_map(|name| {
+			env::var_os(name.as_str())
+				.and_then(|value| value.into_string().ok())
+				.filter(|value| !value.trim().is_empty())
+		})
+	});
+	let Some(credential) = credential else {
+		return headers;
+	};
+	let Some(header_name) = auth.header_name.as_deref() else {
+		return headers;
+	};
+	let Ok(header_name) = http::HeaderName::from_bytes(header_name.as_bytes()) else {
+		return headers;
+	};
+	let prefix = auth.prefix.as_deref().unwrap_or_default();
+	let mut value = Vec::with_capacity(prefix.len() + credential.len());
+	value.extend_from_slice(prefix.as_bytes());
+	value.extend_from_slice(credential.as_bytes());
+	if let Ok(value) = http::HeaderValue::from_bytes(&value) {
+		headers.insert(header_name, value);
+	}
+	headers
+}
+
+fn discovery_headers(
+	provider: &str,
+	definition: &ProviderConfig,
+) -> Result<http::HeaderMap, ModelsConfigError> {
+	let mut headers = http::HeaderMap::new();
+	for (name, source) in definition.header_sources() {
+		let value = match source {
+			HeaderValueSource::Public(value) => Some(value),
+			HeaderValueSource::Environment(variable) => env::var_os(variable.as_str())
+				.and_then(|value| value.into_string().ok())
+				.map(Str::from),
+			HeaderValueSource::Command(_) => None,
+		};
+		let Some(value) = value else {
+			continue;
+		};
+		let name = http::HeaderName::from_bytes(name.as_bytes()).map_err(|source| {
+			ModelsConfigError::DiscoveryHeaderName {
+				provider: Str::new(provider),
+				source,
+			}
+		})?;
+		let value = http::HeaderValue::from_bytes(value.as_bytes()).map_err(|source| {
+			ModelsConfigError::DiscoveryHeaderValue {
+				provider: Str::new(provider),
+				header: Str::new(name.as_str()),
+				source,
+			}
+		})?;
+		headers.insert(name, value);
+	}
+	if definition
+		.auth
+		.as_deref()
+		.is_some_and(|auth| !auth.eq_ignore_ascii_case("none"))
+		&& !headers.contains_key(http::header::AUTHORIZATION)
+	{
+		let env_name = format!(
+			"OMP_{}_API_KEY",
+			provider
+				.chars()
+				.map(|character| {
+					if character.is_ascii_alphanumeric() {
+						character.to_ascii_uppercase()
+					} else {
+						'_'
+					}
+				})
+				.collect::<String>()
+		);
+		if let Some(secret) = env::var_os(env_name).and_then(|value| value.into_string().ok()) {
+			let mut value = Vec::with_capacity("Bearer ".len() + secret.len());
+			value.extend_from_slice(b"Bearer ");
+			value.extend_from_slice(secret.as_bytes());
+			let value = http::HeaderValue::from_bytes(&value).map_err(|source| {
+				ModelsConfigError::DiscoveryHeaderValue {
+					provider: Str::new(provider),
+					header: Str::new_static("authorization"),
+					source,
+				}
+			})?;
+			headers.insert(http::header::AUTHORIZATION, value);
+		}
+	}
+	Ok(headers)
+}
+
 /// Publishes the complete native user-config generation atomically.
 pub fn publish_user_overlay(
 	store: &OverlayStore,
@@ -768,6 +1216,59 @@ pub enum ModelsConfigError {
 	InvalidAuth {
 		/// Provider containing the invalid auth mode.
 		provider: Str,
+	},
+	/// A configured provider discovery policy is invalid.
+	#[error("invalid `discovery` for configured provider {provider}")]
+	InvalidProviderDiscovery {
+		/// Provider containing the invalid discovery policy.
+		provider: Str,
+	},
+	/// An explicit discovery provider omitted its base URL.
+	#[error("configured discovery provider {provider} requires `baseUrl`")]
+	MissingDiscoveryBaseUrl {
+		/// Provider missing the URL.
+		provider: Str,
+	},
+	/// A configured discovery endpoint is invalid.
+	#[error("invalid discovery endpoint for configured provider {provider}")]
+	DiscoveryEndpoint {
+		/// Provider containing the endpoint.
+		provider: Str,
+		/// Typed endpoint validation failure.
+		#[source]
+		source: omp_inference::discovery::EndpointError,
+	},
+	/// The configured provider did not materialize in the catalog.
+	#[error("configured discovery provider {provider} is missing from the catalog")]
+	DiscoveryProviderMissing {
+		/// Missing provider.
+		provider: Str,
+	},
+	/// The configured provider has no route for discovered models.
+	#[error("configured discovery provider {provider} has no route")]
+	DiscoveryRouteMissing {
+		/// Provider missing a route.
+		provider: Str,
+	},
+	/// A configured discovery header name is invalid.
+	#[error("configured discovery provider {provider} has an invalid header name")]
+	DiscoveryHeaderName {
+		/// Provider containing the header.
+		provider: Str,
+		/// Header parser failure.
+		#[source]
+		source: http::header::InvalidHeaderName,
+	},
+	/// A configured discovery header value is invalid and has been redacted.
+	#[error("configured discovery provider {provider} has an invalid value for header {header}")]
+	DiscoveryHeaderValue {
+		/// Provider containing the header.
+		provider: Str,
+		/// Non-secret header name.
+		header: Str,
+		/// Header parser failure, which never contains the value.
+		#[source]
+		source: http::header::InvalidHeaderValue,
 	},
 	/// Reading the configured source failed.
 	#[error(transparent)]
@@ -924,6 +1425,78 @@ mod tests {
 		assert!(matches!(
 			configured_auth_spec("demo", "oauth"),
 			Err(ModelsConfigError::InvalidAuth { .. })
+		));
+	}
+
+	#[test]
+	fn configured_discovery_overrides_implicit_endpoint_with_typed_policy() {
+		let config: ModelsConfig = toml::from_str(
+			"[providers.ollama]\nbaseUrl='http://192.168.1.20:11434'\ndiscovery={type='ollama',timeoutMs=2500}\n",
+		)
+		.expect("decode");
+		let catalog = omp_catalog::Catalog::embedded();
+		let probes = discovery_probes(Some(&config), catalog).expect("discovery probes");
+		let ollama = probes
+			.iter()
+			.find(|probe| probe.provider.as_str() == "ollama")
+			.expect("Ollama probe");
+		assert_eq!(ollama.endpoint.base_url, "http://192.168.1.20:11434");
+		assert_eq!(ollama.endpoint.deadline(), std::time::Duration::from_millis(2500));
+		assert_eq!(
+			probes
+				.iter()
+				.filter(|probe| probe.provider.as_str() == "ollama")
+				.count(),
+			1
+		);
+	}
+
+	#[test]
+	fn proxy_discovery_materializes_both_wire_routes() {
+		let config: ModelsConfig = toml::from_str(
+			"[providers.demo]\nbaseUrl='https://proxy.example/v1'\nauth='apiKey'\ndiscovery={type='proxy'}\n",
+		)
+		.expect("decode");
+		let overlay = lower_user_overlay(&config).expect("overlay");
+		let catalog = omp_catalog::Catalog::embedded()
+			.with_overlay_stack(
+				&omp_catalog::OverlayStack::from_layers([(
+					OverlaySource::UserConfig,
+					overlay,
+				)]),
+				omp_catalog::UnsafeTrustScope::ALL,
+			)
+			.expect("catalog");
+		let provider = catalog
+			.provider(ProviderId::from_ref("demo"))
+			.expect("provider");
+		assert_eq!(provider.routes.len(), 2);
+		let codecs = provider
+			.routes
+			.iter()
+			.filter_map(|route| catalog.route(route))
+			.map(|route| route.codec.as_str())
+			.collect::<Vec<_>>();
+		assert!(codecs.iter().any(|codec| codec.contains("openai")));
+		assert!(codecs.iter().any(|codec| codec.contains("anthropic")));
+		let probes = discovery_probes(Some(&config), &catalog).expect("probes");
+		let proxy = probes
+			.iter()
+			.find(|probe| probe.provider.as_str() == "demo")
+			.expect("proxy");
+		let routes = proxy.proxy_routes.as_ref().expect("proxy routes");
+		assert_ne!(routes.openai, routes.anthropic);
+	}
+
+	#[test]
+	fn openai_v1_injection_is_rejected_for_other_discovery_protocols() {
+		let config: ModelsConfig = toml::from_str(
+			"[providers.demo]\nbaseUrl='http://localhost:9000'\ndiscovery={type='proxy',injectV1=false}\n",
+		)
+		.expect("decode");
+		assert!(matches!(
+			lower_user_overlay(&config),
+			Err(ModelsConfigError::InvalidProviderDiscovery { .. })
 		));
 	}
 }

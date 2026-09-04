@@ -1,4 +1,4 @@
-//! Interactive `ask@1` presenter: the tool waits on the host, the host
+//! Interactive `ask@2` presenter: the tool waits on the host, the host
 //! answers the call identity.
 //!
 //! The pending dialog is not stored here: the tool's own `<ask status=
@@ -16,14 +16,14 @@ use std::{
 };
 
 use omp_core::Str;
-use omp_tools::ask::{Answer, AskPresenter, Fault, Presentation, Question};
+use omp_tools::ask::{AskPresenter, Fault, Presentation, Question, Selection};
 use parking_lot::Mutex;
 
 /// What the host decided for one pending dialog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AskReply {
-	/// Answers in question order.
-	Answers(Vec<Answer>),
+	/// Selections in question order.
+	Answers(Vec<Selection>),
 	/// The user dismissed the dialog (Esc).
 	Cancelled,
 }
@@ -107,8 +107,8 @@ impl AskPresenter for AskRoute {
 			drop(sender);
 			let outcome = response.recv_async().await;
 			match outcome {
-				Ok(AskReply::Answers(answers)) => {
-					Ok(Presentation { answers: align(questions, answers), headless: false })
+				Ok(AskReply::Answers(selections)) => {
+					Ok(Presentation { selections: align(questions, selections) })
 				},
 				Ok(AskReply::Cancelled) => Err(Fault::cancelled()),
 				Err(_) => Err(Fault::Presenter {
@@ -119,25 +119,25 @@ impl AskPresenter for AskRoute {
 	}
 }
 
-/// Orders the host's answers like the questions and fills any the host
-/// skipped with an empty selection, so the payload always has one answer
-/// per question (pi `buildResults`).
-fn align(questions: &[Question], mut answers: Vec<Answer>) -> Vec<Answer> {
+/// Orders the host's selections like the questions and fills any the host
+/// skipped, so the presentation always has one selection per question (pi
+/// `buildResults`).
+fn align(questions: &[Question], mut selections: Vec<Selection>) -> Vec<Selection> {
 	questions
 		.iter()
 		.map(|question| {
-			answers
+			selections
 				.iter()
-				.position(|answer| answer.id == question.id)
+				.position(|selection| selection.id == question.id)
 				.map_or_else(
-					|| Answer {
+					|| Selection {
 						id:           question.id.clone(),
 						selected:     Vec::new(),
 						custom_input: None,
 						note:         None,
 						timed_out:    false,
 					},
-					|at| answers.swap_remove(at),
+					|at| selections.swap_remove(at),
 				)
 		})
 		.collect()
@@ -179,7 +179,7 @@ mod tests {
 		assert!(!route.answer("call-9", AskReply::Cancelled), "unknown identity is ignored");
 		assert!(route.answer(
 			"call-1",
-			AskReply::Answers(vec![Answer {
+			AskReply::Answers(vec![Selection {
 				id:           Str::new_static("second"),
 				selected:     vec![Str::new_static("A")],
 				custom_input: None,
@@ -188,11 +188,10 @@ mod tests {
 			}]),
 		));
 		let presentation = waiting.await.expect("task").expect("answered");
-		assert!(!presentation.headless);
-		assert_eq!(presentation.answers.len(), 2);
-		assert_eq!(presentation.answers[0].id, "first");
-		assert!(presentation.answers[0].selected.is_empty());
-		assert_eq!(presentation.answers[1].selected, [Str::new_static("A")]);
+		assert_eq!(presentation.selections.len(), 2);
+		assert_eq!(presentation.selections[0].id, "first");
+		assert!(presentation.selections[0].selected.is_empty());
+		assert_eq!(presentation.selections[1].selected, [Str::new_static("A")]);
 		assert!(route.pending().is_empty());
 	}
 
@@ -211,7 +210,7 @@ mod tests {
 		assert!(futures::poll!(replacement.as_mut()).is_pending());
 		assert!(route.answer(
 			"call-reused",
-			AskReply::Answers(vec![Answer {
+			AskReply::Answers(vec![Selection {
 				id:           Str::new_static("only"),
 				selected:     vec![Str::new_static("A")],
 				custom_input: None,
@@ -220,7 +219,7 @@ mod tests {
 			}]),
 		));
 		let presentation = replacement.await.expect("replacement answered");
-		assert_eq!(presentation.answers[0].selected, [Str::new_static("A")]);
+		assert_eq!(presentation.selections[0].selected, [Str::new_static("A")]);
 		assert!(route.pending().is_empty());
 	}
 

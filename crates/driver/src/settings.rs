@@ -162,7 +162,7 @@ pub fn current() -> Result<Settings, io::Error> {
 pub fn current_for_project(project: Option<&Path>) -> Result<Settings, io::Error> {
 	let files = crate::cfg::CfgFiles::new(project).map_err(io::Error::other)?;
 	let ctx = Ctx::new();
-	ctx.exec_configs(&files, None);
+	ctx.exec_configs(&files, None).map_err(io::Error::other)?;
 	Ok(Settings::from_con(&ctx))
 }
 

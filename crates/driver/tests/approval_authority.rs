@@ -156,7 +156,6 @@ async fn run(approve: bool) -> (Session, String, bool) {
 		.with_external_executor(Arc::new(EnvToolExecutor::new(
 			environment.client().clone(),
 			approvals,
-			spill.clone(),
 		)))
 		.with_tool_admission(Arc::new(SettingsAdmission::new(
 			&omp_con::Ctx::new(),

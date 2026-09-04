@@ -16,8 +16,7 @@ use omp_agent::HookPhase;
 use omp_core::{ArtifactDigest, Hash32, Provenance, Str, sf};
 use omp_envd::{
 	exthost::{
-		ActivationTrigger, DeclarationSet, ExtensionManifest, HookDeclarationKey, ServiceManifest,
-		ToolDeclarationKey,
+		DeclarationSet, ExtensionManifest, HookDeclarationKey, ServiceManifest, ToolDeclarationKey,
 	},
 	policy::Grants,
 	worker::{ExtHostSpec, HostKey},
@@ -65,9 +64,51 @@ pub struct AdmittedNativeExtension {
 	pub spec: ExtHostSpec,
 }
 
+impl AdmittedNativeExtension {
+	/// Returns contained generated-skill roots declared by this distribution.
+	///
+	/// Runtime `@omp.skill` registration must exactly match these manifest
+	/// rows; discovery can therefore expose their materialized files without
+	/// importing Python in the engine process.
+	#[must_use]
+	pub fn skill_roots(&self) -> Vec<PathBuf> {
+		let site = self.spec.python_site.as_deref().unwrap_or(&self.root);
+		let mut roots = self
+			.spec
+			.manifest
+			.static_declarations()
+			.ordered
+			.iter()
+			.filter(|row| row.kind == "skills")
+			.filter_map(|row| row.path.as_deref())
+			.filter_map(|path| fs::canonicalize(site.join(path)).ok())
+			.filter(|path| path.starts_with(&self.root) && path.file_name().is_some_and(|name| name == "SKILL.md"))
+			.filter_map(|path| path.parent()?.parent().map(Path::to_path_buf))
+			.collect::<Vec<_>>();
+		roots.sort_unstable();
+		roots.dedup();
+		roots
+	}
+}
+
+/// One contained native-extension discovery pass.
+///
+/// A malformed or unreadable package contributes one typed diagnostic without
+/// suppressing unrelated extensions discovered later in precedence order.
+#[derive(Debug, Default)]
+pub struct NativeAdmissionReport {
+	/// Successfully admitted extensions.
+	pub extensions: Vec<AdmittedNativeExtension>,
+	/// Per-root discovery, manifest, and lowering failures.
+	pub errors:     Vec<NativeExtensionError>,
+}
+
 /// Failure while discovering or admitting a local Python extension.
 #[derive(Debug, Error)]
 pub enum NativeExtensionError {
+	/// Selected user profile was invalid.
+	#[error("user profile could not be resolved")]
+	Profile(#[from] omp_core::dirs::ProfileNameError),
 	/// An explicit root could not be resolved.
 	#[error("explicit extension root does not exist: {path}")]
 	MissingExplicitRoot {
@@ -195,36 +236,62 @@ struct LoadedManifest {
 
 /// Discovers and admits the effective local Python extension set.
 ///
-/// Explicit roots are evaluated first and therefore win identity collisions
-/// with automatic roots. Automatic children must remain physically contained
-/// by their user/project container; symlink escapes fail closed.
+/// This compatibility entry point preserves fail-fast callers. Production
+/// composition uses [`admit_native_extensions_contained`] so one broken
+/// package cannot suppress independent extensions.
 pub fn admit_native_extensions(
 	project_root: &Path,
 	home: &Path,
 	options: NativeAdmissionOptions<'_>,
 ) -> Result<Vec<AdmittedNativeExtension>, NativeExtensionError> {
+	let mut report = admit_native_extensions_contained(project_root, home, options);
+	if report.errors.is_empty() {
+		Ok(report.extensions)
+	} else {
+		Err(report.errors.remove(0))
+	}
+}
+
+/// Discovers extensions while containing every package-local failure.
+///
+/// Explicit roots retain precedence over user and workspace roots. Automatic
+/// symlink escapes are reported and skipped rather than allowing one hostile
+/// directory entry to hide the remaining trusted children.
+pub fn admit_native_extensions_contained(
+	project_root: &Path,
+	home: &Path,
+	options: NativeAdmissionOptions<'_>,
+) -> NativeAdmissionReport {
 	if options.mode == NativeLoadMode::Disabled {
-		return Ok(Vec::new());
+		return NativeAdmissionReport::default();
 	}
 
+	let mut report = NativeAdmissionReport::default();
 	let mut candidates = Vec::new();
 	for root in options.explicit_roots {
-		collect_explicit(root, &mut candidates)?;
+		collect_explicit_contained(root, &mut candidates, &mut report.errors);
 	}
 	if options.mode == NativeLoadMode::Merge {
-		let user = omp_core::dirs::profile_config_dir(home).join("agent/extensions");
-		collect_automatic(&user, RootOrigin::User, &mut candidates)?;
+		match omp_core::dirs::profile_config_dir(home) {
+			Ok(config) => collect_automatic_contained(
+				&config.join("agent/extensions"),
+				RootOrigin::User,
+				&mut candidates,
+				&mut report.errors,
+			),
+			Err(error) => report.errors.push(NativeExtensionError::Profile(error)),
+		}
 		if options.include_workspace {
-			collect_automatic(
+			collect_automatic_contained(
 				&project_root.join(".omp/extensions"),
 				RootOrigin::Workspace,
 				&mut candidates,
-			)?;
+				&mut report.errors,
+			);
 		}
 	}
 
 	let mut seen = BTreeSet::new();
-	let mut admitted = Vec::new();
 	for (loaded, origin) in candidates {
 		if !seen.insert(loaded.manifest.id.clone()) {
 			continue;
@@ -235,18 +302,29 @@ pub fn admit_native_extensions(
 			tracing::debug!(id = %loaded.manifest.id, "extension disabled by cl_disabled_extensions");
 			continue;
 		}
-		admitted.push(lower_manifest(loaded, origin, options.setting_overrides)?);
+		match lower_manifest(loaded, origin, options.setting_overrides) {
+			Ok(extension) => report.extensions.push(extension),
+			Err(error) => report.errors.push(error),
+		}
 	}
-	Ok(admitted)
+	report
 }
 
-fn collect_explicit(
+fn collect_explicit_contained(
 	requested: &Path,
 	out: &mut Vec<(LoadedManifest, RootOrigin)>,
-) -> Result<(), NativeExtensionError> {
-	let canonical = fs::canonicalize(requested).map_err(|source| {
-		NativeExtensionError::MissingExplicitRoot { path: requested.to_path_buf(), source }
-	})?;
+	errors: &mut Vec<NativeExtensionError>,
+) {
+	let canonical = match fs::canonicalize(requested) {
+		Ok(path) => path,
+		Err(source) => {
+			errors.push(NativeExtensionError::MissingExplicitRoot {
+				path: requested.to_path_buf(),
+				source,
+			});
+			return;
+		},
+	};
 	let root = if canonical.is_dir() {
 		canonical
 	} else if canonical.is_file()
@@ -259,53 +337,96 @@ fn collect_explicit(
 			.expect("a canonical manifest path has a parent")
 			.to_path_buf()
 	} else {
-		return Err(NativeExtensionError::InvalidExplicitRoot { path: canonical });
+		errors.push(NativeExtensionError::InvalidExplicitRoot { path: canonical });
+		return;
 	};
-	if let Some(manifest) = load_manifest(&root)? {
-		out.push((manifest, RootOrigin::Explicit));
-		return Ok(());
+	match load_manifest(&root) {
+		Ok(Some(manifest)) => {
+			out.push((manifest, RootOrigin::Explicit));
+			return;
+		},
+		Err(error) => {
+			errors.push(error);
+			return;
+		},
+		Ok(None) => {},
+	}
+	// Agent Plugins packages contribute data-only skills/MCP resources. They
+	// are deliberately not admitted to the locked CPython extension runtime.
+	if super::skills::is_agent_plugin_root(&root) {
+		return;
 	}
 	let before = out.len();
-	for child in sorted_children(&root)? {
-		if child.is_dir()
-			&& let Some(manifest) = load_manifest(&child)?
-		{
-			out.push((manifest, RootOrigin::Explicit));
-		}
-	}
-	if out.len() == before {
-		return Err(NativeExtensionError::MissingManifest { path: root });
-	}
-	Ok(())
-}
-
-fn collect_automatic(
-	container: &Path,
-	origin: RootOrigin,
-	out: &mut Vec<(LoadedManifest, RootOrigin)>,
-) -> Result<(), NativeExtensionError> {
-	if !container.exists() {
-		return Ok(());
-	}
-	let trusted = fs::canonicalize(container)
-		.map_err(|source| NativeExtensionError::Scan { path: container.to_path_buf(), source })?;
-	for child in sorted_children(container)? {
+	let errors_before = errors.len();
+	let children = match sorted_children(&root) {
+		Ok(children) => children,
+		Err(error) => {
+			errors.push(error);
+			return;
+		},
+	};
+	for child in children {
 		if !child.is_dir() {
 			continue;
 		}
-		let canonical = fs::canonicalize(&child)
-			.map_err(|source| NativeExtensionError::Scan { path: child.clone(), source })?;
-		if !canonical.starts_with(&trusted) {
-			return Err(NativeExtensionError::UntrustedAutomaticRoot {
-				path:      canonical,
-				container: trusted,
-			});
-		}
-		if let Some(manifest) = load_manifest(&canonical)? {
-			out.push((manifest, origin));
+		match load_manifest(&child) {
+			Ok(Some(manifest)) => out.push((manifest, RootOrigin::Explicit)),
+			Ok(None) => {},
+			Err(error) => errors.push(error),
 		}
 	}
-	Ok(())
+	if out.len() == before && errors.len() == errors_before {
+		errors.push(NativeExtensionError::MissingManifest { path: root });
+	}
+}
+
+fn collect_automatic_contained(
+	container: &Path,
+	origin: RootOrigin,
+	out: &mut Vec<(LoadedManifest, RootOrigin)>,
+	errors: &mut Vec<NativeExtensionError>,
+) {
+	if !container.exists() {
+		return;
+	}
+	let trusted = match fs::canonicalize(container) {
+		Ok(path) => path,
+		Err(source) => {
+			errors.push(NativeExtensionError::Scan { path: container.to_path_buf(), source });
+			return;
+		},
+	};
+	let children = match sorted_children(container) {
+		Ok(children) => children,
+		Err(error) => {
+			errors.push(error);
+			return;
+		},
+	};
+	for child in children {
+		if !child.is_dir() {
+			continue;
+		}
+		let canonical = match fs::canonicalize(&child) {
+			Ok(path) => path,
+			Err(source) => {
+				errors.push(NativeExtensionError::Scan { path: child, source });
+				continue;
+			},
+		};
+		if !canonical.starts_with(&trusted) {
+			errors.push(NativeExtensionError::UntrustedAutomaticRoot {
+				path:      canonical,
+				container: trusted.clone(),
+			});
+			continue;
+		}
+		match load_manifest(&canonical) {
+			Ok(Some(manifest)) => out.push((manifest, origin)),
+			Ok(None) => {},
+			Err(error) => errors.push(error),
+		}
+	}
 }
 
 fn sorted_children(root: &Path) -> Result<Vec<PathBuf>, NativeExtensionError> {
@@ -467,7 +588,7 @@ fn lower_manifest(
 		ServiceManifest::default(),
 		declarations,
 		[],
-		[ActivationTrigger::FirstReach],
+		[],
 	)
 	.with_setting_schemas(manifest.settings.clone());
 	let settings = resolve_extension_settings(&manifest, &BTreeMap::new(), overrides)
@@ -704,6 +825,82 @@ entry = "demo"
 		.expect("Python manifest admission");
 		assert_eq!(admitted.len(), 1);
 		assert_eq!(admitted[0].spec.manifest.entry, "demo");
+	}
+
+	#[test]
+	fn manifest_sealed_generated_skills_publish_contained_discovery_roots() {
+		let tree = tempfile::tempdir().expect("tree");
+		let root = tree.path().join("extension");
+		let module = root.join("src/demo");
+		let skill_root = module.join(".omp-generated/skills/review");
+		fs::create_dir_all(&skill_root).expect("skill root");
+		fs::write(module.join("__init__.py"), "# extension\n").expect("module");
+		fs::write(
+			skill_root.join("SKILL.md"),
+			"---\nname: review\ndescription: Review changes\n---\n\nReview the change.\n",
+		)
+		.expect("skill");
+		fs::write(
+			root.join("omp.toml"),
+			r#"id = "test.skills"
+entry = "demo"
+
+[[declarations]]
+kind = "skills"
+path = "demo/.omp-generated/skills/review/SKILL.md"
+"#,
+		)
+		.expect("manifest");
+
+		let admitted = admit_native_extensions(
+			tree.path(),
+			tree.path(),
+			NativeAdmissionOptions {
+				explicit_roots:    &[root],
+				mode:              NativeLoadMode::ExplicitOnly,
+				include_workspace: false,
+				setting_overrides: &[],
+				disabled:          &[],
+			},
+		)
+		.expect("admission");
+		assert_eq!(
+			admitted[0].skill_roots(),
+			[fs::canonicalize(skill_root.parent().expect("skills root")).expect("canonical skill root")]
+		);
+		assert_eq!(
+			admitted[0].spec.manifest.activation_triggers,
+			[omp_envd::exthost::ActivationTrigger::Static]
+				.into_iter()
+				.collect(),
+		);
+	}
+
+	#[test]
+	fn contained_discovery_keeps_valid_siblings_after_a_manifest_error() {
+		let tree = tempfile::tempdir().expect("tree");
+		let project = tree.path().join("project");
+		let container = project.join(".omp/extensions");
+		extension(&container.join("good"), "test.good", false);
+		let broken = container.join("broken");
+		fs::create_dir_all(&broken).expect("broken extension root");
+		fs::write(broken.join("omp.toml"), "id = [not-valid").expect("broken manifest");
+
+		let report = admit_native_extensions_contained(
+			&project,
+			tree.path(),
+			NativeAdmissionOptions {
+				explicit_roots:    &[],
+				mode:              NativeLoadMode::Merge,
+				include_workspace: true,
+				setting_overrides: &[],
+				disabled:          &[],
+			},
+		);
+		assert_eq!(report.extensions.len(), 1);
+		assert_eq!(report.extensions[0].spec.key.extension().as_str(), "test.good");
+		assert_eq!(report.errors.len(), 1);
+		assert!(matches!(&report.errors[0], NativeExtensionError::Manifest { .. }));
 	}
 
 	#[test]

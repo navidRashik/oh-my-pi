@@ -1670,8 +1670,8 @@ mod tests {
 			Session::create(temp.path().join("idle.oms"), omp_session::ComponentRegistry::standard())
 				.expect("session");
 		let registry = Arc::new(crate::sessions::SessionRegistry::new());
-		let (up, _) = flume::unbounded();
 		let register = |id: &'static str| {
+			let (up, _) = flume::unbounded();
 			registry.register(Str::new_static(id), crate::sessions::KernelHandle {
 				id:        crate::sessions::SessionId::new(Str::new_static(id)),
 				name:      Str::new_static(id),

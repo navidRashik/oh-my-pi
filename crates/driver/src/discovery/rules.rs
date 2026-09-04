@@ -7,9 +7,9 @@
 //!
 //! * **Context files** (pi `--no-context-files`): `AGENTS.md`, `CLAUDE.md` and
 //!   friends walked up from the project root — one file per directory depth,
-//!   the highest-priority provider winning a tie (`.omp/AGENTS.md`, then
-//!   `.claude/CLAUDE.md`, then standalone `AGENTS.md`, then standalone
-//!   `CLAUDE.md`) — plus the user-level `<config root>/agent/AGENTS.md`.
+//!   the highest-priority provider winning a tie (`.omp/AGENTS.md`, Claude,
+//!   Gemini, then standalone `AGENTS.md` / `CLAUDE.md`) — plus
+//!   one user-level winner from native, Claude, Codex, Gemini, and OpenCode.
 //!   Injected whole, farthest first so the closest file reads last.
 //! * **Rules** (pi `--no-rules`): Markdown documents with optional frontmatter
 //!   (`description`, `globs`, `alwaysApply`, `condition`, `scope`, `agents`)
@@ -84,14 +84,26 @@ pub struct ContextFiles {
 	pub warnings: Vec<Warning>,
 }
 
-/// Context-file candidates for one directory, highest priority first
-/// (pi providers `native` 100, `claude` 100, `agents-md` 10, `claude-md` 10;
-/// equal priorities keep registration order).
-const CONTEXT_FILE_PROVIDERS: [(&str, &str); 4] = [
+/// Project context candidates in provider-priority order. Native context is
+/// admitted from the nearest `.omp` root, Claude/Gemini only from the active
+/// project root, and the standalone files walk every project depth.
+const PROJECT_CONTEXT_PROVIDERS: [(&str, &str); 5] = [
 	("native", ".omp/AGENTS.md"),
 	("claude", ".claude/CLAUDE.md"),
+	("gemini", ".gemini/GEMINI.md"),
 	("agents-md", "AGENTS.md"),
 	("claude-md", "CLAUDE.md"),
+];
+
+/// User context candidates in provider-priority order. The capability admits
+/// one user context file, so a higher-priority ecosystem owns the scope even
+/// when lower-priority files also exist.
+const USER_CONTEXT_PROVIDERS: [(&str, &str); 5] = [
+	("native", "agent/AGENTS.md"),
+	("claude", ".claude/CLAUDE.md"),
+	("codex", ".codex/AGENTS.md"),
+	("gemini", ".gemini/GEMINI.md"),
+	("opencode", ".config/opencode/AGENTS.md"),
 ];
 
 impl ContextFiles {
@@ -100,15 +112,23 @@ impl ContextFiles {
 	#[must_use]
 	pub fn discover(project_root: &Path, home: &Path, config_root: &Path) -> Self {
 		let mut out = Self::default();
-		let user = config_root.join("agent/AGENTS.md");
-		if let Some(content) = read_non_empty(&user, &mut out.warnings) {
+		for (provider, relative) in USER_CONTEXT_PROVIDERS {
+			let path = if provider == "native" {
+				config_root.join(relative)
+			} else {
+				home.join(relative)
+			};
+			let Some(content) = read_non_empty(&path, &mut out.warnings) else {
+				continue;
+			};
 			out.files.push(ContextFile {
-				path: user,
+				path,
 				content,
 				level: Level::User,
 				depth: 0,
-				provider: Str::new_static("native"),
+				provider: Str::new_static(provider),
 			});
+			break;
 		}
 		let mut project = Vec::new();
 		let ancestors = walk_up(project_root, home);
@@ -117,8 +137,11 @@ impl ContextFiles {
 		// level.
 		let nearest_config = ancestors.iter().position(|dir| dir.join(".omp").is_dir());
 		for (depth, dir) in ancestors.iter().enumerate() {
-			for (provider, relative) in CONTEXT_FILE_PROVIDERS {
+			for (provider, relative) in PROJECT_CONTEXT_PROVIDERS {
 				if provider == "native" && nearest_config != Some(depth) {
+					continue;
+				}
+				if matches!(provider, "claude" | "gemini") && depth != 0 {
 					continue;
 				}
 				let path = dir.join(relative);
@@ -272,18 +295,28 @@ impl ActiveRules {
 		for dir in &ancestors {
 			for name in [".agent/rules", ".agents/rules"] {
 				for rule in
-					rules_in_dir(&dir.join(name), "agents", Level::Project, &["md"], &mut warnings)
+					rules_in_dir(&dir.join(name), "agents", Level::Project, &["md", "mdc"], &mut warnings)
 				{
 					admit(rule, &mut warnings);
 				}
 			}
 		}
 		for name in [".agent/rules", ".agents/rules"] {
-			for rule in rules_in_dir(&home.join(name), "agents", Level::User, &["md"], &mut warnings) {
+			for rule in rules_in_dir(&home.join(name), "agents", Level::User, &["md", "mdc"], &mut warnings) {
 				admit(rule, &mut warnings);
 			}
 		}
-		// cursor: `.cursor/rules/*.mdc` plus the legacy `.cursorrules` file.
+		// cursor: user rules precede project rules within the provider, then
+		// the legacy project `.cursorrules` file.
+		for rule in rules_in_dir(
+			&home.join(".cursor/rules"),
+			"cursor",
+			Level::User,
+			&["mdc", "md"],
+			&mut warnings,
+		) {
+			admit(rule, &mut warnings);
+		}
 		for rule in rules_in_dir(
 			&project_root.join(".cursor/rules"),
 			"cursor",
@@ -302,7 +335,16 @@ impl ActiveRules {
 		) {
 			admit(rule, &mut warnings);
 		}
-		// windsurf: `.windsurf/rules/*.md`, legacy `.windsurfrules`, global memories.
+		// windsurf: user memories precede project rules within the provider.
+		if let Some(rule) = whole_file_rule(
+			&home.join(".codeium/windsurf/memories/global_rules.md"),
+			"global_rules",
+			"windsurf",
+			Level::User,
+			&mut warnings,
+		) {
+			admit(rule, &mut warnings);
+		}
 		for rule in rules_in_dir(
 			&project_root.join(".windsurf/rules"),
 			"windsurf",
@@ -317,15 +359,6 @@ impl ActiveRules {
 			"windsurfrules",
 			"windsurf",
 			Level::Project,
-			&mut warnings,
-		) {
-			admit(rule, &mut warnings);
-		}
-		if let Some(rule) = whole_file_rule(
-			&home.join(".codeium/windsurf/memories/global_rules.md"),
-			"global_rules",
-			"windsurf",
-			Level::User,
 			&mut warnings,
 		) {
 			admit(rule, &mut warnings);
@@ -623,6 +656,16 @@ fn rules_in_dir(
 			return Vec::new();
 		},
 	};
+	let canonical_dir = match fs::canonicalize(dir) {
+		Ok(path) => path,
+		Err(error) => {
+			warnings.push(Warning {
+				path: dir.to_path_buf(),
+				message: Str::new(format!("Failed to resolve rules directory: {error}")),
+			});
+			return Vec::new();
+		},
+	};
 	let mut files = entries
 		.filter_map(Result::ok)
 		.map(|entry| entry.path())
@@ -641,8 +684,25 @@ fn rules_in_dir(
 	files
 		.into_iter()
 		.filter_map(|path| {
-			let name = Str::new(path.file_stem()?.to_string_lossy());
-			load_rule(&path, name, provider, level, warnings)
+			let canonical = match fs::canonicalize(&path) {
+				Ok(canonical) if canonical.starts_with(&canonical_dir) => canonical,
+				Ok(_) => {
+					warnings.push(Warning {
+						path,
+						message: Str::new_static("rule declaration resolves outside its discovery root"),
+					});
+					return None;
+				},
+				Err(error) => {
+					warnings.push(Warning {
+						path,
+						message: Str::new(format!("Failed to resolve rule file: {error}")),
+					});
+					return None;
+				},
+			};
+			let name = Str::new(canonical.file_stem()?.to_string_lossy());
+			load_rule(&canonical, name, provider, level, warnings)
 		})
 		.collect()
 }
@@ -867,6 +927,55 @@ mod tests {
 		let facts = files.prompt_facts();
 		assert_eq!(facts[4]["origin"], project.join("AGENTS.md").to_string_lossy().as_ref());
 		assert_eq!(facts[4]["content"], "app agents");
+	}
+
+	#[test]
+	fn context_scope_uses_foreign_provider_precedence() {
+		let (_temp, home, _repo, project) = layout();
+		let config_root = home.join(".o2");
+		write(&home.join(".codex/AGENTS.md"), "codex user");
+		write(&home.join(".gemini/GEMINI.md"), "gemini user");
+		write(&project.join(".gemini/GEMINI.md"), "gemini project");
+		write(&project.join("AGENTS.md"), "standalone loses");
+		let files = ContextFiles::discover(&project, &home, &config_root);
+		assert_eq!(
+			files
+				.files
+				.iter()
+				.map(|file| (file.provider.as_str(), file.content.as_str()))
+				.collect::<Vec<_>>(),
+			[("codex", "codex user"), ("gemini", "gemini project")]
+		);
+
+		write(&home.join(".claude/CLAUDE.md"), "claude user");
+		write(&project.join(".claude/CLAUDE.md"), "claude project");
+		let files = ContextFiles::discover(&project, &home, &config_root);
+		assert_eq!(files.files[0].provider, "claude");
+		assert_eq!(files.files.last().unwrap().provider, "claude");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn linked_rule_outside_provider_root_is_rejected_without_hiding_siblings() {
+		use std::os::unix::fs::symlink;
+
+		let (_temp, home, repo, project) = layout();
+		let config_root = home.join(".o2");
+		let rules = repo.join(".omp/rules");
+		write(&rules.join("inside.md"), "---\nalwaysApply: true\n---\ninside");
+		let outside = home.join("outside.md");
+		write(&outside, "---\nalwaysApply: true\n---\noutside");
+		symlink(&outside, rules.join("escape.md")).unwrap();
+
+		let discovered = ActiveRules::discover(&project, &home, &config_root);
+		assert!(discovered.get("inside").is_some());
+		assert!(discovered.get("escape").is_none());
+		assert!(
+			discovered
+				.warnings
+				.iter()
+				.any(|warning| warning.message.contains("outside its discovery root"))
+		);
 	}
 
 	#[test]

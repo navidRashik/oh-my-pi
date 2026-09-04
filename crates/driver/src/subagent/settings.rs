@@ -420,7 +420,7 @@ pub fn child_ctx(
 	for (name, value) in values {
 		child.set_value(name.as_str(), value, omp_con::SetSource::Code)?;
 	}
-	let outcome = child.exec_spawn_configs(loader, agent);
+	let outcome = child.exec_spawn_configs(loader, agent)?;
 	if outcome.failed > 0 {
 		tracing::warn!(
 			agent,

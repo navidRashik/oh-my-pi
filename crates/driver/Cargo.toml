@@ -84,6 +84,7 @@ zeroize.workspace = true
 
 libc.workspace = true
 xutf.workspace = true
+windows-sys.workspace = true
 prost.workspace = true
 smallvec.workspace = true
 ring.workspace = true

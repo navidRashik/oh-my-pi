@@ -15,7 +15,10 @@ use std::{
 	iter,
 	path::{Path, PathBuf},
 	str,
-	sync::LazyLock,
+	sync::{
+		LazyLock,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::{Duration, Instant},
 };
 
@@ -196,6 +199,9 @@ pub enum GrepError {
 		/// Configured timeout.
 		timeout_ms: u32,
 	},
+	/// The caller cancelled the search.
+	#[error("grep was cancelled")]
+	Cancelled,
 }
 /// Regex-engine options used when compiling a [`CompiledGrep`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -681,6 +687,24 @@ impl Matcher for CompiledMatcher {
 	)
 )]
 pub fn search(content: &[u8], options: &GrepOptions) -> Result<GrepResult, GrepError> {
+	search_inner(content, options, None)
+}
+
+/// Search in-memory bytes while observing a caller-owned cancellation flag.
+pub fn search_with_cancellation(
+	content: &[u8],
+	options: &GrepOptions,
+	cancelled: &AtomicBool,
+) -> Result<GrepResult, GrepError> {
+	search_inner(content, options, Some(cancelled))
+}
+
+fn search_inner(
+	content: &[u8],
+	options: &GrepOptions,
+	cancelled: Option<&AtomicBool>,
+) -> Result<GrepResult, GrepError> {
+	check_cancelled(cancelled)?;
 	let deadline = Deadline::new(options.timeout_ms);
 	deadline.check()?;
 	let matcher = CompiledGrep::new(options.pattern.as_str(), RegexOptions {
@@ -688,6 +712,7 @@ pub fn search(content: &[u8], options: &GrepOptions) -> Result<GrepResult, GrepE
 		multiline:   options.multiline,
 	})?;
 	let mut collector = AggregateGrepCollector::new(options);
+	let mut controlled = CancellationSink { sink: &mut collector, cancelled };
 	let mut summary = match matcher.search_slice(
 		options.path.as_str(),
 		content,
@@ -696,13 +721,17 @@ pub fn search(content: &[u8], options: &GrepOptions) -> Result<GrepResult, GrepE
 			context_before: options.context_before,
 			context_after:  options.context_after,
 		},
-		&mut collector,
+		&mut controlled,
 	) {
 		Ok(summary) => summary,
 		Err(GrepStreamError::Grep(error)) => return Err(error),
 		Err(GrepStreamError::Sink(error)) => match error {},
 	};
+	check_cancelled(cancelled)?;
 	deadline.check()?;
+	if summary.status == GrepStreamStatus::Cancelled {
+		return Err(GrepError::Cancelled);
+	}
 	summary.files_searched = 1;
 	let result = collector.finish(summary);
 	tracing::Span::current().record("match_count", result.total_matches);
@@ -733,6 +762,14 @@ pub fn grep_stream<S: GrepSink>(
 	options: &GrepOptions,
 	sink: &mut S,
 ) -> Result<GrepStreamSummary, GrepStreamError<S::Error>> {
+	grep_stream_inner(options, sink, None)
+}
+
+fn grep_stream_inner<S: GrepSink>(
+	options: &GrepOptions,
+	sink: &mut S,
+	cancelled: Option<&AtomicBool>,
+) -> Result<GrepStreamSummary, GrepStreamError<S::Error>> {
 	let deadline = Deadline::new(options.timeout_ms);
 	deadline.check().map_err(GrepStreamError::Grep)?;
 	let target = resolve_search_path(options.path.as_str()).map_err(GrepStreamError::Grep)?;
@@ -761,9 +798,14 @@ pub fn grep_stream<S: GrepSink>(
 	} else {
 		build_walk_request(&target, options)
 			.map_err(GrepStreamError::Grep)?
-			.collect_file_candidates_with_heartbeat(|| deadline.check())
+			.collect_file_candidates_with_heartbeat(|| {
+				check_cancelled(cancelled)?;
+				deadline.check()
+			})
 			.map_err(|error| {
-				GrepStreamError::Grep(if deadline.expired() {
+				GrepStreamError::Grep(if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+					GrepError::Cancelled
+				} else if deadline.expired() {
 					GrepError::Timeout { timeout_ms: options.timeout_ms.unwrap_or(0) }
 				} else {
 					GrepError::Walk { message: Str::from(error.to_string()) }
@@ -773,6 +815,7 @@ pub fn grep_stream<S: GrepSink>(
 	tracing::Span::current().record("candidate_count", candidates.len());
 	let mut saw_limit = false;
 	for candidate in &candidates {
+		check_cancelled(cancelled).map_err(GrepStreamError::Grep)?;
 		deadline.check().map_err(GrepStreamError::Grep)?;
 		let remaining = options
 			.max_count
@@ -792,6 +835,7 @@ pub fn grep_stream<S: GrepSink>(
 			(Some(global), Some(per_file)) => Some(global.min(per_file)),
 			(global, per_file) => global.or(per_file),
 		};
+		let mut controlled = CancellationSink { sink: &mut *sink, cancelled };
 		let file = matcher.search_file(
 			&candidate.path,
 			&candidate.relative,
@@ -800,7 +844,7 @@ pub fn grep_stream<S: GrepSink>(
 				context_before: options.context_before,
 				context_after: options.context_after,
 			},
-			sink,
+			&mut controlled,
 		)?;
 		summary.matches = summary.matches.saturating_add(file.matches);
 		summary.files_searched = summary.files_searched.saturating_add(file.files_searched);
@@ -828,6 +872,7 @@ pub fn grep_stream<S: GrepSink>(
 			return Ok(summary);
 		}
 	}
+	check_cancelled(cancelled).map_err(GrepStreamError::Grep)?;
 	deadline.check().map_err(GrepStreamError::Grep)?;
 	summary.status = if saw_limit {
 		GrepStreamStatus::LimitReached
@@ -838,6 +883,45 @@ pub fn grep_stream<S: GrepSink>(
 	Ok(summary)
 }
 
+fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<(), GrepError> {
+	if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+		Err(GrepError::Cancelled)
+	} else {
+		Ok(())
+	}
+}
+
+struct CancellationSink<'a, S> {
+	sink:      &'a mut S,
+	cancelled: Option<&'a AtomicBool>,
+}
+
+impl<S: GrepSink> GrepSink for CancellationSink<'_, S> {
+	type Error = S::Error;
+
+	fn control(&mut self) -> Result<GrepControl, Self::Error> {
+		if self
+			.cancelled
+			.is_some_and(|flag| flag.load(Ordering::Relaxed))
+		{
+			Ok(GrepControl::Cancel)
+		} else {
+			self.sink.control()
+		}
+	}
+
+	fn matched(&mut self, matched: GrepMatchRef<'_>) -> Result<GrepControl, Self::Error> {
+		if self
+			.cancelled
+			.is_some_and(|flag| flag.load(Ordering::Relaxed))
+		{
+			Ok(GrepControl::Cancel)
+		} else {
+			self.sink.matched(matched)
+		}
+	}
+}
+
 fn record_stream_summary(summary: &GrepStreamSummary) {
 	let span = tracing::Span::current();
 	span.record("files_searched", summary.files_searched);
@@ -846,15 +930,37 @@ fn record_stream_summary(summary: &GrepStreamSummary) {
 
 /// Search a file or directory synchronously and collect the streaming records.
 pub fn grep(options: &GrepOptions) -> Result<GrepResult, GrepError> {
+	grep_inner(options, None)
+}
+
+/// Search while observing a caller-owned cancellation flag.
+///
+/// The flag is checked during candidate discovery, before every file, and
+/// between match records. Dropping an asynchronous owner can therefore stop
+/// the blocking traversal instead of merely abandoning its join handle.
+pub fn grep_with_cancellation(
+	options: &GrepOptions,
+	cancelled: &AtomicBool,
+) -> Result<GrepResult, GrepError> {
+	grep_inner(options, Some(cancelled))
+}
+
+fn grep_inner(
+	options: &GrepOptions,
+	cancelled: Option<&AtomicBool>,
+) -> Result<GrepResult, GrepError> {
 	let mut collector = AggregateGrepCollector::new(options);
 	let mut streaming_options = options.clone();
 	streaming_options.max_count = None;
 	streaming_options.max_count_per_file = None;
-	let summary = match grep_stream(&streaming_options, &mut collector) {
+	let summary = match grep_stream_inner(&streaming_options, &mut collector, cancelled) {
 		Ok(summary) => summary,
 		Err(GrepStreamError::Grep(error)) => return Err(error),
 		Err(GrepStreamError::Sink(error)) => match error {},
 	};
+	if summary.status == GrepStreamStatus::Cancelled {
+		return Err(GrepError::Cancelled);
+	}
 	Ok(collector.finish(summary))
 }
 
@@ -1592,6 +1698,19 @@ mod tests {
 		assert_eq!(result.files_searched, 1);
 		assert_eq!(result.matches.len(), 1);
 		assert_eq!(result.matches[0].path.as_str(), "large.txt");
+	}
+
+	#[test]
+	fn caller_cancellation_stops_before_workspace_traversal() {
+		let root = TempDir::new();
+		fs::write(root.0.join("needle.txt"), "needle\n").unwrap();
+		let mut options = options("needle");
+		options.path = Str::from(root.0.to_string_lossy());
+		let cancelled = AtomicBool::new(true);
+		assert!(matches!(
+			grep_with_cancellation(&options, &cancelled),
+			Err(GrepError::Cancelled)
+		));
 	}
 
 	#[test]

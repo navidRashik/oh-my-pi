@@ -14,7 +14,7 @@ use omp_agent::{
 	ExternalDispatchEvent, ExternalDispatchRequest, ExternalDispatchStream, ExternalToolExecutor,
 	Kernel, RouteFacts, RuntimeFlags,
 };
-use omp_core::{Hash32, SecretString, Str, StrMut, Ulid, sf};
+use omp_core::{FastHashMap, Hash32, SecretString, Str, StrMut, Ulid, sf};
 use omp_dom::{Op, PropKey, Txn, Value};
 use omp_inference::{
 	AnswerBody, Call, CallMeta, ChatEvent, ChatRequest, ChatStream, Client, ContentPart,
@@ -27,7 +27,7 @@ use omp_tool::{
 	Registry,
 };
 use omp_tools::output_schema::SchemaMode;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 #[path = "con_journal.rs"]
 mod con_journal;
@@ -218,6 +218,7 @@ pub struct ProductionInference {
 	model:              omp_catalog::ModelKey,
 	catalog:            Arc<omp_catalog::snapshot::Catalog>,
 	_environment:       omp_envd::ProjectEnvironment,
+	_agent_control:     Mutex<Option<omp_envd::AgentControlBinding>>,
 	_stack:             ProductionStack,
 	con:                Arc<omp_con::Ctx>,
 	_python_components: Vec<omp_envd::exthost::PyComponent>,
@@ -356,9 +357,8 @@ fn convar_reasoning(
 /// admission query by prompting the session's approval authority.
 #[derive(Clone)]
 pub struct EnvToolExecutor {
-	client:        omp_env::EnvClient,
-	approvals:     omp_agent::ApprovalRoute,
-	outcome_store: omp_journal::blob::BlobStore,
+	client:    omp_env::EnvClient,
+	approvals: omp_agent::ApprovalRoute,
 }
 
 impl EnvToolExecutor {
@@ -366,12 +366,8 @@ impl EnvToolExecutor {
 	/// environment raises (an `--approval-mode` tier above the call's
 	/// policy) becomes one prompt on `approvals`.
 	#[must_use]
-	pub const fn new(
-		client: omp_env::EnvClient,
-		approvals: omp_agent::ApprovalRoute,
-		outcome_store: omp_journal::blob::BlobStore,
-	) -> Self {
-		Self { client, approvals, outcome_store }
+	pub const fn new(client: omp_env::EnvClient, approvals: omp_agent::ApprovalRoute) -> Self {
+		Self { client, approvals }
 	}
 }
 
@@ -387,6 +383,15 @@ enum OutcomeReplicationError {
 	Interrupted,
 	#[error("environment outcome identity changed during replication")]
 	IdentityChanged,
+	#[error("environment verdict media reference is invalid")]
+	InvalidMedia,
+	#[error("environment verdict media exceeds the host retrieval bound")]
+	MediaTooLarge {
+		/// Declared media byte length.
+		size:  u64,
+		/// Maximum accepted byte length.
+		limit: u64,
+	},
 }
 
 fn resumable_blob_error(error: &omp_env::ClientError) -> bool {
@@ -448,6 +453,96 @@ async fn replicate_outcome_blob(
 		return Err(OutcomeReplicationError::IdentityChanged);
 	}
 	Ok(reference)
+}
+
+fn valid_blob_media_type(media_type: &str) -> bool {
+	if media_type.bytes().any(|byte| byte.is_ascii_control()) {
+		return false;
+	}
+	let essence = media_type.split(';').next().unwrap_or_default().trim();
+	let Some((kind, subtype)) = essence.split_once('/') else {
+		return false;
+	};
+	!kind.is_empty()
+		&& !subtype.is_empty()
+		&& !essence.bytes().any(|byte| byte.is_ascii_whitespace())
+}
+
+async fn replicate_verdict_parts(
+	client: &omp_env::EnvClient,
+	session_store: &omp_journal::blob::BlobStore,
+	invocation_id: &str,
+	parts: Vec<omp_proto::thread::v1::Part>,
+	max_bytes: u64,
+	cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<ToolPart>, OutcomeReplicationError> {
+	let mut replicated = FastHashMap::<Hash32, u64>::default();
+	let mut projected = Vec::with_capacity(parts.len());
+	for mut part in parts {
+		let Some(omp_proto::thread::v1::part::Kind::Blob(blob)) = part.kind.as_mut() else {
+			if let Some(part) = tool_part(part) {
+				projected.push(part);
+			}
+			continue;
+		};
+		if cancel.is_cancelled() {
+			return Err(OutcomeReplicationError::Interrupted);
+		}
+		if !valid_blob_media_type(&blob.mime) {
+			return Err(OutcomeReplicationError::InvalidMedia);
+		}
+		if blob.size > max_bytes {
+			return Err(OutcomeReplicationError::MediaTooLarge { size: blob.size, limit: max_bytes });
+		}
+		let reference = if blob.inline.is_empty() {
+			let hash: [u8; 32] = blob
+				.hash
+				.as_ref()
+				.try_into()
+				.map_err(|_| OutcomeReplicationError::InvalidMedia)?;
+			omp_journal::blob::BlobRef { hash: Hash32::new(hash), size: blob.size }
+		} else {
+			let size = u64::try_from(blob.inline.len()).unwrap_or(u64::MAX);
+			if size != blob.size {
+				return Err(OutcomeReplicationError::InvalidMedia);
+			}
+			let hash = Hash32::sum(&blob.inline);
+			if !blob.hash.is_empty() && blob.hash.as_ref() != hash.as_bytes() {
+				return Err(OutcomeReplicationError::InvalidMedia);
+			}
+			let reference = session_store.put(&blob.inline)?;
+			blob.hash = Bytes::copy_from_slice(reference.hash.as_bytes());
+			blob.inline = Bytes::new();
+			reference
+		};
+		if let Some(previous_size) = replicated.insert(reference.hash, reference.size) {
+			if previous_size != reference.size {
+				return Err(OutcomeReplicationError::IdentityChanged);
+			}
+		} else if session_store.has(&reference) {
+			if !session_store.verify(&reference)? {
+				return Err(OutcomeReplicationError::IdentityChanged);
+			}
+		} else {
+			let replicated = replicate_outcome_blob(
+				client,
+				session_store,
+				invocation_id,
+				reference.hash,
+				reference.size,
+				max_bytes,
+				cancel,
+			)
+			.await?;
+			if replicated != reference {
+				return Err(OutcomeReplicationError::IdentityChanged);
+			}
+		}
+		if let Some(part) = tool_part(part) {
+			projected.push(part);
+		}
+	}
+	Ok(projected)
 }
 
 /// The prompt an admission query becomes (pi `formatApprovalPrompt`): the
@@ -583,7 +678,7 @@ impl ExternalToolExecutor for EnvToolExecutor {
 	fn invoke(&self, request: ExternalDispatchRequest) -> ExternalDispatchStream {
 		let client = self.client.clone();
 		let approvals = self.approvals.clone();
-		let outcome_store = self.outcome_store.clone();
+		let outcome_store = request.blobs.clone();
 		Box::pin(async_stream::stream! {
 			let client = match client.with_principal(request.session_id.clone(), "kernel") {
 				Ok(client) => client,
@@ -724,11 +819,7 @@ impl ExternalToolExecutor for EnvToolExecutor {
 							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
 							return;
 						}
-						if !verdict.json.is_empty() {
-							tracing::warn!(call_id = %request.call_id, "environment verdict used forbidden inline outcome");
-							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
-							return;
-						}
+						let inline_json = verdict.json;
 						let Some(projection) = verdict.projection else {
 							tracing::warn!(call_id = %request.call_id, "environment verdict omitted output projection facts");
 							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
@@ -770,37 +861,64 @@ impl ExternalToolExecutor for EnvToolExecutor {
 							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
 							return;
 						}
-						let source_artifact = match replicate_outcome_blob(
-							&client,
-							&outcome_store,
-							request.call_id.as_str(),
-							expected_hash,
-							details.size,
-							max_bytes,
-							&request.cancellation,
-						)
-						.await
-						{
-							Ok(source_artifact) => source_artifact,
-							Err(OutcomeReplicationError::Interrupted) => {
-								yield ExternalDispatchEvent::Aborted(Abort::Interrupted {
-									reason: Str::new_static("environment outcome retrieval interrupted"),
-								});
-								return;
-							},
-							Err(source) => {
-								tracing::warn!(%source, call_id = %request.call_id, "environment outcome replication failed");
+						let (source_artifact, bytes) = if inline_json.is_empty() {
+							let source_artifact = match replicate_outcome_blob(
+								&client,
+								&outcome_store,
+								request.call_id.as_str(),
+								expected_hash,
+								details.size,
+								max_bytes,
+								&request.cancellation,
+							)
+							.await
+							{
+								Ok(source_artifact) => source_artifact,
+								Err(OutcomeReplicationError::Interrupted) => {
+									yield ExternalDispatchEvent::Aborted(Abort::Interrupted {
+										reason: Str::new_static("environment outcome retrieval interrupted"),
+									});
+									return;
+								},
+								Err(source) => {
+									tracing::warn!(%source, call_id = %request.call_id, "environment outcome replication failed");
+									yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+									return;
+								},
+							};
+							let bytes = match outcome_store.get(&source_artifact) {
+								Ok(bytes) => bytes,
+								Err(source) => {
+									tracing::warn!(%source, call_id = %request.call_id, "session outcome artifact read failed");
+									yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+									return;
+								},
+							};
+							(source_artifact, bytes)
+						} else {
+							let inline_size = u64::try_from(inline_json.len()).unwrap_or(u64::MAX);
+							if inline_size != details.size
+								|| projection.source_bytes != details.size
+								|| projection.inline_bytes != inline_size
+								|| projection.omitted
+								|| Hash32::sum(&inline_json) != expected_hash
+							{
+								tracing::warn!(
+									call_id = %request.call_id,
+									"environment inline outcome does not match its artifact"
+								);
 								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
 								return;
-							},
-						};
-						let bytes = match outcome_store.get(&source_artifact) {
-							Ok(bytes) => bytes,
-							Err(source) => {
-								tracing::warn!(%source, call_id = %request.call_id, "session outcome artifact read failed");
-								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
-								return;
-							},
+							}
+							let source_artifact = match outcome_store.put(&inline_json) {
+								Ok(source_artifact) => source_artifact,
+								Err(source) => {
+									tracing::warn!(%source, call_id = %request.call_id, "session outcome artifact write failed");
+									yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+									return;
+								},
+							};
+							(source_artifact, inline_json)
 						};
 						let outcome = match serde_json::from_slice::<
 							CallOutcome<serde_json::Value, serde_json::Value>,
@@ -823,7 +941,29 @@ impl ExternalToolExecutor for EnvToolExecutor {
 							yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
 							return;
 						}
-						let mut parts = verdict.parts.into_iter().filter_map(tool_part).collect::<Vec<_>>();
+						let mut parts = match replicate_verdict_parts(
+							&client,
+							&outcome_store,
+							request.call_id.as_str(),
+							verdict.parts,
+							max_bytes,
+							&request.cancellation,
+						)
+						.await
+						{
+							Ok(parts) => parts,
+							Err(OutcomeReplicationError::Interrupted) => {
+								yield ExternalDispatchEvent::Aborted(Abort::Interrupted {
+									reason: Str::new_static("environment media retrieval interrupted"),
+								});
+								return;
+							},
+							Err(source) => {
+								tracing::warn!(%source, call_id = %request.call_id, "environment verdict media replication failed");
+								yield ExternalDispatchEvent::Aborted(invalid_outcome_blob());
+								return;
+							},
+						};
 						if parts.is_empty() {
 							parts = structured_parts(&outcome);
 						}
@@ -1182,6 +1322,8 @@ pub enum ComposedInference {
 		inference:          GatewayInference,
 		/// Environment owner retained for local tool execution.
 		_environment:       omp_envd::ProjectEnvironment,
+		/// Active session's generation-fenced Agent CONTROL lease.
+		_agent_control:     Mutex<Option<omp_envd::AgentControlBinding>>,
 		/// Live Python Component reducers retained for the controller lifetime.
 		_python_components: Vec<omp_envd::exthost::PyComponent>,
 		/// No-session journal cleanup owner.
@@ -1195,6 +1337,24 @@ impl ComposedInference {
 			Self::Production(inference) => inference._ephemeral_journal = Some(journal),
 			Self::Gateway { _ephemeral_journal, .. } => *_ephemeral_journal = Some(journal),
 		}
+	}
+
+	/// Routes environment-originated checkpoint controls to the kernel mailbox
+	/// and clears transient checkpoint state whenever that kernel selects a
+	/// different durable session.
+	pub fn refresh_agent_control(&self, sender: omp_agent::KernelSender, dom: &omp_dom::Dom) {
+		let (environment, slot) = match self {
+			Self::Production(inference) => (&inference._environment, &inference._agent_control),
+			Self::Gateway { _environment, _agent_control, .. } => (_environment, _agent_control),
+		};
+		let mut slot = slot.lock();
+		if slot.is_none() {
+			*slot = Some(environment.bind_agent_control(sender));
+		}
+		slot
+			.as_ref()
+			.expect("Agent CONTROL binding was installed")
+			.refresh_session(dom);
 	}
 
 	/// Borrows the project environment client retained by this composition.
@@ -1310,6 +1470,16 @@ impl omp_agent::Inference for ComposedInference {
 		}
 	}
 
+	fn select_session(&self, dom: &omp_dom::Dom) {
+		let binding = match self {
+			Self::Production(inference) => &inference._agent_control,
+			Self::Gateway { _agent_control, .. } => _agent_control,
+		};
+		if let Some(binding) = binding.lock().as_ref() {
+			binding.refresh_session(dom);
+		}
+	}
+
 	fn install_retry_sink(&mut self, sink: omp_inference::RetrySink) {
 		match self {
 			Self::Production(inference) => inference.install_retry_sink(sink),
@@ -1361,6 +1531,29 @@ fn install_yield_contract(
 	Ok(Arc::new(registry))
 }
 
+/// Replaces generic `yield` with one strict batch-local workpool contract.
+pub(crate) fn install_workpool_yield_contract(
+	registry: &Registry,
+	items: Vec<omp_tools::yield_tool::WorkpoolItem>,
+) -> Result<Arc<Registry>, HeadlessError> {
+	let retained = registry
+		.live_names()
+		.into_iter()
+		.filter(|name| name.as_str() != "yield")
+		.collect::<Vec<_>>();
+	let mut registry = registry.restrict(retained.iter().map(Str::as_str));
+	registry.register(
+		omp_tools::yield_tool::tool_for_workpool(items)?,
+		Presentation::Slot,
+		Claims {
+			precedence: Precedence::CORE,
+			claimant:   Str::new_static("omp/core"),
+			replaces:   None,
+		},
+	)?;
+	Ok(Arc::new(registry))
+}
+
 /// Composes the production environment, inference route, tools, prompt, and
 /// authoritative `.oms` session for a headless command.
 pub async fn compose_kernel(
@@ -1383,9 +1576,69 @@ pub async fn compose_kernel(
 		.clone()
 		.unwrap_or_else(|| Arc::new(crate::sessions::SessionRegistry::new()));
 	let disabled_extensions = crate::discovery::CL_DISABLED_EXTENSIONS.get(&ctx);
+	let native_mode = match options.extensions.native_mode {
+		NativeExtensionMode::Merge => crate::discovery::native::NativeLoadMode::Merge,
+		NativeExtensionMode::ExplicitOnly => crate::discovery::native::NativeLoadMode::ExplicitOnly,
+		NativeExtensionMode::Disabled => crate::discovery::native::NativeLoadMode::Disabled,
+	};
+	let home = if native_mode == crate::discovery::native::NativeLoadMode::Merge {
+		omp_core::dirs::home_dir().ok_or(omp_core::dirs::DataDirError::HomeUnset)?
+	} else {
+		project_root.clone()
+	};
+	let native_extensions = crate::discovery::native::admit_native_extensions_contained(
+		&project_root,
+		&home,
+		crate::discovery::native::NativeAdmissionOptions {
+			explicit_roots:    &options.extensions.native_roots,
+			mode:              native_mode,
+			include_workspace: options.extensions.include_workspace,
+			setting_overrides: &options.extensions.setting_overrides,
+			disabled:          &disabled_extensions,
+		},
+	);
+	for error in &native_extensions.errors {
+		tracing::warn!(error = %error, "Python extension was not admitted");
+	}
+	let mut extension_skill_sources = options
+		.extensions
+		.native_roots
+		.iter()
+		.filter_map(|root| {
+			crate::discovery::skills::agent_plugin_skill_source(
+				root,
+				crate::discovery::skills::SkillLevel::Project,
+			)
+		})
+		.collect::<Vec<_>>();
+	for extension in &native_extensions.extensions {
+		let level = if extension.spec.key.layer() == "user" {
+			crate::discovery::skills::SkillLevel::User
+		} else {
+			crate::discovery::skills::SkillLevel::Project
+		};
+		for root in extension.skill_roots() {
+			extension_skill_sources.push(crate::discovery::skills::SkillSource {
+				provider: sf!("extension:{}", extension.spec.key.extension()),
+				root,
+				level,
+			});
+		}
+	}
 	let skills = match &options.discovered_skills {
-		Some(skills) => Arc::clone(skills),
-		None => Arc::new(crate::discovery::skills::ActiveSkills::discover(&ctx, &project_root)?),
+		Some(skills) => {
+			let mut merged = (**skills).clone();
+			merged.merge_extension_sources(
+				&extension_skill_sources,
+				&crate::discovery::skills::SkillPolicy::from_con(&ctx),
+			);
+			Arc::new(merged)
+		},
+		None => Arc::new(crate::discovery::skills::ActiveSkills::discover_with_sources(
+			&ctx,
+			&project_root,
+			&extension_skill_sources,
+		)?),
 	};
 	let (context_files, rules) = discover_prompt_material(&project_root, &options.prompt)?;
 	let facts = {
@@ -1408,6 +1661,13 @@ pub async fn compose_kernel(
 				managed_skills_root: Some(crate::discovery::skills::managed_skills_root(
 					&omp_core::dirs::user_config_root()?,
 				)),
+				agent_plugin_roots:  options
+					.extensions
+					.native_roots
+					.iter()
+					.filter(|root| crate::discovery::skills::is_agent_plugin_root(root))
+					.cloned()
+					.collect(),
 			},
 			dynamic_tools: vec![
 				omp_envd::DynamicTool::new(
@@ -1444,29 +1704,9 @@ pub async fn compose_kernel(
 			&options.extensions.setting_overrides,
 		)?;
 	}
-	let native_mode = match options.extensions.native_mode {
-		NativeExtensionMode::Merge => crate::discovery::native::NativeLoadMode::Merge,
-		NativeExtensionMode::ExplicitOnly => crate::discovery::native::NativeLoadMode::ExplicitOnly,
-		NativeExtensionMode::Disabled => crate::discovery::native::NativeLoadMode::Disabled,
-	};
-	let home = if native_mode == crate::discovery::native::NativeLoadMode::Merge {
-		omp_core::dirs::home_dir().ok_or(omp_core::dirs::DataDirError::HomeUnset)?
-	} else {
-		project_root.clone()
-	};
-	let native_extensions = crate::discovery::native::admit_native_extensions(
-		&project_root,
-		&home,
-		crate::discovery::native::NativeAdmissionOptions {
-			explicit_roots:    &options.extensions.native_roots,
-			mode:              native_mode,
-			include_workspace: options.extensions.include_workspace,
-			setting_overrides: &options.extensions.setting_overrides,
-			disabled:          &disabled_extensions,
-		},
-	)?;
 	trusted_extensions.extend(
 		native_extensions
+			.extensions
 			.into_iter()
 			.map(|extension| extension.spec),
 	);
@@ -1537,6 +1777,7 @@ pub async fn compose_kernel(
 		ComposedInference::Gateway {
 			inference:          GatewayInference::new(channel, model.as_str()),
 			_environment:       environment,
+			_agent_control:     Mutex::new(None),
 			_python_components: python_components,
 			_ephemeral_journal: None,
 		}
@@ -1579,6 +1820,7 @@ pub async fn compose_kernel(
 			model: omp_catalog::ModelKey::from(model.as_str()),
 			catalog: Arc::clone(&catalog),
 			_environment: environment,
+			_agent_control: Mutex::new(None),
 			_stack: stack,
 			con: Arc::clone(&ctx),
 			_python_components: python_components,
@@ -1610,7 +1852,9 @@ pub async fn compose_kernel(
 			.to_path_buf(),
 	});
 	let mut session = if journal_path.exists() {
-		Session::open(&journal_path, component_registry)?
+		let mut session = Session::open(&journal_path, component_registry)?;
+		session.recover_process_disappearance()?;
+		session
 	} else {
 		if let Some(parent) = journal_path.parent() {
 			fs::create_dir_all(parent)?;
@@ -1645,7 +1889,27 @@ pub async fn compose_kernel(
 	let unit_grace = omp_envd::host_settings::SV_INTERRUPT_GRACE
 		.get(&ctx)
 		.to_std()?;
+	let output_spill_bytes =
+		usize::try_from(omp_envd::tool_settings::SV_TOOLS_OUTPUT_SPILL_BYTES.get(&ctx))
+			.unwrap_or(usize::MAX);
+	let artifact_head_bytes =
+		usize::try_from(omp_tools::pi_settings::SV_TOOLS_ARTIFACT_HEAD_BYTES.get(&ctx))
+			.unwrap_or(usize::MAX);
+	let artifact_tail_bytes =
+		usize::try_from(omp_tools::pi_settings::SV_TOOLS_ARTIFACT_TAIL_BYTES.get(&ctx))
+			.unwrap_or(usize::MAX);
+	let artifact_tail_lines =
+		usize::try_from(omp_tools::pi_settings::SV_TOOLS_ARTIFACT_TAIL_LINES.get(&ctx))
+			.unwrap_or(usize::MAX);
+	let output_max_columns = omp_tools::pi_settings::SV_TOOLS_OUTPUT_MAX_COLUMNS.get(&ctx);
+	let max_line_bytes = if output_max_columns == 0 {
+		usize::MAX
+	} else {
+		usize::try_from(output_max_columns).unwrap_or(usize::MAX)
+	};
 	let policy = DispatchPolicy::new(spill)
+		.with_limits(output_spill_bytes, max_line_bytes, Duration::from_secs(30))
+		.with_artifact_projection(artifact_head_bytes, artifact_tail_bytes, artifact_tail_lines)
 		.with_interrupt_grace(unit_grace.saturating_add(Duration::from_secs(1)));
 	let runtime_flags = RuntimeFlags {
 		automatic_compaction:     ctx
@@ -1704,9 +1968,8 @@ pub async fn compose_kernel(
 		Some(Arc::new(omp_agent::ApprovalBook::new())),
 		Some(approvals.clone()),
 	);
-	let outcome_store = session.blobs().clone();
 	let mut kernel = kernel
-		.with_external_executor(Arc::new(EnvToolExecutor::new(tool_client, approvals, outcome_store)))
+		.with_external_executor(Arc::new(EnvToolExecutor::new(tool_client, approvals)))
 		.with_tool_admission(Arc::new(SettingsAdmission::new(&ctx, options.approval_mode)));
 	kernel.register_live_component(con_journal.live_component());
 	for component in live_python_components {
@@ -1733,6 +1996,9 @@ pub async fn compose_kernel(
 		crate::subagent::settings::CL_IRC_RELAY_TO_MAIN.get(&relay_ctx)
 	});
 	let up = kernel.mailbox();
+	kernel
+		.inference()
+		.refresh_agent_control(up.clone(), session.dom());
 	let autoreply = crate::subagent::autoreply::producer(
 		kernel.inference(),
 		&live_sessions,
@@ -1775,6 +2041,7 @@ pub async fn compose_kernel(
 			hub_environment,
 			project_root.clone(),
 			name,
+			Arc::clone(&ctx),
 		)));
 	}
 	Ok((kernel, session, prompt))
@@ -1883,6 +2150,7 @@ impl SessionHome {
 	pub fn open(&self, path: &Path) -> Result<Session, HeadlessError> {
 		let path = resolve_session_path(&self.sessions_dir, path);
 		let mut session = Session::open(&path, ComponentRegistry::standard())?;
+		session.recover_process_disappearance()?;
 		install_prompt_facts(
 			&mut session,
 			&self.project_root,
@@ -2437,6 +2705,7 @@ mod tests {
 	use omp_catalog::{
 		ModelKey, ReasoningEffort, ThinkingEffort, ThinkingPolicy, WireTarget, snapshot::Catalog,
 	};
+	use omp_core::sf;
 	use omp_inference::{
 		ChatRequest, NegotiationPolicy, RequestId, Sampling, Setting,
 		codec::{
@@ -2447,8 +2716,9 @@ mod tests {
 
 	use super::{
 		EphemeralJournal, HeadlessError, KernelOptions, PromptOverrides, apply_model_override,
-		convar_reasoning, install_prompt_facts, install_yield_contract, remember_terminal_session,
-		replicate_outcome_blob, route_facts, select_journal_path, session_local_tree,
+		convar_reasoning, install_prompt_facts, install_workpool_yield_contract,
+		install_yield_contract, remember_terminal_session, replicate_outcome_blob,
+		replicate_verdict_parts, route_facts, select_journal_path, session_local_tree,
 		validate_tool_names,
 	};
 
@@ -2563,6 +2833,42 @@ mod tests {
 			.expect("replicated outcome");
 		assert_eq!(reference.hash, digest);
 		assert_eq!(store.get(&reference).expect("read local replica").as_ref(), bytes);
+	}
+
+	#[tokio::test]
+	async fn inline_tool_media_is_canonicalized_into_the_session_cas() {
+		let (client, _transport) = omp_env::EnvClient::in_process(0);
+		let scratch = tempfile::tempdir().expect("temporary CAS");
+		let store = omp_journal::blob::BlobStore::open(scratch.path()).expect("open session CAS");
+		let bytes = bytes::Bytes::from_static(b"tool image");
+		let cancel = tokio_util::sync::CancellationToken::new();
+		let parts = replicate_verdict_parts(
+			&client,
+			&store,
+			"call-media",
+			vec![omp_proto::thread::v1::Part {
+				kind: Some(omp_proto::thread::v1::part::Kind::Blob(omp_proto::thread::v1::Blob {
+					mime: "image/png".to_owned(),
+					size: u64::try_from(bytes.len()).expect("fixture length"),
+					inline: bytes.clone(),
+					..Default::default()
+				})),
+			}],
+			1024,
+			&cancel,
+		)
+		.await
+		.expect("pin media");
+		let [omp_tool::Part::Blob { blob, .. }] = parts.as_slice() else {
+			panic!("one canonical blob part: {parts:?}");
+		};
+		let reference = omp_journal::blob::BlobRef::parse_hex(blob.hash.as_str(), blob.byte_len)
+			.expect("canonical reference");
+		assert_eq!(
+			store.get(&reference).expect("session media").as_ref(),
+			bytes.as_ref(),
+			"tool media resolves without the environment host"
+		);
 	}
 
 	fn gpt5_policy(catalog: &Catalog) -> &ThinkingPolicy {
@@ -3017,6 +3323,55 @@ mod tests {
 			installed.live_spec("yield").expect("yield").constraint,
 			omp_tool::Constraint::None
 		));
+	}
+
+	#[test]
+	fn workpool_yield_contract_is_child_local_and_rebuilt_for_each_batch() {
+		let mut registry = omp_tool::Registry::new();
+		registry
+			.register(
+				omp_tools::yield_tool::tool(),
+				omp_tool::Presentation::Hidden,
+				omp_tool::Claims {
+					precedence: omp_tool::Precedence::CORE,
+					claimant:   omp_core::Str::new_static("omp/core"),
+					replaces:   None,
+				},
+			)
+			.expect("generic yield");
+		let original = Arc::new(registry);
+		let batch = install_workpool_yield_contract(original.as_ref(), vec![
+			omp_tools::yield_tool::WorkpoolItem { id: sf!("pool#1"), index: 1 },
+			omp_tools::yield_tool::WorkpoolItem { id: sf!("pool#2"), index: 2 },
+		])
+		.expect("batch contract");
+		assert!(matches!(
+			original
+				.live_spec("yield")
+				.expect("parent yield")
+				.constraint,
+			omp_tool::Constraint::None
+		));
+		let schema: serde_json::Value =
+			serde_json::from_slice(&batch.live_spec("yield").expect("child yield").schema)
+				.expect("batch schema");
+		assert_eq!(schema["properties"]["key"]["enum"], serde_json::json!([1, 2]));
+		assert!(matches!(
+			batch.live_spec("yield").expect("child yield").constraint,
+			omp_tool::Constraint::None
+		));
+		assert_eq!(
+			batch.presentation("yield").expect("child presentation"),
+			omp_tool::Presentation::Slot
+		);
+		let next = install_workpool_yield_contract(batch.as_ref(), vec![
+			omp_tools::yield_tool::WorkpoolItem { id: sf!("pool#3"), index: 1 },
+		])
+		.expect("next batch contract");
+		let next_schema: serde_json::Value =
+			serde_json::from_slice(&next.live_spec("yield").expect("next yield").schema)
+				.expect("next schema");
+		assert_eq!(next_schema["properties"]["key"]["enum"], serde_json::json!([1]));
 	}
 
 	#[test]

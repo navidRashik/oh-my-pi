@@ -7,11 +7,14 @@
 //! yield contributes the complete payload verbatim. When the run ends with only
 //! incremental sections, the accumulated sections are the result.
 
-use omp_core::Str;
-use omp_dom::{PropId, PropKey, Value};
+use omp_core::{FastHashMap, FastHashSet, Str};
+use omp_dom::{KnownTag, PropId, PropKey, Tag, Value};
 use omp_session::Session;
-use omp_tools::yield_tool::{Params as YieldParams, ResultEnvelope, YieldType};
+use omp_tools::yield_tool::{
+	Params as YieldParams, ResultEnvelope, WorkpoolItem, WorkpoolParams, YieldType,
+};
 use serde_json::{Map, Value as Json};
+use thiserror::Error;
 
 /// Standard prefix when a yield explicitly contains null data.
 pub(crate) const WARNING_NULL_YIELD: &str =
@@ -42,7 +45,7 @@ impl Assembled {
 /// Every `yield` call that settled `ok`, in journal order.
 pub(crate) fn settled_yields(session: &Session) -> Vec<YieldParams> {
 	let dom = session.dom();
-	let yield_tag = omp_dom::Tag::Custom(Str::new_static("yield"));
+	let yield_tag = Tag::Custom(Str::new_static("yield"));
 	dom.handles()
 		.filter_map(|handle| {
 			let node = dom.get(handle)?;
@@ -66,6 +69,185 @@ pub(crate) fn settled_yields(session: &Session) -> Vec<YieldParams> {
 			serde_json::from_str::<YieldParams>(raw).ok()
 		})
 		.collect()
+}
+
+/// Reconstructs one workpool batch result from its latest replayed turn.
+///
+/// Successful fields are inserted in the batch's authored item order, never
+/// tool-call order. The fold revalidates correlation so a malformed or stale
+/// journal cannot smuggle duplicate or unknown item ids into the aggregate.
+pub(super) fn assemble_workpool_batch(
+	session: &Session,
+	items: &[WorkpoolItem],
+) -> Result<Json, WorkpoolAssemblyError> {
+	let mut by_index = FastHashMap::default();
+	let mut ids = FastHashSet::default();
+	for item in items {
+		if by_index.insert(item.index, item).is_some() || !ids.insert(item.id.clone()) {
+			return Err(WorkpoolAssemblyError::DuplicateItem { id: item.id.clone() });
+		}
+	}
+	let mut yielded = FastHashMap::<Str, Json>::default();
+	for raw in settled_yield_inputs_in_last_turn(session) {
+		let params = serde_json::from_str::<WorkpoolParams>(raw)
+			.map_err(|source| WorkpoolAssemblyError::Malformed { source })?;
+		let item = by_index
+			.get(&params.key)
+			.ok_or(WorkpoolAssemblyError::UnknownItem { key: params.key })?;
+		if yielded.contains_key(&item.id) {
+			return Err(WorkpoolAssemblyError::DuplicateItem { id: item.id.clone() });
+		}
+		match (params.data, params.error) {
+			(Some(data), None) => {
+				yielded.insert(item.id.clone(), data);
+			},
+			(None, Some(error)) if error.trim().is_empty() => {
+				return Err(WorkpoolAssemblyError::Envelope { id: item.id.clone() });
+			},
+			(None, Some(error)) => {
+				return Err(WorkpoolAssemblyError::ItemFailed { id: item.id.clone(), error });
+			},
+			_ => return Err(WorkpoolAssemblyError::Envelope { id: item.id.clone() }),
+		}
+	}
+	let missing = items
+		.iter()
+		.filter(|item| !yielded.contains_key(&item.id))
+		.map(|item| item.id.clone())
+		.collect::<Vec<_>>();
+	if !missing.is_empty() {
+		return Err(WorkpoolAssemblyError::MissingItems { ids: missing });
+	}
+	let mut output = Map::with_capacity(items.len());
+	for item in items {
+		if let Some(value) = yielded.remove(&item.id) {
+			output.insert(item.id.to_string(), value);
+		}
+	}
+	Ok(Json::Object(output))
+}
+
+fn settled_yield_inputs_in_last_turn(session: &Session) -> Vec<&str> {
+	let dom = session.dom();
+	let Some(turn) = dom
+		.children(dom.body())
+		.iter()
+		.rev()
+		.copied()
+		.find(|handle| {
+			dom.get(*handle)
+				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Turn))
+		})
+	else {
+		return Vec::new();
+	};
+	dom.children(turn)
+		.iter()
+		.filter_map(|handle| {
+			let node = dom.get(*handle)?;
+			if node.tag != Tag::Custom(Str::new_static("yield"))
+				|| node
+					.prop(&PropKey::from(PropId::Status))
+					.and_then(Value::as_str)
+					!= Some("ok")
+			{
+				return None;
+			}
+			dom.children(*handle).iter().find_map(|child| {
+				let input = dom.get(*child)?;
+				if input.tag != Tag::Known(KnownTag::Input) {
+					return None;
+				}
+				input.content.as_deref().or_else(|| {
+					input
+						.prop(&PropKey::from(PropId::Text))
+						.and_then(Value::as_str)
+				})
+			})
+		})
+		.collect()
+}
+
+/// Invalid or incomplete replayed workpool yield sequence.
+#[derive(Debug, Error)]
+pub(super) enum WorkpoolAssemblyError {
+	/// A settled input is not the batch-local yield shape.
+	#[error("settled workpool yield has malformed arguments")]
+	Malformed {
+		/// JSON decoding cause.
+		#[source]
+		source: serde_json::Error,
+	},
+	/// A key was not advertised for this batch.
+	#[error("workpool item key {key} is not in the active batch")]
+	UnknownItem {
+		/// Rejected one-based key.
+		key: u32,
+	},
+	/// The same stable item was accepted twice.
+	#[error("workpool item `{id}` was submitted more than once")]
+	DuplicateItem {
+		/// Repeated item identity.
+		id: Str,
+	},
+	/// A settled item did not choose exactly one outcome.
+	#[error("workpool item `{id}` must contain exactly one of data or error")]
+	Envelope {
+		/// Malformed item identity.
+		id: Str,
+	},
+	/// A child explicitly failed one item.
+	#[error("workpool item `{id}` failed")]
+	ItemFailed {
+		/// Failed item identity.
+		id:    Str,
+		/// Child-supplied reason.
+		error: Str,
+	},
+	/// The child ended its turn before every item yielded.
+	#[error("workpool turn ended without every required item")]
+	MissingItems {
+		/// Missing stable item identities in authored order.
+		ids: Vec<Str>,
+	},
+}
+
+impl WorkpoolAssemblyError {
+	/// Converts a failed batch into the stable structured artifact projection.
+	pub(super) fn into_output(self) -> Json {
+		match self {
+			Self::Malformed { .. } => serde_json::json!({
+				"status": "failed",
+				"code": "malformed_yield"
+			}),
+			Self::UnknownItem { key } => serde_json::json!({
+				"status": "failed",
+				"code": "unknown_item",
+				"key": key
+			}),
+			Self::DuplicateItem { id } => serde_json::json!({
+				"status": "failed",
+				"code": "duplicate_item",
+				"id": id
+			}),
+			Self::Envelope { id } => serde_json::json!({
+				"status": "failed",
+				"code": "invalid_envelope",
+				"id": id
+			}),
+			Self::ItemFailed { id, error } => serde_json::json!({
+				"status": "failed",
+				"code": "item_failed",
+				"id": id,
+				"error": error
+			}),
+			Self::MissingItems { ids } => serde_json::json!({
+				"status": "failed",
+				"code": "missing_items",
+				"ids": ids
+			}),
+		}
+	}
 }
 
 /// Top-level output-schema property names declared as arrays. An incremental
@@ -216,6 +398,98 @@ mod tests {
 
 	fn params(value: Json) -> YieldParams {
 		serde_json::from_value(value).expect("yield params")
+	}
+
+	fn settle_workpool(session: &mut Session, call_id: &str, args: Json) {
+		let raw = serde_json::value::to_raw_value(&args).expect("workpool args");
+		let call = session
+			.call("yield", 2, Str::new(call_id), None, Some(raw), None)
+			.expect("yield call");
+		let outcome = serde_json::value::to_raw_value(&json!({
+			"incremental": true,
+			"use_last_turn": false,
+			"validation": null,
+			"complete": false
+		}))
+		.expect("yield outcome");
+		session.settle(call, outcome).expect("yield settlement");
+	}
+
+	#[test]
+	fn workpool_batch_assembles_in_item_order_and_replays_identically() {
+		let temp = tempfile::tempdir().expect("temporary directory");
+		let path = temp.path().join("worker.oms");
+		let mut session = Session::create(&path, omp_session::ComponentRegistry::standard())
+			.expect("worker session");
+		session.begin_turn().expect("turn");
+		session.user("batch", Vec::new()).expect("prompt");
+		settle_workpool(&mut session, "second", json!({"key": 2, "data": {"answer": 2}}));
+		settle_workpool(
+			&mut session,
+			"first",
+			json!({"key": 1, "data": {"summary": "partial", "confidence": 0.8}}),
+		);
+		let items =
+			vec![WorkpoolItem { id: Str::new_static("pool#first"), index: 1 }, WorkpoolItem {
+				id:    Str::new_static("pool#second"),
+				index: 2,
+			}];
+		let live = assemble_workpool_batch(&session, &items).expect("live assembly");
+		assert_eq!(
+			live.to_string(),
+			r#"{"pool#first":{"summary":"partial","confidence":0.8},"pool#second":{"answer":2}}"#
+		);
+		drop(session);
+		let replayed = Session::open(&path, omp_session::ComponentRegistry::standard())
+			.expect("replayed session");
+		assert_eq!(assemble_workpool_batch(&replayed, &items).expect("replayed assembly"), live);
+	}
+
+	#[test]
+	fn workpool_batch_rejects_unknown_duplicate_missing_and_error_outcomes() {
+		let items = vec![WorkpoolItem { id: Str::new_static("pool#1"), index: 1 }, WorkpoolItem {
+			id:    Str::new_static("pool#2"),
+			index: 2,
+		}];
+		let make = |calls: &[(&str, Json)]| {
+			let temp = tempfile::tempdir().expect("temporary directory");
+			let mut session = Session::create(
+				temp.path().join("worker.oms"),
+				omp_session::ComponentRegistry::standard(),
+			)
+			.expect("worker session");
+			session.begin_turn().expect("turn");
+			session.user("batch", Vec::new()).expect("prompt");
+			for (id, args) in calls {
+				settle_workpool(&mut session, id, args.clone());
+			}
+			session
+		};
+		assert!(matches!(
+			assemble_workpool_batch(&make(&[("unknown", json!({"key": 9, "data": "x"}))]), &items),
+			Err(WorkpoolAssemblyError::UnknownItem { key: 9 })
+		));
+		assert!(matches!(
+			assemble_workpool_batch(
+				&make(&[
+					("one", json!({"key": 1, "data": "x"})),
+					("again", json!({"key": 1, "data": "y"}))
+				]),
+				&items
+			),
+			Err(WorkpoolAssemblyError::DuplicateItem { .. })
+		));
+		assert!(matches!(
+			assemble_workpool_batch(&make(&[("one", json!({"key": 1, "data": "x"}))]), &items),
+			Err(WorkpoolAssemblyError::MissingItems { .. })
+		));
+		assert!(matches!(
+			assemble_workpool_batch(
+				&make(&[("failed", json!({"key": 1, "error": "blocked"}))]),
+				&items
+			),
+			Err(WorkpoolAssemblyError::ItemFailed { .. })
+		));
 	}
 
 	#[test]
