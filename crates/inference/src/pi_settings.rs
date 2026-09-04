@@ -667,11 +667,6 @@ omp_con::var! {
 		default: 120000,
 		flags: archive,
 	};
-	/// pi `extensionHandlers.toolCallTimeoutMs` (number, default: 30_000).
-	pub static AI_EXTENSION_HANDLERS_TOOL_CALL_TIMEOUT_MS = ai_extension_handlers_tool_call_timeout_ms: i64 {
-		default: 30000,
-		flags: archive,
-	};
 	/// pi `gc.blobs` (boolean, default: true).
 	pub static AI_GC_BLOBS = ai_gc_blobs: bool {
 		default: true,
@@ -837,7 +832,6 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("commit.cacheEnabled", "ai_commit_cache_enabled"),
 	("commit.cacheTtlDays", "ai_commit_cache_ttl_days"),
 	("commit.changelogMaxDiffChars", "ai_commit_changelog_max_diff_chars"),
-	("extensionHandlers.toolCallTimeoutMs", "ai_extension_handlers_tool_call_timeout_ms"),
 	("gc.blobs", "ai_gc_blobs"),
 	("gc.archive", "ai_gc_archive"),
 	("gc.wal", "ai_gc_wal"),
