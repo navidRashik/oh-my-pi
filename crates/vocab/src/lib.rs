@@ -516,6 +516,10 @@ pub enum PropId {
 	TokensBefore,
 	/// Context tokens after a maintenance step.
 	TokensAfter,
+	/// Ordered snapcompact frame references retained by a compaction.
+	Frames,
+	/// Number of snapcompact frames retained by a compaction.
+	FrameCount,
 	/// Human-readable warning attached to an element.
 	Warning,
 	/// Message author attribution (a collaboration guest, an agent).

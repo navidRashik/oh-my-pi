@@ -164,7 +164,7 @@ fn session_switch_is_not_process_exit() {
 
 	let mut second = session(&second_path);
 	second
-		.process_exit()
+		.record_exit(omp_session::ExitCause::Normal)
 		.expect("process exit records separately");
 	assert!(process_exit_observed(second.dom()));
 	let restored = Session::open(first_path, ComponentRegistry::default()).expect("first restores");

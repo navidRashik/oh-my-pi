@@ -298,14 +298,16 @@ fn history_tool_parts(parts: &[ToolPart]) -> Result<Vec<thread::Part>, Projectio
 /// Projects the selected session body into canonical inference thread items.
 ///
 /// The function reads only the DOM. If a compaction marker exists, older
-/// turns are omitted and its content-addressed summary is prepended as a
-/// synthetic user message.
+/// turns are omitted and its content-addressed summary plus ordered
+/// snapcompact frame references are prepended as a synthetic user message.
 #[must_use]
 pub fn project_thread(dom: &Dom) -> Vec<Item> {
-	let (boundary, summary) = newest_compaction(dom);
+	let (boundary, compaction) = newest_compaction(dom);
 	let mut items = Vec::new();
-	if let Some(summary) = summary {
-		items.push(message_item(thread::Role::User, summary, None, true));
+	if let Some(compaction) = compaction
+		&& let Some(summary) = prop_text(compaction, PropId::Summary)
+	{
+		items.push(compaction_message_item(summary, &compaction_frames(compaction)));
 	}
 	project_window(dom, Window { after: boundary, through: None }, &mut items);
 	items
@@ -756,9 +758,9 @@ fn artifact_part(artifact: &Node) -> Option<thread::Part> {
 fn project_tool(dom: &Dom, handle: Handle, name: &str, node: &Node, items: &mut Vec<Item>) {
 	let id = prop_text(node, PropId::Id).unwrap_or_default().to_owned();
 	let status = prop_text(node, PropId::Status).unwrap_or("running");
-	// A live in-flight call is not history yet. Omit it until the controller
-	// journals its terminal state; `Session::open` turns crash leftovers into
-	// durable aborted results before returning. This defensive path keeps any
+	// A live in-flight call is not history yet. Omit it until the writable
+	// controller journals its terminal state during process-disappearance
+	// recovery. This defensive path keeps any
 	// direct DOM projection acceptable to providers that require every call
 	// to have a matching result without inventing lifecycle state.
 	if matches!(status, "arguments" | "running") {
@@ -860,6 +862,54 @@ fn projected_tool_parts(node: &Node) -> Option<Vec<thread::Part>> {
 	Some(projected)
 }
 
+/// Ordered snapcompact frame references materialized on a `<compaction>`.
+///
+/// Invalid extension-authored JSON projects as no frames; journal-authored
+/// compactions always carry the typed [`Attachment`] encoding.
+#[must_use]
+pub fn compaction_frames(node: &Node) -> Vec<Attachment> {
+	let Some(Value::Json(raw)) = node.prop(&PropKey::from(PropId::Frames)) else {
+		return Vec::new();
+	};
+	serde_json::from_str(raw.get()).unwrap_or_default()
+}
+
+/// Number of snapcompact frames exposed by a `<compaction>`.
+#[must_use]
+pub fn compaction_frame_count(node: &Node) -> usize {
+	node
+		.prop(&PropKey::from(PropId::FrameCount))
+		.and_then(|value| match value {
+			Value::Int(count) => usize::try_from(*count).ok(),
+			_ => None,
+		})
+		.unwrap_or_else(|| compaction_frames(node).len())
+}
+
+fn compaction_message_item(summary: &str, frames: &[Attachment]) -> Item {
+	let mut parts = Vec::with_capacity(frames.len().saturating_add(1));
+	parts.push(thread::Part { kind: Some(part::Kind::Text(summary.to_owned())) });
+	parts.extend(frames.iter().map(|frame| thread::Part {
+		kind: Some(part::Kind::Blob(thread::Blob {
+			hash: frame.blob.hash.as_bytes().to_vec().into(),
+			mime: frame.mime.as_str().to_owned(),
+			size: frame.blob.size,
+			..Default::default()
+		})),
+	}));
+	Item {
+		seq:           0,
+		created_at_ms: 0,
+		kind:          Some(item::Kind::Message(thread::Message {
+			role: thread::Role::User as i32,
+			parts,
+			synthetic: Some(true),
+			..Default::default()
+		})),
+		props:         None,
+	}
+}
+
 fn message_item(
 	role: thread::Role,
 	text: &str,
@@ -880,7 +930,7 @@ fn message_item(
 	}
 }
 
-fn newest_compaction(dom: &Dom) -> (Option<EntryId>, Option<&str>) {
+fn newest_compaction(dom: &Dom) -> (Option<EntryId>, Option<&Node>) {
 	let mut result = (None, None);
 	for handle in dom.children(dom.meta()) {
 		let Some(node) = dom.get(*handle) else {
@@ -891,8 +941,7 @@ fn newest_compaction(dom: &Dom) -> (Option<EntryId>, Option<&str>) {
 		}
 		let boundary =
 			prop_text(node, PropId::Boundary).and_then(|value| EntryId::from_str(value).ok());
-		let summary = prop_text(node, PropId::Summary);
-		result = (boundary, summary);
+		result = (boundary, Some(node));
 	}
 	result
 }

@@ -152,6 +152,65 @@ pub struct AsyncResult {
 	pub jobs: Vec<AsyncJobDelivery>,
 }
 
+/// One advisor note in a replay-stable transcript card.
+///
+/// The producer stamps the advisor identity; consumers MUST NOT infer it from
+/// the currently configured roster because replay may select an older branch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisorNote {
+	/// Configured advisor identity, or `default` for the implicit advisor.
+	pub advisor:  Str,
+	/// Importance assigned by the producing advisor.
+	pub severity: AdvisorSeverity,
+	/// Concrete advice shown to the user and injected into the primary turn.
+	pub note:     Str,
+}
+
+/// Importance of an advisor note.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	PartialEq,
+	Eq,
+	PartialOrd,
+	Ord,
+	Serialize,
+	Deserialize,
+	Display,
+	EnumString,
+	IntoStaticStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum AdvisorSeverity {
+	/// Non-urgent advice.
+	#[default]
+	Nit,
+	/// The primary may be heading in the wrong direction.
+	Concern,
+	/// Work must stop and be reconsidered.
+	Blocker,
+}
+
+impl AdvisorSeverity {
+	/// Whether delivery should interrupt an active primary turn.
+	#[must_use]
+	pub const fn interrupting(self) -> bool {
+		!matches!(self, Self::Nit)
+	}
+}
+
+/// Replay-stable payload of a journaled `<notice kind=advisor>` patch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisorMessage {
+	/// Notes delivered together, preserving producer order and attribution.
+	pub notes: Vec<AdvisorNote>,
+}
+
 /// Replay-stable payload of a user-invoked skill prompt.
 ///
 /// The controller journals this on a `<user skill_prompt=true>` patch. The
@@ -570,6 +629,54 @@ pub struct ReceiptIdentity {
 	pub model:    Str,
 }
 
+/// Stable category for one inference recovery action retained by the journal.
+#[derive(Clone, Copy, Debug, Display, EnumString, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum InferenceRecoveryKind {
+	/// Malformed JSON was repaired.
+	JsonRepair,
+	/// Leaked dialect markup was normalized.
+	DialectNormalization,
+	/// A partial tool call was assembled and validated.
+	ToolAssembly,
+	/// Leaked reasoning became a thinking block.
+	ThinkingClassification,
+	/// Exactly framed Harmony channel markup was repaired.
+	HarmonyLeakRepair,
+	/// Provable Harmony leakage rejected an attempt.
+	HarmonyLeakDetection,
+	/// Reasoning stopped making bounded progress.
+	ReasoningStall,
+	/// Repetition was detected within an attempt.
+	WithinAttemptRepetition,
+	/// A tool call repeated across turns.
+	CrossTurnToolLoop,
+	/// A malformed tool result was repaired.
+	ToolResultRepair,
+	/// A fabricated result was rejected.
+	FabricatedResultRejection,
+	/// Expired provider state was reseeded.
+	SessionReseed,
+	/// Empty output was classified.
+	EmptyOutput,
+}
+
+/// Replay-stable, secret-free evidence for one inference recovery action.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InferenceRecovery {
+	/// Provider attempt on which recovery occurred.
+	pub attempt:     u32,
+	/// Typed recovery category.
+	pub kind:        InferenceRecoveryKind,
+	/// Stable catalog/recovery rule identifier.
+	pub rule:        Str,
+	/// Number of input bytes examined.
+	pub input_bytes: u64,
+	/// Number of bounded repair steps performed.
+	pub steps:       u32,
+}
+
 /// `turn.receipt@1` payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnReceipt {
@@ -603,6 +710,10 @@ pub struct TurnReceipt {
 	/// receipts written before this field existed remain `None`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub identity:                    Option<ReceiptIdentity>,
+	/// Secret-free typed recovery evidence accumulated across hidden retries
+	/// and the committed provider attempt.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub recoveries:                  Vec<InferenceRecovery>,
 }
 
 impl TurnReceipt {
@@ -619,6 +730,7 @@ impl TurnReceipt {
 			duration_ms: None,
 			premium_requests_millionths: 0,
 			identity: None,
+			recoveries: Vec::new(),
 		}
 	}
 }
@@ -634,6 +746,14 @@ pub struct Patch {
 	/// Serialized array of DOM operations; `omp-dom` owns their Rust type.
 	pub ops: Box<RawValue>,
 }
+
+/// Maximum snapcompact frames one compaction may retain.
+///
+/// This matches the renderer's archive bound while keeping the durable format
+/// independently defensive against oversized imported payloads.
+pub const MAX_SNAPCOMPACT_FRAMES: usize = 80;
+/// Maximum aggregate encoded frame bytes one compaction may retain.
+pub const MAX_SNAPCOMPACT_FRAME_BYTES: u64 = 3_000_000;
 
 /// `compaction@1` payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -656,10 +776,13 @@ pub struct Compaction {
 	/// Dead-end warning stamped by a progress guard.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub warning:       Option<Str>,
+	/// Oldest-to-newest snapcompact PNG frames retained in the session CAS.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub frames:        Vec<Attachment>,
 }
 
 impl Compaction {
-	/// A compaction with no method or token facts.
+	/// A compaction with no method, token facts, warning, or retained frames.
 	#[must_use]
 	pub const fn new(summary: BlobRef, boundary: EntryId) -> Self {
 		Self {
@@ -669,7 +792,24 @@ impl Compaction {
 			tokens_before: None,
 			tokens_after: None,
 			warning: None,
+			frames: Vec::new(),
 		}
+	}
+
+	/// Number of retained snapcompact frames.
+	#[must_use]
+	pub const fn frame_count(&self) -> usize {
+		self.frames.len()
+	}
+
+	/// Aggregate encoded bytes declared by the retained frame references.
+	#[must_use]
+	pub fn frame_bytes(&self) -> u64 {
+		self
+			.frames
+			.iter()
+			.map(|frame| frame.blob.size)
+			.fold(0, u64::saturating_add)
 	}
 }
 
@@ -744,6 +884,55 @@ mod tests {
 			)
 			.is_err()
 		);
+	}
+
+	#[test]
+	fn advisor_message_round_trips_order_attribution_and_severity() {
+		let payload = AdvisorMessage {
+			notes: vec![
+				AdvisorNote {
+					advisor:  Str::new_static("security"),
+					severity: AdvisorSeverity::Blocker,
+					note:     Str::new_static("Do not expose the token."),
+				},
+				AdvisorNote {
+					advisor:  Str::new_static("performance"),
+					severity: AdvisorSeverity::Concern,
+					note:     Str::new_static("Keep append cost linear."),
+				},
+			],
+		};
+		let json = serde_json::to_string(&payload).expect("advisor message serializes");
+		assert_eq!(
+			json,
+			r#"{"notes":[{"advisor":"security","severity":"blocker","note":"Do not expose the token."},{"advisor":"performance","severity":"concern","note":"Keep append cost linear."}]}"#
+		);
+		assert_eq!(
+			serde_json::from_str::<AdvisorMessage>(&json).expect("advisor message decodes"),
+			payload
+		);
+	}
+
+	#[test]
+	fn recovery_evidence_is_typed_and_legacy_receipts_default_empty() {
+		let legacy: TurnReceipt =
+			serde_json::from_str(r#"{"tokens_in":1,"tokens_out":2,"cost_nano_usd":3}"#)
+				.expect("legacy receipt");
+		assert!(legacy.recoveries.is_empty());
+
+		let receipt = TurnReceipt {
+			recoveries: vec![InferenceRecovery {
+				attempt:     1,
+				kind:        InferenceRecoveryKind::HarmonyLeakRepair,
+				rule:        Str::new_static("harmony/codex/final"),
+				input_bytes: 64,
+				steps:       1,
+			}],
+			..TurnReceipt::default()
+		};
+		let json = serde_json::to_string(&receipt).expect("recovery receipt");
+		assert!(json.contains(r#""kind":"harmony_leak_repair""#));
+		assert_eq!(serde_json::from_str::<TurnReceipt>(&json).expect("round trip"), receipt);
 	}
 
 	#[test]

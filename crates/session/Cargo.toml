@@ -18,6 +18,7 @@ flume = { workspace = true }
 omp-core = { workspace = true }
 omp-dom = { workspace = true }
 omp-journal = { workspace = true }
+omp-observability = { workspace = true }
 omp-proto = { workspace = true }
 omp-tool = { workspace = true }
 serde = { workspace = true }

@@ -1019,6 +1019,7 @@ message DapSessionResponse {
   DapSessionRef session = 1;
   repeated DapCapability granted_capabilities = 2;
   bytes adapter_capabilities_json = 3;
+  string adapter = 4;
 }
 
 message DapActionRequest {
@@ -1028,6 +1029,7 @@ message DapActionRequest {
   string command = 4;
   bytes arguments_json = 5;
   uint32 max_response_bytes = 6;
+  uint32 timeout_ms = 7;
 }
 
 message DapActionResponse {

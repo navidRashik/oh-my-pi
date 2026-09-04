@@ -5,6 +5,7 @@
 //! folded, and replay uses that same fold.
 
 mod component;
+pub mod custom_message;
 pub mod components {
 	//! Built-in journal-derived `<meta>` components.
 
@@ -21,15 +22,21 @@ pub mod components {
 	/// Todo snapshot projection component.
 	pub mod todo;
 }
+pub mod exit_diagnostics;
 mod fold;
+pub mod late_diagnostics;
 pub mod projection;
 pub mod rewind;
 mod session;
 
 pub use component::{Component, ComponentRegistry, Draft};
+pub use exit_diagnostics::{
+	CrashTail, ExitCause, ExitSignal, ExitStatus, SessionExit, latest_session_exit,
+};
 pub use projection::{
 	ASSISTANT_CONTENT_TAG, FILE_MENTION_PROP, PROVIDER_BLOCK_INDEX_PROP, ProjectionError,
-	file_mentions, project_thread, project_thread_history, project_thread_through,
+	compaction_frame_count, compaction_frames, file_mentions, project_thread,
+	project_thread_history, project_thread_through,
 };
 pub use rewind::{LifecycleWork, diff};
 pub use session::{AttachmentInput, Session, SessionError, UnsettledCall};

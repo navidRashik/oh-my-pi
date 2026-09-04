@@ -38,6 +38,24 @@ pub enum SessionError {
 	/// A compacted summary blob could not be read.
 	#[error(transparent)]
 	Blob(#[from] omp_journal::blob::Error),
+	/// A compaction retained more snapcompact frames than the durable format
+	/// admits.
+	#[error("compaction retained {actual} snapcompact frames; maximum is {maximum}")]
+	TooManyCompactionFrames {
+		/// Declared frame count.
+		actual:  usize,
+		/// Durable frame-count bound.
+		maximum: usize,
+	},
+	/// A compaction retained more aggregate snapcompact bytes than the durable
+	/// format admits.
+	#[error("compaction retained {actual} snapcompact frame bytes; maximum is {maximum}")]
+	CompactionFramesTooLarge {
+		/// Aggregate bytes declared by the frame references.
+		actual:  u64,
+		/// Durable aggregate-byte bound.
+		maximum: u64,
+	},
 	/// A compacted summary blob is not UTF-8.
 	#[error("compaction summary is not UTF-8")]
 	SummaryUtf8 {
@@ -219,6 +237,11 @@ impl Session {
 
 	/// Opens a journal by replaying every file-prefix operation and historical
 	/// prior jump.
+	///
+	/// Opening is a pure semantic materialization step: it never appends
+	/// recovery records, closes streams, or changes DOM allocator floors. A
+	/// writable controller adopting the session calls
+	/// [`Self::recover_process_disappearance`] explicitly.
 	pub fn open(
 		path: impl AsRef<Path>,
 		components: ComponentRegistry,
@@ -230,6 +253,8 @@ impl Session {
 
 	/// Opens a journal using the supplied store for every referenced blob,
 	/// including compaction summaries written before the process restarted.
+	///
+	/// Like [`Self::open`], this only materializes committed state.
 	pub fn open_with_blob_store(
 		path: impl AsRef<Path>,
 		components: ComponentRegistry,
@@ -254,7 +279,6 @@ impl Session {
 			.map(|(index, entry)| (entry.id, index))
 			.collect();
 		session.rebuild_all()?;
-		session.recover_unsettled_calls()?;
 		Ok(session)
 	}
 
@@ -426,8 +450,9 @@ impl Session {
 
 	/// Journals synthetic aborts for every call left without a terminal result.
 	///
-	/// Reopening invokes this before returning the session, so strict-provider
-	/// projection never has to hide or invent a result for a call whose process
+	/// The writable session owner invokes process-disappearance recovery before
+	/// projecting the next provider request, so strict-provider projection
+	/// never has to hide or invent a result for a call whose process
 	/// disappeared. Calls cut off during argument streaming first receive
 	/// canonical empty arguments, closing their durable stream before the
 	/// abort is appended.
@@ -504,22 +529,6 @@ impl Session {
 		})
 	}
 
-	/// Records process exit as a transition distinct from a session switch.
-	pub fn process_exit(&mut self) -> Result<EntryId, SessionError> {
-		use crate::components::lifecycle::{PROCESS_EXITED, transitions_handle};
-
-		let handle = transitions_handle(&self.dom).ok_or(SessionError::MissingSessionTransitions)?;
-		self.patch(Txn {
-			cause: self.head.ok_or(SessionError::MissingSessionTransitions)?,
-			label: Some(Str::new_static("process.exit")),
-			ops:   vec![Op::Set {
-				h:     handle,
-				prop:  PropKey::Custom(Str::new_static(PROCESS_EXITED)),
-				value: Value::Bool(true),
-			}],
-		})
-	}
-
 	/// Returns an actor snapshot followed by ordered patch, stream, and reset
 	/// events.
 	pub fn subscribe(&mut self) -> (Snapshot, Receiver<Event>) {
@@ -528,6 +537,7 @@ impl Session {
 
 	/// Begins an explicit turn, caused by the previous journal head.
 	pub fn begin_turn(&mut self) -> Result<EntryId, SessionError> {
+		self.clear_exit_diagnostics()?;
 		let by = self.head.ok_or(SessionError::NoActiveTurn)?;
 		self.commit(KindName::TurnStart, Some(by), None, None, &TurnStart {})
 	}
@@ -766,6 +776,19 @@ impl Session {
 		self.commit(KindName::ToolUpdate, Some(call), None, None, &ToolUpdate(update))
 	}
 
+	/// Records that an authorized call crossed into its execution unit.
+	///
+	/// This is distinct from [`Self::call_ready`]: replay can therefore tell a
+	/// never-started placeholder from an interrupted call whose effects may be
+	/// uncertain.
+	pub fn call_started(&mut self, call: EntryId) -> Result<EntryId, SessionError> {
+		self.ensure_call(call)?;
+		let update = serde_json::value::to_raw_value(&serde_json::json!({
+			"kernel": "started",
+		}))?;
+		self.commit(KindName::ToolUpdate, Some(call), None, None, &ToolUpdate(update))
+	}
+
 	/// Records a typed ephemeral update caused by a tool call.
 	pub fn call_update(
 		&mut self,
@@ -897,9 +920,10 @@ impl Session {
 	}
 
 	/// Records a content-addressed compaction summary, its hidden boundary,
-	/// and the maintenance facts the transcript divider labels.
+	/// maintenance facts, and bounded snapcompact frame references.
 	pub fn compaction(&mut self, compaction: Compaction) -> Result<EntryId, SessionError> {
 		let by = self.turn_cause()?;
+		self.validate_compaction_frames(&compaction)?;
 		if !self
 			.chain_indices(self.head.ok_or(SessionError::NoActiveTurn)?)?
 			.into_iter()
@@ -1054,6 +1078,23 @@ impl Session {
 		complete
 			.then_some(())
 			.ok_or(SessionError::UnknownCall { id: call })
+	}
+
+	pub(crate) fn validate_compaction_frames(
+		&self,
+		compaction: &Compaction,
+	) -> Result<(), SessionError> {
+		let actual = compaction.frame_count();
+		let maximum = omp_journal::data::MAX_SNAPCOMPACT_FRAMES;
+		if actual > maximum {
+			return Err(SessionError::TooManyCompactionFrames { actual, maximum });
+		}
+		let actual = compaction.frame_bytes();
+		let maximum = omp_journal::data::MAX_SNAPCOMPACT_FRAME_BYTES;
+		if actual > maximum {
+			return Err(SessionError::CompactionFramesTooLarge { actual, maximum });
+		}
+		Ok(())
 	}
 
 	pub(crate) fn compaction_summary(&mut self, summary: &BlobRef) -> Result<Str, SessionError> {

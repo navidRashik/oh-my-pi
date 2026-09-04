@@ -5,7 +5,7 @@
 //! world/tests/world.rs:134-170`; event names and APIs are the omp2 session
 //! contract rather than either donor's vocabulary.
 
-use omp_core::Str;
+use omp_core::{Hash32, Str};
 use omp_dom::{KnownTag, Op, PropId, Tag, Txn, Value};
 use omp_journal::{Journal, kind};
 use omp_session::{ComponentRegistry, Session};
@@ -399,11 +399,15 @@ fn write_api_assigns_the_declared_causes() {
 /// (the transcript's usage row and maintenance dividers project only these).
 #[test]
 fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
-	use omp_journal::data::{Compaction, ReceiptIdentity, ReceiptRole, TurnReceipt};
+	use omp_journal::data::{
+		Compaction, InferenceRecovery, InferenceRecoveryKind, ReceiptIdentity, ReceiptRole,
+		TurnReceipt,
+	};
 	let directory = tempfile::tempdir().expect("temporary session directory");
 	let path = directory.path().join("facts.oms");
 	let store = omp_journal::blob::BlobStore::open(directory.path()).expect("blob store opens");
 	let summary = store.put(b"# Summary").expect("summary stores");
+	let frame = store.put(b"snapcompact png").expect("frame stores");
 	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
 	session.begin_turn().expect("turn");
 	session.user("user", Vec::new()).expect("user");
@@ -418,6 +422,13 @@ fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
 			duration_ms:                 Some(3_100),
 			premium_requests_millionths: 330_000,
 			identity:                    None,
+			recoveries:                  vec![InferenceRecovery {
+				attempt:     1,
+				kind:        InferenceRecoveryKind::HarmonyLeakRepair,
+				rule:        Str::new_static("harmony/codex/final"),
+				input_bytes: 48,
+				steps:       1,
+			}],
 		})
 		.expect("receipt");
 	session
@@ -435,10 +446,14 @@ fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
 		.compaction(Compaction {
 			summary,
 			boundary: receipt,
-			method: Some(Str::new_static("handoff")),
+			method: Some(Str::new_static("snapcompact")),
 			tokens_before: Some(256_000),
 			tokens_after: Some(20_000),
 			warning: Some(Str::new_static("dead end")),
+			frames: vec![omp_journal::data::Attachment {
+				blob: frame,
+				mime: Str::new_static("image/png"),
+			}],
 		})
 		.expect("compaction");
 	let live = session.dom().snapshot();
@@ -458,6 +473,20 @@ fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
 	assert_eq!(int(usage, PropId::CacheWrite), 100);
 	assert_eq!(int(usage, PropId::TtftMs), 420);
 	assert_eq!(int(usage, PropId::DurationMs), 3_100);
+	let recoveries = match usage.prop(&omp_dom::PropKey::Custom(Str::new_static("recoveries"))) {
+		Some(Value::Json(raw)) => {
+			serde_json::from_str::<serde_json::Value>(raw.get()).expect("typed recovery evidence")
+		},
+		other => panic!("recovery evidence is {other:?}"),
+	};
+	assert_eq!(
+		recoveries
+			.as_array()
+			.and_then(|items| items.first())
+			.and_then(|item| item.get("kind"))
+			.and_then(serde_json::Value::as_str),
+		Some("harmony_leak_repair")
+	);
 	let advisor = dom
 		.get(usages.next().expect("advisor usage"))
 		.expect("advisor usage node");
@@ -483,7 +512,7 @@ fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
 		compaction
 			.prop(&PropId::Method.into())
 			.and_then(Value::as_str),
-		Some("handoff")
+		Some("snapcompact")
 	);
 	assert_eq!(int(compaction, PropId::TokensBefore), 256_000);
 	assert_eq!(int(compaction, PropId::TokensAfter), 20_000);
@@ -493,6 +522,73 @@ fn receipt_and_compaction_facts_materialize_and_survive_reopen() {
 			.and_then(Value::as_str),
 		Some("dead end")
 	);
+	assert_eq!(int(compaction, PropId::FrameCount), 1);
+	let frames = omp_session::compaction_frames(compaction);
+	assert_eq!(frames, vec![omp_journal::data::Attachment {
+		blob: frame,
+		mime: Str::new_static("image/png"),
+	}]);
+	let projected = omp_session::project_thread(dom);
+	let message = projected
+		.first()
+		.and_then(|item| match item.kind.as_ref()? {
+			omp_proto::thread::v1::item::Kind::Message(message) => Some(message),
+			_ => None,
+		})
+		.expect("compaction summary message");
+	assert_eq!(message.parts.len(), 2, "summary text is followed by the retained frame");
+	let blob = message.parts[1]
+		.kind
+		.as_ref()
+		.and_then(|part| match part {
+			omp_proto::thread::v1::part::Kind::Blob(blob) => Some(blob),
+			_ => None,
+		})
+		.expect("frame blob");
+	assert_eq!(blob.hash.as_ref(), frame.hash.as_bytes());
+	assert_eq!(blob.size, frame.size);
+}
+
+#[test]
+fn compaction_rejects_frame_count_and_byte_payloads_beyond_durable_bounds() {
+	use omp_journal::{
+		blob::BlobRef,
+		data::{Attachment, Compaction, MAX_SNAPCOMPACT_FRAME_BYTES, MAX_SNAPCOMPACT_FRAMES},
+	};
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let mut session =
+		Session::create(directory.path().join("frame-bounds.oms"), ComponentRegistry::default())
+			.expect("session creates");
+	session.begin_turn().expect("turn");
+	let boundary = session.user("old", Vec::new()).expect("user");
+	let summary = session.blobs().put(b"summary").expect("summary");
+
+	let frame = Attachment {
+		blob: BlobRef { hash: Hash32::sum(b"frame"), size: 1 },
+		mime: Str::new_static("image/png"),
+	};
+	let mut too_many = Compaction::new(summary, boundary);
+	too_many.frames = vec![frame; MAX_SNAPCOMPACT_FRAMES + 1];
+	assert!(matches!(
+		session.compaction(too_many),
+		Err(omp_session::SessionError::TooManyCompactionFrames {
+			actual,
+			maximum: MAX_SNAPCOMPACT_FRAMES,
+		}) if actual == MAX_SNAPCOMPACT_FRAMES + 1
+	));
+
+	let mut too_large = Compaction::new(summary, boundary);
+	too_large.frames.push(Attachment {
+		blob: BlobRef { hash: Hash32::sum(b"large frame"), size: MAX_SNAPCOMPACT_FRAME_BYTES + 1 },
+		mime: Str::new_static("image/png"),
+	});
+	assert!(matches!(
+		session.compaction(too_large),
+		Err(omp_session::SessionError::CompactionFramesTooLarge {
+			actual,
+			maximum: MAX_SNAPCOMPACT_FRAME_BYTES,
+		}) if actual == MAX_SNAPCOMPACT_FRAME_BYTES + 1
+	));
 }
 
 proptest! {

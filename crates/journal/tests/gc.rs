@@ -6,6 +6,7 @@ use omp_core::Str;
 use omp_journal::{
 	EntryDraft, Journal, Kind,
 	blob::{BlobStore, GcPolicy},
+	data::{Attachment, Compaction},
 	gc::{collect_blobs, copy_journal_blobs, prune_abandoned},
 	kind::KindName,
 	live_chain,
@@ -271,6 +272,54 @@ fn shared_session_root_survives_switch_and_one_session_deletion() {
 	std::fs::remove_file(&paths[1]).expect("delete last session");
 	collect_blobs(&store, &[], no_grace()).expect("collect without sessions");
 	assert!(!store.has(&shared), "last journal deletion releases the root");
+}
+
+#[test]
+fn snapcompact_frames_remain_rooted_and_copy_with_their_session() {
+	let parent = tempfile::tempdir().expect("temporary directory");
+	let source = BlobStore::open(parent.path().join("source")).expect("source store");
+	let destination = BlobStore::open(parent.path().join("destination")).expect("destination store");
+	let summary = source.put(b"snapcompact summary").expect("summary");
+	let frame = source.put(b"snapcompact png").expect("frame");
+	let unrelated = source.put(b"unrelated").expect("unrelated");
+	let path = source.root().join("snapcompact.oms");
+	let mut journal = Journal::create(&path).expect("journal");
+	let genesis = journal
+		.append(draft(KindName::Journal, None, None))
+		.expect("genesis");
+	let payload = Compaction {
+		summary,
+		boundary: genesis.id,
+		method: Some(Str::new_static("snapcompact")),
+		tokens_before: Some(100_000),
+		tokens_after: Some(8_000),
+		warning: None,
+		frames: vec![Attachment { blob: frame, mime: Str::new_static("image/png") }],
+	};
+	journal
+		.append(draft_data(
+			KindName::Compaction,
+			Some(genesis.id),
+			None,
+			Str::new(serde_json::to_string(&payload).expect("payload json")),
+		))
+		.expect("compaction");
+	drop(journal);
+
+	let report =
+		collect_blobs(&source, std::slice::from_ref(&path), no_grace()).expect("collect blobs");
+	assert_eq!(report.roots_retained, 2);
+	assert!(source.has(&summary), "summary remains rooted");
+	assert!(source.has(&frame), "snapcompact frame remains rooted");
+	assert!(!source.has(&unrelated), "unrelated blob is collectable");
+
+	assert_eq!(
+		copy_journal_blobs(&source, &destination, std::slice::from_ref(&path))
+			.expect("copy session roots"),
+		2
+	);
+	assert_eq!(destination.get(&summary).expect("copied summary").as_ref(), b"snapcompact summary");
+	assert_eq!(destination.get(&frame).expect("copied frame").as_ref(), b"snapcompact png");
 }
 
 #[test]

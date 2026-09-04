@@ -291,8 +291,23 @@ impl Session {
 		let ToolUpdate(update): ToolUpdate = serde_json::from_str(entry.data.as_str())?;
 		let call = self.entry_call_handle(entry)?;
 		let value: serde_json::Value = serde_json::from_str(update.get())?;
-		if value.get("kernel").and_then(serde_json::Value::as_str) == Some("ready") {
-			return self.fold_tool_ready(entry, call, &value);
+		match value.get("kernel").and_then(serde_json::Value::as_str) {
+			Some("ready") => return self.fold_tool_ready(entry, call, &value),
+			Some("started") => {
+				return self.apply_ops(entry, vec![
+					Op::Set {
+						h: call,
+						prop: PropKey::Custom(Str::new_static("execution-started")),
+						value: Value::Bool(true),
+					},
+					Op::Set {
+						h: call,
+						prop: PropId::Order.into(),
+						value: Value::Str(Str::new(entry.id.to_string())),
+					},
+				]);
+			},
+			_ => {},
 		}
 		let mut ops = vec![Op::Set {
 			h:     call,
@@ -434,6 +449,9 @@ impl Session {
 	fn fold_receipt(&mut self, entry: &Entry) -> Result<(), SessionError> {
 		let payload: TurnReceipt = serde_json::from_str(entry.data.as_str())?;
 		let turn = self.current_turn_handle()?;
+		let recoveries = (!payload.recoveries.is_empty())
+			.then(|| serde_json::value::to_raw_value(&payload.recoveries))
+			.transpose()?;
 		let mut node = entry_node(KnownTag::Usage, entry)
 			.with_prop(PropId::TokensIn, unsigned(payload.tokens_in))
 			.with_prop(PropId::TokensOut, unsigned(payload.tokens_out))
@@ -443,6 +461,10 @@ impl Session {
 		if payload.premium_requests_millionths != 0 {
 			node =
 				node.with_prop(PropId::PremiumRequests, unsigned(payload.premium_requests_millionths));
+		}
+		if let Some(recoveries) = recoveries {
+			node =
+				node.with_prop(PropKey::Custom(Str::new_static("recoveries")), Value::Json(recoveries));
 		}
 		if let Some(identity) = payload.identity {
 			let kind: &'static str = identity.role.into();
@@ -464,12 +486,41 @@ impl Session {
 	fn fold_patch(&mut self, entry: &Entry) -> Result<(), SessionError> {
 		let payload: Patch = serde_json::from_str(entry.data.as_str())?;
 		let ops: Vec<Op> = serde_json::from_str(payload.ops.get())?;
+		let Some(boundary) = self.head else {
+			return self.apply_ops(entry, ops);
+		};
+		let meta = self.dom.meta();
+		let after = self.dom.children(meta).last().copied();
+		let ops = ops
+			.into_iter()
+			.map(|op| match op {
+				Op::Ins { parent, after: sibling, node } => match legacy_handoff_document(&node) {
+					Some(summary) => Op::Ins {
+						parent: meta,
+						after,
+						node: NodeSpec::new(KnownTag::Compaction)
+							.with_prop(PropId::Id, Value::Str(Str::new(entry.id.to_string())))
+							.with_prop(PropId::Cause, Value::Str(Str::new(entry.id.to_string())))
+							.with_prop(PropId::Boundary, Value::Str(Str::new(boundary.to_string())))
+							.with_prop(PropId::Summary, Value::Str(summary))
+							.with_prop(PropId::Method, Value::Str(Str::new_static("handoff"))),
+					},
+					None => Op::Ins { parent, after: sibling, node },
+				},
+				other => other,
+			})
+			.collect();
 		self.apply_ops(entry, ops)
 	}
 
 	fn fold_compaction(&mut self, entry: &Entry) -> Result<(), SessionError> {
 		let payload: Compaction = serde_json::from_str(entry.data.as_str())?;
+		self.validate_compaction_frames(&payload)?;
 		let summary = self.compaction_summary(&payload.summary)?;
+		let frames = (!payload.frames.is_empty())
+			.then(|| serde_json::value::to_raw_value(&payload.frames))
+			.transpose()?;
+		let frame_count = u64::try_from(payload.frame_count()).unwrap_or(u64::MAX);
 		let meta = self.dom.meta();
 		let mut node = NodeSpec::new(KnownTag::Compaction)
 			.with_prop(PropId::Id, Value::Str(Str::new(entry.id.to_string())))
@@ -485,6 +536,11 @@ impl Session {
 		}
 		if let Some(after) = payload.tokens_after {
 			node = node.with_prop(PropId::TokensAfter, unsigned(after));
+		}
+		if let Some(frames) = frames {
+			node = node
+				.with_prop(PropId::Frames, Value::Json(frames))
+				.with_prop(PropId::FrameCount, unsigned(frame_count));
 		}
 		if let Some(warning) = payload.warning {
 			node = node.with_prop(PropId::Warning, Value::Str(warning));
@@ -766,6 +822,33 @@ pub(crate) fn prompt_parts_text(raw: &RawValue) -> Result<Str, SessionError> {
 		}
 	}
 	Ok(Str::new(text))
+}
+
+/// Recognizes both custom-message DOM shapes used by prior omp journals:
+/// `<developer kind=custom name=handoff>` and the older
+/// `<notice kind=custom name=handoff>`.
+fn legacy_handoff_document(node: &NodeSpec) -> Option<Str> {
+	if !matches!(&node.tag, Tag::Known(KnownTag::Developer | KnownTag::Notice)) {
+		return None;
+	}
+	let prop = |key: PropKey| {
+		node
+			.props
+			.iter()
+			.find_map(|(candidate, value)| (candidate == &key).then_some(value))
+	};
+	if prop(PropId::Kind.into()).and_then(Value::as_str) != Some("custom")
+		|| prop(PropId::Name.into()).and_then(Value::as_str) != Some("handoff")
+		|| matches!(
+			prop(PropKey::Custom(Str::new_static(crate::custom_message::DISPLAY_PROP))),
+			Some(Value::Bool(false))
+		) {
+		return None;
+	}
+	Some(node.content.as_ref().map_or_else(Str::default, |body| {
+		let document = crate::custom_message::extract_handoff_document(body.as_str());
+		body.slice_ref(document)
+	}))
 }
 
 fn unsigned(value: u64) -> Value {

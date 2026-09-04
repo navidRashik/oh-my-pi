@@ -402,6 +402,102 @@ fn projection_excludes_pre_compaction_turns_and_prepends_summary() {
 }
 
 #[test]
+fn legacy_custom_handoff_normalizes_across_projection_replay_and_branching() {
+	let directory = tempfile::tempdir().expect("temporary session directory");
+	let path = directory.path().join("legacy-handoff.oms");
+	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
+	session.begin_turn().expect("turn starts");
+	let boundary = session
+		.user("history replaced by handoff", Vec::new())
+		.expect("user appends");
+	let turn = *session
+		.dom()
+		.children(session.dom().body())
+		.last()
+		.expect("turn");
+	let legacy = session
+		.patch(Txn {
+			cause: session.head().expect("head"),
+			label: Some(Str::new_static("legacy.custom-message")),
+			ops:   vec![Op::Ins {
+				parent: turn,
+				after:  session.dom().children(turn).last().copied(),
+				node:   NodeSpec::new(KnownTag::Notice)
+					.with_prop(PropId::Kind, Value::Str(Str::new_static("custom")))
+					.with_prop(PropId::Name, Value::Str(Str::new_static("handoff")))
+					.with_content(
+						"preamble<handoff-context>\n# Goal\nContinue here.\n</handoff-context>trailer",
+					),
+			}],
+		})
+		.expect("legacy custom handoff appends");
+	session.begin_turn().expect("tail turn starts");
+	session.user("tail", Vec::new()).expect("tail appends");
+
+	let compactions = find_tag(&session, KnownTag::Compaction);
+	assert_eq!(compactions.len(), 1);
+	let compaction = session.dom().get(compactions[0]).expect("compaction");
+	assert_eq!(
+		compaction
+			.prop(&PropId::Method.into())
+			.and_then(Value::as_str),
+		Some("handoff")
+	);
+	assert_eq!(
+		compaction
+			.prop(&PropId::Summary.into())
+			.and_then(Value::as_str),
+		Some("# Goal\nContinue here.")
+	);
+	let boundary_text = boundary.to_string();
+	assert_eq!(
+		compaction
+			.prop(&PropId::Boundary.into())
+			.and_then(Value::as_str),
+		Some(boundary_text.as_str())
+	);
+	assert!(find_tag(&session, KnownTag::Notice).is_empty());
+
+	let model_text = |session: &Session| {
+		project_thread(session.dom())
+			.into_iter()
+			.filter_map(|item| match item.kind? {
+				item::Kind::Message(message) => match message.parts.first()?.kind.as_ref()? {
+					part::Kind::Text(text) => Some(text.clone()),
+					_ => None,
+				},
+				_ => None,
+			})
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(model_text(&session), ["# Goal\nContinue here.", "tail"]);
+	let live = session.dom().snapshot();
+	drop(session);
+
+	let mut restored =
+		Session::open(&path, ComponentRegistry::default()).expect("legacy handoff replays");
+	assert_eq!(restored.dom().snapshot(), live);
+	assert_eq!(model_text(&restored), ["# Goal\nContinue here.", "tail"]);
+
+	restored
+		.rewind(boundary)
+		.expect("branch selects pre-handoff history");
+	restored.begin_turn().expect("branch turn starts");
+	restored
+		.user("alternate branch", Vec::new())
+		.expect("branch user appends");
+	assert!(find_tag(&restored, KnownTag::Compaction).is_empty());
+	assert_eq!(model_text(&restored), ["history replaced by handoff", "alternate branch"]);
+	let branched = restored.dom().snapshot();
+	drop(restored);
+
+	let reopened = Session::open(&path, ComponentRegistry::default()).expect("branch replays");
+	assert_eq!(reopened.dom().snapshot(), branched);
+	assert_eq!(model_text(&reopened), ["history replaced by handoff", "alternate branch"]);
+	assert!(reopened.entry(legacy).is_some(), "abandoned handoff remains journaled");
+}
+
+#[test]
 fn projection_through_keeps_only_entries_up_to_the_cut_and_no_summary() {
 	use omp_session::project_thread_through;
 
@@ -506,7 +602,11 @@ fn reopen_journals_abort_results_for_ready_and_partial_calls() {
 		.expect("partial argument delta");
 	drop(session);
 
-	let restored = Session::open(&path, ComponentRegistry::default()).expect("session restores");
+	let mut restored = Session::open(&path, ComponentRegistry::default()).expect("session restores");
+	assert_eq!(restored.unsettled_calls().len(), 2);
+	restored
+		.recover_process_disappearance()
+		.expect("writable owner recovers calls");
 	assert!(restored.unsettled_calls().is_empty());
 	let statuses: std::collections::BTreeMap<_, _> = restored
 		.dom()
@@ -549,8 +649,14 @@ fn reopen_journals_abort_results_for_ready_and_partial_calls() {
 	assert_eq!(results, [("ready-call", true), ("abandoned-call", true)]);
 	drop(restored);
 	let recovered_journal = std::fs::read(&path).expect("recovered journal bytes");
-	let reopened = Session::open(&path, ComponentRegistry::default()).expect("session reopens");
-	assert!(reopened.unsettled_calls().is_empty(), "recovery is idempotent");
+	let mut reopened = Session::open(&path, ComponentRegistry::default()).expect("session reopens");
+	assert!(reopened.unsettled_calls().is_empty(), "recovery is durable");
+	assert!(
+		!reopened
+			.recover_process_disappearance()
+			.expect("second owner recovery"),
+		"recovery is idempotent"
+	);
 	drop(reopened);
 	assert_eq!(
 		std::fs::read(&path).expect("journal bytes"),
