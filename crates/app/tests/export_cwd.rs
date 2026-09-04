@@ -40,15 +40,14 @@ fn cwd_is_applied_before_export_session_resolution() {
 		.output()
 		.expect("run omp export");
 	assert!(output.status.success(), "export failed: {}", String::from_utf8_lossy(&output.stderr));
-	assert!(
-		project
-			.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.export.oms")
-			.is_file()
-	);
-	assert!(project.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.txt").is_file());
+	let exported = project.join("omp-session-01ARZ3NDEKTSV4RRFFQ69G5FAV.html");
+	assert!(exported.is_file());
+	let html = fs::read_to_string(exported).expect("HTML export");
+	assert!(html.starts_with("<!doctype html>"));
+	assert!(html.contains("cwd export"));
 	assert!(
 		!launch
-			.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.export.oms")
+			.join("omp-session-01ARZ3NDEKTSV4RRFFQ69G5FAV.html")
 			.exists()
 	);
 }

@@ -22,11 +22,9 @@ use super::ServiceState;
 static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// pi `dumpLlmRequestToTmpDir`: `<tmp>/omp-request-<stem>.json`.
-pub(super) fn dump_request(state: &ServiceState) -> ServiceResult<PathBuf> {
+pub(super) fn dump_request(state: &ServiceState, dom: &omp_dom::Dom) -> ServiceResult<PathBuf> {
 	let journal = state.live_journal.read().clone();
-	let session = omp_session::Session::open(&journal, omp_session::ComponentRegistry::standard())
-		.map_err(ServiceError::failed)?;
-	let items = omp_session::project_thread(session.dom());
+	let items = omp_session::project_thread(dom);
 	let stem = journal
 		.file_stem()
 		.and_then(|stem| stem.to_str())

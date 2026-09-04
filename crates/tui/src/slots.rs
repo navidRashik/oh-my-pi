@@ -10,7 +10,8 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use omp_core::Str;
 
 use crate::{
-	Frame, IntoComponent, Prop, Size, Ui, UiContext,
+	CellContent, Frame, IntoComponent, Pipeline, Prop, RichSink, RichText, RowMark, Size, Style, Ui,
+	UiContext,
 	components::{Pre, TextLeaf},
 	frame_text,
 };
@@ -70,11 +71,19 @@ pub enum BlockState {
 }
 
 /// One width-independent logical-history row.
+///
+/// The plain text and its coalesced semantic styles are retained together.
+/// Terminal escapes are never cached here: the renderer materializes them
+/// exactly once when this row enters native history.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Row {
-	block:   BlockId,
-	ordinal: u32,
-	text:    Str,
+	block:        BlockId,
+	ordinal:      u32,
+	text:         Str,
+	rich:         Arc<RichText>,
+	soft_wrap:    bool,
+	prompt_start: bool,
+	prompt_end:   bool,
 }
 
 impl Row {
@@ -88,7 +97,7 @@ impl Row {
 		self.ordinal
 	}
 
-	/// Plain semantic fallback used to rewrap history after a resize.
+	/// Plain semantic text represented by this styled row.
 	pub fn text(&self) -> &str {
 		self.text.as_str()
 	}
@@ -166,6 +175,16 @@ pub enum Delivered {
 	Partial(usize),
 }
 
+#[derive(Clone)]
+struct RenderedRow {
+	frame:        Arc<Frame>,
+	text:         Str,
+	rich:         Arc<RichText>,
+	soft_wrap:    bool,
+	prompt_start: bool,
+	prompt_end:   bool,
+}
+
 struct Block {
 	mode:        Mode,
 	state:       BlockState,
@@ -174,9 +193,13 @@ struct Block {
 	/// rather than the engine's plain text leaf: its settled render, not a
 	/// preformatted copy of `text`, is what commits.
 	custom_root: bool,
+	/// A discarded streaming prefix is frozen at exactly the rows already
+	/// acknowledged; later context or width changes must not resurrect its
+	/// vanished tail.
+	frozen:      bool,
 	text:        String,
-	rendered:    Vec<Arc<Frame>>,
-	commit_rows: Vec<Arc<Frame>>,
+	rendered:    Vec<RenderedRow>,
+	commit_rows: Vec<RenderedRow>,
 	emitted:     usize,
 }
 
@@ -187,6 +210,7 @@ impl Block {
 			state: BlockState::Active,
 			ui: None,
 			custom_root: false,
+			frozen: false,
 			text: String::new(),
 			rendered: Vec::new(),
 			commit_rows: Vec::new(),
@@ -368,6 +392,7 @@ impl Slots {
 			// Only an append-only stream emits while active, and it emits
 			// from its rendered rows: those acknowledged are the block.
 			block.commit_rows = block.rendered[..block.emitted.min(block.rendered.len())].to_vec();
+			block.frozen = true;
 			block.state = BlockState::Finalized;
 		}
 		self.advance_frontier();
@@ -550,14 +575,21 @@ impl Slots {
 				ui.resize(width);
 			}
 			Self::render_block(width, block);
-			if block.mode == Mode::Mutable || (block.custom_root && block.state != BlockState::Active)
+			if !block.frozen
+				&& (block.mode == Mode::Mutable
+					|| (block.custom_root && block.state != BlockState::Active))
 			{
 				block.commit_rows.clone_from(&block.rendered);
-			} else if block.state != BlockState::Active {
+			} else if !block.frozen && block.state != BlockState::Active {
 				block.commit_rows =
 					Self::settled_text_rows(width, block.text.as_str(), self.ctx.clone());
 			}
-			block.emitted = block.emitted.min(block.commit_rows.len());
+			let retained_rows = if block.state == BlockState::Active {
+				block.rendered.len()
+			} else {
+				block.commit_rows.len()
+			};
+			block.emitted = block.emitted.min(retained_rows);
 		}
 	}
 
@@ -569,17 +601,24 @@ impl Slots {
 		block.rendered = Self::rows_from_frame(width, ui.frame());
 	}
 
-	fn settled_text_rows(width: u16, text: &str, ctx: UiContext) -> Vec<Arc<Frame>> {
+	fn settled_text_rows(width: u16, text: &str, ctx: UiContext) -> Vec<RenderedRow> {
 		let ui = Ui::from_root(Pre::new().text(text), width, ctx);
 		Self::rows_from_frame(width, ui.frame())
 	}
 
-	fn rows_from_frame(width: u16, frame: &Frame) -> Vec<Arc<Frame>> {
+	fn rows_from_frame(width: u16, frame: &Frame) -> Vec<RenderedRow> {
 		let mut rows = Vec::with_capacity(usize::from(frame.size().height));
 		for row in 0..frame.size().height {
 			let mut one = Frame::new(Size::new(width, 1));
 			one.blit(frame, row, 1, 0, 0);
-			rows.push(Arc::new(one));
+			rows.push(RenderedRow {
+				text:         Str::from(frame_text(&one)),
+				rich:         Arc::new(Self::styled_row(&one)),
+				prompt_start: one.row_mark(0, RowMark::PromptStart),
+				prompt_end:   one.row_mark(0, RowMark::PromptEnd),
+				frame:        Arc::new(one),
+				soft_wrap:    frame.soft_wrap(row),
+			});
 		}
 		rows
 	}
@@ -624,21 +663,60 @@ impl Slots {
 		out: &mut Vec<PlannedRow>,
 		id: BlockId,
 		block: &Block,
-		frames: &[Arc<Frame>],
+		frames: &[RenderedRow],
 		end: usize,
 	) {
 		for ordinal in block.emitted..end {
-			let frame = Arc::clone(&frames[ordinal]);
-			out.push(PlannedRow { logical: Self::logical_row(id, ordinal, &frame), frame });
+			let rendered = &frames[ordinal];
+			let frame = Arc::clone(&rendered.frame);
+			out.push(PlannedRow {
+				logical: Self::logical_row(id, ordinal, rendered),
+				frame,
+			});
 		}
 	}
 
-	fn logical_row(id: BlockId, ordinal: usize, frame: &Frame) -> Row {
+	fn logical_row(id: BlockId, ordinal: usize, rendered: &RenderedRow) -> Row {
 		Row {
-			block:   id,
-			ordinal: u32::try_from(ordinal).unwrap_or(u32::MAX),
-			text:    Str::from(frame_text(frame).trim_end_matches('\n')),
+			block:        id,
+			ordinal:      u32::try_from(ordinal).unwrap_or(u32::MAX),
+			text:         rendered.text.clone(),
+			rich:         Arc::clone(&rendered.rich),
+			soft_wrap:    rendered.soft_wrap,
+			prompt_start: rendered.prompt_start,
+			prompt_end:   rendered.prompt_end,
 		}
+	}
+
+	/// Captures one rendered row as escape-free text plus coalesced
+	/// `(Style, Range)` runs. Styled blanks remain meaningful (message fills
+	/// and native selection), while terminal-padding blanks are omitted.
+	fn styled_row(frame: &Frame) -> RichText {
+		let end = (0..frame.size().width)
+			.rfind(|&x| {
+				let cell = frame.cell(x, 0);
+				cell.style() != Style::default()
+					|| !matches!(cell.content(), CellContent::Blank | CellContent::Continuation)
+			})
+			.map_or(0, |x| x + 1);
+		let mut rich = RichText::default();
+		let mut x = 0;
+		while x < end {
+			let cell = frame.cell(x, 0);
+			match cell.content() {
+				CellContent::Blank | CellContent::Image { .. } => {
+					rich.run(cell.style(), " ");
+					x += 1;
+				},
+				CellContent::Grapheme { text, width } => {
+					rich.run(cell.style(), text);
+					x = x.saturating_add(*width);
+				},
+				CellContent::Continuation => x += 1,
+			}
+		}
+		rich.newline();
+		rich
 	}
 
 	fn live_demand(&self) -> usize {
@@ -681,8 +759,8 @@ impl Slots {
 			let available = block.rendered.len().saturating_sub(block.emitted);
 			let take = rows.min(available);
 			let source = block.rendered.len().saturating_sub(take);
-			for frame in &block.rendered[source..] {
-				viewport.blit(frame, 0, 1, 0, u16::try_from(y).expect("viewport row fits u16"));
+			for row in &block.rendered[source..] {
+				viewport.blit(&row.frame, 0, 1, 0, u16::try_from(y).expect("viewport row fits u16"));
 				y += 1;
 			}
 			if take == 0 {
@@ -720,14 +798,74 @@ impl Slots {
 
 	fn replay_rows(&self) -> Vec<PlannedRow> {
 		let mut rows = Vec::new();
-		for logical in &self.history {
-			let ui =
-				Ui::from_root(Pre::new().text(logical.text.clone()), self.width, self.ctx.clone());
-			for physical in 0..ui.frame().size().height {
-				let mut frame = Frame::new(Size::new(self.width, 1));
-				frame.blit(ui.frame(), physical, 1, 0, 0);
-				rows.push(PlannedRow { logical: logical.clone(), frame: Arc::new(frame) });
+		let mut cursor = 0;
+		while cursor < self.history.len() {
+			let id = self.history[cursor].block;
+			let end = cursor
+				+ self.history[cursor..]
+					.iter()
+					.take_while(|row| row.block == id)
+					.count();
+			let block = self.block(id);
+			if block.state == BlockState::Committed
+				&& !block.frozen
+				&& !block.commit_rows.is_empty()
+			{
+				for (ordinal, rendered) in block.commit_rows.iter().enumerate() {
+					rows.push(PlannedRow {
+						logical: Self::logical_row(id, ordinal, rendered),
+						frame:   Arc::clone(&rendered.frame),
+					});
+				}
+			} else {
+				let mut logical_cursor = cursor;
+				while logical_cursor < end {
+					let first = &self.history[logical_cursor];
+					let mut source = RichText::default();
+					let mut prompt_start = false;
+					let mut prompt_end = false;
+					loop {
+						let logical = &self.history[logical_cursor];
+						logical.rich.replay_row(0, &mut source);
+						prompt_start |= logical.prompt_start;
+						prompt_end |= logical.prompt_end;
+						logical_cursor += 1;
+						if !logical.soft_wrap || logical_cursor == end {
+							break;
+						}
+					}
+					let mut wrapped = RichText::default();
+					{
+						let mut sink = (&mut wrapped).wrap_chars(self.width);
+						source.replay_row(0, &mut sink);
+					}
+					let count = RichText::rows(&wrapped).max(1);
+					for physical in 0..count {
+						let mut frame = Frame::new(Size::new(self.width, 1));
+						let mut x = 0;
+						for (style, text) in wrapped.row_runs(physical) {
+							x = frame.put_clipped(
+								x,
+								0,
+								self.width.saturating_sub(x),
+								text,
+								style,
+							);
+						}
+						if prompt_start && physical == 0 {
+							frame.mark_row(0, RowMark::PromptStart);
+						}
+						if prompt_end && physical + 1 == count {
+							frame.mark_row(0, RowMark::PromptEnd);
+						}
+						rows.push(PlannedRow {
+							logical: first.clone(),
+							frame:   Arc::new(frame),
+						});
+					}
+				}
 			}
+			cursor = end;
 		}
 		rows
 	}
@@ -749,18 +887,18 @@ impl Slots {
 		for index in 0..id.index() {
 			let block_id = Self::id(index);
 			let block = &self.blocks[index];
-			for (ordinal, frame) in block.commit_rows.iter().enumerate() {
+			for (ordinal, rendered) in block.commit_rows.iter().enumerate() {
 				rows.push(PlannedRow {
-					logical: Self::logical_row(block_id, ordinal, frame),
-					frame:   Arc::clone(frame),
+					logical: Self::logical_row(block_id, ordinal, rendered),
+					frame:   Arc::clone(&rendered.frame),
 				});
 			}
 		}
 		let block = self.block(id);
-		for (ordinal, frame) in block.commit_rows.iter().enumerate() {
+		for (ordinal, rendered) in block.commit_rows.iter().enumerate() {
 			rows.push(PlannedRow {
-				logical: Self::logical_row(id, ordinal, frame),
-				frame:   Arc::clone(frame),
+				logical: Self::logical_row(id, ordinal, rendered),
+				frame:   Arc::clone(&rendered.frame),
 			});
 		}
 		self.repair =
@@ -802,7 +940,7 @@ impl Slots {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{anim, components::Markdown};
+	use crate::{Color, anim, components::Markdown};
 
 	fn history(slots: &Slots) -> Vec<(u32, String)> {
 		slots
@@ -886,6 +1024,60 @@ mod tests {
 			history(&slots).starts_with(&before),
 			"already-delivered history remains an exact prefix"
 		);
+	}
+
+	#[test]
+	fn committed_rows_retain_semantic_styles_and_links_across_rebuilds() {
+		let foreground = Color::Rgb(0x12, 0x34, 0x56);
+		let background = Color::Rgb(0x21, 0x43, 0x65);
+		let link = "https://example.test/committed";
+		let expected = Style::new()
+			.fg(foreground)
+			.bg(background)
+			.bold()
+			.underline()
+			.link(link);
+		let content = || {
+			TextLeaf::new()
+				.text("colored")
+				.with(Prop::Fg, foreground)
+				.with(Prop::Bg, background)
+				.with(Prop::Bold, true)
+				.with(Prop::Underline, true)
+				.with(Prop::Href, link)
+		};
+		let mut slots = Slots::new(12, 2, ResizePolicy::Rebuild);
+		let id = slots.open(Mode::Mutable);
+		slots.set(id, content());
+		slots.finalize(id);
+
+		let initial = slots.plan();
+		let styled = initial
+			.rows()
+			.iter()
+			.find(|row| row.logical().text().contains("colored"))
+			.expect("styled row is staged");
+		assert_eq!(styled.frame().cell(0, 0).style(), expected);
+		assert_eq!(styled.logical().rich.row_runs(0).next().expect("styled run").0, expected);
+		assert!(!styled.logical().text().contains('\x1b'), "cached text remains escape-free");
+		slots.commit(initial, Delivered::All);
+
+		for width in [24, 8, 12] {
+			slots.resize(width, 2);
+			let replay = slots.plan();
+			assert!(replay.rebuild());
+			let styled = replay
+				.rows()
+				.iter()
+				.find(|row| row.logical().text().contains("colored"))
+				.expect("styled row survives replay");
+			assert_eq!(
+				styled.frame().cell(0, 0).style(),
+				expected,
+				"semantic style changed at width {width}",
+			);
+			slots.commit(replay, Delivered::All);
+		}
 	}
 
 	#[test]

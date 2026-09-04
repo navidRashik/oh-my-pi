@@ -2209,8 +2209,11 @@ pub struct Editor {
 	history_index:         Option<usize>,
 	history_draft:         Str,
 	history_query:         Option<Str>,
-	/// Volatile speech-preview range and exact text in the visible buffer.
+	/// Volatile speech/IME preview range and exact text in the visible buffer.
 	volatile:              Option<(Range<usize>, Str)>,
+	/// Whether a volatile preview exposes its insertion caret. Native IMEs
+	/// use `None` to hide it while selecting a marked-text candidate.
+	volatile_cursor:       bool,
 	last_layout_width:     Cell<u16>,
 	last_page_rows:        Cell<usize>,
 }
@@ -2232,6 +2235,7 @@ impl Editor {
 			history_draft: Default::default(),
 			history_query: None,
 			volatile: None,
+			volatile_cursor: true,
 			last_layout_width: Cell::new(80),
 			last_page_rows: Cell::new(DEFAULT_PAGE_ROWS),
 		}
@@ -2250,6 +2254,7 @@ impl Editor {
 		self.history_index = None;
 		self.history_query = None;
 		self.volatile = None;
+		self.volatile_cursor = true;
 		self.buffer.replace_external(text, false);
 		self.refresh();
 	}
@@ -2688,6 +2693,17 @@ impl Editor {
 	/// Replacements do not enter undo history. The caret stays synchronized
 	/// with its logical position around the span as its byte length changes.
 	pub fn set_volatile_text(&mut self, text: &str) {
+		self.set_volatile_text_selection(text, Some(text.len()..text.len()));
+	}
+
+	/// Shows or replaces one volatile native-IME preedit and applies the
+	/// byte-indexed selection winit reports inside that preedit. `None`
+	/// hides the insertion caret while the platform candidate picker owns it.
+	pub fn set_volatile_text_selection(
+		&mut self,
+		text: &str,
+		selection: Option<Range<usize>>,
+	) {
 		self.history_index = None;
 		self.history_query = None;
 		let range = self
@@ -2698,13 +2714,48 @@ impl Editor {
 			})
 			.map_or_else(|| self.buffer.cursor()..self.buffer.cursor(), |(range, _)| range);
 		let range = self.buffer.replace_transient_range(range, text);
+		self.volatile_cursor = selection.is_some();
+		if let Some(selection) = selection {
+			let (start, end) = {
+				// `replace_transient_range` applies the same NFC/control
+				// sanitation as ordinary input. Clamp the platform's offsets
+				// against those retained bytes so decomposed marked text
+				// cannot place the caret beyond the normalized span.
+				let retained = &self.buffer.text()[range.clone()];
+				let boundary = |mut at: usize| {
+					at = at.min(retained.len());
+					while !retained.is_char_boundary(at) {
+						at -= 1;
+					}
+					at
+				};
+				let start = boundary(selection.start);
+				let end = boundary(selection.end);
+				if start <= end { (start, end) } else { (end, start) }
+			};
+			self.buffer.cursor = range.start + end;
+			self.buffer.anchor = (start != end).then_some(range.start + start);
+		}
 		self.volatile =
 			(!range.is_empty()).then(|| (range.clone(), Str::new(&self.buffer.text()[range])));
 		self.refresh();
 	}
 
+	/// Whether the retained editor should expose its hardware/native caret.
+	#[must_use]
+	pub const fn caret_visible(&self) -> bool {
+		self.volatile_cursor
+	}
+
+	/// Whether a volatile speech/IME span is currently retained.
+	#[must_use]
+	pub const fn volatile_active(&self) -> bool {
+		self.volatile.is_some()
+	}
+
 	/// Discards the active volatile speech-recognition preview.
 	pub fn clear_volatile_text(&mut self) {
+		self.volatile_cursor = true;
 		let Some((range, expected)) = self.volatile.take() else {
 			return;
 		};
@@ -2718,6 +2769,7 @@ impl Editor {
 	pub fn commit_volatile_text(&mut self, text: &str) {
 		self.history_index = None;
 		self.history_query = None;
+		self.volatile_cursor = true;
 		if let Some((range, expected)) = self.volatile.take()
 			&& self.buffer.text().get(range.clone()) == Some(expected.as_str())
 		{

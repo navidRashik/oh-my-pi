@@ -1916,12 +1916,53 @@ where
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
 							"export_html" => {
-								let response = RpcResponse::error(
-									id,
-									command.as_str(),
-									"HTML export is unavailable on the journal RPC actor",
-									Some(RpcErrorCode::new("unsupported")),
+								let requested = request.params.get("outputPath").and_then(Value::as_str);
+								let target = requested.map_or_else(
+									|| {
+										let stem = active_session_path
+											.file_stem()
+											.and_then(|value| value.to_str())
+											.unwrap_or("session");
+										runtime.project.join(format!("omp-session-{stem}.html"))
+									},
+									|path| {
+										let path = std::path::PathBuf::from(path);
+										if path.is_absolute() {
+											path
+										} else {
+											runtime.project.join(path)
+										}
+									},
 								);
+								let blobs = omp_journal::blob::BlobStore::open(
+									active_session_path
+										.parent()
+										.unwrap_or_else(|| std::path::Path::new(".")),
+								);
+								let response = match blobs
+									.into_diagnostic()
+									.and_then(|blobs| {
+										crate::render_cmd::export_html_snapshot(
+											&active_session_path,
+											&replica,
+											&blobs,
+											&target,
+										)
+									})
+								{
+									Ok(()) => RpcResponse::success(
+										id,
+										command.as_str(),
+										json!({"path": target}),
+									)
+									.into_diagnostic()?,
+									Err(source) => RpcResponse::error(
+										id,
+										command.as_str(),
+										source.to_string(),
+										Some(RpcErrorCode::new("export_error")),
+									),
+								};
 								outgoing_tx.send(Outgoing::Frame(serde_json::to_value(response).into_diagnostic()?)).into_diagnostic()?;
 							},
 							"get_login_providers" => {

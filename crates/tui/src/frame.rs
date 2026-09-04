@@ -926,10 +926,17 @@ impl Frame {
 		self.cursor = Some((x, y));
 	}
 
+	/// Removes the terminal/native hardware cursor from this frame.
+	pub const fn clear_cursor(&mut self) {
+		self.touch();
+		self.cursor = None;
+	}
+
 	/// Replaces every cell with a styled blank.
 	pub fn clear(&mut self, style: Style) {
 		self.touch();
 		self.cells.fill(Cell::blank(style));
+		self.cursor = None;
 		self.decors.clear();
 		self.noselect.clear();
 		self.soft_wraps.clear();

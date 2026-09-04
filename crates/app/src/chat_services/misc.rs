@@ -31,11 +31,13 @@ fn failed(error: impl std::fmt::Display) -> ServiceError {
 	ServiceError::failed(error)
 }
 
-/// `/export [path]`: the pure transcript projection of the live journal.
-pub fn export(state: &ServiceState, path: Option<&Path>) -> ServiceResult<PathBuf> {
+/// `/export [path]`: a standalone HTML projection of the live journal.
+pub fn export(
+	state: &ServiceState,
+	dom: &omp_dom::Dom,
+	path: Option<&Path>,
+) -> ServiceResult<PathBuf> {
 	let journal = state.live_journal.read().clone();
-	let session = omp_session::Session::open(&journal, omp_session::ComponentRegistry::standard())
-		.map_err(failed)?;
 	let target = match path {
 		Some(path) if path.is_absolute() => path.to_path_buf(),
 		Some(path) => state.project.join(path),
@@ -44,10 +46,14 @@ pub fn export(state: &ServiceState, path: Option<&Path>) -> ServiceResult<PathBu
 				.file_stem()
 				.and_then(|stem| stem.to_str())
 				.unwrap_or("session");
-			state.project.join(format!("{stem}.txt"))
+			state.project.join(format!("omp-session-{stem}.html"))
 		},
 	};
-	fs::write(&target, crate::print_mode::transcript_text(session.dom())).map_err(failed)?;
+	let blobs = omp_journal::blob::BlobStore::open(
+		journal.parent().unwrap_or_else(|| Path::new(".")),
+	)
+	.map_err(failed)?;
+	crate::render_cmd::export_html_snapshot(&journal, dom, &blobs, &target).map_err(failed)?;
 	Ok(target)
 }
 

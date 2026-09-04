@@ -34,14 +34,14 @@ use std::{
 
 use omp_core::Str;
 use omp_tui::{
-	CellContent, Charset, DecorKind, Frame, Graphics, Key, Keymap, Mouse, MouseButton, MouseReport,
-	Size, Style, UiContext,
+	Appearance, CellContent, Charset, DecorKind, Frame, Graphics, Key, Keymap, Mouse, MouseButton,
+	MouseReport, Size, Style, UiContext,
 	paste::{self, ClipboardRead, ClipboardReadOutcome, ClipboardWriteOutcome},
 };
 use smallvec::SmallVec;
 use winit::{
 	application::ApplicationHandler,
-	dpi::{LogicalSize, PhysicalPosition},
+	dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
 	event::{ElementState, Ime, KeyEvent, MouseScrollDelta, WindowEvent},
 	event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
 	keyboard::{KeyCode, ModifiersState, PhysicalKey},
@@ -81,6 +81,13 @@ const MULTI_CLICK_DELAY: Duration = Duration::from_millis(420);
 
 /// Maximum pointer drift between presses in one multi-click gesture.
 const MULTI_CLICK_DISTANCE: f32 = 6.0;
+
+const fn native_appearance(theme: window::Theme) -> Appearance {
+	match theme {
+		window::Theme::Light => Appearance::Light,
+		window::Theme::Dark => Appearance::Dark,
+	}
+}
 
 /// Window and text configuration for one host run.
 #[derive(Clone, Debug)]
@@ -433,6 +440,7 @@ struct WindowHost<S> {
 	compositor:        Compositor,
 	ctx:               UiContext,
 	theme:             GuiTheme,
+	opacity:           f32,
 	metrics:           CellMetrics,
 	/// Physical font px including the scale factor.
 	px:                f32,
@@ -453,6 +461,8 @@ struct WindowHost<S> {
 	/// Last cursor icon set, to skip redundant sets.
 	cursor:            CursorIcon,
 	last_select_press: Option<(Instant, [f32; 2])>,
+	window_focused:    bool,
+	ime_enabled:       bool,
 	started:           Instant,
 	blink_epoch:       Instant,
 	next_tick:         Instant,
@@ -516,6 +526,53 @@ fn pane_in_editor<S>(pane: &Pane<S>, metrics: &CellMetrics, pointer: [f32; 2]) -
 
 fn pane_max_scroll<S>(pane: &Pane<S>, metrics: &CellMetrics) -> f32 {
 	f32::from(pane.doc_rows.saturating_sub(pane.viewport.height)) * metrics.line_height
+}
+
+/// Resolves the focused scene's retained caret to a physical input-method
+/// candidate area. Active layers own the caret exactly as the compositor
+/// does; otherwise the document cursor is translated through native
+/// scrollback.
+fn ime_cursor_area(
+	scene: &SceneFrame<'_>,
+	origin: [f32; 2],
+	scroll: f32,
+	metrics: &CellMetrics,
+) -> Option<(PhysicalPosition<i32>, PhysicalSize<u32>)> {
+	let layer_cursor = scene
+		.layers
+		.iter()
+		.rev()
+		.filter(|layer| layer.active)
+		.find_map(|layer| {
+			let (col, row) = layer.frame.cursor()?;
+			let band = layer.band(scene.viewport);
+			(row >= band.src_top && row < band.src_top.saturating_add(band.rows))
+				.then_some((band.x.saturating_add(col), band.y.saturating_add(row - band.src_top)))
+	});
+	let (col, row) = match layer_cursor {
+		Some(cursor) => cursor,
+		None if scene.layers.iter().any(|layer| layer.active) => return None,
+		None => {
+			let (col, row) = scene.frame.cursor()?;
+			let document_rows = scene.frame.size().height;
+			let scroll_rows = scroll / metrics.line_height;
+			let end =
+				(f32::from(document_rows) - scroll_rows).clamp(0.0, f32::from(document_rows));
+			let start = (end - f32::from(scene.viewport.height)).max(0.0);
+			let viewport_row = f32::from(row) - start;
+			if viewport_row < 0.0 || viewport_row >= f32::from(scene.viewport.height) {
+				return None;
+			}
+			(col, viewport_row.floor() as u16)
+		},
+	};
+	let position = PhysicalPosition::new(
+		(origin[0] + f32::from(col) * metrics.advance).round() as i32,
+		(origin[1] + f32::from(row) * metrics.line_height).round() as i32,
+	);
+	let size =
+		PhysicalSize::new(metrics.advance.ceil().max(1.0) as u32, metrics.line_height.ceil() as u32);
+	Some((position, size))
 }
 
 /// Arrow keycap → pane direction, for ⌘⌥/⌘⌃ chords.
@@ -657,7 +714,19 @@ impl<S: Scene> WindowHost<S> {
 		if index >= self.tabs.len() || index == self.active {
 			return;
 		}
+		let prior = self.focused();
+		if self.window_focused
+			&& let Some(pane) = self.pane_mut(prior)
+		{
+			let _ = pane.scene.focus(false);
+		}
 		self.active = index;
+		if self.window_focused {
+			let focused = self.focused();
+			if let Some(pane) = self.pane_mut(focused) {
+				let _ = pane.scene.focus(true);
+			}
+		}
 		if self.tabs[index].stale {
 			self.tabs[index].stale = false;
 			self.relayout(true);
@@ -714,8 +783,19 @@ impl<S: Scene> WindowHost<S> {
 	}
 
 	fn focus_pane(&mut self, id: PaneId) {
-		if self.tab().focused != id && self.pane(id).is_some() {
+		let prior = self.tab().focused;
+		if prior != id && self.pane(id).is_some() {
+			if self.window_focused
+				&& let Some(pane) = self.pane_mut(prior)
+			{
+				let _ = pane.scene.focus(false);
+			}
 			self.tab_mut().focused = id;
+			if self.window_focused
+				&& let Some(pane) = self.pane_mut(id)
+			{
+				let _ = pane.scene.focus(true);
+			}
 			self.blink_epoch = Instant::now();
 			self.window.request_redraw();
 		}
@@ -965,13 +1045,15 @@ impl<S: Scene> WindowHost<S> {
 		if size.width == 0 || size.height == 0 {
 			return;
 		}
+		let window = Arc::clone(&self.window);
+		let track_ime = self.window_focused && self.ime_enabled;
 		let metrics = self.metrics;
 		let theme = self.theme;
 		let px = self.px;
 		let hairline = self.px_scale().max(1.0);
 		let blink = (self.blink_epoch.elapsed().as_millis() / 530).is_multiple_of(2);
 		let now = self.started.elapsed();
-		let window = [size.width as f32, size.height as f32];
+		let viewport = [size.width as f32, size.height as f32];
 		let Self {
 			compositor,
 			fonts,
@@ -984,13 +1066,17 @@ impl<S: Scene> WindowHost<S> {
 			animating,
 			..
 		} = self;
-		compositor.begin(window, &theme);
+		compositor.begin(viewport, &theme);
 
 		let tab = &mut tabs[*active];
 		let focused = tab.focused;
 		let mut shimmer = false;
+		let mut ime_area = None;
 		for pane in &mut tab.panes {
 			let scene_frame = pane.scene.render();
+			if track_ime && pane.id == focused {
+				ime_area = ime_cursor_area(&scene_frame, pane.origin, pane.scroll, &metrics);
+			}
 			let doc_rows = scene_frame.frame.size().height;
 			let doc_width = scene_frame.frame.size().width;
 			let mut selection = pane.selection;
@@ -1035,7 +1121,7 @@ impl<S: Scene> WindowHost<S> {
 					.iter()
 					.any(|layer| shimmering(layer.frame));
 			let view = View {
-				window,
+				window: viewport,
 				origin: pane.origin,
 				scroll: pane.scroll,
 				selection: pane.selection,
@@ -1077,7 +1163,7 @@ impl<S: Scene> WindowHost<S> {
 				layers:      SmallVec::new(),
 			};
 			let view = View {
-				window,
+				window: viewport,
 				origin: *strip_origin,
 				scroll: 0.0,
 				selection: None,
@@ -1106,6 +1192,9 @@ impl<S: Scene> WindowHost<S> {
 			&instances.glyphs,
 		);
 		gpu.queue.present(target);
+		if let Some((position, size)) = ime_area {
+			window.set_ime_cursor_area(position, size);
+		}
 	}
 }
 
@@ -1158,18 +1247,20 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 		} else {
 			Charset::Unicode
 		};
-		let ctx = UiContext {
-			charset,
-			graphics: Graphics::KittyPlaceholders,
-			native_decor: self.config.native_decor,
-			..UiContext::default()
-		};
+		let mut ctx = UiContext::default();
+		ctx.charset = charset;
+		ctx.graphics = Graphics::KittyPlaceholders;
+		ctx.native_decor = self.config.native_decor;
+		if let Some(theme) = window.theme() {
+			ctx.apply_appearance(native_appearance(theme));
+		}
 		let mut theme = GuiTheme::from_ctx(&ctx, self.config.opacity);
 		theme.corner_radius = 12.0 * scale;
 
 		let scene = (self.build)(&ctx);
 		let seed = PaneId(0);
 		let now = Instant::now();
+		let window_focused = window.has_focus();
 		let mut host = WindowHost {
 			id: window.id(),
 			window,
@@ -1179,6 +1270,7 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 			compositor: Compositor::default(),
 			ctx,
 			theme,
+			opacity: self.config.opacity,
 			metrics,
 			px,
 			font_size,
@@ -1200,6 +1292,8 @@ impl<S: Scene, F: Fn(&UiContext) -> S> Shell<S, F> {
 			grab: Grab::None,
 			cursor: CursorIcon::Default,
 			last_select_press: None,
+			window_focused,
+			ime_enabled: false,
 			started: now,
 			blink_epoch: now,
 			next_tick: now,
@@ -1714,7 +1808,12 @@ impl<S: Scene, F: Fn(&UiContext) -> S> ApplicationHandler<UserEvent> for Shell<S
 			return;
 		};
 		match event {
-			WindowEvent::CloseRequested => {
+			WindowEvent::CloseRequested | WindowEvent::Destroyed => {
+				for tab in &mut self.windows[widx].tabs {
+					for pane in &mut tab.panes {
+						let _ = pane.scene.focus(false);
+					}
+				}
 				self.windows.remove(widx);
 				if self.windows.is_empty() {
 					el.exit();
@@ -1735,6 +1834,49 @@ impl<S: Scene, F: Fn(&UiContext) -> S> ApplicationHandler<UserEvent> for Shell<S
 				win.surface.resize(gpu, size.width, size.height);
 				win.refont(win.font_size, gpu);
 				win.window.request_redraw();
+			},
+			WindowEvent::Focused(focused) => {
+				let win = &mut self.windows[widx];
+				win.window_focused = focused;
+				win.window.set_ime_allowed(focused);
+				let pane_id = win.focused();
+				let effect = win
+					.pane_mut(pane_id)
+					.map_or(Effect::Ignored, |pane| pane.scene.focus(focused));
+				self.handle_effect(el, id, pane_id, effect);
+				if let Some(win) = self.windows.iter_mut().find(|win| win.id == id) {
+					if !focused {
+						win.ime_enabled = false;
+					}
+					win.blink_epoch = Instant::now();
+					win.window.request_redraw();
+				}
+			},
+			WindowEvent::ThemeChanged(theme) => {
+				let appearance = native_appearance(theme);
+				let win = &mut self.windows[widx];
+				if win.ctx.apply_appearance(appearance) {
+					win.theme = GuiTheme::from_ctx(&win.ctx, win.opacity);
+					win.theme.corner_radius = 12.0 * win.window.scale_factor() as f32;
+					for tab in &mut win.tabs {
+						for pane in &mut tab.panes {
+							let _ = pane.scene.appearance(appearance);
+						}
+					}
+					win.rebuild_strip();
+					win.window.request_redraw();
+				}
+			},
+			WindowEvent::DroppedFile(path) => {
+				let win = &mut self.windows[widx];
+				let pane_id = win.focused();
+				let effect = win
+					.pane_mut(pane_id)
+					.map_or(Effect::Ignored, |pane| pane.scene.drop_files(&[path.as_path()]));
+				self.handle_effect(el, id, pane_id, effect);
+				if let Some(win) = self.windows.iter().find(|win| win.id == id) {
+					win.window.request_redraw();
+				}
 			},
 			WindowEvent::ModifiersChanged(modifiers) => {
 				self.windows[widx].mods = modifiers.state();
@@ -1772,22 +1914,45 @@ impl<S: Scene, F: Fn(&UiContext) -> S> ApplicationHandler<UserEvent> for Shell<S
 					win.window.request_redraw();
 				}
 			},
+			WindowEvent::Ime(Ime::Enabled) => {
+				let win = &mut self.windows[widx];
+				win.ime_enabled = true;
+				win.window.request_redraw();
+			},
+			WindowEvent::Ime(Ime::Preedit(text, selection)) => {
+				let win = &mut self.windows[widx];
+				win.blink_epoch = Instant::now();
+				let focused = win.focused();
+				let effect = win.pane_mut(focused).map_or(Effect::Ignored, |pane| {
+					pane
+						.scene
+						.ime_preedit(&text, selection.map(|(start, end)| start..end))
+				});
+				self.handle_effect(el, id, focused, effect);
+				if let Some(win) = self.windows.iter().find(|w| w.id == id) {
+					win.window.request_redraw();
+				}
+			},
 			WindowEvent::Ime(Ime::Commit(text)) => {
 				let win = &mut self.windows[widx];
 				win.blink_epoch = Instant::now();
 				let focused = win.focused();
-				for c in text.chars() {
-					let effect = {
-						let Some(win) = self.windows.iter_mut().find(|w| w.id == id) else {
-							return;
-						};
-						let Some(pane) = win.pane_mut(focused) else {
-							return;
-						};
-						pane.scene.key(Key::Char(c))
-					};
-					self.handle_effect(el, id, focused, effect);
+				let effect = win
+					.pane_mut(focused)
+					.map_or(Effect::Ignored, |pane| pane.scene.ime_commit(&text));
+				self.handle_effect(el, id, focused, effect);
+				if let Some(win) = self.windows.iter().find(|w| w.id == id) {
+					win.window.request_redraw();
 				}
+			},
+			WindowEvent::Ime(Ime::Disabled) => {
+				let win = &mut self.windows[widx];
+				win.ime_enabled = false;
+				let focused = win.focused();
+				let effect = win
+					.pane_mut(focused)
+					.map_or(Effect::Ignored, |pane| pane.scene.ime_preedit("", None));
+				self.handle_effect(el, id, focused, effect);
 				if let Some(win) = self.windows.iter().find(|w| w.id == id) {
 					win.window.request_redraw();
 				}
@@ -2032,8 +2197,31 @@ fn write_clipboard_detached(text: Str) {
 #[cfg(test)]
 mod tests {
 	use omp_tui::{Frame, Size, Style};
+	use smallvec::SmallVec;
 
-	use super::{Selection, selection_text};
+	use super::{CellMetrics, SceneFrame, Selection, ime_cursor_area, selection_text};
+
+	#[test]
+	fn ime_candidate_area_tracks_the_visible_document_caret() {
+		let mut frame = Frame::new(Size::new(20, 10));
+		frame.set_cursor(3, 8);
+		let scene = SceneFrame {
+			frame: &frame,
+			viewport: Size::new(20, 4),
+			editor_rows: 2,
+			layers: SmallVec::new(),
+		};
+		let metrics =
+			CellMetrics { advance: 8.0, ascent: 11.0, descent: 3.0, line_height: 16.0 };
+		let (position, size) =
+			ime_cursor_area(&scene, [10.0, 20.0], 0.0, &metrics).expect("visible caret");
+		assert_eq!((position.x, position.y), (34, 52));
+		assert_eq!((size.width, size.height), (8, 16));
+		assert!(
+			ime_cursor_area(&scene, [10.0, 20.0], 64.0, &metrics).is_none(),
+			"scrolling the retained caret out of the viewport hides the candidate area",
+		);
+	}
 
 	#[test]
 	fn selection_text_trims_hard_rows_and_inserts_newlines() {

@@ -32,7 +32,7 @@ pub use misc::secrets_files;
 mod plugins;
 mod session_ops;
 pub(crate) mod sessions;
-mod stats;
+pub(crate) mod stats;
 mod tools;
 /// Kernel notification recorder behind `/trace`.
 pub mod trace;
@@ -309,8 +309,12 @@ impl Services for AppServices {
 		Ok(collab_state(&self.state.collab))
 	}
 
-	fn export(&self, path: Option<&std::path::Path>) -> ServiceResult<PathBuf> {
-		misc::export(&self.state, path)
+	fn export(
+		&self,
+		dom: &omp_dom::Dom,
+		path: Option<&std::path::Path>,
+	) -> ServiceResult<PathBuf> {
+		misc::export(&self.state, dom, path)
 	}
 
 	fn sessions(&self, scope: SessionScope) -> ServiceResult<Vec<SessionRow>> {
@@ -415,8 +419,8 @@ impl Services for AppServices {
 		workspace::create_worktree(&self.state, branch)
 	}
 
-	fn dump_request(&self) -> ServiceResult<PathBuf> {
-		control::dump_request(&self.state)
+	fn dump_request(&self, dom: &omp_dom::Dom) -> ServiceResult<PathBuf> {
+		control::dump_request(&self.state, dom)
 	}
 
 	fn request_restart(&self) -> ServiceResult<()> {

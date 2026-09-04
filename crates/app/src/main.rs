@@ -135,6 +135,8 @@ async fn main() -> ExitCode {
 			// Usage diagnostics are stack-free and carry their explicit status.
 			if let Some(signal) = error.downcast_ref::<omp_app::exit_diagnostics::SignalExit>() {
 				ExitCode::from(signal.exit_code())
+			} else if error.downcast_ref::<omp_app::print_mode::PrintFailure>().is_some() {
+				ExitCode::FAILURE
 			} else if let Some(usage) = error.downcast_ref::<omp_app::usage_error::CliUsageError>() {
 				if usage.lowercase() {
 					eprintln!("error: {usage}");

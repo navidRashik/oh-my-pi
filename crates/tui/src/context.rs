@@ -551,29 +551,29 @@ impl Theme {
 	pub const fn for_appearance(appearance: Appearance) -> Self {
 		match appearance {
 			Appearance::Dark => Self {
-				fg:                Color::Default,
-				accent:            Color::Rgb(0xfe, 0xbc, 0x38),
-				info:              Color::Rgb(0x00, 0x88, 0xfa),
-				ok:                Color::Rgb(0x89, 0xd2, 0x81),
-				warn:              Color::Rgb(0xe4, 0xc0, 0x0f),
-				err:               Color::Rgb(0xfc, 0x3a, 0x4b),
-				muted:             Color::Rgb(0x77, 0x7d, 0x88),
-				dim:               Color::Rgb(0x5f, 0x66, 0x73),
-				output:            Color::Rgb(0x77, 0x7d, 0x88),
-				border:            Color::Rgb(0x17, 0x8f, 0xb9),
-				code_border:       Color::Rgb(0x77, 0x7d, 0x88),
-				tool_diff_added:   Color::Rgb(0x89, 0xd2, 0x81),
-				tool_diff_removed: Color::Rgb(0xfc, 0x3a, 0x4b),
-				tool_diff_context: Color::Rgb(0x77, 0x7d, 0x88),
-				surface:           Color::Rgb(0x22, 0x1d, 0x1a),
-				hover:             Color::Rgb(0x31, 0x36, 0x3f),
-				selection:         Color::Rgb(0x31, 0x36, 0x3f),
-				shadow:            Color::Rgb(0x12, 0x12, 0x12),
-				panel:             Color::Rgb(0x12, 0x12, 0x12),
-				error_surface:     Color::Rgb(0x29, 0x1d, 0x1d),
-				secondary:         Color::Rgb(0xb2, 0x81, 0xd6),
-				python:            Color::Rgb(0xe4, 0xc0, 0x0f),
-				status_rule:       Color::Rgb(0x17, 0x8f, 0xb9),
+				fg:                Color::Rgb(0xe8, 0xec, 0xf4),
+				accent:            Color::Rgb(0x00, 0xb4, 0xff),
+				info:              Color::Rgb(0x4a, 0x9e, 0xff),
+				ok:                Color::Rgb(0x00, 0xff, 0x88),
+				warn:              Color::Rgb(0xff, 0xb3, 0x47),
+				err:               Color::Rgb(0xff, 0x47, 0x57),
+				muted:             Color::Rgb(0x6b, 0x72, 0x80),
+				dim:               Color::Rgb(0x6b, 0x72, 0x80),
+				output:            Color::Rgb(0x9c, 0xa3, 0xb0),
+				border:            Color::Rgb(0x1f, 0x25, 0x2d),
+				code_border:       Color::Rgb(0xd4, 0xc0, 0x90),
+				tool_diff_added:   Color::Rgb(0x00, 0xff, 0x88),
+				tool_diff_removed: Color::Rgb(0xff, 0x47, 0x57),
+				tool_diff_context: Color::Rgb(0x6b, 0x72, 0x80),
+				surface:           Color::Rgb(0x3a, 0x3f, 0x4b),
+				hover:             Color::Rgb(0x2c, 0x31, 0x3a),
+				selection:         Color::Rgb(0x36, 0x4c, 0x61),
+				shadow:            Color::Rgb(0x05, 0x07, 0x0c),
+				panel:             Color::Rgb(0x0f, 0x12, 0x16),
+				error_surface:     Color::Rgb(0x1a, 0x0f, 0x10),
+				secondary:         Color::Rgb(0xab, 0x77, 0xe6),
+				python:            Color::Rgb(0x37, 0x76, 0xab),
+				status_rule:       Color::Rgb(0x2a, 0x30, 0x38),
 				border_muted:      Color::Rgb(0x3d, 0x42, 0x4a),
 				status_bg:         Color::Rgb(0x12, 0x12, 0x12),
 				status_sep:        Color::Indexed(244),
@@ -588,33 +588,33 @@ impl Theme {
 				status_untracked:  Color::Indexed(39),
 				status_output:     Color::Indexed(205),
 				status_cost:       Color::Indexed(205),
-				status_subagents:  Color::Rgb(0xfe, 0xbc, 0x38),
-				contrast:          Color::Rgb(0x12, 0x12, 0x12),
+				status_subagents:  Color::Rgb(0xff, 0xb3, 0x47),
+				contrast:          Color::Rgb(0x10, 0x12, 0x16),
 			},
 			Appearance::Light => Self {
-				fg:                Color::Default,
-				accent:            Color::Rgb(0x5a, 0x80, 0x80),
-				info:              Color::Rgb(0x54, 0x7d, 0xa7),
-				ok:                Color::Rgb(0x58, 0x84, 0x58),
-				warn:              Color::Rgb(0x9a, 0x73, 0x26),
-				err:               Color::Rgb(0xaa, 0x55, 0x55),
-				muted:             Color::Rgb(0x6c, 0x6c, 0x6c),
-				dim:               Color::Rgb(0x76, 0x76, 0x76),
-				output:            Color::Rgb(0x6c, 0x6c, 0x6c),
-				border:            Color::Rgb(0x54, 0x7d, 0xa7),
-				code_border:       Color::Rgb(0x6c, 0x6c, 0x6c),
-				tool_diff_added:   Color::Rgb(0x58, 0x84, 0x58),
-				tool_diff_removed: Color::Rgb(0xaa, 0x55, 0x55),
-				tool_diff_context: Color::Rgb(0x6c, 0x6c, 0x6c),
-				surface:           Color::Rgb(0xe8, 0xe8, 0xe8),
-				hover:             Color::Rgb(0xd0, 0xd0, 0xe0),
-				selection:         Color::Rgb(0xd0, 0xd0, 0xe0),
-				shadow:            Color::Rgb(0xb0, 0xb0, 0xb0),
-				panel:             Color::Rgb(0xe0, 0xe0, 0xe0),
-				error_surface:     Color::Rgb(0xf0, 0xe8, 0xe8),
-				secondary:         Color::Rgb(0x7e, 0x57, 0xc2),
-				python:            Color::Rgb(0x9a, 0x73, 0x26),
-				status_rule:       Color::Rgb(0x54, 0x7d, 0xa7),
+				fg:                Color::Rgb(0x24, 0x28, 0x30),
+				accent:            Color::Rgb(0x00, 0x5f, 0xaf),
+				info:              Color::Rgb(0x00, 0x72, 0x7d),
+				ok:                Color::Rgb(0x3f, 0x70, 0x19),
+				warn:              Color::Rgb(0x8a, 0x5a, 0x00),
+				err:               Color::Rgb(0xb0, 0x24, 0x32),
+				muted:             Color::Rgb(0x6b, 0x70, 0x78),
+				dim:               Color::Rgb(0x6b, 0x70, 0x78),
+				output:            Color::Rgb(0x4b, 0x52, 0x5d),
+				border:            Color::Rgb(0xd0, 0xd7, 0xde),
+				code_border:       Color::Rgb(0x6b, 0x70, 0x78),
+				tool_diff_added:   Color::Rgb(0x3f, 0x70, 0x19),
+				tool_diff_removed: Color::Rgb(0xb0, 0x24, 0x32),
+				tool_diff_context: Color::Rgb(0x6b, 0x70, 0x78),
+				surface:           Color::Rgb(0xe2, 0xe5, 0xea),
+				hover:             Color::Rgb(0xed, 0xef, 0xf2),
+				selection:         Color::Rgb(0xc2, 0xda, 0xed),
+				shadow:            Color::Rgb(0xb8, 0xbd, 0xc7),
+				panel:             Color::Rgb(0xee, 0xf0, 0xf3),
+				error_surface:     Color::Rgb(0xff, 0xed, 0xee),
+				secondary:         Color::Rgb(0x6f, 0x42, 0xc1),
+				python:            Color::Rgb(0x37, 0x76, 0xab),
+				status_rule:       Color::Rgb(0xc8, 0xd0, 0xd8),
 				border_muted:      Color::Rgb(0xb0, 0xb0, 0xb0),
 				status_bg:         Color::Rgb(0xe0, 0xe0, 0xe0),
 				status_sep:        Color::Rgb(0x80, 0x80, 0x80),
@@ -629,7 +629,7 @@ impl Theme {
 				status_untracked:  Color::Indexed(31),
 				status_output:     Color::Indexed(133),
 				status_cost:       Color::Indexed(133),
-				status_subagents:  Color::Rgb(0x5a, 0x80, 0x80),
+				status_subagents:  Color::Rgb(0x00, 0x5f, 0xaf),
 				contrast:          Color::Rgb(0xff, 0xff, 0xff),
 			},
 		}
@@ -770,10 +770,13 @@ pub struct UiContext {
 	pub jamo_width:   JamoWidth,
 	/// Semantic color palette.
 	pub theme:        Theme,
-	/// Named theme the palette was selected from (`--theme`, `cl_theme`).
-	/// An appearance change re-selects its dark or light variant instead of
-	/// falling back to the stock palette; `None` means the stock palette.
-	pub palette:      Option<Arc<JsonTheme>>,
+	/// Named palettes selected for dark and light terminal appearances.
+	///
+	/// Each entry is independent: an appearance change selects the persisted
+	/// palette for that appearance rather than another variant of the palette
+	/// that happened to be active before the change. `None` means the stock
+	/// palette for that appearance.
+	pub palettes:     [Option<Arc<JsonTheme>>; 2],
 	/// Custom element registry.
 	pub elements:     Elements,
 	/// Presentation clock of the pass in flight: [`crate::Ui::tick`] advances
@@ -801,7 +804,7 @@ impl Default for UiContext {
 			native_decor: false,
 			jamo_width:   rich::jamo_width(),
 			theme:        Theme::default(),
-			palette:      None,
+			palettes:     [None, None],
 			elements:     Elements::default(),
 			now:          time::Duration::default(),
 			revision:     0,
@@ -844,19 +847,16 @@ impl UiContext {
 
 	/// Applies a terminal-reported dark/light appearance change.
 	///
-	/// Stock palettes and named themes follow the terminal, including their
-	/// 256-color quantized form. A caller-supplied ad-hoc theme is preserved
-	/// so the host can choose whether and how to restyle it.
+	/// The complete next theme is selected before any context field changes,
+	/// so hosts can publish the cloned [`UiContext`] atomically. Indexed-color
+	/// terminals retain quantization. A caller-supplied ad-hoc theme is
+	/// preserved so the host can choose whether and how to restyle it.
 	pub fn apply_appearance(&mut self, appearance: Appearance) -> bool {
 		if self.appearance == appearance {
 			return false;
 		}
-		let (stock, next) = match &self.palette {
-			Some(palette) => {
-				(palette.for_appearance(self.appearance), palette.for_appearance(appearance))
-			},
-			None => (Theme::for_appearance(self.appearance), Theme::for_appearance(appearance)),
-		};
+		let stock = self.resolved_palette(self.appearance);
+		let next = self.resolved_palette(appearance);
 		if self.theme == stock {
 			self.theme = next;
 		} else if self.theme == stock.quantized_256() {
@@ -866,25 +866,74 @@ impl UiContext {
 		true
 	}
 
-	/// Selects the palette of a named theme for the current appearance and
-	/// remembers the theme so later appearance changes re-select its
-	/// variant; `None` returns to the stock palette.
+	/// Selects one named palette for both terminal appearances.
+	///
+	/// This is the fixed-theme path used by explicit command-line themes and
+	/// previews. Persisted automatic dark/light choices use
+	/// [`Self::set_appearance_palettes`] instead.
 	pub fn set_palette(&mut self, palette: Option<Arc<JsonTheme>>) -> bool {
-		let theme = match &palette {
-			Some(palette) => palette.for_appearance(self.appearance),
-			None => Theme::for_appearance(self.appearance),
-		};
-		let changed = self.theme != theme || self.palette.is_some() != palette.is_some();
+		self.set_appearance_palettes(palette.clone(), palette)
+	}
+
+	/// Selects independent named palettes for dark and light appearances.
+	///
+	/// The active semantic theme and both future selections change together;
+	/// `None` selects omp's stock palette for that appearance.
+	pub fn set_appearance_palettes(
+		&mut self,
+		dark: Option<Arc<JsonTheme>>,
+		light: Option<Arc<JsonTheme>>,
+	) -> bool {
+		let palettes = [dark, light];
+		let previous = self.resolved_palette(self.appearance);
+		let indexed = self.theme == previous.quantized_256() && self.theme != previous;
+		let resolved = palettes[Self::palette_index(self.appearance)]
+			.as_ref()
+			.map_or_else(
+				|| Theme::for_appearance(self.appearance),
+				|palette| palette.for_appearance(self.appearance),
+			);
+		let theme = if indexed { resolved.quantized_256() } else { resolved };
+		let changed = self.theme != theme || self.palettes != palettes;
 		self.theme = theme;
-		self.palette = palette;
+		self.palettes = palettes;
 		changed
 	}
 
-	/// Returns this context showing `palette` (see [`Self::set_palette`]).
+	/// Returns this context showing one fixed `palette` (see
+	/// [`Self::set_palette`]).
 	#[must_use]
 	pub fn with_palette(mut self, palette: Option<Arc<JsonTheme>>) -> Self {
 		self.set_palette(palette);
 		self
+	}
+
+	/// Returns this context with independent named palettes for dark and light
+	/// terminal appearances.
+	#[must_use]
+	pub fn with_appearance_palettes(
+		mut self,
+		dark: Option<Arc<JsonTheme>>,
+		light: Option<Arc<JsonTheme>>,
+	) -> Self {
+		self.set_appearance_palettes(dark, light);
+		self
+	}
+
+	const fn palette_index(appearance: Appearance) -> usize {
+		match appearance {
+			Appearance::Dark => 0,
+			Appearance::Light => 1,
+		}
+	}
+
+	fn resolved_palette(&self, appearance: Appearance) -> Theme {
+		self.palettes[Self::palette_index(appearance)]
+			.as_ref()
+			.map_or_else(
+				|| Theme::for_appearance(appearance),
+				|palette| palette.for_appearance(appearance),
+			)
 	}
 
 	/// Returns this context configured for the detected terminal.
@@ -902,6 +951,7 @@ impl PartialEq for UiContext {
 			&& self.native_decor == other.native_decor
 			&& self.jamo_width == other.jamo_width
 			&& self.theme == other.theme
+			&& self.palettes == other.palettes
 			&& self.elements.ptr_eq(&other.elements)
 	}
 }
@@ -910,9 +960,9 @@ impl Eq for UiContext {}
 
 #[cfg(test)]
 mod tests {
-	use std::time::Duration;
+	use std::{sync::Arc, time::Duration};
 
-	use super::{Appearance, Charset, Theme, UiContext};
+	use super::{Appearance, Charset, JsonTheme, Theme, UiContext};
 	use crate::frame::Color;
 
 	#[test]
@@ -969,6 +1019,38 @@ mod tests {
 		let mut custom_ctx = UiContext { theme: custom, ..UiContext::default() };
 		assert!(custom_ctx.apply_appearance(Appearance::Light));
 		assert_eq!(custom_ctx.theme, custom);
+	}
+
+	#[test]
+	fn appearance_changes_select_independent_named_palettes_atomically() {
+		let dark = Arc::new(
+			JsonTheme::parse(
+				r##"{"name":"night","dark":{"accent":"#111111"},"light":{"accent":"#121212"}}"##,
+			)
+			.unwrap(),
+		);
+		let light = Arc::new(
+			JsonTheme::parse(
+				r##"{"name":"day","dark":{"accent":"#dddddd"},"light":{"accent":"#eeeeee"}}"##,
+			)
+			.unwrap(),
+		);
+		let mut ui = UiContext::default()
+			.with_appearance_palettes(Some(Arc::clone(&dark)), Some(Arc::clone(&light)));
+		assert_eq!(ui.theme.accent, Color::Rgb(0x11, 0x11, 0x11));
+
+		assert!(ui.apply_appearance(Appearance::Light));
+		assert_eq!(
+			ui.theme.accent,
+			Color::Rgb(0xee, 0xee, 0xee),
+			"light appearance selects the separately named day palette",
+		);
+		assert!(ui.apply_appearance(Appearance::Dark));
+		assert_eq!(
+			ui.theme.accent,
+			Color::Rgb(0x11, 0x11, 0x11),
+			"dark selection survives the round trip",
+		);
 	}
 
 	#[test]

@@ -342,13 +342,13 @@ fn apply_sgr(parameters: &str, style: &mut Style) {
 	}
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Run {
 	end:   u32,
 	style: Style,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RowMeta {
 	run_end: u32,
 	width:   u16,
@@ -357,7 +357,7 @@ struct RowMeta {
 }
 
 /// Flat rendered rich text with coalesced styled runs and row metadata.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RichText {
 	text:          String,
 	runs:          Vec<Run>,

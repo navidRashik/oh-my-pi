@@ -16,13 +16,14 @@ use async_trait::async_trait;
 use omp_chat::{
 	ExtensionStatus, HostAction, HostMailbox,
 	overlays::{
-		PanelCall, PanelEvent, PanelOpener,
+		CancelledPanel, PanelCall, PanelEvent, PanelOpener,
 		ask::AskDialog,
 		ext_input::{FIELD, InputDialog, InputSpec},
 	},
 };
 use omp_con::{Ctx, RegItem};
 use omp_core::{Str, Ulid};
+use omp_driver::collab::session::{CollabCommandHandle, HostUiRequestError};
 use omp_driver::headless::AskRoute;
 use omp_envd::exthost::{
 	ControlAuthority, ControlAuthorityFactory, ControlCompositionError, UiControlAuthority,
@@ -32,18 +33,66 @@ use omp_envd::exthost::{
 use omp_tools::ask::{
 	AskPresenter, Fault as AskFault, OptionItem, Presentation, Question, Selection,
 };
+use omp_proto::collab::v1::{
+	EditorSpec, SelectOption, SelectSpec, UiRequest, select_spec, ui_request,
+};
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 const YES: &str = "Yes";
 const NO: &str = "No";
 /// Extension dialog request ids never collide with tool call ids.
 const REQUEST_PREFIX: &str = "ext-ui:";
 
+fn remote_select(questions: &[Question]) -> Option<UiRequest> {
+	let question = questions.first()?;
+	if questions.len() != 1 || question.options.is_empty() || question.multi {
+		return None;
+	}
+	Some(UiRequest {
+		title: question.question.to_string(),
+		spec: Some(ui_request::Spec::Select(SelectSpec {
+			options: question
+				.options
+				.iter()
+				.map(|option| SelectOption {
+					label: option.label.to_string(),
+					description: option.description.as_ref().map(ToString::to_string),
+				})
+				.collect(),
+			initial_index: u32::try_from(question.recommended.unwrap_or_default())
+				.unwrap_or(u32::MAX),
+			marker: if question.multi {
+				select_spec::Marker::Checkbox
+			} else {
+				select_spec::Marker::Radio
+			} as i32,
+			checked_indices: Vec::new(),
+			markable_count: u32::try_from(question.options.len()).unwrap_or(u32::MAX),
+			help_text: None,
+		})),
+		..UiRequest::default()
+	})
+}
+
+fn remote_selection(question: &Question, value: String) -> Selection {
+	let value = Str::new(value);
+	let known = question.options.iter().any(|option| option.label == value);
+	Selection {
+		id: question.id.clone(),
+		selected: if known { vec![value.clone()] } else { Vec::new() },
+		custom_input: (!known).then_some(value),
+		note: None,
+		timed_out: false,
+	}
+}
+
 /// Chat-owned UI authority handed to the Environment for the chat's
 /// lifetime.
 pub struct ChatUiOwner {
 	con:         Arc<Ctx>,
 	ask:         AskRoute,
+	collab:      Option<CollabCommandHandle>,
 	dialog_gate: tokio::sync::Mutex<()>,
 }
 
@@ -51,8 +100,8 @@ impl ChatUiOwner {
 	/// Wraps the actor's console (its mailbox carries host actions) and the
 	/// environment's `ask` route.
 	#[must_use]
-	pub fn new(con: Arc<Ctx>, ask: AskRoute) -> Self {
-		Self { con, ask, dialog_gate: tokio::sync::Mutex::new(()) }
+	pub fn new(con: Arc<Ctx>, ask: AskRoute, collab: Option<CollabCommandHandle>) -> Self {
+		Self { con, ask, collab, dialog_gate: tokio::sync::Mutex::new(()) }
 	}
 
 	/// Factory the Environment binds per authenticated extension connection.
@@ -96,6 +145,7 @@ impl ChatUiOwner {
 		&self,
 		id: Str,
 		questions: Vec<Question>,
+		remote: Option<UiRequest>,
 		open: impl Fn(
 			Str,
 			Vec<Question>,
@@ -113,12 +163,53 @@ impl ChatUiOwner {
 		if let Poll::Ready(settled) = futures::poll!(present.as_mut()) {
 			return finish(settled);
 		}
+		let local_cancel = CancellationToken::new();
+		let panel_cancel = local_cancel.clone();
 		let dialog_id = id.clone();
 		let dialog_questions = questions.clone();
 		mailbox.post(HostAction::Open(PanelOpener::new(move |cx| {
-			Ok(open(dialog_id.clone(), dialog_questions.clone(), cx))
+			Ok(Box::new(CancelledPanel::new(
+				open(dialog_id.clone(), dialog_questions.clone(), cx),
+				panel_cancel.clone(),
+			)) as Box<dyn omp_chat::overlays::Panel>)
 		})));
-		finish(present.await)
+		let Some((collab, request)) = self.collab.as_ref().zip(remote) else {
+			return finish(present.await);
+		};
+		let remote_cancel = CancellationToken::new();
+		let remote_answer = collab.request_guest_ui(request, remote_cancel.clone());
+		tokio::pin!(remote_answer);
+		tokio::select! {
+			local = present.as_mut() => {
+				remote_cancel.cancel();
+				finish(local)
+			},
+			remote = &mut remote_answer => match remote {
+				Ok(answer) => {
+					local_cancel.cancel();
+					let _ = self.ask.answer(
+						id.as_str(),
+						omp_driver::headless::AskReply::Cancelled,
+					);
+					Ok(answer.value.map(|value| vec![remote_selection(&questions[0], value)]))
+				},
+				Err(
+					HostUiRequestError::NotHost
+					| HostUiRequestError::Unavailable
+					| HostUiRequestError::Capacity
+					| HostUiRequestError::TooLarge
+					| HostUiRequestError::OwnerStopped
+				) => finish(present.await),
+				Err(HostUiRequestError::Cancelled) => {
+					local_cancel.cancel();
+					let _ = self.ask.answer(
+						id.as_str(),
+						omp_driver::headless::AskReply::Cancelled,
+					);
+					Ok(None)
+				},
+			},
+		}
 	}
 
 	async fn ask_dialog(
@@ -128,7 +219,8 @@ impl ChatUiOwner {
 		self
 			.dialog(
 				Str::new(format!("{REQUEST_PREFIX}{}", Ulid::generate())),
-				questions,
+				questions.clone(),
+				remote_select(&questions),
 				|id, questions, cx| {
 					Box::new(AskDialog::open(id, questions, None, cx.ui.now, cx.viewport, cx.ui))
 				},
@@ -145,10 +237,18 @@ impl ChatUiOwner {
 			multi:       false,
 			recommended: None,
 		};
+		let remote = UiRequest {
+			title: spec.title.to_string(),
+			spec: Some(ui_request::Spec::Editor(EditorSpec {
+				prefill: Some(spec.prefill.to_string()),
+			})),
+			..UiRequest::default()
+		};
 		let answers = self
 			.dialog(
 				Str::new(format!("{REQUEST_PREFIX}{}", Ulid::generate())),
 				vec![question],
+				Some(remote),
 				move |id, _, cx| Box::new(InputDialog::open(id, spec.clone(), cx.viewport, cx.ui)),
 			)
 			.await?;
@@ -283,8 +383,9 @@ impl AskPresenter for ChatUiOwner {
 		let id = Str::new(invocation);
 		let questions = questions.to_vec();
 		Box::pin(async move {
+			let remote = remote_select(&questions);
 			let selections = self
-				.dialog(id, questions, |id, questions, cx| {
+				.dialog(id, questions, remote, |id, questions, cx| {
 					Box::new(AskDialog::open(
 						id,
 						questions,
@@ -819,7 +920,7 @@ mod tests {
 	fn owner() -> (Arc<ChatUiOwner>, Arc<Ctx>, AskRoute) {
 		let ctx = Arc::new(HostMailbox::new().attach(Ctx::builder()).build());
 		let ask = AskRoute::new();
-		(Arc::new(ChatUiOwner::new(Arc::clone(&ctx), ask.clone())), ctx, ask)
+		(Arc::new(ChatUiOwner::new(Arc::clone(&ctx), ask.clone(), None)), ctx, ask)
 	}
 
 	fn context() -> ControlRequestContext {
@@ -1115,10 +1216,35 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn collaboration_select_projection_is_correlated_and_single_choice_only() {
+		let single = Question {
+			id: Str::new_static("release"),
+			question: Str::new_static("Ship?"),
+			header: None,
+			options: vec![option("Yes", None), option("No", None)],
+			multi: false,
+			recommended: Some(1),
+		};
+		let request = remote_select(std::slice::from_ref(&single)).expect("remote request");
+		let Some(ui_request::Spec::Select(spec)) = request.spec else {
+			panic!("select");
+		};
+		assert_eq!(spec.initial_index, 1);
+		assert_eq!(spec.options.len(), 2);
+		let selected = remote_selection(&single, "Yes".to_owned());
+		assert_eq!(selected.selected, [Str::new_static("Yes")]);
+		assert!(selected.custom_input.is_none());
+
+		let mut multi = single;
+		multi.multi = true;
+		assert!(remote_select(&[multi]).is_none(), "multi-step asks remain local");
+	}
+
 	#[tokio::test]
 	async fn without_a_host_mailbox_dialogs_are_refused_typed() {
 		let ctx = Arc::new(Ctx::new());
-		let owner = ChatUiOwner::new(Arc::clone(&ctx), AskRoute::new());
+		let owner = ChatUiOwner::new(Arc::clone(&ctx), AskRoute::new(), None);
 		let error = owner
 			.request(context(), UiControlRequest::Dialog {
 				kind:   Str::new_static("confirm"),

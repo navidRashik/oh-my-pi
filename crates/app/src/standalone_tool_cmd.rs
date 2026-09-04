@@ -33,7 +33,7 @@ pub(crate) async fn read(args: ReadCliArgs) -> miette::Result<()> {
 	Ok(())
 }
 
-/// Executes `web_search@1` through the production inference facade.
+/// Executes `web_search@2` through the production inference facade.
 pub(crate) async fn search(args: SearchCliArgs) -> miette::Result<()> {
 	let session = session().await?;
 	let payload: omp_tools::web_search::Payload = invoke::<_, _, omp_tools::web_search::Fault>(
@@ -48,10 +48,22 @@ pub(crate) async fn search(args: SearchCliArgs) -> miette::Result<()> {
 				crate::cli::SearchRecency::Year => omp_tools::web_search::Recency::Year,
 			}),
 			limit:              args.limit,
+			after:              None,
+			before:             None,
+			allowed_domains:    Vec::new(),
+			excluded_domains:   Vec::new(),
+			country:            None,
+			language:           None,
 			max_tokens:         None,
 			temperature:        None,
 			num_search_results: None,
-			provider:           args.provider,
+			provider:           args
+				.provider
+				.as_deref()
+				.map(str::parse)
+				.transpose()
+				.map_err(|_| miette!("unknown web search provider"))?,
+			timeout_ms:         None,
 		},
 	)
 	.await?;

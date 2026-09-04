@@ -3113,28 +3113,28 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "github.cache.enabled",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_github_cache_enabled",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		declaration: "crates/envd/src/tool_settings.rs",
+		consumer:    "crates/envd/src/tool_settings.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "github.cache.softTtlSec",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_github_cache_soft_ttl_sec",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		declaration: "crates/envd/src/tool_settings.rs",
+		consumer:    "crates/envd/src/tool_settings.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "github.cache.hardTtlSec",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_github_cache_hard_ttl_sec",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		declaration: "crates/envd/src/tool_settings.rs",
+		consumer:    "crates/envd/src/tool_settings.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -4292,10 +4292,10 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "extensionHandlers.toolCallTimeoutMs",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "ai_extension_handlers_tool_call_timeout_ms",
-		declaration: "crates/inference/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		declaration: "crates/envd/src/pi_settings.rs",
+		consumer:    "crates/envd/src/tools.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -4549,14 +4549,14 @@ fn inventory_has_no_missing_or_wrong_status_variant() {
 			.iter()
 			.filter(|row| matches!(row.coverage, Coverage::Mapped))
 			.count(),
-		178
+		182
 	);
 	assert_eq!(
 		ROWS
 			.iter()
 			.filter(|row| matches!(row.coverage, Coverage::Declared))
 			.count(),
-		280
+		276
 	);
 	assert_eq!(
 		ROWS
@@ -4932,6 +4932,46 @@ fn tools_computer_group_mechanically_matches_current_pi() {
 }
 
 #[test]
+fn tools_github_group_mechanically_matches_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| !matches!(row.coverage, Coverage::Deviation))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	let expected = pi
+		.entries
+		.into_iter()
+		.filter(|entry| entry.tab == "tools" && entry.group == "GitHub")
+		.map(|mut entry| {
+			entry.convar = mappings[entry.path.as_str()].to_owned();
+			entry
+		})
+		.collect::<Vec<_>>();
+	let entries = omp_con::builtin_ui_entries()
+		.filter(|entry| entry.tab == omp_con::SettingTab::Tools && entry.group == "GitHub")
+		.collect::<Vec<_>>();
+	let actual = entries
+		.iter()
+		.filter(|entry| !matches!(entry.widget, omp_con::UiWidget::ConfigOnly))
+		.map(|entry| projected_ui_entry(entry))
+		.collect::<Vec<_>>();
+	assert_eq!(entries.len(), 3);
+	assert_eq!(
+		entries
+			.iter()
+			.filter(|entry| matches!(entry.widget, omp_con::UiWidget::ConfigOnly))
+			.count(),
+		2
+	);
+	assert_eq!(actual.len(), 1);
+	assert_eq!(actual, expected);
+}
+
+#[test]
 fn tools_execution_group_mechanically_matches_current_pi() {
 	let Some(pi) = current_pi_ui() else {
 		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
@@ -5013,6 +5053,43 @@ fn tools_discovery_and_mcp_group_mechanically_matches_current_pi() {
 }
 
 #[test]
+fn tools_extensions_group_mechanically_matches_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let visible = pi
+		.entries
+		.into_iter()
+		.filter(|entry| entry.tab == "tools" && entry.group == "Extensions")
+		.collect::<Vec<_>>();
+	assert!(
+		visible.is_empty(),
+		"current pi hides numeric extension settings without finite options"
+	);
+	let entries = omp_con::builtin_ui_entries()
+		.filter(|entry| {
+			entry.tab == omp_con::SettingTab::Tools && entry.group == "Extensions"
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(entries.len(), 1);
+	assert_eq!(entries[0].pi_path, "extensionHandlers.toolCallTimeoutMs");
+	assert_eq!(
+		entries[0].convar,
+		"ai_extension_handlers_tool_call_timeout_ms"
+	);
+	assert_eq!(entries[0].label, "Tool Call Handler Timeout (ms)");
+	assert_eq!(
+		entries[0].description,
+		"Positive finite active-work timeout for extension tool_call handlers; invalid values use \
+		 30000ms, and time awaiting OMP-owned dialogs does not count"
+	);
+	assert!(entries[0].warning.is_none());
+	assert!(matches!(entries[0].widget, omp_con::UiWidget::ConfigOnly));
+	assert!(entries[0].condition.is_none());
+}
+
+#[test]
 fn curated_settings_metadata_mechanically_matches_current_pi_for_every_mapped_setting() {
 	let Some(mut pi) = current_pi_ui() else {
 		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
@@ -5054,7 +5131,7 @@ fn curated_settings_metadata_mechanically_matches_current_pi_for_every_mapped_se
 		.filter(|(_, (actual, expected))| actual != expected)
 		.collect::<Vec<_>>();
 	assert!(differences.is_empty(), "mapped metadata differences: {differences:#?}");
-	assert_eq!(actual.len(), 138);
+	assert_eq!(actual.len(), 139);
 
 	let ctx = omp_con::Ctx::new();
 	for entry in omp_con::builtin_ui_entries() {

@@ -1060,7 +1060,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		harness.client(),
 		"builtin-write",
 		"write",
-		"1",
+		"2",
 		json!({"path":"nested/written.txt","content":"written through adapter\n"}),
 	)
 	.await;
@@ -1155,7 +1155,7 @@ async fn special_writes_round_trip_through_production_read_backends() {
 		harness.client(),
 		"write-archive-member",
 		"write",
-		"1",
+		"2",
 		json!({
 			"path": "bundle.zip:dir/member.txt",
 			"content": "changed through write\n"
@@ -1185,7 +1185,7 @@ async fn special_writes_round_trip_through_production_read_backends() {
 		harness.client(),
 		"write-sqlite-insert",
 		"write",
-		"1",
+		"2",
 		json!({
 			"path": "catalog.sqlite:people",
 			"content": r#"{"id":4,"name":"Linus","score":40}"#
@@ -1205,7 +1205,7 @@ async fn special_writes_round_trip_through_production_read_backends() {
 		harness.client(),
 		"write-sqlite-update",
 		"write",
-		"1",
+		"2",
 		json!({
 			"path": "catalog.sqlite:people:4",
 			"content": r#"{"name":"Linus Torvalds","score":41}"#
@@ -1225,7 +1225,7 @@ async fn special_writes_round_trip_through_production_read_backends() {
 		harness.client(),
 		"write-sqlite-delete",
 		"write",
-		"1",
+		"2",
 		json!({"path":"catalog.sqlite:people:4","content":""}),
 	)
 	.await;

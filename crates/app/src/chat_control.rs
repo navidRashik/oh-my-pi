@@ -24,7 +24,9 @@ use omp_chat::{
 	commands::{CompactionMethod, ShakeMode, TodoOp},
 	host::SpawnKind,
 	overlays::{
-		Outcome, Services,
+		CancelledPanel, Outcome, PanelOpener, Services,
+		ask::AskDialog,
+		ext_input::{InputDialog, InputSpec},
 		git::{GitOp, GitOutcome, GitPatchAction, GitPatchScope},
 		hub::{AgentOp, AgentOutcome},
 		services::{
@@ -49,6 +51,7 @@ use omp_proto::{
 	toolhost::v1::HookEventId,
 };
 use omp_session::{AttachmentInput, Session, SessionError, components::jobs};
+use omp_tools::ask::{OptionItem, Question};
 use omp_voice::transport::{
 	LiveDelegationAdmission, LiveDelegationRequest, LiveDelegationTerminal,
 };
@@ -147,7 +150,11 @@ async fn restore_checkpoint_workspace(
 		.map_err(|source| SessionHookError::Workspace { source })?;
 	ensure_workspace_restore(&preview)?;
 	let restored = env
-		.restore_workspace(RestoreWorkspace { dry_run: false, ..request })
+		.restore_workspace(RestoreWorkspace {
+			dry_run: false,
+			expected_generation: preview.from_generation,
+			..request
+		})
 		.await
 		.map_err(|source| SessionHookError::Workspace { source })?;
 	if let Err(error) = ensure_workspace_restore(&restored) {
@@ -425,6 +432,76 @@ fn collab_status(
 	}
 }
 
+const COLLAB_UI_PREFIX: &str = "collab-ui:";
+
+fn spawn_collab_ui(
+	collab: omp_driver::collab::session::CollabCommandHandle,
+	ctx: Arc<Ctx>,
+) -> tokio::task::JoinHandle<()> {
+	let requests = collab.remote_ui_requests();
+	tokio::spawn(async move {
+		while let Ok(remote) = requests.recv_async().await {
+			let Some(mailbox) = ctx.user::<HostMailbox>() else {
+				continue;
+			};
+			let request = remote.request;
+			let cancel = remote.cancel;
+			mailbox.post(HostAction::Open(PanelOpener::new(move |cx| {
+				let id = Str::new(format!("{COLLAB_UI_PREFIX}{}", request.request_id));
+				let panel: Box<dyn omp_chat::overlays::Panel> = match request.spec.clone() {
+					Some(omp_proto::collab::v1::ui_request::Spec::Select(spec)) => {
+						let options = spec
+							.options
+							.into_iter()
+							.map(|option| OptionItem {
+								label:       Str::new(option.label),
+								description: option.description.map(Str::new),
+								preview:     None,
+							})
+							.collect();
+						Box::new(AskDialog::open(
+							id,
+							vec![Question {
+								id: Str::new_static("value"),
+								question: Str::new(request.title.clone()),
+								header: None,
+								options,
+								multi: false,
+								recommended: Some(
+									usize::try_from(spec.initial_index).unwrap_or_default(),
+								),
+							}],
+							None,
+							cx.ui.now,
+							cx.viewport,
+							cx.ui,
+						))
+					},
+					Some(omp_proto::collab::v1::ui_request::Spec::Editor(spec)) => {
+						Box::new(InputDialog::open(
+							id,
+							InputSpec {
+								title: Str::new(request.title.clone()),
+								placeholder: Str::new_static(""),
+								prefill: spec.prefill.map_or_else(Str::default, Str::new),
+								mask: false,
+								multiline: true,
+							},
+							cx.viewport,
+							cx.ui,
+						))
+					},
+					None => return Err(Str::new_static("collaboration UI request omitted its spec")),
+				};
+				Ok(
+					Box::new(CancelledPanel::new(panel, cancel.clone()))
+						as Box<dyn omp_chat::overlays::Panel>,
+				)
+			})));
+		}
+	})
+}
+
 fn spawn_collab_status(
 	collab: omp_driver::collab::session::CollabCommandHandle,
 	ctx: Arc<Ctx>,
@@ -502,6 +579,8 @@ pub(crate) struct Controller<C = ComposedInference> {
 	catalog: Option<Arc<Catalog>>,
 	/// Continuous presence/session-state projection into the chat actor.
 	collab_status: tokio::task::JoinHandle<()>,
+	/// Host dialogs projected into this guest actor.
+	collab_ui: tokio::task::JoinHandle<()>,
 	/// Ordered events following the collaboration guest snapshot.
 	collab_replica: flume::Receiver<Event>,
 	/// Host-authenticated guest mutations.
@@ -514,9 +593,6 @@ pub(crate) struct Controller<C = ComposedInference> {
 	live_journal: Arc<RwLock<PathBuf>>,
 	data_dir: PathBuf,
 	voice: crate::chat_voice::PushToTalk,
-	/// A prose-only hidden Goal continuation holds at idle until genuine user
-	/// input or new tool progress re-arms it.
-	goal_continuation_suppressed: bool,
 	/// Commands that mutate the session, deferred while a turn runs.
 	pending: Vec<HostCommand>,
 	/// Abnormal process boundary that requested shutdown. Ordinary actor quit
@@ -554,11 +630,15 @@ impl<C: omp_agent::Inference> Controller<C> {
 		ephemeral: Option<PathBuf>,
 		ask: omp_driver::headless::AskRoute,
 	) -> (Self, omp_dom::Snapshot) {
+		if ctx.user::<omp_chat::PendingInputGate>().is_none() {
+			ctx.insert_user(omp_chat::PendingInputGate::default());
+		}
 		let up = kernel.mailbox();
 		let live_events = kernel.subscribe();
 		let lifecycle = kernel.lifecycle_hooks();
 		let collab_replica = collab.replica_events();
 		let collab_remote = collab.remote_mutations();
+		let collab_ui = spawn_collab_ui(collab.clone(), Arc::clone(&ctx));
 		let session_id = display_name(&session);
 		let (snapshot, events) = session.subscribe();
 		let forwarder = Some(forward(events, relay.clone()));
@@ -579,6 +659,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 			collab,
 			catalog,
 			collab_status,
+			collab_ui,
 			collab_replica,
 			collab_remote,
 			env,
@@ -593,7 +674,6 @@ impl<C: omp_agent::Inference> Controller<C> {
 				live_auth,
 				session_id,
 			),
-			goal_continuation_suppressed: false,
 			pending: Vec::new(),
 			exit_cause: None,
 			tan_tx,
@@ -628,13 +708,19 @@ impl<C: omp_agent::Inference> Controller<C> {
 			}),
 		)
 		.await?;
+		let input_gate = self
+			.ctx
+			.user::<omp_chat::PendingInputGate>()
+			.expect("controller installs the pending-input gate");
 		loop {
 			let goal_continuation_ready = self.goal_continuation_ready();
 			let flow = tokio::select! {
+				biased;
 				command = command_rx.recv_async() => match command {
 					Ok(command) => self.apply_idle(command).await?,
 					Err(_) => Flow::Quit,
 				},
+				() = input_gate.changed() => Flow::Idle,
 				done = self.tan_rx.recv_async() => {
 					if let Ok(done) = done {
 						self.settle_tan(done)?;
@@ -745,6 +831,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 	fn shutdown(&mut self) -> miette::Result<()> {
 		let session = display_name(&self.session);
 		self.collab_status.abort();
+		self.collab_ui.abort();
 		if let Some(mailbox) = self.ctx.user::<HostMailbox>() {
 			mailbox.post(HostAction::CollabStatus(None));
 		}
@@ -798,7 +885,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 	/// pause and Plan ownership suppress the timer. The convars gate both Goal
 	/// runtime availability and which presentation modes may auto-continue.
 	fn goal_continuation_ready(&self) -> bool {
-		if self.goal_continuation_suppressed
+		if self
+			.ctx
+			.user::<omp_chat::PendingInputGate>()
+			.is_some_and(|gate| gate.pending())
 			|| self.is_paused()
 			|| !omp_chat::settings::CL_GOAL_ENABLED.get(&self.ctx)
 		{
@@ -830,6 +920,29 @@ impl<C: omp_agent::Inference> Controller<C> {
 			omp_session::custom_message::CustomMessage::new("goal-continuation", prompt)
 				.with_display(false),
 		)
+	}
+
+	fn set_goal_continuation_armed(&mut self, armed: bool) -> miette::Result<()> {
+		let Some((handle, node)) = omp_agent::find_director(self.session.dom(), "goal") else {
+			return Ok(());
+		};
+		if omp_agent::state_bool(node, "continuation_armed") == Some(armed) {
+			return Ok(());
+		}
+		let cause = self.head()?;
+		self
+			.session
+			.patch(Txn {
+				cause,
+				label: Some(Str::new_static("goal.continuation")),
+				ops: vec![Op::Set {
+					h:     handle,
+					prop:  PropKey::Custom(Str::new_static("state/continuation_armed")),
+					value: Value::Bool(armed),
+				}],
+			})
+			.into_diagnostic()?;
+		Ok(())
 	}
 
 	fn latest_turn_had_tool_calls(&self) -> bool {
@@ -1114,11 +1227,13 @@ impl<C: omp_agent::Inference> Controller<C> {
 			Some(TurnRequest::Custom(message))
 				if message.custom_type.as_str() == "goal-continuation"
 		);
-		if matches!(
+		if goal_continuation_turn {
+			self.set_goal_continuation_armed(false)?;
+		} else if matches!(
 			input.as_ref(),
 			Some(TurnRequest::User(_) | TurnRequest::Authored { .. } | TurnRequest::Skill(_))
 		) {
-			self.goal_continuation_suppressed = false;
+			self.set_goal_continuation_armed(true)?;
 		}
 		let mut quit = false;
 		let ask = self.ask.clone();
@@ -1359,13 +1474,21 @@ impl<C: omp_agent::Inference> Controller<C> {
 				.voice
 				.settle_delegation(id, terminal, final_text, &self.ctx);
 		}
-		if matches!(&result, Ok(outcome) if outcome.stop == TurnStop::Completed) {
-			let had_tool_calls = self.latest_turn_had_tool_calls();
-			if goal_continuation_turn {
-				self.goal_continuation_suppressed = !had_tool_calls;
-			} else if had_tool_calls {
-				self.goal_continuation_suppressed = false;
-			}
+		if matches!(&result, Ok(outcome) if outcome.stop == TurnStop::Completed)
+			&& self.latest_turn_had_tool_calls()
+		{
+			self.set_goal_continuation_armed(true)?;
+		}
+		if matches!(&result, Ok(outcome) if outcome.stop == TurnStop::Cancelled)
+			&& omp_agent::find_director(self.session.dom(), "goal").is_some_and(|(_, node)| {
+				omp_agent::director_status(node) == Some("active")
+					&& !omp_agent::state_bool(node, "done").unwrap_or(false)
+					&& !omp_agent::state_bool(node, "dropped").unwrap_or(false)
+			})
+		{
+			let registry = omp_agent::DirectorRegistry::standard();
+			let mut stack = omp_agent::DirectorStack::from_dom(self.session.dom(), &registry);
+			let _ = stack.pause(&mut self.session, "goal").into_diagnostic()?;
 		}
 		if let Err(error) = result {
 			if matches!(&error, omp_agent::KernelError::NothingToRetry) {
@@ -1698,7 +1821,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 			},
 			HostCommand::Director { id, engage, args } => {
 				match self.director(id.as_str(), engage, &args) {
-					Ok(()) if id.as_str() == "goal" => self.goal_continuation_suppressed = false,
+					Ok(()) if id.as_str() == "goal" => {
+						self.set_goal_continuation_armed(true)?;
+					},
 					Ok(()) => {},
 					Err(error) => self.reply(Severity::Warn, format!("{id}: {error}")),
 				}
@@ -1811,6 +1936,28 @@ impl<C: omp_agent::Inference> Controller<C> {
 	}
 
 	fn answer_ask(&self, id: &str, answers: Option<Vec<omp_tools::ask::Selection>>) {
+		if let Some(request_id) = id
+			.strip_prefix(COLLAB_UI_PREFIX)
+			.and_then(|value| value.parse::<u32>().ok())
+		{
+			let value = answers.and_then(|answers| {
+				answers.into_iter().next().and_then(|answer| {
+					answer
+						.custom_input
+						.or_else(|| answer.selected.into_iter().next())
+						.map(|value| value.to_string())
+				})
+			});
+			let collab = self.collab.clone();
+			tokio::spawn(async move {
+				let _ = collab
+					.request(omp_driver::collab::session::CollabOwnerCommand::UiResponse(
+						omp_proto::collab::v1::UiResponse { request_id, value },
+					))
+					.await;
+			});
+			return;
+		}
 		answer_ask(&self.ask, id, answers);
 	}
 
@@ -1951,7 +2098,11 @@ impl<C: omp_agent::Inference> Controller<C> {
 				match omp_collab::link::RelayEndpoint::parse(origin) {
 					Ok(relay) => {
 						let (snapshot, events) = self.session.subscribe();
-						Ok(CollabOwnerCommand::Start { relay, snapshot, events })
+						let agents = omp_driver::collab::observer::HostAgentBridge::new(
+							Arc::clone(&self.home.live),
+							self.home.sessions_dir.clone(),
+						);
+						Ok(CollabOwnerCommand::Start { relay, snapshot, events, agents })
 					},
 					Err(error) => Err(ServiceError::failed(error)),
 				}
@@ -2168,6 +2319,18 @@ impl<C: omp_agent::Inference> Controller<C> {
 			.kernel
 			.flush_session_state(&mut self.session)
 			.into_diagnostic()?;
+		// A session selected from storage never resumes autonomous work merely
+		// because its last process disappeared. The pause is a target-journal
+		// fact, so replay and every actor see the same admission gate.
+		if omp_agent::find_director(next.dom(), "goal").is_some_and(|(_, node)| {
+			omp_agent::director_status(node) == Some("active")
+				&& !omp_agent::state_bool(node, "done").unwrap_or(false)
+				&& !omp_agent::state_bool(node, "dropped").unwrap_or(false)
+		}) {
+			let registry = omp_agent::DirectorRegistry::standard();
+			let mut stack = omp_agent::DirectorStack::from_dom(next.dom(), &registry);
+			let _ = stack.pause(&mut next, "goal").into_diagnostic()?;
+		}
 		// Subscribe before the swap: nothing writes `next` until it is live,
 		// so its receiver holds no events when the reset goes out.
 		let (snapshot, events) = next.subscribe();
@@ -2175,7 +2338,6 @@ impl<C: omp_agent::Inference> Controller<C> {
 		self.home.unregister(&self.session);
 		let previous = std::mem::replace(&mut self.session, next);
 		drop(previous);
-		self.goal_continuation_suppressed = false;
 		if let Some(forwarder) = self.forwarder.take() {
 			// The old DOM's sender is gone; the forwarder drains what it
 			// buffered and ends, so nothing from the old session lands after
@@ -2445,39 +2607,49 @@ impl<C: omp_agent::Inference> Controller<C> {
 					"budget" => {
 						let (handle, _) = omp_agent::find_director(self.session.dom(), "goal")
 							.ok_or(DirectorFailure::NotActive)?;
-						let budget = args
-							.get(1)
-							.and_then(|value| value.parse::<i64>().ok())
-							.map_or(Value::Null, Value::Int);
+						let budget = match args.get(1) {
+							None => Value::Null,
+							Some(value) => {
+								let parsed = value
+									.parse::<i64>()
+									.ok()
+									.filter(|budget| *budget > 0)
+									.ok_or_else(|| DirectorFailure::InvalidArgument {
+										name:  "token budget",
+										value: value.clone(),
+									})?;
+								Value::Int(parsed)
+							},
+						};
 						let cause = self.session.head().ok_or(DirectorFailure::NoHead)?;
 						self.session.patch(Txn {
 							cause,
-							label: Some(Str::new_static("director.state")),
-							ops: vec![Op::Set {
-								h:     handle,
-								prop:  PropKey::Custom(Str::new_static("state/token_budget")),
-								value: budget,
-							}],
+							label: Some(Str::new_static("goal.budget")),
+							ops: vec![
+								Op::Set {
+									h:     handle,
+									prop:  PropKey::Custom(Str::new_static("state/token_budget")),
+									value: budget,
+								},
+								Op::Set {
+									h:     handle,
+									prop:  PropKey::Custom(Str::new_static(
+										"state/continuation_armed",
+									)),
+									value: Value::Bool(true),
+								},
+							],
 						})?;
 						return Ok(());
 					},
 					_ => {
 						let objective = args.get(1).cloned().unwrap_or_default();
 						if active {
-							// Replace the objective in place (pi `replaceGoalFromObjective`).
-							let (handle, _) = omp_agent::find_director(self.session.dom(), "goal")
-								.ok_or(DirectorFailure::NotActive)?;
-							let cause = self.session.head().ok_or(DirectorFailure::NoHead)?;
-							self.session.patch(Txn {
-								cause,
-								label: Some(Str::new_static("director.state")),
-								ops: vec![Op::Set {
-									h:     handle,
-									prop:  PropKey::Custom(Str::new_static("state/objective")),
-									value: Value::Str(objective),
-								}],
-							})?;
-							return Ok(());
+							// Replacement is a new accountable objective: identity,
+							// usage, budget, and completion evidence reset together.
+							stack.exit(&mut self.session, id)?;
+							stack =
+								omp_agent::DirectorStack::from_dom(self.session.dom(), &registry);
 						}
 						Box::new(Goal::new(objective, None))
 					},
@@ -3788,6 +3960,89 @@ mod tests {
 				.expect("selector"),
 			1
 		);
+		let (_, goal) =
+			omp_agent::find_director(session.dom(), "goal").expect("goal remains engaged");
+		assert_eq!(
+			omp_agent::state_bool(goal, "continuation_armed"),
+			Some(false),
+			"the prose-only hold must survive journal replay"
+		);
+	}
+
+	#[tokio::test]
+	async fn pending_composer_input_wins_and_rearms_the_idle_boundary() {
+		let harness = HarnessSpec::new(Script::Text, Duration::ZERO).build_with(|session, _| {
+			let registry = omp_agent::DirectorRegistry::standard();
+			omp_agent::DirectorStack::from_dom(session.dom(), &registry)
+				.engage(session, Box::new(omp_agent::directors::goal::Goal::new("finish", None)))
+				.expect("goal engages");
+		});
+		let gate = harness
+			.ctx
+			.user::<omp_chat::PendingInputGate>()
+			.expect("controller installs input gate");
+		harness
+			.commands
+			.send(HostCommand::Submit(Str::new_static("start")))
+			.expect("initial prompt");
+		next_event(&harness.events, |event| {
+			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Completed })
+		})
+		.await;
+		gate.set_pending(true);
+		assert!(
+			tokio::time::timeout(Duration::from_millis(900), async {
+				loop {
+					if matches!(
+						harness.events.recv_async().await.expect("kernel event"),
+						KernelEvent::InferenceStarted
+					) {
+						break;
+					}
+				}
+			})
+			.await
+			.is_err(),
+			"an unsent draft suppresses automatic Goal work"
+		);
+		gate.set_pending(false);
+		next_event(&harness.events, |event| {
+			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Completed })
+		})
+		.await;
+		let _ = harness.quit().await;
+	}
+
+	#[tokio::test]
+	async fn interrupt_pauses_an_active_goal_durably() {
+		let harness = HarnessSpec::new(Script::Text, Duration::from_millis(300)).build_with(
+			|session, _| {
+				let registry = omp_agent::DirectorRegistry::standard();
+				omp_agent::DirectorStack::from_dom(session.dom(), &registry)
+					.engage(
+						session,
+						Box::new(omp_agent::directors::goal::Goal::new("finish", None)),
+					)
+					.expect("goal engages");
+			},
+		);
+		harness
+			.commands
+			.send(HostCommand::Submit(Str::new_static("start")))
+			.expect("initial prompt");
+		next_event(&harness.events, |event| matches!(event, KernelEvent::InferenceStarted)).await;
+		harness
+			.commands
+			.send(HostCommand::Interrupt)
+			.expect("interrupt");
+		next_event(&harness.events, |event| {
+			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Cancelled })
+		})
+		.await;
+		let (journal, _dir) = harness.quit().await;
+		let session = Session::open(&journal, ComponentRegistry::standard()).expect("journal replays");
+		let (_, goal) = omp_agent::find_director(session.dom(), "goal").expect("goal retained");
+		assert_eq!(omp_agent::director_status(goal), Some("paused"));
 	}
 
 	fn sleep_command() -> HostCommand {

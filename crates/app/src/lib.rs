@@ -78,6 +78,7 @@ pub mod ssh_cmd;
 pub mod standalone_tool_cmd;
 pub mod startup_notice;
 mod startup_update;
+pub mod stats_cmd;
 pub mod theme_watcher;
 pub mod tiny_models_cmd;
 pub mod token_cmd;

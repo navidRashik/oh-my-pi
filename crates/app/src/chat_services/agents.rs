@@ -20,8 +20,25 @@ const LIVE_SUBSCRIBE_BUDGET: Duration = Duration::from_millis(750);
 /// Requests the transcript of agent `id`.
 pub fn view(state: &ServiceState, id: &str) -> ServiceResult<Pending<AgentView>> {
 	let (tx, rx) = flume::bounded(1);
+	if state
+		.collab
+		.presence()
+		.is_some_and(|facts| facts.role() == omp_collab::presence::CollabRole::Guest)
+	{
+		let collab = state.collab.clone();
+		let id = Str::new(id);
+		state.runtime.spawn(async move {
+			let view = collab
+				.observe_agent(id)
+				.await
+				.map(|view| AgentView { snapshot: view.snapshot, events: view.events })
+				.map_err(ServiceError::failed);
+			let _ = tx.send(view);
+		});
+		return Ok(rx);
+	}
 	let journal = journal_path(state, id);
-	match state.sessions.lookup(&SessionId::new(Str::new(id))) {
+	match state.sessions.lookup(SessionId::from_ref(id)) {
 		Some(live) => {
 			let (reply_tx, reply_rx) = flume::bounded(1);
 			if live.up.send(Up::Subscribe(reply_tx)).is_err() {

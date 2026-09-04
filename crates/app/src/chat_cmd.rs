@@ -225,10 +225,14 @@ pub(crate) struct Launch {
 	pub templates:     Arc<PromptTemplates>,
 	/// Discovered skill declarations shared with the kernel and slash console.
 	pub skills:        Arc<omp_driver::discovery::skills::ActiveSkills>,
-	/// The named theme the interactive host paints with: `cl_theme` resolved
-	/// against `--theme` paths and the theme directories; `None` is the stock
-	/// palette.
+	/// The named dark-appearance theme the interactive host paints with:
+	/// `cl_theme_dark` resolved against `--theme` paths and the theme
+	/// directories; `None` is the stock dark palette.
 	pub theme:         Option<Arc<omp_tui::JsonTheme>>,
+	/// The independently persisted named light-appearance theme. An explicit
+	/// `cl_theme`/`--use-theme` override fills both fields with the same fixed
+	/// named theme.
+	pub light_theme:   Option<Arc<omp_tui::JsonTheme>>,
 	/// Every discovered named palette, retained for `/settings` runtime choices
 	/// and observer-local preview.
 	pub theme_catalog: Arc<omp_tui::ThemeCatalog>,
@@ -367,7 +371,8 @@ impl Launch {
 		for warning in &active_skills.warnings {
 			eprintln!("warning: {}: {}", warning.path.display(), warning.message);
 		}
-		let (theme, theme_catalog) = resolve_theme(&ctx, &theme, &config_root, &project)?;
+		let (theme, light_theme, theme_catalog) =
+			resolve_theme(&ctx, &theme, &config_root, &project)?;
 
 		let resuming = continue_session || resume.is_some() || fork.is_some();
 		let settings = ModelSettings::from_con(&ctx).resolve_path_scopes(&project, &home);
@@ -513,6 +518,7 @@ impl Launch {
 			templates: Arc::new(templates),
 			skills: active_skills,
 			theme,
+			light_theme,
 			theme_catalog,
 			live_sessions,
 			options,
@@ -602,20 +608,27 @@ impl Launch {
 /// Stock palette name: `cl_theme`'s default, meaning "follow the terminal".
 const STOCK_THEME: &str = "default";
 
-/// Resolves the interactive palette from `cl_theme` (`--use-theme`, or the
-/// archived setting) against the `--theme` paths, then `<config
-/// root>/agent/themes`, then `<project>/.omp/themes` (pi `loadThemeJson`).
-/// With the stock name, the first `--theme` file is the theme; an unknown
-/// name warns and keeps the stock palette. A broken explicit path is an
-/// error: the operator asked for it.
+/// Resolves the interactive dark and light palettes from their archived
+/// `cl_theme_dark` / `cl_theme_light` profile choices against `--theme` paths,
+/// then `<config root>/agent/themes`, then `<project>/.omp/themes` (pi
+/// `loadThemeJson`). `cl_theme` (`--use-theme`) remains an explicit fixed
+/// override and therefore fills both appearance slots with the same theme.
+///
+/// With the stock override name, the first `--theme` file is a fixed theme; an
+/// unknown named choice warns and keeps that appearance's stock palette. A
+/// broken explicit path is an error: the operator asked for it.
 fn resolve_theme(
 	ctx: &omp_con::Ctx,
 	explicit: &[PathBuf],
 	config_root: &Path,
 	project: &Path,
-) -> miette::Result<(Option<Arc<omp_tui::JsonTheme>>, Arc<omp_tui::ThemeCatalog>)> {
+) -> miette::Result<(
+	Option<Arc<omp_tui::JsonTheme>>,
+	Option<Arc<omp_tui::JsonTheme>>,
+	Arc<omp_tui::ThemeCatalog>,
+)> {
 	let override_name = omp_con::CL_THEME.get(ctx);
-	let stock = override_name.is_empty() || override_name == STOCK_THEME;
+	let automatic = override_name.is_empty() || override_name == STOCK_THEME;
 	let catalog = omp_tui::ThemeCatalog::load(explicit, &[
 		config_root.join("agent/themes"),
 		project.join(".omp/themes"),
@@ -624,25 +637,41 @@ fn resolve_theme(
 	for warning in &catalog.warnings {
 		eprintln!("warning: {}: {}", warning.path.display(), warning.message);
 	}
-	let selected = if stock && !explicit.is_empty() {
-		catalog.first_explicit()
+	let (dark, light) = if automatic && explicit.is_empty() {
+		(
+			resolve_named_theme(
+				&catalog,
+				&omp_chat::settings::CL_THEME_DARK.get(ctx),
+				"titanium",
+			),
+			resolve_named_theme(&catalog, &omp_chat::settings::CL_THEME_LIGHT.get(ctx), "light"),
+		)
 	} else {
-		let name = if stock {
-			omp_chat::settings::CL_THEME_DARK.get(ctx)
+		let selected = if automatic {
+			catalog.first_explicit()
 		} else {
-			override_name
+			resolve_named_theme(&catalog, &override_name, STOCK_THEME)
+				.or_else(|| catalog.first_explicit())
 		};
-		match catalog.get(&name) {
-			Some(theme) => Some(theme),
-			None => {
-				if !name.is_empty() && name != STOCK_THEME && name != "titanium" && name != "light" {
-					eprintln!("warning: theme `{name}` not found; using the stock palette");
-				}
-				catalog.first_explicit()
-			},
-		}
+		(selected.clone(), selected)
 	};
-	Ok((selected, Arc::new(catalog)))
+	Ok((dark, light, Arc::new(catalog)))
+}
+
+fn resolve_named_theme(
+	catalog: &omp_tui::ThemeCatalog,
+	name: &str,
+	stock_name: &str,
+) -> Option<Arc<omp_tui::JsonTheme>> {
+	match catalog.get(name) {
+		Some(theme) => Some(theme),
+		None => {
+			if !name.is_empty() && name != STOCK_THEME && name != stock_name {
+				eprintln!("warning: theme `{name}` not found; using the stock palette");
+			}
+			None
+		},
+	}
 }
 
 /// The launch's prompt templates and skills as the chat console sees them.
@@ -1080,6 +1109,7 @@ pub(crate) async fn run(
 	let chat_ui_owner = Arc::new(crate::chat_services::extension_ui::ChatUiOwner::new(
 		Arc::clone(ctx),
 		ask_route.clone(),
+		Some(collab.clone()),
 	));
 	kernel
 		.inference()
@@ -1125,7 +1155,8 @@ pub(crate) async fn run(
 		project: project.clone(),
 		welcome,
 		services,
-		ui: omp_tui::UiContext::default().with_palette(launch.theme.clone()),
+		ui: omp_tui::UiContext::default()
+			.with_appearance_palettes(launch.theme.clone(), launch.light_theme.clone()),
 		speech,
 	};
 	let skill_prompt = (!launch_inputs.has_files)
@@ -1157,8 +1188,9 @@ pub(crate) async fn run(
 	#[cfg(feature = "gui")]
 	if presentation == ChatPresentation::Gui {
 		let controller = tokio::spawn(controller);
+		// The native actor owns exactly one controller shutdown request on
+		// window/debug close; awaiting it here must not emit a second quit.
 		crate::gui::run(options)?;
-		let _ = commands.send(omp_chat::HostCommand::Quit);
 		controller.await.into_diagnostic()??;
 		if let Some(path) = ephemeral_path {
 			let _ = fs::remove_file(path);
@@ -1312,6 +1344,16 @@ mod tests {
 		assert!(!omp_con::CL_SHOWTHINKING.get(&ctx));
 		assert!(!omp_chat::chrome::CL_TITLE_STATE.get(&ctx));
 		assert_eq!(omp_con::CL_THEME.get(&ctx), "ocean");
+		assert_eq!(
+			launch.theme.as_ref().map(|theme| theme.name.as_str()),
+			Some("Ocean"),
+			"the explicit theme fills the dark appearance slot",
+		);
+		assert_eq!(
+			launch.light_theme.as_ref().map(|theme| theme.name.as_str()),
+			Some("Ocean"),
+			"the explicit theme remains fixed across appearance changes",
+		);
 		assert_eq!(omp_envd::pi_settings::SV_SKILLS_INCLUDE.get(&ctx), vec![Str::new_static(
 			"rust*"
 		)]);
@@ -1452,7 +1494,8 @@ mod tests {
 			Some("Plain body\n\nextra words"),
 			"unreferenced words are appended"
 		);
-		assert!(launch.theme.is_none(), "stock palette without --theme or cl_theme");
+		assert!(launch.theme.is_none(), "stock dark palette without --theme or cl_theme");
+		assert!(launch.light_theme.is_none(), "stock light palette without --theme or cl_theme");
 
 		let ctx = omp_chat::HostMailbox::new()
 			.attach(omp_con::Ctx::builder())
@@ -1479,6 +1522,47 @@ mod tests {
 		assert_eq!(posted.as_deref(), Some("Fix a then run b"));
 	}
 
+	#[test]
+	fn archived_dark_and_light_names_resolve_independently() {
+		let dir = tempfile::tempdir().unwrap();
+		let themes = dir.path().join("home/.o2/agent/themes");
+		fs::create_dir_all(&themes).unwrap();
+		fs::write(
+			themes.join("night.json"),
+			r##"{"name":"Night","dark":{"accent":"#111111"},"light":{"accent":"#121212"}}"##,
+		)
+		.unwrap();
+		fs::write(
+			themes.join("day.json"),
+			r##"{"name":"Day","dark":{"accent":"#dddddd"},"light":{"accent":"#eeeeee"}}"##,
+		)
+		.unwrap();
+		let ctx = omp_con::Ctx::new();
+		omp_chat::settings::CL_THEME_DARK
+			.set(&ctx, Str::new_static("night"))
+			.unwrap();
+		omp_chat::settings::CL_THEME_LIGHT
+			.set(&ctx, Str::new_static("day"))
+			.unwrap();
+
+		let (dark, light, _) =
+			resolve_theme(&ctx, &[], &dir.path().join("home/.o2"), dir.path()).unwrap();
+		let mut ui = omp_tui::UiContext::default().with_appearance_palettes(dark, light);
+		assert_eq!(ui.theme.accent, omp_tui::Color::Rgb(0x11, 0x11, 0x11));
+		assert!(ui.apply_appearance(omp_tui::Appearance::Light));
+		assert_eq!(
+			ui.theme.accent,
+			omp_tui::Color::Rgb(0xee, 0xee, 0xee),
+			"the persisted light name selects a different palette",
+		);
+		assert!(ui.apply_appearance(omp_tui::Appearance::Dark));
+		assert_eq!(
+			ui.theme.accent,
+			omp_tui::Color::Rgb(0x11, 0x11, 0x11),
+			"the persisted dark name survives a terminal appearance round trip",
+		);
+	}
+
 	#[tokio::test]
 	async fn unknown_theme_name_keeps_the_stock_palette_and_broken_theme_file_fails() {
 		let dir = tempfile::tempdir().unwrap();
@@ -1491,6 +1575,7 @@ mod tests {
 				.await
 				.expect("launch lowers");
 		assert!(launch.theme.is_none());
+		assert!(launch.light_theme.is_none());
 
 		let broken = dir.path().join("broken.json");
 		fs::write(&broken, "{").unwrap();

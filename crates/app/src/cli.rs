@@ -80,7 +80,7 @@ use crate::{
 	git_cmd::GitArgs,
 	grep_cmd, grievances_cmd, models_cmd, print_mode, profile_alias, render_cmd,
 	render_cmd::RenderArgs,
-	rpc_mode, say_cmd, setup_cmd, smoke_test, ssh_cmd,
+	rpc_mode, say_cmd, setup_cmd, smoke_test, ssh_cmd, stats_cmd,
 	ssh_cmd::SshArgs,
 	startup_notice,
 	startup_notice::Eligibility,
@@ -377,8 +377,7 @@ pub struct OmpCli {
 	/// Suppress the workspace extension layer for this invocation.
 	#[arg(long = "no-workspace-ext", hide = true)]
 	pub no_workspace_ext:  bool,
-	/// Export one validated native journal copy and its text transcript, then
-	/// exit.
+	/// Export one durable session to a standalone HTML transcript, then exit.
 	#[arg(long, global = true, value_name = "SESSION_OMS")]
 	pub export:            Option<PathBuf>,
 	/// Operation to run. Defaults to interactive project chat.
@@ -494,6 +493,17 @@ pub struct InstallArgs {
 	/// Install-record scope.
 	#[arg(long, value_enum, default_value_t = ExtScope::User)]
 	pub scope:   ExtScope,
+}
+
+/// Non-interactive historical usage-statistics options.
+#[derive(Clone, Debug, Args)]
+pub struct StatsArgs {
+	/// Emit the complete aggregate as machine-readable JSON.
+	#[arg(short = 'j', long)]
+	pub json: bool,
+	/// Print the human-readable aggregate (the default).
+	#[arg(short = 's', long)]
+	pub summary: bool,
 }
 
 /// Durable quota-history options.
@@ -1040,6 +1050,8 @@ pub enum Command {
 	Git(GitArgs),
 	/// Inspect or invalidate durable provider quota observations.
 	Usage(UsageArgs),
+	/// Aggregate historical usage from durable session journals.
+	Stats(StatsArgs),
 	/// Benchmark model chat, prefill, and generation TTFT/decode/cache
 	/// performance.
 	#[command(alias = "if-bench")]
@@ -1501,7 +1513,6 @@ fn launch_option(argument: &OsString) -> Option<bool> {
 			| "--no-session"
 			| "--py-eval"
 			| "--print-thoughts"
-			| "--shape-transcript"
 			| "--acp-terminal-auth"
 			| "--smoke-test"
 			| "--plan-mode"
@@ -1950,9 +1961,6 @@ pub struct PrintArgs {
 	/// Additional user messages applied in order after the initial prompt.
 	#[arg(long = "follow-up", value_name = "TEXT")]
 	pub follow_ups:       Vec<Str>,
-	/// Drop provider payloads and partial transcript snapshots from NDJSON.
-	#[arg(long)]
-	pub shape_transcript: bool,
 }
 
 impl std::ops::Deref for PrintArgs {
@@ -2457,6 +2465,7 @@ enum DispatchTarget {
 	Gallery,
 	Git,
 	Usage,
+	Stats,
 	Bench,
 	DryBalance,
 	TinyModels,
@@ -2508,6 +2517,7 @@ const fn dispatch_target(command: Option<&Command>) -> DispatchTarget {
 		Some(Command::Gallery(_)) => DispatchTarget::Gallery,
 		Some(Command::Git(_)) => DispatchTarget::Git,
 		Some(Command::Usage(_)) => DispatchTarget::Usage,
+		Some(Command::Stats(_)) => DispatchTarget::Stats,
 		Some(Command::Bench(_)) => DispatchTarget::Bench,
 		Some(Command::DryBalance(_)) => DispatchTarget::DryBalance,
 		Some(Command::TinyModels(_)) => DispatchTarget::TinyModels,
@@ -2856,7 +2866,6 @@ fn promote_piped_launch(cli: &mut OmpCli) {
 			mode: "text".to_owned(),
 			print_thoughts: false,
 			follow_ups: Vec::new(),
-			shape_transcript: false,
 		}),
 		other => other,
 	});
@@ -2912,8 +2921,7 @@ async fn dispatch_with_input(cli: OmpCli, piped_input: Option<Str>) -> miette::R
 		let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
 		let cwd = env::current_dir().into_diagnostic()?;
 		let exported = crate::render_cmd::export_session(journal, &data_dir, &cwd)?;
-		println!("Journal: {}", exported.journal.display());
-		println!("Transcript: {}", exported.transcript.display());
+		println!("Exported to: {}", exported.html.display());
 		return Ok(());
 	}
 	if cli.smoke_test {
@@ -3035,10 +3043,11 @@ async fn dispatch_with_input(cli: OmpCli, piped_input: Option<Str>) -> miette::R
 		Command::Worktree(args) => {
 			worktree_cmd::run(&omp_core::dirs::data_dir(None).into_diagnostic()?, &args)
 		},
-		Command::Gc(args) => gc_cmd::run(args),
+		Command::Gc(args) => gc_cmd::run(args).await,
 		Command::Gallery(args) => gallery_cmd::run(args),
 		Command::Git(args) => git_cmd::run(args).await,
 		Command::Usage(args) => usage_cmd::run(args).await,
+		Command::Stats(args) => stats_cmd::run(args),
 		Command::Bench(args) => bench_cmd::run(args).await,
 		Command::DryBalance(args) => dry_balance_cmd::run(args).await,
 		Command::TinyModels(args) => tiny_models_cmd::run(args).await,
@@ -4937,6 +4946,14 @@ mod tests {
 		assert!(matches!(
 			parse(&["omp", "models", "find", "model"]).command,
 			Some(Command::Models(_))
+		));
+		assert!(matches!(
+			parse(&["omp", "stats", "--json"]).command,
+			Some(Command::Stats(StatsArgs { json: true, summary: false }))
+		));
+		assert!(matches!(
+			parse(&["omp", "stats", "--summary"]).command,
+			Some(Command::Stats(StatsArgs { json: false, summary: true }))
 		));
 		assert!(matches!(
 			parse(&["omp", "update", "--check"]).command,

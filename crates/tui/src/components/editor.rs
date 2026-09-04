@@ -718,6 +718,17 @@ impl EditInput {
 		self.refresh_keyword_spans();
 	}
 
+	/// Shows or replaces native-IME marked text and its byte-indexed
+	/// selection inside the marked span.
+	pub fn set_volatile_text_selection(
+		&mut self,
+		text: &str,
+		selection: Option<Range<usize>>,
+	) {
+		self.editor.set_volatile_text_selection(text, selection);
+		self.refresh_keyword_spans();
+	}
+
 	/// Discards the active volatile speech-recognition preview.
 	pub fn clear_volatile_text(&mut self) {
 		self.editor.clear_volatile_text();
@@ -1552,8 +1563,10 @@ impl Component for EditInput {
 			let selection_bytes = selection.map(|(start, end)| {
 				(byte_at_column(content.text, start), byte_at_column(content.text, end))
 			});
-			let cursor = (focused && selection.is_none())
-				.then_some(content.cursor_column)
+			let cursor = (focused
+				&& self.editor.caret_visible()
+				&& (selection.is_none() || self.editor.volatile_active()))
+			.then_some(content.cursor_column)
 				.flatten()
 				.map(|column| byte_at_column(content.text, column));
 			paint_xml_range(
@@ -2531,6 +2544,17 @@ impl EditorPane {
 	/// Shows or replaces one volatile speech-recognition preview.
 	pub fn set_volatile_text(&mut self, text: &str) {
 		self.input_mut().set_volatile_text(text);
+		self.children[0].invalidate();
+	}
+
+	/// Shows or replaces native-IME marked text and its byte-indexed
+	/// selection inside the marked span.
+	pub fn set_volatile_text_selection(
+		&mut self,
+		text: &str,
+		selection: Option<Range<usize>>,
+	) {
+		self.input_mut().set_volatile_text_selection(text, selection);
 		self.children[0].invalidate();
 	}
 

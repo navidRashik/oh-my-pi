@@ -69,7 +69,7 @@ impl SpeechSynth for EnvSpeechSynth {
 				audio = self.bridge.speak(wire) => audio.map_err(|error| {
 					tracing::debug!(
 						code = %error.code,
-						diagnostic = %error.message,
+						kind = %error.kind,
 						"vocalizer synthesis backend failed"
 					);
 					SpeechSynthFailure::Backend { code: error.code }

@@ -2435,7 +2435,12 @@ mod tests {
 		ConptyChunks, MAX_CONPTY_WRITE_CHUNK_BYTES, MAX_OUTPUT_BACKLOG_BYTES, OutputBacklogGuard,
 		RESET_HISTORY, Renderer, ResolvedLayer, SYNC_OUTPUT_BEGIN, SYNC_OUTPUT_END,
 	};
-	use crate::{Frame, Graphics, RowMark, Size, Style, test_support::TerminalModel};
+	use crate::{
+		Color, Frame, Graphics, Prop, RowMark, Size, Style,
+		components::TextLeaf,
+		slots::{Mode, ResizePolicy, Slots},
+		test_support::TerminalModel,
+	};
 
 	fn frame(width: u16, lines: &[&str]) -> Frame {
 		let mut frame =
@@ -2538,6 +2543,55 @@ mod tests {
 		let hello = output.find("hello").unwrap();
 		let world = output.find("world").unwrap();
 		assert!(start < hello && hello < world && world < close, "{output:?}");
+	}
+
+	#[test]
+	fn committed_history_materializes_cached_style_and_link_once() {
+		let foreground = Color::Rgb(18, 52, 86);
+		let target = "https://example.test/history";
+		let mut slots = Slots::new(16, 2, ResizePolicy::Rebuild);
+		let id = slots.open(Mode::Mutable);
+		slots.set(
+			id,
+			TextLeaf::new()
+				.text("colored")
+				.with(Prop::Fg, foreground)
+				.with(Prop::Bold, true)
+				.with(Prop::Href, target),
+		);
+		slots.finalize(id);
+
+		let mut renderer = Renderer::new(Vec::new());
+		renderer.set_hyperlinks(true);
+		let plan = slots.plan();
+		let delivered = renderer.present_plan(&plan, &[]).expect("history delivery");
+		slots.commit(plan, delivered);
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).expect("terminal UTF-8");
+		assert_eq!(
+			output.matches("38;2;18;52;86").count(),
+			1,
+			"foreground SGR is emitted only at final materialization: {output:?}",
+		);
+		assert_eq!(
+			output.matches(target).count(),
+			1,
+			"the cached semantic link is materialized once: {output:?}",
+		);
+		assert!(output.contains("\x1b[0m"), "history delivery restores the terminal style");
+		assert!(
+			output.ends_with(SYNC_OUTPUT_END),
+			"the reset is sealed inside the delivery transaction before control returns",
+		);
+
+		let paint_only = slots.plan();
+		assert!(paint_only.rows().is_empty());
+		renderer
+			.present_plan(&paint_only, &[])
+			.expect("history-neutral repaint");
+		let repeated =
+			String::from_utf8(mem::take(renderer.writer_mut())).expect("terminal UTF-8");
+		assert!(!repeated.contains("38;2;18;52;86"));
+		assert!(!repeated.contains(target));
 	}
 
 	#[test]

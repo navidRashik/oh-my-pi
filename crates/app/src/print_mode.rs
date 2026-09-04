@@ -45,6 +45,11 @@ use crate::{
 	usage_error::CliUsageError,
 };
 
+/// A print-mode failure already written to standard error.
+#[derive(Debug, miette::Diagnostic, thiserror::Error)]
+#[error("print request failed")]
+pub struct PrintFailure;
+
 /// Runs prompts through the new durable headless kernel.
 pub async fn run(args: PrintArgs, piped_input: Option<Str>) -> miette::Result<()> {
 	// The kernel owns the deadline and journals the terminal assistant before
@@ -60,7 +65,7 @@ struct PrintOptions {
 }
 
 async fn run_inner(args: PrintArgs, piped_input: Option<Str>) -> miette::Result<()> {
-	let PrintArgs { launch, mode, print_thoughts, follow_ups, shape_transcript: _ } = args;
+	let PrintArgs { launch, mode, print_thoughts, follow_ups } = args;
 	let print_thoughts = print_thoughts && !launch.hide_thinking;
 	let args = PrintOptions { mode, print_thoughts };
 	if launch.from_claude || launch.from_codex {
@@ -214,9 +219,11 @@ async fn run_inner(args: PrintArgs, piped_input: Option<Str>) -> miette::Result<
 		let stop = match result {
 			Ok(outcome) => outcome.stop,
 			Err(error) => {
+				let message = sanitize_text(&error.to_string());
 				let cause = kernel_exit_cause(&error, launch.model.as_str());
 				session.record_exit(cause).into_diagnostic()?;
-				return Err(miette::Report::from_err(error));
+				report_print_failure(&message).await?;
+				return Err(PrintFailure.into());
 			},
 		};
 		if stop != TurnStop::Completed {
@@ -239,7 +246,8 @@ async fn run_inner(args: PrintArgs, piped_input: Option<Str>) -> miette::Result<
 				TurnStop::Completed => ExitCause::Normal,
 			};
 			session.record_exit(cause).into_diagnostic()?;
-			return Err(miette!("{}", sanitize_text(message.as_str())));
+			report_print_failure(&sanitize_text(message.as_str())).await?;
+			return Err(PrintFailure.into());
 		}
 		if args.mode == "text"
 			&& let Some(message) = turn_error_message(&replica, submission_turn)
@@ -268,6 +276,13 @@ async fn run_inner(args: PrintArgs, piped_input: Option<Str>) -> miette::Result<
 		let _ = fs::remove_file(path);
 	}
 	Ok(())
+}
+
+async fn report_print_failure(message: &str) -> miette::Result<()> {
+	let mut stderr = tokio::io::stderr();
+	stderr.write_all(message.as_bytes()).await.into_diagnostic()?;
+	stderr.write_all(b"\n").await.into_diagnostic()?;
+	stderr.flush().await.into_diagnostic()
 }
 
 fn kernel_exit_cause(error: &KernelError, model: &str) -> ExitCause {
@@ -1246,6 +1261,18 @@ fn transcript_messages_from_with(
 					saw_assistant = true;
 					messages.push(message_value_with(dom, *handle, state));
 				},
+				Some(Tag::Known(KnownTag::Developer)) => {
+					let node = dom.get(*handle).expect("matched developer node");
+					messages.push(serde_json::json!({
+						"role": "developer",
+						"content": node.content.as_deref().unwrap_or_default(),
+						"timestamp": state
+							.node_timestamps
+							.get(handle)
+							.copied()
+							.unwrap_or_else(|| node_timestamp_ms(node, PropId::Id)),
+					}));
+				},
 				Some(Tag::Custom(_))
 					if matches!(
 						prop_text(dom.get(*handle), PropId::Status),
@@ -1308,6 +1335,28 @@ fn message_value_impl(dom: &Dom, handle: Handle, state: Option<&JsonState>) -> s
 				.map(|value| (provider_block_index(node), position, value))
 		})
 		.collect::<Vec<_>>();
+	// Journals written before ordered assistant-content children stored text
+	// and thinking directly on the assistant. Preserve those blocks even when
+	// a following tool call makes the indexed content list non-empty.
+	if indexed.is_empty() {
+		if let Some(thinking) = node_text(node, PropId::Thinking)
+			&& !thinking.is_empty()
+		{
+			indexed.push((
+				0,
+				0,
+				serde_json::json!({"type":"thinking","thinking":thinking}),
+			));
+		}
+		if let Some(text) = node_text(node, PropId::Text)
+			.or(node.content.as_deref())
+			.filter(|text| !text.is_empty())
+		{
+			let position = indexed.len();
+			let index = u32::try_from(position).unwrap_or(u32::MAX);
+			indexed.push((index, position, serde_json::json!({"type":"text","text":text})));
+		}
+	}
 	let mut next_index = indexed
 		.iter()
 		.map(|(index, ..)| index.saturating_add(1))
@@ -1331,6 +1380,18 @@ fn message_value_impl(dom: &Dom, handle: Handle, state: Option<&JsonState>) -> s
 			}
 			let index = state
 				.and_then(|state| state.call_indices.get(call).copied())
+				.or_else(|| {
+					dom.get(*call)
+						.and_then(|node| {
+							node.prop(&PropKey::Custom(Str::new_static(
+								omp_session::PROVIDER_BLOCK_INDEX_PROP,
+							)))
+						})
+						.and_then(|value| match value {
+							Value::Int(index) => u32::try_from(*index).ok(),
+							_ => None,
+						})
+				})
 				.unwrap_or_else(|| {
 					let index = next_index;
 					next_index = next_index.saturating_add(1);
@@ -1802,6 +1863,10 @@ fn tool_name(node: Option<&Node>) -> Option<&str> {
 }
 
 /// Projects the plain headless transcript from the authoritative session DOM.
+///
+/// This is intentionally the model-visible answer/tool timeline, not a
+/// terminal screenshot: it is stable across terminal widths and contains
+/// neither ANSI styling nor observer-local chrome.
 #[must_use]
 pub fn transcript_text(dom: &Dom) -> String {
 	let mut output = String::new();
@@ -1843,7 +1908,319 @@ pub fn transcript_text(dom: &Dom) -> String {
 			}
 		}
 	}
-	output
+	sanitize_text(&output)
+}
+
+/// Projects text and tool markers in exact provider content order.
+#[must_use]
+pub fn transcript_text_with_blobs(dom: &Dom, blobs: &BlobStore) -> String {
+	let document = transcript_json(dom, blobs);
+	let mut output = String::new();
+	if let Some(messages) = document["messages"].as_array() {
+		for message in messages {
+			if message["role"] != "assistant" {
+				continue;
+			}
+			let Some(content) = message["content"].as_array() else {
+				continue;
+			};
+			for part in content {
+				match part["type"].as_str() {
+					Some("text") => {
+						if let Some(text) = part["text"].as_str() {
+							output.push_str(text);
+							if !text.is_empty() && !text.ends_with('\n') {
+								output.push('\n');
+							}
+						}
+					},
+					Some("toolCall") => {
+						output.push_str("[tool: ");
+						output.push_str(part["name"].as_str().unwrap_or("tool"));
+						output.push_str("]\n");
+					},
+					_ => {},
+				}
+			}
+		}
+	}
+	sanitize_text(&output)
+}
+
+/// Stable, provider-payload-free JSON projection of the live session branch.
+#[must_use]
+pub fn transcript_json(dom: &Dom, blobs: &BlobStore) -> serde_json::Value {
+	let model = dom
+		.children(dom.body())
+		.iter()
+		.flat_map(|turn| dom.children(*turn))
+		.find_map(|handle| {
+			let node = dom.get(*handle)?;
+			(node.tag == Tag::Known(KnownTag::Assistant))
+				.then(|| prop_text(Some(node), PropId::Model))
+				.flatten()
+		})
+		.unwrap_or("session");
+	let state = JsonState::new(
+		Arc::new(Catalog::embedded().clone()),
+		blobs.clone(),
+		Str::new(model),
+	);
+	let notices = dom
+		.children(dom.body())
+		.iter()
+		.flat_map(|turn| dom.children(*turn))
+		.filter_map(|handle| {
+			let node = dom.get(*handle)?;
+			(node.tag == Tag::Known(KnownTag::Notice)).then(|| {
+				serde_json::json!({
+					"kind": node_text(node, PropId::Kind).unwrap_or("info"),
+					"text": node.content.as_deref().unwrap_or_default(),
+				})
+			})
+		})
+		.collect::<Vec<_>>();
+	let mut value = serde_json::json!({
+		"format": "omp-transcript@1",
+		"messages": transcript_messages_from_with(dom, 0, &state),
+		"notices": notices,
+	});
+	if let Some((_, exit)) = latest_session_exit(dom)
+		&& exit.status != ExitStatus::Clean
+	{
+		value["sessionExit"] = serde_json::json!(exit);
+	}
+	value
+}
+
+/// Pi-compatible concise Markdown projection of the live session branch.
+///
+/// Tool call/result pairs collapse into one bounded line, reasoning is hidden
+/// unless requested, and attachment bytes never enter the Markdown document.
+#[must_use]
+pub fn transcript_markdown(dom: &Dom, blobs: &BlobStore, include_thinking: bool) -> String {
+	let document = transcript_json(dom, blobs);
+	let messages = document["messages"].as_array().map(Vec::as_slice).unwrap_or_default();
+	let mut results = FastHashMap::<&str, &serde_json::Value>::default();
+	for message in messages {
+		if message["role"] == "toolResult"
+			&& let Some(id) = message["toolCallId"].as_str()
+		{
+			results.insert(id, message);
+		}
+	}
+	let mut consumed = omp_core::FastHashSet::<&str>::default();
+	let mut lines = Vec::new();
+	for message in messages {
+		match message["role"].as_str() {
+			Some("user" | "developer") => {
+				let role = message["role"].as_str().unwrap_or("user");
+				let text = json_content_text(&message["content"]);
+				if !text.trim().is_empty() {
+					lines.push(format!("## {role}"));
+					lines.push(String::new());
+					lines.push(text);
+					lines.push(String::new());
+				}
+			},
+			Some("assistant") => {
+				let mut body = Vec::new();
+				if let Some(content) = message["content"].as_array() {
+					for part in content {
+						match part["type"].as_str() {
+							Some("text") => {
+								if let Some(text) = part["text"].as_str()
+									&& !text.trim().is_empty()
+								{
+									body.push(text.to_owned());
+								}
+							},
+							Some("thinking") if include_thinking => {
+								if let Some(text) = part["thinking"].as_str()
+									&& !text.trim().is_empty()
+								{
+									body.push(format!("_thinking:_ {text}"));
+								}
+							},
+							Some("toolCall") => {
+								let id = part["id"].as_str().unwrap_or_default();
+								let result = results.get(id).copied();
+								if result.is_some() {
+									consumed.insert(id);
+								}
+								body.push(markdown_tool_line(part, result));
+							},
+							Some("image") => body.push("[image]".to_owned()),
+							Some(kind) if kind != "redactedThinking" => {
+								if let Some(uri) = part["uri"].as_str() {
+									body.push(format!("[{kind}] {uri}"));
+								}
+							},
+							_ => {},
+						}
+					}
+				}
+				if let Some(error) = message["errorMessage"].as_str()
+					&& !error.trim().is_empty()
+				{
+					body.push(format!("[error] {}", one_line(error, 120)));
+				}
+				if !body.is_empty() {
+					lines.push("## assistant".to_owned());
+					lines.push(String::new());
+					lines.extend(body);
+					lines.push(String::new());
+				}
+			},
+			Some("toolResult") => {
+				let id = message["toolCallId"].as_str().unwrap_or_default();
+				if !consumed.contains(id) {
+					let call = serde_json::json!({
+						"name": message["toolName"],
+						"arguments": {},
+					});
+					lines.push(markdown_tool_line(&call, Some(message)));
+					lines.push(String::new());
+				}
+			},
+			_ => {},
+		}
+	}
+	if let Some(notices) = document["notices"].as_array() {
+		for notice in notices {
+			let text = notice["text"].as_str().unwrap_or_default();
+			if !text.trim().is_empty() {
+				lines.push(format!(
+					"[{}] {}",
+					notice["kind"].as_str().unwrap_or("notice"),
+					one_line(text, 240),
+				));
+				lines.push(String::new());
+			}
+		}
+	}
+	if let Some(exit) = document.get("sessionExit")
+		&& let Ok(exit) = serde_json::from_value::<omp_session::SessionExit>(exit.clone())
+		&& let Some(text) = omp_chat::notices::session_exit::text(&exit)
+	{
+		lines.push(format!("[session-exit] {}", one_line(text.as_str(), 240)));
+		lines.push(String::new());
+	}
+	let rendered = lines.join("\n");
+	format!("{}\n", sanitize_text(rendered.trim()))
+}
+
+fn json_content_text(content: &serde_json::Value) -> String {
+	if let Some(text) = content.as_str() {
+		return text.to_owned();
+	}
+	let Some(parts) = content.as_array() else {
+		return String::new();
+	};
+	parts
+		.iter()
+		.filter_map(|part| match part["type"].as_str() {
+			Some("text") => part["text"].as_str().map(ToOwned::to_owned),
+			Some("image") => Some("[image]".to_owned()),
+			Some(kind) => Some(format!("[{kind}]")),
+			None => None,
+		})
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
+fn markdown_tool_line(
+	call: &serde_json::Value,
+	result: Option<&serde_json::Value>,
+) -> String {
+	let name = call["name"]
+		.as_str()
+		.or_else(|| call["toolName"].as_str())
+		.unwrap_or("tool");
+	let args = call.get("arguments").unwrap_or(&serde_json::Value::Null);
+	let head = format!("→ {name}({})", primary_arg(name, args));
+	let Some(result) = result else {
+		return format!("{head} ⇒ pending");
+	};
+	let text = json_content_text(&result["content"]);
+	let count = if text.is_empty() { 0 } else { text.split('\n').count() };
+	let noun = if count == 1 { "line" } else { "lines" };
+	if result["isError"].as_bool().unwrap_or(false) {
+		let preview = one_line(text.split('\n').next().unwrap_or_default(), 120);
+		if preview.is_empty() {
+			format!("{head} ⇒ error · {count} {noun}")
+		} else {
+			format!("{head} ⇒ error · {count} {noun} — {preview}")
+		}
+	} else {
+		format!("{head} ⇒ ok · {count} {noun}")
+	}
+}
+
+fn primary_arg(name: &str, args: &serde_json::Value) -> String {
+	let scalar = |key: &str| {
+		args.get(key).and_then(|value| {
+			if let Some(text) = value.as_str() {
+				Some(text.to_owned())
+			} else {
+				value.as_array().and_then(|items| {
+					items
+						.iter()
+						.map(serde_json::Value::as_str)
+						.collect::<Option<Vec<_>>>()
+						.map(|items| items.join(", "))
+				})
+			}
+		})
+	};
+	let value = if name == "advise" {
+		match (scalar("severity"), scalar("note")) {
+			(Some(severity), Some(note)) => Some(format!("{severity}: {note}")),
+			(_, note) => note,
+		}
+	} else if name == "grep" {
+		match (scalar("pattern"), scalar("path").or_else(|| scalar("paths"))) {
+			(Some(pattern), Some(path)) => Some(format!("{pattern} @ {path}")),
+			(pattern, path) => pattern.or(path),
+		}
+	} else if name == "glob" {
+		scalar("path").or_else(|| scalar("paths"))
+	} else if name == "ast_grep" {
+		scalar("pat")
+	} else {
+		[
+			"path", "file_path", "filePath", "command", "cmd", "pattern", "url", "query",
+			"prompt", "assignment", "note", "message", "op", "name", "id",
+		]
+		.into_iter()
+		.find_map(scalar)
+	};
+	if let Some(value) = value {
+		return one_line(&value, 120);
+	}
+	let Some(object) = args.as_object() else {
+		return String::new();
+	};
+	let visible = object
+		.iter()
+		.filter(|(key, _)| key.as_str() != "i")
+		.map(|(key, value)| (key.clone(), value.clone()))
+		.collect::<serde_json::Map<_, _>>();
+	if visible.is_empty() {
+		return String::new();
+	}
+	one_line(&serde_json::to_string(&visible).unwrap_or_default(), 120)
+}
+
+fn one_line(text: &str, max: usize) -> String {
+	let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+	let count = flat.chars().count();
+	if count <= max {
+		return flat;
+	}
+	let mut out = flat.chars().take(max.saturating_sub(1)).collect::<String>();
+	out.push('…');
+	out
 }
 
 #[cfg(test)]
@@ -1984,6 +2361,20 @@ mod tests {
 			"The file says hello.\nhello from fixture\n",
 		);
 		assert_eq!(final_response_text(session.dom(), 1, false), "");
+		let markdown = transcript_markdown(session.dom(), session.blobs(), false);
+		assert_eq!(
+			markdown,
+			"## user\n\nread note.txt\n\n\
+			 ## assistant\n\nLet me read that file.\n→ read(note.txt) ⇒ ok · 1 line\n\n\
+			 ## assistant\n\nhello from fixture\n",
+		);
+		let with_thinking = transcript_markdown(session.dom(), session.blobs(), true);
+		assert_eq!(
+			with_thinking,
+			"## user\n\nread note.txt\n\n\
+			 ## assistant\n\nLet me read that file.\n→ read(note.txt) ⇒ ok · 1 line\n\n\
+			 ## assistant\n\n_thinking:_ The file says hello.\nhello from fixture\n",
+		);
 	}
 
 	#[test]
@@ -2152,5 +2543,14 @@ mod tests {
 				.iter()
 				.any(|message| message["role"] == "toolResult")
 		);
+	}
+
+	#[test]
+	fn exported_text_is_control_safe_and_previews_are_unicode_bounded() {
+		assert_eq!(sanitize_text("\u{1b}[31mred\u{1b}[0m\u{0}ok\n"), "redok\n");
+		assert_eq!(one_line("😀 😀 😀 😀", 3), "😀 …");
+		let long = "x".repeat(200);
+		assert_eq!(one_line(&long, 120).chars().count(), 120);
+		assert!(one_line(&long, 120).ends_with('…'));
 	}
 }

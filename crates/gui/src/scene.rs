@@ -1,10 +1,10 @@
 //! The host contract: a scene produces frames and routes input.
 
-use std::time::Duration;
+use std::{ops::Range, path::Path, time::Duration};
 
 use omp_core::Str;
 use omp_tui::{
-	Frame, Key, Layer, MouseReport, Size,
+	Appearance, Frame, Key, Layer, MouseReport, Size,
 	paste::{Clipboard, ClipboardRead, ClipboardReadOutcome, ClipboardWriteOutcome},
 };
 use smallvec::SmallVec;
@@ -64,6 +64,49 @@ pub trait Scene {
 	/// Routes clipboard text; `raw` inserts verbatim without attachment
 	/// staging or drop classification.
 	fn paste(&mut self, text: &str, raw: bool) -> Effect;
+
+	/// Shows or replaces native input-method marked text at the editing
+	/// caret. `selection` is byte-indexed within `text`; `None` hides the
+	/// marked-text caret until the next preedit event.
+	fn ime_preedit(&mut self, _text: &str, _selection: Option<Range<usize>>) -> Effect {
+		Effect::Ignored
+	}
+
+	/// Commits one native input-method segment. The default preserves the
+	/// former character-key path for generic scenes; editors override this
+	/// to make the whole segment one undo unit.
+	fn ime_commit(&mut self, text: &str) -> Effect {
+		let mut result = Effect::Ignored;
+		for character in text.chars() {
+			match self.key(Key::Char(character)) {
+				Effect::Quit => return Effect::Quit,
+				Effect::Ignored => {},
+				effect => result = effect,
+			}
+		}
+		result
+	}
+
+	/// Notifies the scene when its native window gains or loses focus.
+	fn focus(&mut self, _focused: bool) -> Effect {
+		Effect::Ignored
+	}
+
+	/// Applies the native window's current light/dark appearance.
+	fn appearance(&mut self, _appearance: Appearance) -> Effect {
+		Effect::Ignored
+	}
+
+	/// Routes files dropped from the desktop through the same typed path as
+	/// file-manager clipboard payloads. The borrowed path list is
+	/// materialized once at this host boundary.
+	fn drop_files(&mut self, paths: &[&Path]) -> Effect {
+		let paths = paths
+			.iter()
+			.map(|path| Str::new(path.to_string_lossy()))
+			.collect();
+		self.clipboard(ClipboardReadOutcome::Payload(Clipboard::Paths(paths)), false)
+	}
 
 	/// Routes one typed system-clipboard result.
 	///
