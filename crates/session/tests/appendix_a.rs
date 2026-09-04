@@ -51,7 +51,11 @@ fn checkpoint_survives_to_fork() {
 	let fork = directory.path().join("fork.oms");
 	let mut original = session(&source);
 	original.begin_turn().expect("turn starts");
-	run_component_tool(&mut original, "checkpoint", serde_json::json!({"checkpoint":"stash-1"}));
+	run_component_tool(
+		&mut original,
+		"checkpoint",
+		serde_json::json!({"action":"created","checkpoints":[{"label":"stash-1"}]}),
+	);
 	assert_eq!(checkpoints(original.dom()), [Str::new_static("stash-1")]);
 	drop(original);
 	std::fs::copy(&source, &fork).expect("journal copies to fork");
@@ -111,7 +115,11 @@ fn save_from_abandoned_branch_never_returns() {
 	let path = directory.path().join("save.oms");
 	let mut world = session(&path);
 	let root = world.begin_turn().expect("turn starts");
-	run_component_tool(&mut world, "checkpoint", serde_json::json!({"checkpoint":"abandoned-save"}));
+	run_component_tool(
+		&mut world,
+		"checkpoint",
+		serde_json::json!({"action":"created","checkpoints":[{"label":"abandoned-save"}]}),
+	);
 	assert_eq!(checkpoints(world.dom()), [Str::new_static("abandoned-save")]);
 	world.rewind(root).expect("rewind before save");
 	world.begin_turn().expect("branch is made durable");
@@ -156,7 +164,11 @@ fn session_switch_is_not_process_exit() {
 	let second_path = directory.path().join("second.oms");
 	let mut first = session(&first_path);
 	first.begin_turn().expect("turn starts");
-	run_component_tool(&mut first, "checkpoint", serde_json::json!({"checkpoint":"dirty-worktree"}));
+	run_component_tool(
+		&mut first,
+		"checkpoint",
+		serde_json::json!({"action":"created","checkpoints":[{"label":"dirty-worktree"}]}),
+	);
 	first.session_switch().expect("session switch records");
 	assert_eq!(session_switch_count(first.dom()), 1);
 	assert!(!process_exit_observed(first.dom()));

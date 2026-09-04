@@ -315,17 +315,21 @@ fn todo_and_jobs_are_journal_derived_meta_components() {
 	let mut session = Session::create(&path, ComponentRegistry::default()).expect("session creates");
 	session.begin_turn().expect("turn starts");
 	let todo = session
-		.call("todo", 1, "todo-1", None, Some(raw(serde_json::json!({}))), None)
+		.call("todo", 3, "todo-1", None, Some(raw(serde_json::json!({}))), None)
 		.expect("todo call appends");
 	session
 		.settle(
 			todo,
 			raw(serde_json::json!({
-				"phases": [{
-					"phase": "Build",
-					"items": [{"text": "land substrate", "status": "in_progress"}]
-				}],
-				"rendered": "Build"
+				"op": "block",
+				"phases": [
+					{"name": "Build", "tasks": [{
+						"content": "land substrate",
+						"status": "blocked",
+						"blocker": "waiting on owner"
+					}]},
+					{"name": "Ship", "tasks": []}
+				]
 			})),
 		)
 		.expect("todo snapshot settles");
@@ -336,7 +340,52 @@ fn todo_and_jobs_are_journal_derived_meta_components() {
 		item
 			.prop(&omp_dom::PropKey::from(omp_dom::PropId::Status))
 			.and_then(omp_dom::Value::as_str),
-		Some("in_progress")
+		Some("blocked")
+	);
+	assert_eq!(
+		item
+			.prop(&omp_dom::PropKey::from(omp_dom::PropId::Detail))
+			.and_then(omp_dom::Value::as_str),
+		Some("waiting on owner")
+	);
+	let todo_root = find_tag(&session, KnownTag::Todo)[0];
+	let phase_order = session
+		.dom()
+		.get(todo_root)
+		.and_then(|node| node.prop(&PropKey::Custom(Str::new_static("phase-order"))))
+		.and_then(|value| match value {
+			Value::Json(raw) => Some(raw.get()),
+			_ => None,
+		})
+		.expect("phase order");
+	assert_eq!(
+		serde_json::from_str::<Vec<Str>>(phase_order).expect("phase order JSON"),
+		vec![Str::new_static("Build"), Str::new_static("Ship")]
+	);
+	let malformed = session
+		.call("todo", 3, "todo-bad", None, Some(raw(serde_json::json!({}))), None)
+		.expect("malformed todo call appends");
+	session
+		.settle(
+			malformed,
+			raw(serde_json::json!({
+				"op": "init",
+				"phases": [{"name": "Broken", "tasks": [
+					{"content": "duplicate", "status": "pending"},
+					{"content": "duplicate", "status": "pending"}
+				]}]
+			})),
+		)
+		.expect("malformed historical result remains transcript data");
+	let retained = find_tag(&session, KnownTag::Item);
+	assert_eq!(retained.len(), 1, "malformed snapshots never erase valid state");
+	assert_eq!(
+		session
+			.dom()
+			.get(retained[0])
+			.and_then(|node| node.prop(&PropId::Label.into()))
+			.and_then(Value::as_str),
+		Some("land substrate")
 	);
 
 	let call = session
@@ -349,7 +398,27 @@ fn todo_and_jobs_are_journal_derived_meta_components() {
 	drop(session);
 
 	let restored = Session::open(path, ComponentRegistry::default()).expect("session restores");
-	assert_eq!(find_tag(&restored, KnownTag::Item).len(), 1);
+	let restored_items = find_tag(&restored, KnownTag::Item);
+	assert_eq!(restored_items.len(), 1);
+	assert_eq!(
+		restored
+			.dom()
+			.get(restored_items[0])
+			.and_then(|node| node.prop(&PropId::Detail.into()))
+			.and_then(Value::as_str),
+		Some("waiting on owner")
+	);
+	let restored_todo = find_tag(&restored, KnownTag::Todo)[0];
+	let restored_order = restored
+		.dom()
+		.get(restored_todo)
+		.and_then(|node| node.prop(&PropKey::Custom(Str::new_static("phase-order"))))
+		.and_then(|value| match value {
+			Value::Json(raw) => serde_json::from_str::<Vec<Str>>(raw.get()).ok(),
+			_ => None,
+		})
+		.expect("replayed phase order");
+	assert_eq!(restored_order, vec![Str::new_static("Build"), Str::new_static("Ship")]);
 	assert_eq!(find_tag(&restored, KnownTag::Job).len(), 1);
 }
 

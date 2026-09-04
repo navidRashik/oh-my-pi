@@ -114,6 +114,49 @@ pub fn set_status(cause: EntryId, handle: Handle, status: impl Into<Str>) -> Txn
 	}
 }
 
+/// Builds the clean running-state transition for an explicitly revived
+/// subagent. Old terminal output remains in journal history, but not on the
+/// live node, and delivery is re-armed for the next settlement.
+#[must_use]
+pub fn restart(cause: EntryId, handle: Handle, started: impl Into<Str>) -> Txn {
+	Txn {
+		cause,
+		label: Some(Str::new_static("jobs.restart")),
+		ops: vec![
+			Op::Set {
+				h: handle,
+				prop: PropId::Status.into(),
+				value: Value::Str(Str::new_static("running")),
+			},
+			Op::Set {
+				h: handle,
+				prop: PropKey::Custom(Str::new_static("started")),
+				value: Value::Str(started.into()),
+			},
+			Op::Set {
+				h: handle,
+				prop: PropId::Data.into(),
+				value: Value::Null,
+			},
+			Op::Set {
+				h: handle,
+				prop: PropId::DurationMs.into(),
+				value: Value::Null,
+			},
+			Op::Set {
+				h: handle,
+				prop: PropKey::Custom(Str::new_static("error")),
+				value: Value::Null,
+			},
+			Op::Set {
+				h: handle,
+				prop: PropKey::Custom(Str::new_static("delivered")),
+				value: Value::Bool(false),
+			},
+		],
+	}
+}
+
 /// Finds the authoritative jobs component root.
 #[must_use]
 pub fn jobs_handle(dom: &Dom) -> Option<Handle> {

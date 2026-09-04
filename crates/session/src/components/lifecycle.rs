@@ -32,9 +32,14 @@ impl Component for Checkpoint {
 		let Some(outcome) = tool_outcome(entry, dom, CHECKPOINT) else {
 			return;
 		};
+		if outcome.get("action").and_then(serde_json::Value::as_str) != Some("created") {
+			return;
+		}
 		let Some(name) = outcome
-			.get("checkpoint")
-			.or_else(|| outcome.get("name"))
+			.get("checkpoints")
+			.and_then(serde_json::Value::as_array)
+			.and_then(|checkpoints| checkpoints.first())
+			.and_then(|checkpoint| checkpoint.get("label"))
 			.and_then(serde_json::Value::as_str)
 		else {
 			return;
