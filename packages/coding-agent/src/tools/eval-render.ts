@@ -40,15 +40,10 @@ import {
 } from "./render-utils";
 export const EVAL_DEFAULT_PREVIEW_LINES = 10;
 
-/**
- * Ctrl+O expands a structured `display()` value to its full, structure-aware
- * JSON tree. This effectively-unbounded cap lets the tree renderer surface
- * every field, depth level, and scalar tail on demand, while the collapsed
- * view keeps the tight `JSON_TREE_*_COLLAPSED` preview. Capped at the signed
- * 32-bit max because the native `truncateToWidth` width argument is i32 and
- * silently truncates to empty past `2**31`.
- */
-const DISPLAY_TREE_UNBOUNDED = 0x7fff_ffff;
+/** Maximum detailed characters shown per structured `display()` value. */
+const DISPLAY_DETAIL_MAX_LENGTH = 8000;
+/** Effectively unlimited depth accepted by `Bun.inspect`; cycles remain bounded. */
+const DISPLAY_DETAIL_DEPTH = 0x7fff_ffff;
 
 function languageForHighlighter(language: EvalLanguage | undefined): "python" | "javascript" {
 	if (language === "js") return "javascript";
@@ -506,6 +501,32 @@ function formatCellOutputLines(
 	return { lines: visualLines, hiddenCount: skippedCount };
 }
 
+function inspectDisplayValue(value: unknown, compact: boolean): string {
+	try {
+		return replaceTabs(Bun.inspect(value, { colors: false, compact, depth: DISPLAY_DETAIL_DEPTH }));
+	} catch {
+		return replaceTabs(String(value));
+	}
+}
+
+function formatExpandedDisplayLines(values: readonly unknown[], theme: Theme, width: number): string[] {
+	const lines: string[] = [];
+	for (let index = 0; index < values.length; index++) {
+		if (index > 0) lines.push("");
+		const inspected = inspectDisplayValue(values[index], false);
+		const detail =
+			inspected.length > DISPLAY_DETAIL_MAX_LENGTH
+				? `${inspected.slice(0, DISPLAY_DETAIL_MAX_LENGTH)}\n[…${inspected.length - DISPLAY_DETAIL_MAX_LENGTH}ch elided…]`
+				: inspected;
+		const styled = `display[${index + 1}]:\n${detail}`
+			.split("\n")
+			.map(line => theme.fg("toolOutput", line))
+			.join("\n");
+		lines.push(...Bun.wrapAnsi(styled, Math.max(1, width), { hard: true, wordWrap: false, trim: false }).split("\n"));
+	}
+	return lines;
+}
+
 export const evalToolRenderer = {
 	animatedPendingPreview: true,
 	animatedPartialResult: true,
@@ -581,20 +602,26 @@ export const evalToolRenderer = {
 		const jsonOutputs = details?.jsonOutputs ?? [];
 		const expanded = options.renderContext?.expanded ?? options.expanded;
 		const labelOutputs = jsonOutputs.length > 1;
-		// One structure-aware tree per display() value. Collapsed uses the tight
-		// preview caps; Ctrl+O expands the same tree with unbounded caps so no
-		// field is hidden. Keeping the tree (never JSON.stringify) preserves
-		// structured-clone values — undefined, NaN, bigint — that JSON encoding
-		// would drop or corrupt (#10779 review).
-		const jsonLines = jsonOutputs.flatMap((value, index) => {
+		const jsonTreeLines = jsonOutputs.flatMap((value, index) => {
 			const tree = renderJsonTreeLines(
 				value,
 				uiTheme,
-				expanded ? DISPLAY_TREE_UNBOUNDED : JSON_TREE_MAX_DEPTH_COLLAPSED,
-				expanded ? DISPLAY_TREE_UNBOUNDED : JSON_TREE_MAX_LINES_COLLAPSED,
-				expanded ? DISPLAY_TREE_UNBOUNDED : JSON_TREE_SCALAR_LEN_COLLAPSED,
+				JSON_TREE_MAX_DEPTH_COLLAPSED,
+				JSON_TREE_MAX_LINES_COLLAPSED,
+				JSON_TREE_SCALAR_LEN_COLLAPSED,
 			);
-			const body = tree.truncated ? [...tree.lines, uiTheme.fg("dim", "…")] : tree.lines;
+			let body: string[];
+			if (tree.lines.length === 0) {
+				// Structured-clone built-ins such as Date, Map, Set, and RegExp
+				// have no enumerable root keys, so the JSON tree is empty.
+				const fallback = truncateToWidth(
+					inspectDisplayValue(value, true).replace(/\s+/g, " "),
+					JSON_TREE_SCALAR_LEN_COLLAPSED,
+				);
+				body = [uiTheme.fg("dim", fallback)];
+			} else {
+				body = tree.truncated ? [...tree.lines, uiTheme.fg("dim", "…")] : tree.lines;
+			}
 			return labelOutputs ? [uiTheme.fg("dim", `display[${index + 1}]`), ...body] : body;
 		});
 
@@ -684,11 +711,12 @@ export const evalToolRenderer = {
 							lines.push("");
 						}
 					}
-					if (jsonLines.length > 0) {
+					const displayLines = expanded ? formatExpandedDisplayLines(jsonOutputs, uiTheme, width) : jsonTreeLines;
+					if (displayLines.length > 0) {
 						if (lines.length > 0) {
 							lines.push("");
 						}
-						lines.push(...jsonLines);
+						lines.push(...displayLines);
 					}
 					if (timeoutLine) {
 						lines.push(timeoutLine);
@@ -712,7 +740,7 @@ export const evalToolRenderer = {
 		}
 
 		const displayOutput = output;
-		const combinedOutput = [displayOutput, ...jsonLines].filter(Boolean).join("\n");
+		const combinedOutput = [displayOutput, ...(expanded ? [] : jsonTreeLines)].filter(Boolean).join("\n");
 
 		const statusEvents = details?.statusEvents ?? [];
 		const statusLines = renderStatusEvents(

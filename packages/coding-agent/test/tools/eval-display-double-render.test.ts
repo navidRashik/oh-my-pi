@@ -122,16 +122,31 @@ describe("eval renderer: structured display() value renders once", () => {
 	});
 
 	it("renders structured-clone values faithfully when expanded", async () => {
-		const value = { missing: undefined, num: Number.NaN, big: 10n };
+		const cycle: { self?: unknown } = {};
+		cycle.self = cycle;
+		const value = {
+			missing: undefined,
+			num: Number.NaN,
+			big: 10n,
+			date: new Date("2026-01-01T00:00:00.000Z"),
+			cycle,
+		};
 
 		const { rendered, boxBottom } = await renderDisplay(value, theme, true);
 		const belowBox = rendered.slice(boxBottom + 1).join("\n");
 
-		// JSON.stringify would drop `missing`, coerce NaN to null, and stringify
-		// the bigint object to `[object Object]`; the structure-aware tree keeps them.
 		expect(belowBox).toContain("missing: undefined");
 		expect(belowBox).toContain("num: NaN");
-		expect(belowBox).toContain("big: 10");
+		expect(belowBox).toContain("big: 10n");
+		expect(belowBox).toContain("date: 2026-01-01T00:00:00.000Z");
+		expect(belowBox).toContain("[Circular]");
 		expect(belowBox).not.toContain("[object Object]");
+	});
+
+	it("falls back to a faithful collapsed preview for root built-ins", async () => {
+		const { rendered, boxBottom } = await renderDisplay(new Date("2026-01-01T00:00:00.000Z"), theme, false);
+		const belowBox = rendered.slice(boxBottom + 1).join("\n");
+
+		expect(belowBox).toContain("2026-01-01T00:00:00.000Z");
 	});
 });
