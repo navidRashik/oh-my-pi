@@ -876,9 +876,11 @@ async fn stable_roundtrip(
 	};
 	let outcome = serde_json::from_slice::<Value>(&completion_details(&complete))
 		.expect("sibling details JSON");
-	let details = &outcome["value"];
+	let details = outcome.get("value").unwrap_or(&outcome);
 	(
-		details["pid"].as_i64().expect("sibling pid") as i32,
+		details["pid"]
+			.as_i64()
+			.unwrap_or_else(|| panic!("sibling outcome omitted pid: {outcome:#}")) as i32,
 		details["env_socket"].as_str().map(ToOwned::to_owned),
 	)
 }
@@ -1105,13 +1107,14 @@ fn completion_text(complete: &WorkerCompletion) -> &str {
 }
 
 fn completion_details(complete: &WorkerCompletion) -> Bytes {
-	if let Some(details) = &complete.details_json {
+	if let Some(details) = complete.details_json.as_ref() {
+		assert!(!details.is_empty(), "inline completion details must contain one JSON value");
 		return details.clone();
 	}
 	let blob = complete
 		.details_blob
 		.as_ref()
-		.expect("completion carries a result artifact");
+		.expect("completion carries inline details or a result artifact");
 	let hash: [u8; 32] = blob.hash.as_ref().try_into().expect("result artifact hash");
 	test_result_store()
 		.get(BlobId { hash, size: blob.size })

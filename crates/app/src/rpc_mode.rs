@@ -36,7 +36,7 @@ use omp_tool::{
 	HostToolExecutor, HostToolInvocation, HostToolResult as RuntimeHostToolResult, HostToolSpec,
 	HostToolUpdateSink,
 };
-use omp_tools::ask::{Answer, AskPresenter, Fault as AskFault, Presentation, Question};
+use omp_tools::ask::{AskPresenter, Fault as AskFault, Presentation, Question, Selection};
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, stdin, stdout};
@@ -101,7 +101,7 @@ async fn run_inner(args: ChatArgs, ui_enabled: bool) -> miette::Result<()> {
 
 /// Remote retained-dialog bridge enabled by `rpc-ui`.
 ///
-/// The environment's `ask@1` presenter emits ordinary
+/// The environment's `ask@2` presenter emits ordinary
 /// `extension_ui_request` frames and waits for correlated
 /// `extension_ui_response` input. Plain `rpc` never installs this presenter.
 #[doc(hidden)]
@@ -212,17 +212,24 @@ impl AskPresenter for RpcUiBridge {
 				let option_details = question
 					.options
 					.iter()
-					.map(|option| json!({ "description": option.description }))
+					.map(|option| {
+						json!({
+							"description": option.description,
+							"preview": option.preview,
+						})
+					})
 					.collect::<Vec<_>>();
 				let request = json!({
 					"type": "extension_ui_request",
 					"id": id,
 					"method": "select",
 					"title": question.question,
+					"header": question.header,
 					"options": options,
 					"optionDetails": option_details,
 					"multi": question.multi,
 					"recommended": question.recommended,
+					"allowOther": true,
 				});
 				if bridge.inner.requests_tx.send_async(request).await.is_err() {
 					return Err(AskFault::Presenter {
@@ -250,7 +257,7 @@ impl AskPresenter for RpcUiBridge {
 						message: Str::new_static("RPC UI host returned an unknown ask option"),
 					});
 				}
-				answers.push(Answer {
+				answers.push(Selection {
 					id: question.id.clone(),
 					selected,
 					custom_input: fields
@@ -258,10 +265,13 @@ impl AskPresenter for RpcUiBridge {
 						.and_then(Value::as_str)
 						.map(Str::new),
 					note: fields.get("note").and_then(Value::as_str).map(Str::new),
-					timed_out: false,
+					timed_out: fields
+						.get("timedOut")
+						.and_then(Value::as_bool)
+						.unwrap_or(false),
 				});
 			}
-			Ok(Presentation { answers, headless: false })
+			Ok(Presentation { selections: answers })
 		})
 	}
 }
@@ -1583,6 +1593,7 @@ where
 											name: Str::new(tool.name),
 											description: Str::new(tool.description),
 											parameters: tool.parameters,
+											rev: None,
 										}).collect();
 										host_tool_revision = host_tool_revision.saturating_add(1);
 										match tool_registry.replace_host_tools(
@@ -2470,7 +2481,9 @@ where
 	host_tools.close("RPC client disconnected before host tool execution completed");
 	let (kernel, mut session) = current.expect("RPC shutdown waits for active turn");
 	kernel.flush_session_state(&mut session).into_diagnostic()?;
-	session.process_exit().into_diagnostic()?;
+	session
+		.record_exit(omp_session::ExitCause::Normal)
+		.into_diagnostic()?;
 	while let Ok(event) = dom_events.try_recv() {
 		replica.apply_event(&event).into_diagnostic()?;
 		for frame in projection.observe(&replica) {

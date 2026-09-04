@@ -6,11 +6,14 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use omp_chat::overlays::services::{
-	AccountRow, ActiveAccountUsage, ActiveUsageRequest, AgentRow, AgentView, CleanseRequest,
-	CleanseRun, ExtensionRow, ForeignSessionRow, ForeignSessionSource, LoginFlow, MemoryOp,
-	Mutation, Mutations, Pending, PluginsReport, ServiceError, ServiceResult, Services, SessionRow,
-	SessionScope, SettingsChoice, SettingsInventory, SshHostRow, SshHostSpec, ToolRow, UsageReport,
+use omp_chat::{
+	history::{HistoryEntry, HistoryStorage},
+	overlays::services::{
+		AccountRow, ActiveAccountUsage, ActiveUsageRequest, AgentRow, AgentView, CleanseRequest,
+		CleanseRun, ExtensionRow, ForeignSessionRow, ForeignSessionSource, LoginFlow, MemoryOp,
+		Mutation, Mutations, Pending, PluginsReport, ServiceError, ServiceResult, Services, SessionRow,
+		SessionScope, SettingsChoice, SettingsInventory, SshHostRow, SshHostSpec, ToolRow, UsageReport,
+	},
 };
 use omp_core::{Str, sf};
 use omp_driver::registry::ProductionInference as ProductionStack;
@@ -109,7 +112,8 @@ impl StackHandles {
 
 /// [`Services`] over the composed kernel.
 pub struct AppServices {
-	state: Arc<ServiceState>,
+	state:   Arc<ServiceState>,
+	history: Option<HistoryStorage>,
 }
 
 impl AppServices {
@@ -118,6 +122,13 @@ impl AppServices {
 	/// store.
 	#[must_use]
 	pub fn new(state: ServiceState) -> Self {
+		let history = match HistoryStorage::open(state.data_dir.join("history.db")) {
+			Ok(history) => Some(history),
+			Err(error) => {
+				tracing::warn!(%error, "prompt history unavailable");
+				None
+			},
+		};
 		let live_journal = Arc::clone(&state.live_journal);
 		let root = live_journal.read().parent().map(PathBuf::from);
 		if let Some(root) = root
@@ -139,7 +150,7 @@ impl AppServices {
 				}),
 			);
 		}
-		Self { state: Arc::new(state) }
+		Self { state: Arc::new(state), history }
 	}
 }
 
@@ -247,6 +258,51 @@ impl Services for AppServices {
 
 	fn live_session_id(&self) -> ServiceResult<Str> {
 		accounts::live_session_id(&self.state)
+	}
+
+	fn history_recent(&self, limit: usize) -> ServiceResult<Vec<HistoryEntry>> {
+		self
+			.history
+			.as_ref()
+			.ok_or(ServiceError::Unavailable("prompt history"))?
+			.recent(limit)
+			.map_err(ServiceError::failed)
+	}
+
+	fn history_search(&self, query: &str, limit: usize) -> ServiceResult<Vec<HistoryEntry>> {
+		self
+			.history
+			.as_ref()
+			.ok_or(ServiceError::Unavailable("prompt history"))?
+			.search(query, limit)
+			.map_err(ServiceError::failed)
+	}
+
+	fn history_matching_session_ids(&self, query: &str, limit: usize) -> ServiceResult<Vec<Str>> {
+		self
+			.history
+			.as_ref()
+			.ok_or(ServiceError::Unavailable("prompt history"))?
+			.matching_session_ids(query, limit)
+			.map_err(ServiceError::failed)
+	}
+
+	fn history_add(&self, prompt: &str) -> ServiceResult<()> {
+		let history = self
+			.history
+			.as_ref()
+			.ok_or(ServiceError::Unavailable("prompt history"))?;
+		let session_id = self
+			.state
+			.live_journal
+			.read()
+			.file_stem()
+			.and_then(|stem| stem.to_str())
+			.map(Str::new);
+		history
+			.add(prompt, Some(&self.state.project), session_id.as_deref())
+			.map(|_| ())
+			.map_err(ServiceError::failed)
 	}
 
 	fn collaboration(&self) -> ServiceResult<omp_chat::overlays::services::CollabState> {

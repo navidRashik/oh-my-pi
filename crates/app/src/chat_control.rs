@@ -45,6 +45,7 @@ use omp_driver::headless::kernel::{ComposedInference, KernelOptions, SessionHome
 use omp_journal::{EntryId, blob::BlobStore, data::Attachment, gc::copy_journal_blobs};
 use omp_proto::{
 	collab::v1::{ContextUsage, ModelMetadata, SessionStateUpdate},
+	env::v1::{RestoreWorkspace, WorkspaceRestored},
 	toolhost::v1::HookEventId,
 };
 use omp_session::{AttachmentInput, Session, SessionError, components::jobs};
@@ -61,6 +62,10 @@ const TAN_CONTEXT: &str = include_str!("../../chat/prompts/tan-context-switch.md
 const QUEUED: &str = "queued";
 /// How often the idle loop commits settlements of agents it revived.
 const REVIVED_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+/// pi's idle grace period before an active Goal starts a distinct continuation
+/// turn. User input and session controls win by returning the controller to the
+/// idle loop before this timer fires.
+const GOAL_CONTINUATION_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// A lifecycle transform requested behavior the controller cannot perform.
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +78,124 @@ enum SessionHookError {
 		/// Mutable field without an implementation.
 		field: &'static str,
 	},
+	/// Workspace restoration was requested for a point without a checkpoint.
+	#[error("rewind target {target} has no workspace checkpoint")]
+	WorkspaceCheckpointMissing {
+		/// Journal point selected by the rewind.
+		target: EntryId,
+	},
+	/// The project environment rejected a workspace operation.
+	#[error("workspace checkpoint operation failed")]
+	Workspace {
+		/// Typed environment protocol failure.
+		#[source]
+		source: omp_env::ClientError,
+	},
+	/// Open or concurrently changed documents blocked restoration.
+	#[error("workspace restoration was blocked by {count} conflict(s), first at {path}")]
+	WorkspaceConflict {
+		/// Number of reported conflicts.
+		count: usize,
+		/// First conflicting workspace-relative path.
+		path:  Str,
+	},
+	/// A workspace restoration partially committed and retained an undo point.
+	#[error("workspace restoration partially committed; undo snapshot {undo} was retained")]
+	WorkspacePartial {
+		/// Pre-restore generation retained by the environment.
+		undo: Str,
+	},
+}
+
+fn checkpoint_snapshot_at(session: &Session, target: EntryId) -> Option<Str> {
+	session.dom().handles().find_map(|handle| {
+		let node = session.dom().get(handle)?;
+		if node.tag != Tag::Custom(Str::new_static("rewind-checkpoint")) {
+			return None;
+		}
+		let checkpoint_target = node
+			.prop(&PropKey::Custom(Str::new_static("target")))
+			.and_then(Value::as_str)?
+			.parse::<EntryId>()
+			.ok()?;
+		if checkpoint_target != target {
+			return None;
+		}
+		node
+			.prop(&PropKey::Custom(Str::new_static("workspace-snapshot")))
+			.and_then(Value::as_str)
+			.map(Str::new)
+	})
+}
+
+async fn restore_checkpoint_workspace(
+	env: &omp_env::EnvClient,
+	snapshot_id: &str,
+	paths: Vec<String>,
+) -> Result<WorkspaceRestored, SessionHookError> {
+	let request = RestoreWorkspace {
+		snapshot_id: snapshot_id.to_owned(),
+		dry_run: true,
+		scope: "session-rewind".to_owned(),
+		paths,
+		wire_revision: omp_proto::SCHEMA_REV,
+		..Default::default()
+	};
+	let preview = env
+		.restore_workspace(request.clone())
+		.await
+		.map_err(|source| SessionHookError::Workspace { source })?;
+	ensure_workspace_restore(&preview)?;
+	let restored = env
+		.restore_workspace(RestoreWorkspace { dry_run: false, ..request })
+		.await
+		.map_err(|source| SessionHookError::Workspace { source })?;
+	if let Err(error) = ensure_workspace_restore(&restored) {
+		if restored.partial {
+			rollback_checkpoint_workspace(env, &restored.undo_snapshot_id).await;
+		}
+		return Err(error);
+	}
+	Ok(restored)
+}
+
+async fn rollback_checkpoint_workspace(env: &omp_env::EnvClient, snapshot_id: &str) {
+	if snapshot_id.is_empty() {
+		return;
+	}
+	let rollback = env
+		.restore_workspace(RestoreWorkspace {
+			snapshot_id: snapshot_id.to_owned(),
+			scope: "session-rewind-rollback".to_owned(),
+			wire_revision: omp_proto::SCHEMA_REV,
+			..Default::default()
+		})
+		.await;
+	if rollback.as_ref().is_err()
+		|| rollback
+			.as_ref()
+			.is_ok_and(|value| value.partial || !value.conflicts.is_empty())
+	{
+		tracing::error!(
+			snapshot = snapshot_id,
+			"session rewind workspace restore and rollback both failed"
+		);
+	}
+}
+
+fn ensure_workspace_restore(restored: &WorkspaceRestored) -> Result<(), SessionHookError> {
+	if restored.partial {
+		return Err(SessionHookError::WorkspacePartial {
+			undo: Str::new(&restored.undo_snapshot_id),
+		});
+	}
+	if let Some(first) = restored.conflicts.first() {
+		return Err(SessionHookError::WorkspaceConflict {
+			count: restored.conflicts.len(),
+			path:  Str::new(&first.path),
+		});
+	}
+	Ok(())
 }
 
 fn store_attachments(
@@ -144,8 +267,8 @@ enum Flow {
 	Idle,
 	/// Run this turn.
 	Turn(TurnRequest),
-	/// Run one provider-authenticated live delegation as an ordinary kernel
-	/// turn while retaining its transport correlation identity.
+	/// Run one provider-authenticated live delegation as a durable custom
+	/// developer turn while retaining its transport correlation identity.
 	LiveTurn { id: Str, input: TurnInput },
 	/// Re-run the aborted tool tail of the last turn (pi `retry()`).
 	Retry,
@@ -164,6 +287,8 @@ enum TurnRequest {
 		author: Str,
 	},
 	Skill(omp_journal::data::SkillPrompt),
+	/// Extension-authored developer context with durable presentation metadata.
+	Custom(omp_session::custom_message::CustomMessage),
 }
 
 /// Builds the closed user-local execution request behind a `!` / `$`
@@ -310,7 +435,7 @@ fn spawn_collab_status(
 	let mut state = collab.subscribe_state();
 	let con_writes = ctx.subscribe_session_writes();
 	tokio::spawn(async move {
-		let mut last = None::<Option<omp_chat::status_band::CollabStatus>>;
+		let mut last = Some(None::<omp_chat::status_band::CollabStatus>);
 		loop {
 			let current = collab_status(*presence.borrow(), state.borrow().as_ref());
 			if last.as_ref() != Some(&current) {
@@ -345,7 +470,9 @@ fn spawn_collab_status(
 				},
 			}
 		}
-		if let Some(mailbox) = ctx.user::<HostMailbox>() {
+		if last.as_ref().is_some_and(Option::is_some)
+			&& let Some(mailbox) = ctx.user::<HostMailbox>()
+		{
 			mailbox.post(HostAction::CollabStatus(None));
 		}
 	})
@@ -360,45 +487,51 @@ struct TanDone {
 
 /// The chat controller: session owner, kernel driver, command applier.
 pub(crate) struct Controller<C = ComposedInference> {
-	kernel:         Kernel<C>,
-	lifecycle:      Option<LifecycleHooks>,
-	session:        Session,
-	home:           SessionHome,
-	relay:          flume::Sender<Event>,
-	forwarder:      Option<tokio::task::JoinHandle<()>>,
-	ctx:            Arc<Ctx>,
-	mutations:      Arc<dyn Mutations>,
-	services:       Arc<dyn Services>,
+	kernel: Kernel<C>,
+	lifecycle: Option<LifecycleHooks>,
+	session: Session,
+	home: SessionHome,
+	relay: flume::Sender<Event>,
+	forwarder: Option<tokio::task::JoinHandle<()>>,
+	ctx: Arc<Ctx>,
+	mutations: Arc<dyn Mutations>,
+	services: Arc<dyn Services>,
 	/// Collaboration relay and replica owner.
-	collab:         omp_driver::collab::session::CollabCommandHandle,
+	collab: omp_driver::collab::session::CollabCommandHandle,
 	/// Catalog used to publish the host's current model metadata.
-	catalog:        Option<Arc<Catalog>>,
+	catalog: Option<Arc<Catalog>>,
 	/// Continuous presence/session-state projection into the chat actor.
-	collab_status:  tokio::task::JoinHandle<()>,
+	collab_status: tokio::task::JoinHandle<()>,
 	/// Ordered events following the collaboration guest snapshot.
 	collab_replica: flume::Receiver<Event>,
 	/// Host-authenticated guest mutations.
-	collab_remote:  flume::Receiver<AuthorizedMutation>,
+	collab_remote: flume::Receiver<AuthorizedMutation>,
 	/// Environment authority (isolated workspaces for revived agents).
-	env:            omp_env::EnvClient,
-	up:             flume::Sender<Up>,
-	live_events:    flume::Receiver<KernelEvent>,
-	live_next:      Option<LiveDelegationRequest>,
-	live_journal:   Arc<RwLock<PathBuf>>,
-	data_dir:       PathBuf,
-	voice:          crate::chat_voice::PushToTalk,
+	env: omp_env::EnvClient,
+	up: flume::Sender<Up>,
+	live_events: flume::Receiver<KernelEvent>,
+	live_next: Option<LiveDelegationRequest>,
+	live_journal: Arc<RwLock<PathBuf>>,
+	data_dir: PathBuf,
+	voice: crate::chat_voice::PushToTalk,
+	/// A prose-only hidden Goal continuation holds at idle until genuine user
+	/// input or new tool progress re-arms it.
+	goal_continuation_suppressed: bool,
 	/// Commands that mutate the session, deferred while a turn runs.
-	pending:        Vec<HostCommand>,
-	tan_tx:         flume::Sender<TanDone>,
-	tan_rx:         flume::Receiver<TanDone>,
+	pending: Vec<HostCommand>,
+	/// Abnormal process boundary that requested shutdown. Ordinary actor quit
+	/// leaves this empty and records a silent clean exit.
+	exit_cause: Option<omp_session::ExitCause>,
+	tan_tx: flume::Sender<TanDone>,
+	tan_rx: flume::Receiver<TanDone>,
 	/// Agents the controller revived from the hub and still running: their
 	/// settlement is journaled by the idle loop's poll tick, since no turn
 	/// may follow to commit it.
-	revived:        Vec<Str>,
+	revived: Vec<Str>,
 	/// Journal deleted by `/drop` once the replacement session is live.
-	ephemeral:      Option<PathBuf>,
+	ephemeral: Option<PathBuf>,
 	/// Pairs waiting `ask` calls with the host's answers.
-	ask:            omp_driver::headless::AskRoute,
+	ask: omp_driver::headless::AskRoute,
 }
 
 impl<C: omp_agent::Inference> Controller<C> {
@@ -460,7 +593,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 				live_auth,
 				session_id,
 			),
+			goal_continuation_suppressed: false,
 			pending: Vec::new(),
+			exit_cause: None,
 			tan_tx,
 			tan_rx,
 			revived: Vec::new(),
@@ -494,6 +629,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 		)
 		.await?;
 		loop {
+			let goal_continuation_ready = self.goal_continuation_ready();
 			let flow = tokio::select! {
 				command = command_rx.recv_async() => match command {
 					Ok(command) => self.apply_idle(command).await?,
@@ -515,6 +651,11 @@ impl<C: omp_agent::Inference> Controller<C> {
 					self.settle_revived()?;
 					Flow::Idle
 				},
+				() = tokio::time::sleep(GOAL_CONTINUATION_DELAY), if goal_continuation_ready => {
+					self.goal_continuation().map_or(Flow::Idle, |message| {
+						Flow::Turn(TurnRequest::Custom(message))
+					})
+				},
 			};
 			match flow {
 				Flow::Idle => {},
@@ -528,8 +669,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 				},
 				Flow::LiveTurn { id, input } => {
 					self.voice.delegation_started(&id, &self.ctx);
+					let message =
+						omp_session::custom_message::CustomMessage::live_delegation(input.text);
 					let quit = self
-						.run_turn(Some(TurnRequest::User(input)), &command_rx, Some(id))
+						.run_turn(Some(TurnRequest::Custom(message)), &command_rx, Some(id))
 						.await? || self.after_turn(&command_rx).await?;
 					if quit {
 						self.shutdown()?;
@@ -614,16 +757,28 @@ impl<C: omp_agent::Inference> Controller<C> {
 			.kernel
 			.flush_session_state(&mut self.session)
 			.into_diagnostic()?;
-		self.session.process_exit().into_diagnostic()?;
+		let cause = self
+			.exit_cause
+			.take()
+			.unwrap_or(omp_session::ExitCause::Normal);
+		let signal = match &cause {
+			omp_session::ExitCause::Signal { signal } => Some(signal.clone()),
+			_ => None,
+		};
+		self.session.record_exit(cause).into_diagnostic()?;
 		self.notify_lifecycle(
 			HookEventId::HookEventSessionShutdown,
 			serde_json::json!({
 				"session_id": session,
-				"reason": "user_exit",
+				"reason": signal.as_ref().map_or("user_exit", |signal| signal.name.as_str()),
 				"budget": "1s",
 				"target_session": serde_json::Value::Null,
 			}),
-		)
+		)?;
+		match signal {
+			Some(signal) => Err(crate::exit_diagnostics::SignalExit::new(signal).into()),
+			None => Ok(()),
+		}
 	}
 
 	fn cancel_live_delegations(&mut self) {
@@ -635,6 +790,57 @@ impl<C: omp_agent::Inference> Controller<C> {
 
 	fn is_paused(&self) -> bool {
 		omp_agent::pause_state(self.session.dom()).active
+	}
+
+	/// Whether the interactive idle boundary may arm a Goal continuation.
+	///
+	/// The DOM remains authoritative: an active Goal is required, while global
+	/// pause and Plan ownership suppress the timer. The convars gate both Goal
+	/// runtime availability and which presentation modes may auto-continue.
+	fn goal_continuation_ready(&self) -> bool {
+		if self.goal_continuation_suppressed
+			|| self.is_paused()
+			|| !omp_chat::settings::CL_GOAL_ENABLED.get(&self.ctx)
+		{
+			return false;
+		}
+		if !omp_chat::settings::CL_GOAL_CONTINUATION_MODES
+			.get(&self.ctx)
+			.iter()
+			.any(|mode| mode.as_str() == "interactive")
+		{
+			return false;
+		}
+		if omp_agent::find_director(self.session.dom(), "plan")
+			.is_some_and(|(_, node)| omp_agent::director_status(node) != Some("queued"))
+		{
+			return false;
+		}
+		omp_agent::directors::goal::continuation_is_active(self.session.dom())
+	}
+
+	/// Revalidates the session and mode gates when the 800 ms timer fires, then
+	/// builds one hidden developer input for one new session turn.
+	fn goal_continuation(&self) -> Option<omp_session::custom_message::CustomMessage> {
+		if !self.goal_continuation_ready() {
+			return None;
+		}
+		let prompt = omp_agent::directors::goal::continuation_prompt(self.session.dom())?;
+		Some(
+			omp_session::custom_message::CustomMessage::new("goal-continuation", prompt)
+				.with_display(false),
+		)
+	}
+
+	fn latest_turn_had_tool_calls(&self) -> bool {
+		let dom = self.session.dom();
+		let Some(turn) = dom.children(dom.body()).last().copied() else {
+			return false;
+		};
+		dom.children(turn).iter().any(|handle| {
+			dom.get(*handle)
+				.is_some_and(|node| node.prop(&PropKey::from(PropId::Rev)).is_some())
+		})
 	}
 
 	fn publish_collab_state(&self) {
@@ -722,6 +928,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 				| HostCommand::SessionDrop
 				| HostCommand::Fork { .. }
 				| HostCommand::Rewind { .. }
+				| HostCommand::ProcessSignal(_)
 				| HostCommand::Quit
 		) {
 			self
@@ -827,6 +1034,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 					LiveDelegationAdmission::Ignored | LiveDelegationAdmission::Queued => Flow::Idle,
 				}
 			},
+			HostCommand::ProcessSignal(signal) => {
+				self.exit_cause = Some(omp_session::ExitCause::Signal { signal });
+				Flow::Quit
+			},
 			HostCommand::Quit => Flow::Quit,
 			other => {
 				self.apply_session_command(other).await?;
@@ -898,6 +1109,17 @@ impl<C: omp_agent::Inference> Controller<C> {
 		command_rx: &flume::Receiver<HostCommand>,
 		live_id: Option<Str>,
 	) -> miette::Result<bool> {
+		let goal_continuation_turn = matches!(
+			input.as_ref(),
+			Some(TurnRequest::Custom(message))
+				if message.custom_type.as_str() == "goal-continuation"
+		);
+		if matches!(
+			input.as_ref(),
+			Some(TurnRequest::User(_) | TurnRequest::Authored { .. } | TurnRequest::Skill(_))
+		) {
+			self.goal_continuation_suppressed = false;
+		}
 		let mut quit = false;
 		let ask = self.ask.clone();
 		let pause_up = self.up.clone();
@@ -913,28 +1135,35 @@ impl<C: omp_agent::Inference> Controller<C> {
 			let control = omp_agent::RunControl::default();
 			let turn =
 				match input {
-					Some(TurnRequest::User(input)) => {
+					Some(TurnRequest::User(input)) => futures::future::Either::Left(
 						futures::future::Either::Left(futures::future::Either::Left(
 							self.kernel.run_turn(&mut self.session, input, control),
-						))
-					},
-					Some(TurnRequest::Authored { input, author }) => {
+						)),
+					),
+					Some(TurnRequest::Authored { input, author }) => futures::future::Either::Left(
 						futures::future::Either::Left(futures::future::Either::Right(
 							self
 								.kernel
 								.run_authored_turn(&mut self.session, input, author, control),
-						))
-					},
-					Some(TurnRequest::Skill(prompt)) => {
+						)),
+					),
+					Some(TurnRequest::Skill(prompt)) => futures::future::Either::Left(
 						futures::future::Either::Right(futures::future::Either::Left(
 							self
 								.kernel
 								.run_skill_turn(&mut self.session, prompt, control),
-						))
-					},
-					None => futures::future::Either::Right(futures::future::Either::Right(
+						)),
+					),
+					Some(TurnRequest::Custom(message)) => futures::future::Either::Left(
+						futures::future::Either::Right(futures::future::Either::Right(
+							self
+								.kernel
+								.run_custom_turn(&mut self.session, message, control),
+						)),
+					),
+					None => futures::future::Either::Right(
 						self.kernel.retry_tool_tail(&mut self.session, control),
-					)),
+					),
 				};
 			tokio::pin!(turn);
 			loop {
@@ -988,6 +1217,11 @@ impl<C: omp_agent::Inference> Controller<C> {
 							let _ = self.up.send(Up::Approve { id, decision });
 						},
 						Ok(HostCommand::AskAnswer { id, answers }) => answer_ask(&ask, &id, answers),
+						Ok(HostCommand::ProcessSignal(signal)) => {
+							self.exit_cause = Some(omp_session::ExitCause::Signal { signal });
+							let _ = self.up.send(Up::Cancel);
+							quit = true;
+						},
 						Ok(HostCommand::Quit) | Err(_) => {
 							let _ = self.up.send(Up::Cancel);
 							quit = true;
@@ -1125,6 +1359,14 @@ impl<C: omp_agent::Inference> Controller<C> {
 				.voice
 				.settle_delegation(id, terminal, final_text, &self.ctx);
 		}
+		if matches!(&result, Ok(outcome) if outcome.stop == TurnStop::Completed) {
+			let had_tool_calls = self.latest_turn_had_tool_calls();
+			if goal_continuation_turn {
+				self.goal_continuation_suppressed = !had_tool_calls;
+			} else if had_tool_calls {
+				self.goal_continuation_suppressed = false;
+			}
+		}
 		if let Err(error) = result {
 			if matches!(&error, omp_agent::KernelError::NothingToRetry) {
 				// pi `input-controller.ts:1311`.
@@ -1170,10 +1412,9 @@ impl<C: omp_agent::Inference> Controller<C> {
 			self.record_loop_prompt(&next.request)?;
 			if self
 				.run_turn(
-					Some(TurnRequest::User(TurnInput {
-						text:        next.request,
-						attachments: Vec::new(),
-					})),
+					Some(TurnRequest::Custom(
+						omp_session::custom_message::CustomMessage::live_delegation(next.request),
+					)),
 					command_rx,
 					Some(next.id),
 				)
@@ -1307,22 +1548,38 @@ impl<C: omp_agent::Inference> Controller<C> {
 					}),
 				)
 				.await?;
-				if effective
+				let restore_workspace = effective
 					.get("restore_workspace")
 					.and_then(serde_json::Value::as_bool)
-					!= Some(false)
-				{
-					return Err(SessionHookError::UnsupportedTransform {
-						event: HookEventId::HookEventSessionRewind,
-						field: "restore_workspace",
+					.unwrap_or(false);
+				let targets = effective
+					.get("targets")
+					.and_then(serde_json::Value::as_array)
+					.map(|values| {
+						values
+							.iter()
+							.filter_map(serde_json::Value::as_str)
+							.map(ToOwned::to_owned)
+							.collect::<Vec<_>>()
 					})
-					.into_diagnostic();
-				}
+					.unwrap_or_default();
 				self.cancel_live_delegations();
 				self
 					.kernel
 					.flush_session_state(&mut self.session)
 					.into_diagnostic()?;
+				let restored_workspace = if restore_workspace {
+					let snapshot_id = checkpoint_snapshot_at(&self.session, target)
+						.ok_or(SessionHookError::WorkspaceCheckpointMissing { target })
+						.into_diagnostic()?;
+					Some(
+						restore_checkpoint_workspace(&self.env, snapshot_id.as_str(), targets.clone())
+							.await
+							.into_diagnostic()?,
+					)
+				} else {
+					None
+				};
 				let before = self.session.dom().snapshot();
 				match self.session.rewind(target) {
 					Ok(work) => {
@@ -1351,11 +1608,21 @@ impl<C: omp_agent::Inference> Controller<C> {
 							serde_json::json!({
 								"to_event": target,
 								"new_head": new_head,
-								"restored_workspace": false,
+								"restored_workspace": restored_workspace.is_some(),
+								"workspace_targets": targets,
 								"running_jobs": running_jobs,
 								"cancelled_jobs": cancelled_jobs,
 							}),
 						)?;
+						if let Some(restored) = restored_workspace {
+							self.reply(
+								Severity::Info,
+								format!(
+									"Rewound with workspace restored: {} written, {} deleted, {} unchanged",
+									restored.written, restored.deleted, restored.unchanged
+								),
+							);
+						}
 						if !work.terminate.is_empty() {
 							self.reply(
 								Severity::Warn,
@@ -1366,7 +1633,12 @@ impl<C: omp_agent::Inference> Controller<C> {
 							);
 						}
 					},
-					Err(error) => self.reply(Severity::Warn, format!("Rewind failed: {error}")),
+					Err(error) => {
+						if let Some(restored) = restored_workspace {
+							rollback_checkpoint_workspace(&self.env, &restored.undo_snapshot_id).await;
+						}
+						self.reply(Severity::Warn, format!("Rewind failed: {error}"));
+					},
 				}
 			},
 			HostCommand::Rename { title } => {
@@ -1425,8 +1697,10 @@ impl<C: omp_agent::Inference> Controller<C> {
 				}
 			},
 			HostCommand::Director { id, engage, args } => {
-				if let Err(error) = self.director(id.as_str(), engage, &args) {
-					self.reply(Severity::Warn, format!("{id}: {error}"));
+				match self.director(id.as_str(), engage, &args) {
+					Ok(()) if id.as_str() == "goal" => self.goal_continuation_suppressed = false,
+					Ok(()) => {},
+					Err(error) => self.reply(Severity::Warn, format!("{id}: {error}")),
 				}
 			},
 			HostCommand::Spawn { .. } if self.is_paused() => {
@@ -1530,12 +1804,13 @@ impl<C: omp_agent::Inference> Controller<C> {
 			| HostCommand::PushToTalk { .. }
 			| HostCommand::LiveVoice(_)
 			| HostCommand::LiveDelegation { .. }
+			| HostCommand::ProcessSignal(_)
 			| HostCommand::Quit => {},
 		}
 		Ok(())
 	}
 
-	fn answer_ask(&self, id: &str, answers: Option<Vec<omp_tools::ask::Answer>>) {
+	fn answer_ask(&self, id: &str, answers: Option<Vec<omp_tools::ask::Selection>>) {
 		answer_ask(&self.ask, id, answers);
 	}
 
@@ -1625,8 +1900,8 @@ impl<C: omp_agent::Inference> Controller<C> {
 	/// Brings a settled agent back over its journal, optionally with a first
 	/// prompt; its settlement is committed by the idle poll tick.
 	fn revive(&mut self, id: &str, prompt: Option<Str>) -> Result<(), ServiceError> {
-		let cfg_root = self.home.project_root.join(".omp");
-		let cfg = move |name: &str| fs::read_to_string(cfg_root.join(name)).ok().map(Str::new);
+		let cfg = omp_driver::cfg::CfgFiles::new(Some(&self.home.project_root))
+			.map_err(ServiceError::failed)?;
 		omp_driver::subagent::revive::revive_child(
 			&mut self.session,
 			omp_driver::subagent::revive::ReviveRequest {
@@ -1790,6 +2065,11 @@ impl<C: omp_agent::Inference> Controller<C> {
 						Ok(HostCommand::Approve { id, decision }) => {
 							let _ = self.up.send(Up::Approve { id, decision });
 						},
+						Ok(HostCommand::ProcessSignal(signal)) => {
+							self.exit_cause = Some(omp_session::ExitCause::Signal { signal });
+							let _ = self.up.send(Up::Cancel);
+							quit = true;
+						},
 						Ok(HostCommand::Quit) | Err(_) => {
 							let _ = self.up.send(Up::Cancel);
 							quit = true;
@@ -1875,7 +2155,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 		.await?;
 		self.voice.cancel(&self.ctx);
 		self.live_next = None;
-		if self.voice.switch_session(to.clone()).is_some() {
+		if self.voice.switch_session(to.clone(), &self.ctx).is_some() {
 			let _ = self.up.send(Up::Interrupt);
 		}
 		// A hosted room is bound to one authoritative patch stream. End it
@@ -1895,6 +2175,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 		self.home.unregister(&self.session);
 		let previous = std::mem::replace(&mut self.session, next);
 		drop(previous);
+		self.goal_continuation_suppressed = false;
 		if let Some(forwarder) = self.forwarder.take() {
 			// The old DOM's sender is gone; the forwarder drains what it
 			// buffered and ends, so nothing from the old session lands after
@@ -1954,6 +2235,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 				tokens_before: None,
 				tokens_after: None,
 				warning: None,
+				frames: Vec::new(),
 			})
 			.into_diagnostic()?;
 		Ok(dropped)
@@ -2746,7 +3028,7 @@ impl<C: omp_agent::Inference> Controller<C> {
 fn answer_ask(
 	route: &omp_driver::headless::AskRoute,
 	id: &str,
-	answers: Option<Vec<omp_tools::ask::Answer>>,
+	answers: Option<Vec<omp_tools::ask::Selection>>,
 ) {
 	let reply = match answers {
 		Some(answers) => omp_driver::headless::AskReply::Answers(answers),
@@ -3066,6 +3348,7 @@ mod tests {
 		BlockKind, ChatEvent, ChatRequest, ChatStream, Completion, ExecutionReceipt, FinishReason,
 		ProviderId, RequestId, ResponseMeta, RouteId, ToolCall, ToolCallId, Usage, call::OpaqueJson,
 	};
+	use omp_session::ComponentRegistry;
 	use omp_tool::{
 		Claims, Constraint, Effects, Ev, IncomingParams, Part, Precedence, Presentation, PromptCaps,
 		Registry, Rev, Tool, ToolSpec, ToolTerminal,
@@ -3392,6 +3675,119 @@ mod tests {
 
 	fn harness(inference_delay: Duration) -> Harness {
 		HarnessSpec::new(Script::Text, inference_delay).build()
+	}
+
+	#[tokio::test]
+	async fn process_signal_records_typed_exit_before_controller_stops() {
+		let harness = harness(Duration::ZERO);
+		harness
+			.commands
+			.send(HostCommand::ProcessSignal(omp_session::ExitSignal::new("SIGTERM", Some(15))))
+			.expect("signal");
+		let error = tokio::time::timeout(Duration::from_secs(5), harness.run)
+			.await
+			.expect("controller exits")
+			.expect("controller task")
+			.expect_err("signal returns process status");
+		assert_eq!(
+			error
+				.downcast_ref::<crate::exit_diagnostics::SignalExit>()
+				.expect("typed signal exit")
+				.exit_code(),
+			143
+		);
+		let session =
+			Session::open(&harness.journal, ComponentRegistry::standard()).expect("journal replays");
+		let (_, exit) = omp_session::latest_session_exit(session.dom()).expect("exit record");
+		assert_eq!(exit.status, omp_session::ExitStatus::Interrupted);
+		assert!(matches!(
+			exit.cause,
+			omp_session::ExitCause::Signal { ref signal } if signal.name == "SIGTERM"
+		));
+		drop(harness.dir);
+	}
+
+	/// Goal owns future work without recursively issuing another request in the
+	/// same turn. The interactive host waits through pi's 800 ms idle boundary,
+	/// then starts one hidden continuation as a distinct durable turn.
+	#[tokio::test]
+	async fn goal_continuation_waits_for_idle_and_starts_one_distinct_turn() {
+		let harness = HarnessSpec::new(Script::Text, Duration::ZERO).build_with(|session, _| {
+			let registry = omp_agent::DirectorRegistry::standard();
+			omp_agent::DirectorStack::from_dom(session.dom(), &registry)
+				.engage(session, Box::new(omp_agent::directors::goal::Goal::new("finish", None)))
+				.expect("goal engages");
+		});
+		harness
+			.commands
+			.send(HostCommand::Submit(Str::new_static("start")))
+			.expect("initial prompt");
+		next_event(&harness.events, |event| {
+			matches!(event, KernelEvent::TurnEnded { stop: TurnStop::Completed })
+		})
+		.await;
+
+		assert!(
+			tokio::time::timeout(Duration::from_millis(700), async {
+				loop {
+					if matches!(
+						harness.events.recv_async().await.expect("kernel event"),
+						KernelEvent::InferenceStarted
+					) {
+						break;
+					}
+				}
+			})
+			.await
+			.is_err(),
+			"goal must not self-loop before the idle boundary"
+		);
+		tokio::time::timeout(Duration::from_millis(500), async {
+			loop {
+				if matches!(
+					harness.events.recv_async().await.expect("kernel event"),
+					KernelEvent::TurnEnded { stop: TurnStop::Completed }
+				) {
+					break;
+				}
+			}
+		})
+		.await
+		.expect("one continuation turn completes after 800 ms");
+		assert!(
+			tokio::time::timeout(Duration::from_millis(900), async {
+				loop {
+					if matches!(
+						harness.events.recv_async().await.expect("kernel event"),
+						KernelEvent::InferenceStarted
+					) {
+						break;
+					}
+				}
+			})
+			.await
+			.is_err(),
+			"a prose-only continuation holds for user guidance instead of self-prompting again"
+		);
+
+		let (journal, _dir) = harness.quit().await;
+		let session = Session::open(&journal, omp_session::ComponentRegistry::standard())
+			.expect("journal replays");
+		assert_eq!(session.dom().count("body turn").expect("selector"), 2);
+		assert_eq!(
+			session
+				.dom()
+				.count("body turn assistant")
+				.expect("selector"),
+			2
+		);
+		assert_eq!(
+			session
+				.dom()
+				.count("body turn developer[name=goal-continuation]")
+				.expect("selector"),
+			1
+		);
 	}
 
 	fn sleep_command() -> HostCommand {

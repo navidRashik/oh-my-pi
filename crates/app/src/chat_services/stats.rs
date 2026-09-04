@@ -302,6 +302,7 @@ mod tests {
 				duration_ms:                 Some(1_000),
 				premium_requests_millionths: 0,
 				identity:                    None,
+				recoveries:                  Vec::new(),
 			})
 			.unwrap();
 		session
@@ -332,6 +333,7 @@ mod tests {
 				duration_ms:                 None,
 				premium_requests_millionths: 0,
 				identity:                    None,
+				recoveries:                  Vec::new(),
 			})
 			.unwrap();
 		path

@@ -348,43 +348,43 @@ const ROWS: &[Row] = &[
 		coverage:    Coverage::Mapped,
 		convar:      "sv_tools_output_spill_bytes",
 		declaration: "crates/envd/src/tool_settings.rs",
-		consumer:    "crates/envd/src/tool_settings.rs",
+		consumer:    "crates/driver/src/headless/kernel.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "tools.artifactTailBytes",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_tools_artifact_tail_bytes",
 		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		consumer:    "crates/driver/src/headless/kernel.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "tools.artifactHeadBytes",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_tools_artifact_head_bytes",
 		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		consumer:    "crates/driver/src/headless/kernel.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "tools.outputMaxColumns",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_tools_output_max_columns",
 		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		consumer:    "crates/driver/src/headless/kernel.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "tools.artifactTailLines",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_tools_artifact_tail_lines",
 		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		consumer:    "crates/driver/src/headless/kernel.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -1239,19 +1239,19 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "startup.checkUpdate",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "cl_startup_check_update",
 		declaration: "crates/app/src/settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		consumer:    "crates/app/src/startup_update.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "update.channel",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "cl_update_channel",
 		declaration: "crates/app/src/settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		consumer:    "crates/app/src/startup_update.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -3041,28 +3041,28 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "computer.display",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_computer_display",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		declaration: "crates/envd/src/computer.rs",
+		consumer:    "crates/envd/src/computer.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "computer.maxWidth",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_computer_max_width",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		declaration: "crates/envd/src/computer.rs",
+		consumer:    "crates/envd/src/computer.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "computer.maxHeight",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_computer_max_height",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		declaration: "crates/envd/src/computer.rs",
+		consumer:    "crates/envd/src/computer.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -3070,8 +3070,8 @@ const ROWS: &[Row] = &[
 		key:         "inspect_image.timeoutMs",
 		coverage:    Coverage::Declared,
 		convar:      "sv_inspect_image_timeout_ms",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		declaration: "crates/envd/src/tool_settings.rs",
+		consumer:    "UNCONSUMED: Read.question uses the ordinary turn cancellation boundary",
 		adr:         "",
 		quote:       "",
 	},
@@ -3239,10 +3239,10 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "tools.abortOnFabricatedResult",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_tools_abort_on_fabricated_result",
-		declaration: "crates/tools/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		declaration: "crates/envd/src/tool_settings.rs",
+		consumer:    "crates/envd/src/tool_settings.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -3284,10 +3284,10 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "irc.timeoutMs",
-		coverage:    Coverage::Declared,
-		convar:      "ai_irc_timeout_ms",
-		declaration: "crates/inference/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		coverage:    Coverage::Mapped,
+		convar:      "sv_irc_timeout",
+		declaration: "crates/driver/src/subagent/settings.rs",
+		consumer:    "crates/driver/src/subagent/hub.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -3344,28 +3344,28 @@ const ROWS: &[Row] = &[
 	},
 	Row {
 		key:         "mcp.renderMarkdownResults",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_mcp_render_markdown_results",
 		declaration: "crates/envd/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		consumer:    "crates/envd/src/mcp/manager.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "mcp.notifications",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_mcp_notifications",
 		declaration: "crates/envd/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		consumer:    "crates/envd/src/mcp/manager.rs",
 		adr:         "",
 		quote:       "",
 	},
 	Row {
 		key:         "mcp.notificationDebounceMs",
-		coverage:    Coverage::Declared,
+		coverage:    Coverage::Mapped,
 		convar:      "sv_mcp_notification_debounce_ms",
 		declaration: "crates/envd/src/pi_settings.rs",
-		consumer:    "UNCONSUMED: feature behavior remains separately audited",
+		consumer:    "crates/envd/src/mcp/manager.rs",
 		adr:         "",
 		quote:       "",
 	},
@@ -4462,7 +4462,7 @@ fn normalized(text: &str) -> String {
 }
 
 #[test]
-fn all_486_pi_settings_have_literal_control_plane_dispositions() {
+fn all_485_pi_settings_have_literal_control_plane_dispositions() {
 	let force_ctx = omp_con::Ctx::new();
 	let _force_link = [
 		omp_app::settings::LEGACY_CONVAR_MAPPINGS.len(),
@@ -4473,7 +4473,7 @@ fn all_486_pi_settings_have_literal_control_plane_dispositions() {
 		omp_catalog::pi_settings::LEGACY_CONVAR_MAPPINGS.len(),
 		omp_inference::pi_settings::LEGACY_CONVAR_MAPPINGS.len(),
 	];
-	assert_eq!(ROWS.len(), 486, "pi inventory must stay literal and complete");
+	assert_eq!(ROWS.len(), 485, "pi inventory must stay literal and complete");
 	let mut keys = BTreeSet::new();
 	let ctx = force_ctx;
 	for row in ROWS {
@@ -4549,21 +4549,21 @@ fn inventory_has_no_missing_or_wrong_status_variant() {
 			.iter()
 			.filter(|row| matches!(row.coverage, Coverage::Mapped))
 			.count(),
-		158
+		178
 	);
 	assert_eq!(
 		ROWS
 			.iter()
 			.filter(|row| matches!(row.coverage, Coverage::Declared))
 			.count(),
-		299
+		280
 	);
 	assert_eq!(
 		ROWS
 			.iter()
 			.filter(|row| matches!(row.coverage, Coverage::Deviation))
 			.count(),
-		29
+		27
 	);
 }
 
@@ -4645,6 +4645,12 @@ fn projected_ui_entry(entry: &omp_con::UiSpec) -> PiUiEntry {
 			options
 				.iter()
 				.map(|option| option.value.to_owned())
+				.collect()
+		},
+		omp_con::UiWidget::RuntimeSubmenu(omp_con::UiRuntimeOptions::ThinkingLevels) => {
+			["auto", "minimal", "low", "medium", "high", "xhigh", "max"]
+				.into_iter()
+				.map(str::to_owned)
 				.collect()
 		},
 		omp_con::UiWidget::Boolean
@@ -4886,6 +4892,127 @@ fn tools_grep_and_browser_group_mechanically_matches_current_pi() {
 }
 
 #[test]
+fn tools_computer_group_mechanically_matches_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| !matches!(row.coverage, Coverage::Deviation))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	let expected = pi
+		.entries
+		.into_iter()
+		.filter(|entry| entry.tab == "tools" && entry.group == "Computer")
+		.map(|mut entry| {
+			entry.convar = mappings[entry.path.as_str()].to_owned();
+			entry
+		})
+		.collect::<Vec<_>>();
+	let entries = omp_con::builtin_ui_entries()
+		.filter(|entry| entry.tab == omp_con::SettingTab::Tools && entry.group == "Computer")
+		.collect::<Vec<_>>();
+	let actual = entries
+		.iter()
+		.filter(|entry| !matches!(entry.widget, omp_con::UiWidget::ConfigOnly))
+		.map(|entry| projected_ui_entry(entry))
+		.collect::<Vec<_>>();
+	assert_eq!(entries.len(), 3);
+	assert_eq!(
+		entries
+			.iter()
+			.filter(|entry| matches!(entry.widget, omp_con::UiWidget::ConfigOnly))
+			.count(),
+		2
+	);
+	assert_eq!(actual.len(), 1);
+	assert_eq!(actual, expected);
+}
+
+#[test]
+fn tools_execution_group_mechanically_matches_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| !matches!(row.coverage, Coverage::Deviation))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	let expected = pi
+		.entries
+		.into_iter()
+		.filter(|entry| entry.tab == "tools" && entry.group == "Execution")
+		.map(|mut entry| {
+			entry.convar = mappings[entry.path.as_str()].to_owned();
+			entry
+		})
+		.collect::<Vec<_>>();
+	let actual = omp_con::builtin_ui_entries()
+		.filter(|entry| entry.tab == omp_con::SettingTab::Tools && entry.group == "Execution")
+		.map(projected_ui_entry)
+		.collect::<Vec<_>>();
+	assert_eq!(actual.len(), 7);
+	assert_eq!(actual, expected);
+}
+
+#[test]
+fn tools_discovery_and_mcp_group_mechanically_matches_current_pi() {
+	let Some(pi) = current_pi_ui() else {
+		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
+		return;
+	};
+	let mappings = ROWS
+		.iter()
+		.filter(|row| !matches!(row.coverage, Coverage::Deviation))
+		.map(|row| (row.key, row.convar))
+		.collect::<BTreeMap<_, _>>();
+	let expected = pi
+		.entries
+		.into_iter()
+		.filter(|entry| {
+			entry.tab == "tools"
+				&& entry.group == "Discovery & MCP"
+				&& mappings.contains_key(entry.path.as_str())
+		})
+		.map(|mut entry| {
+			entry.convar = mappings[entry.path.as_str()].to_owned();
+			entry
+		})
+		.collect::<Vec<_>>();
+	let entries = omp_con::builtin_ui_entries()
+		.filter(|entry| {
+			entry.tab == omp_con::SettingTab::Tools && entry.group == "Discovery & MCP"
+		})
+		.collect::<Vec<_>>();
+	let deviations = ["tools.xdev", "tools.xdevDocs", "tools.xdevInlineDevices"];
+	assert_eq!(entries.len() + deviations.len(), 7);
+	assert!(deviations.iter().all(|key| {
+		ROWS
+			.iter()
+			.any(|row| row.key == *key && matches!(row.coverage, Coverage::Deviation))
+	}));
+	let actual = entries
+		.iter()
+		.filter(|entry| !matches!(entry.widget, omp_con::UiWidget::ConfigOnly))
+		.map(|entry| projected_ui_entry(entry))
+		.collect::<Vec<_>>();
+	assert_eq!(entries.len(), 4);
+	assert_eq!(
+		entries
+			.iter()
+			.filter(|entry| matches!(entry.widget, omp_con::UiWidget::ConfigOnly))
+			.count(),
+		1
+	);
+	assert_eq!(actual.len(), 3);
+	assert_eq!(actual, expected);
+}
+
+#[test]
 fn curated_settings_metadata_mechanically_matches_current_pi_for_every_mapped_setting() {
 	let Some(mut pi) = current_pi_ui() else {
 		eprintln!("skipping live pi metadata comparison: /work/pi is unavailable");
@@ -4909,8 +5036,25 @@ fn curated_settings_metadata_mechanically_matches_current_pi_for_every_mapped_se
 		})
 		.map(projected_ui_entry)
 		.collect::<Vec<_>>();
-	assert_eq!(actual, pi.entries);
-	assert_eq!(actual.len(), 122);
+	let actual_paths = actual
+		.iter()
+		.map(|entry| entry.path.as_str())
+		.collect::<BTreeSet<_>>();
+	let missing = pi
+		.entries
+		.iter()
+		.filter(|entry| !actual_paths.contains(entry.path.as_str()))
+		.map(|entry| entry.path.as_str())
+		.collect::<Vec<_>>();
+	assert_eq!(actual.len(), pi.entries.len(), "mapped metadata row count; missing {missing:?}");
+	let differences = actual
+		.iter()
+		.zip(&pi.entries)
+		.enumerate()
+		.filter(|(_, (actual, expected))| actual != expected)
+		.collect::<Vec<_>>();
+	assert!(differences.is_empty(), "mapped metadata differences: {differences:#?}");
+	assert_eq!(actual.len(), 138);
 
 	let ctx = omp_con::Ctx::new();
 	for entry in omp_con::builtin_ui_entries() {

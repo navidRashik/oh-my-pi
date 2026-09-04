@@ -15,8 +15,8 @@ use omp_driver::{
 	sessions::SessionRegistry,
 };
 use omp_inference::{
-	BlockKind, ChatEvent, ChatRequest, ChatStream, Completion, ExecutionReceipt, FinishReason,
-	ProviderId, RequestId, ResponseMeta, RouteId, Usage,
+	Artifact, ArtifactBody, BlockKind, ChatEvent, ChatRequest, ChatStream, Completion,
+	ExecutionReceipt, FinishReason, ProviderId, RequestId, ResponseMeta, RouteId, Usage,
 };
 use omp_journal::blob::BlobStore;
 use omp_session::{ComponentRegistry, Session};
@@ -28,6 +28,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 enum Script {
 	Pending,
 	Text(&'static str),
+	TextAndImage(&'static str, &'static [u8]),
 }
 
 struct ScriptedInference {
@@ -59,6 +60,32 @@ impl Inference for ScriptedInference {
 					ChatEvent::Completed(Completion {
 						reason:  FinishReason::Stop,
 						blocks:  1,
+						usage:   Usage::default(),
+						receipt: ExecutionReceipt::default().into(),
+					}),
+				]
+				.into_iter()
+				.map(Ok);
+				ChatStream::ordinary(Box::pin(futures::stream::iter(events)))
+			},
+			Script::TextAndImage(text, image) => {
+				let events = vec![
+					started(),
+					ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text },
+					ChatEvent::TextDelta { index: 0, text: Str::new(text) },
+					ChatEvent::BlockStarted { index: 1, kind: BlockKind::Artifact },
+					ChatEvent::Artifact {
+						index:    1,
+						artifact: Artifact {
+							media_type: Str::new_static("image/png"),
+							size:       None,
+							digest:     None,
+							body:       ArtifactBody::Bytes(bytes::Bytes::from_static(image)),
+						},
+					},
+					ChatEvent::Completed(Completion {
+						reason:  FinishReason::Stop,
+						blocks:  2,
 						usage:   Usage::default(),
 						receipt: ExecutionReceipt::default().into(),
 					}),
@@ -208,7 +235,8 @@ async fn standard_acp_cancel_interrupts_the_active_prompt() {
 #[tokio::test]
 async fn content_block_prompts_journal_text_and_image_attachments() {
 	let directory = tempfile::tempdir().expect("temporary directory");
-	let (kernel, session, home) = harness(&directory, [Script::Text("seen")]);
+	let (kernel, session, home) =
+		harness(&directory, [Script::TextAndImage("seen", b"provider image")]);
 	let journal_path = session.journal_path().to_path_buf();
 	let frames = exchange(
 		kernel,
@@ -251,6 +279,17 @@ async fn content_block_prompts_journal_text_and_image_attachments() {
 		}),
 		"private DOM patch vocabulary must never leak onto ACP: {frames:#?}",
 	);
+	assert!(
+		frames.iter().any(|frame| {
+			frame["method"] == "session/update"
+				&& frame["params"]["sessionId"] == "startup"
+				&& frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+				&& frame["params"]["update"]["content"]["type"] == "image"
+				&& frame["params"]["update"]["content"]["data"]
+					== omp_core::base64::encode(b"provider image").into_string()
+		}),
+		"provider media must resolve from the same session CAS as the prompt: {frames:#?}",
+	);
 
 	let reopened = Session::open(&journal_path, ComponentRegistry::standard()).expect("reopen");
 	let dom = reopened.dom();
@@ -278,6 +317,46 @@ async fn content_block_prompts_journal_text_and_image_attachments() {
 		.get(&attachments[0])
 		.expect("image blob is content-addressed in the session store");
 	assert_eq!(stored.as_ref(), b"\x89PNG\r\n\x1a\n");
+
+	let provider_blob = omp_journal::blob::BlobRef {
+		hash: omp_core::Hash32::sum(b"provider image"),
+		size: u64::try_from(b"provider image".len()).expect("fixture length"),
+	};
+	assert_eq!(
+		reopened
+			.blobs()
+			.get(&provider_blob)
+			.expect("provider image in session CAS")
+			.as_ref(),
+		b"provider image"
+	);
+	let assistant = dom
+		.children(turn)
+		.iter()
+		.copied()
+		.find(|handle| {
+			dom.get(*handle)
+				.is_some_and(|node| node.tag == omp_dom::Tag::Known(omp_dom::KnownTag::Assistant))
+		})
+		.expect("journaled assistant");
+	let artifact = dom
+		.children(assistant)
+		.iter()
+		.filter_map(|handle| dom.get(*handle))
+		.find(|node| matches!(&node.tag, omp_dom::Tag::Custom(tag) if tag.as_str() == "artifact"))
+		.expect("journaled provider artifact");
+	let provider_uri = format!("artifact://sha256/{}", provider_blob.to_hex());
+	assert_eq!(
+		artifact
+			.prop(&omp_dom::PropKey::Known(omp_dom::PropId::Blob))
+			.and_then(omp_dom::Value::as_str),
+		Some(provider_uri.as_str())
+	);
+	assert_eq!(
+		artifact.prop(&omp_dom::PropKey::Custom(Str::new_static("size"))),
+		Some(&omp_dom::Value::Int(i64::try_from(provider_blob.size).expect("fixture size"))),
+		"the actual CAS size is journaled even when the provider omitted it"
+	);
 }
 
 #[tokio::test]
@@ -287,7 +366,16 @@ async fn new_load_and_resume_switch_the_authoritative_durable_session() {
 	let resumed_path = directory.path().join("sessions").join("resumed.oms");
 	std::fs::create_dir_all(target_path.parent().expect("session parent"))
 		.expect("sessions directory");
-	drop(Session::create(&target_path, ComponentRegistry::standard()).expect("durable load target"));
+	let mut target =
+		Session::create(&target_path, ComponentRegistry::standard()).expect("durable load target");
+	let image = target
+		.store_attachment("image/png", b"switched image")
+		.expect("target image");
+	target.begin_turn().expect("target turn");
+	target
+		.user("loaded [Image #1]", vec![image])
+		.expect("target image prompt");
+	drop(target);
 	drop(
 		Session::create(&resumed_path, ComponentRegistry::standard()).expect("durable resume target"),
 	);
@@ -332,6 +420,17 @@ async fn new_load_and_resume_switch_the_authoritative_durable_session() {
 	);
 	assert_eq!(response(&frames, "load")["result"]["modes"]["currentModeId"], "default",);
 	assert_eq!(response(&frames, "resume")["result"]["modes"]["currentModeId"], "default",);
+	assert!(
+		frames.iter().any(|frame| {
+			frame["method"] == "session/update"
+				&& frame["params"]["sessionId"] == "target"
+				&& frame["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+				&& frame["params"]["update"]["content"]["type"] == "image"
+				&& frame["params"]["update"]["content"]["data"]
+					== omp_core::base64::encode(b"switched image").into_string()
+		}),
+		"loading a session resolves its image from that session's CAS: {frames:#?}"
+	);
 
 	let target =
 		Session::open(&target_path, ComponentRegistry::standard()).expect("load target reopens");

@@ -580,9 +580,10 @@ async fn rpc_ui_routes_retained_select_dialogs_and_responses() {
 	let (server, request, presentation) = tokio::join!(server, client, presenter);
 	server.expect("server");
 	assert_eq!(request["method"], "select");
+	assert_eq!(request["allowOther"], true);
+	assert_eq!(request["recommended"], 0);
 	let presentation = presentation
 		.expect("presenter task")
 		.expect("dialog answer");
-	assert!(!presentation.headless);
-	assert_eq!(presentation.answers[0].selected, [Str::new_static("A")]);
+	assert_eq!(presentation.selections[0].selected, [Str::new_static("A")]);
 }

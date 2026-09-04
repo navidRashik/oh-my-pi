@@ -134,6 +134,7 @@ impl AcpEventMapper {
 			})
 			.collect::<Vec<_>>();
 		blocks.sort_by_key(|(index, position, _)| (*index, *position));
+		let mut emitted_text = false;
 		for (_, _, child) in blocks {
 			let Some(block) = self.dom.get(child) else {
 				continue;
@@ -154,17 +155,19 @@ impl AcpEventMapper {
 			};
 			let update = match block.prop(&PropId::Kind.into()).and_then(Value::as_str) {
 				Some("thinking") => "agent_thought_chunk",
-				Some("text") => "agent_message_chunk",
+				Some("text") => {
+					emitted_text = true;
+					"agent_message_chunk"
+				},
 				_ => continue,
 			};
 			updates.push(message_chunk(update, text, &message_id));
 		}
-		if updates.last().is_none_or(|update| {
-			update.get("messageId").and_then(JsonValue::as_str) != Some(message_id.as_str())
-		}) && let Some(text) = node
-			.prop(&PropId::Text.into())
-			.and_then(Value::as_str)
-			.filter(|text| !text.is_empty())
+		if !emitted_text
+			&& let Some(text) = node
+				.prop(&PropId::Text.into())
+				.and_then(Value::as_str)
+				.filter(|text| !text.is_empty())
 		{
 			updates.push(message_chunk("agent_message_chunk", text, &message_id));
 		}

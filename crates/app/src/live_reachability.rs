@@ -7,7 +7,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use omp_core::{Str, sf};
-use omp_voice::transport::LiveProxy;
+use omp_voice::{live::LiveIcePath, transport::LiveProxy};
 use smallvec::SmallVec;
 use strum::IntoStaticStr;
 use tokio::{
@@ -116,6 +116,24 @@ impl Default for ProbeEvidence {
 pub(crate) struct LiveReachabilityDiagnostic {
 	pub(crate) class:   LiveFailureClass,
 	pub(crate) message: Str,
+}
+
+/// Adds the last selected ICE candidate classes and relay/direct aggregate.
+///
+/// The typed path cannot contain endpoint or credential material, so this
+/// diagnostic remains safe for the live overlay and diagnostic bundles.
+pub(crate) fn annotate_ice_path(
+	mut diagnostic: LiveReachabilityDiagnostic,
+	path: Option<LiveIcePath>,
+) -> LiveReachabilityDiagnostic {
+	let Some(path) = path else {
+		return diagnostic;
+	};
+	diagnostic.message = Str::new(format!(
+		"{} Last ICE path: {}; local {}; remote {}.",
+		diagnostic.message, path.kind, path.local, path.remote
+	));
+	diagnostic
 }
 
 /// Runs a bounded DNS/TCP/TLS/UDP diagnosis without provider credentials.
@@ -388,6 +406,26 @@ mod tests {
 		assert!(!report.message.contains("employee"));
 		assert!(!report.message.contains("secret"));
 		assert!(!report.message.contains("proxy.example"));
+	}
+
+	#[test]
+	fn selected_ice_path_annotation_contains_only_redacted_classes_and_aggregate() {
+		use omp_voice::live::{LiveIceCandidateClass, LiveIcePathKind};
+
+		let report = annotate_ice_path(
+			diagnosis(LiveFailureClass::Ice, ProbeEvidence::default(), false),
+			Some(LiveIcePath {
+				local:  LiveIceCandidateClass::Relay,
+				remote: LiveIceCandidateClass::Host,
+				kind:   LiveIcePathKind::Relay,
+			}),
+		);
+		assert!(report.message.contains("Last ICE path: relay"));
+		assert!(report.message.contains("local relay"));
+		assert!(report.message.contains("remote host"));
+		for sensitive in ["192.0.2.", "10.0.0.", ":3478", "credential", "password", "ssid"] {
+			assert!(!report.message.to_ascii_lowercase().contains(sensitive));
+		}
 	}
 
 	#[test]

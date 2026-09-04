@@ -1,6 +1,5 @@
 //! `omp ext` command parsing and extension-backend dispatch.
 pub(crate) mod config;
-pub mod materialize;
 pub(crate) mod service;
 
 use std::{
@@ -11,14 +10,14 @@ use std::{
 
 use clap::{Args, Subcommand, ValueEnum};
 use futures::StreamExt as _;
-use miette::{IntoDiagnostic as _, miette};
+use miette::{Diagnostic, IntoDiagnostic as _, miette};
 use omp_core::{Hash32, Str, base64, encoding::hex, sf};
 use omp_env::{BundleFile, pack_bundle, unpack_bundle};
 use omp_ext::{
 	Layer as BackendLayer,
 	config::{
 		DeploymentManifest, ExtensionEnvironment, FeatureSelection, MissingSourceOutcome,
-		MissingSourcePolicy, SourceSpec, effective_missing_source,
+		MissingSourcePolicy, OfflineMode, SourceSpec, effective_missing_source,
 	},
 	doctor::{CredentialHealth, DoctorRequest, DoctorSeverity, RuntimeHealth, diagnose},
 	index::SignedIndex,
@@ -26,10 +25,10 @@ use omp_ext::{
 		InstalledExtension, InstalledRecord, LockFile, LockedExtension, LockedPackage, Wheel,
 		index_source,
 	},
-	resolver::{ResolvePlan, ResolveRequirement, SystemUv, minimal_unsat_core},
+	resolver::{ResolvePlan, ResolveRequirement, SystemUv, compare_versions, minimal_unsat_core},
 	trust::{
 		Grant, GrantsFile, KeysFile, RevocationFreshness, RevocationsFile, grant_covers,
-		verify_artifact_signature,
+		parse_grant_requests, validate_grant_request, verify_artifact_signature,
 	},
 	upgrade::{
 		Generation, PinsFile, apply_uninstall, concrete_features, gc_generations, plan_uninstall,
@@ -41,6 +40,47 @@ use omp_proto::env::v1::{MaterializeSite, SiteFile};
 use sha2::{Digest as _, Sha256};
 use toml::map;
 const MAX_WHEEL_BYTES: usize = 256 * 1024 * 1024;
+
+/// Typed application-boundary wrapper preserving the extension diagnostic and
+/// its command-specific process status.
+#[derive(Debug, thiserror::Error, Diagnostic)]
+#[error("extension operation failed")]
+pub struct ExtensionCliFailure {
+	#[source]
+	source: omp_ext::ExtensionError,
+}
+
+impl ExtensionCliFailure {
+	fn new(source: omp_ext::ExtensionError) -> Self {
+		Self { source }
+	}
+
+	/// Uniform `omp ext` exit status for the stable diagnostic code.
+	pub const fn exit_code(&self) -> u8 {
+		self.source.exit_code()
+	}
+}
+
+fn extension_failure(error: omp_ext::ExtensionError) -> miette::Report {
+	miette::Report::new(ExtensionCliFailure::new(error))
+}
+
+/// Ctrl+C observed while an extension installer-owned child or network stream
+/// was active.
+#[derive(Clone, Copy, Debug, thiserror::Error, Diagnostic)]
+#[error("extension operation interrupted")]
+pub struct ExtensionInterrupt;
+
+impl ExtensionInterrupt {
+	/// Conventional shell status for SIGINT.
+	pub const fn exit_code(&self) -> u8 {
+		130
+	}
+}
+
+fn extension_interrupt() -> miette::Report {
+	miette::Report::new(ExtensionInterrupt)
+}
 
 /// Shared options accepted by every `omp ext` operation.
 #[derive(Clone, Debug, Args)]
@@ -107,7 +147,7 @@ pub struct ExtArgs {
 	#[arg(long, global = true)]
 	pub json:          bool,
 	/// Include resolver and verification detail.
-	#[arg(short, long, global = true)]
+	#[arg(long, global = true)]
 	pub verbose:       bool,
 	/// Extension operation.
 	#[command(subcommand)]
@@ -613,20 +653,71 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 		scope,
 		layer,
 		uv,
+		store,
+		cache,
 		index: resolution_indexes,
+		index_keys,
 		exclude_newer,
 		targets: resolution_targets,
 		locked,
 		offline,
+		disable,
+		grant,
+		allow_build,
+		sign_key,
+		trace,
+		env_socket,
 		json,
 		command,
 		..
 	} = args;
 	let data_dir = omp_core::dirs::data_dir(data_dir).into_diagnostic()?;
-	let state = StatePaths::new(&data_dir, &project);
+	let mut environment = ExtensionEnvironment::from_environment();
+	if let Some(store) = store {
+		environment.store = Some(store);
+	}
+	if let Some(cache) = cache {
+		environment.cache = Some(cache);
+	}
+	if let Some(index_keys) = index_keys {
+		environment.index_keys = Some(index_keys);
+	}
+	if !resolution_indexes.is_empty() {
+		environment.indexes = resolution_indexes
+			.into_iter()
+			.map(|value| value.to_string())
+			.collect();
+	}
+	if let Some(exclude_newer) = exclude_newer {
+		environment.exclude_newer = Some(exclude_newer);
+	}
+	if !resolution_targets.is_empty() {
+		environment.targets = resolution_targets;
+	}
+	if let Some(uv) = uv {
+		environment.uv = Some(uv);
+	}
+	if !disable.is_empty() {
+		environment.disabled.extend(disable);
+	}
+	if let Some(grant) = grant {
+		environment.grant = Some(grant.to_string());
+	}
+	environment.allow_build |= allow_build;
+	if let Some(sign_key) = sign_key {
+		environment.sign_key = Some(sign_key);
+	}
+	environment.trace |= trace;
+	if let Some(env_socket) = env_socket {
+		environment.env_socket = Some(env_socket);
+	}
+	environment.locked |= locked;
+	if offline && environment.offline == OfflineMode::Online {
+		environment.offline = OfflineMode::Offline;
+	}
+	let state = StatePaths::new(&data_dir, &project).with_environment(&environment);
 	let scoped_state = state.scoped(scope);
 	let settings = omp_driver::settings::current().map_err(|error| miette!("{error}"))?;
-	let _environment = ExtensionEnvironment::from_environment();
 	let extension_scopes = settings
 		.extension_scopes(
 			omp_driver::settings::workspace_extension_overlay(&project)
@@ -637,7 +728,19 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 	match command {
 		ExtCommand::List(args) => list(&state, args, json),
 		ExtCommand::Info(args) => info(&state, args, json),
-		ExtCommand::Install(args) => install(&scoped_state, args, uv, json).await,
+		ExtCommand::Install(mut args) => {
+			if args.target.is_empty() {
+				args.target.clone_from(&environment.targets);
+			}
+			install(
+				&scoped_state,
+				args,
+				environment.uv.clone(),
+				environment.grant.as_deref(),
+				json,
+			)
+			.await
+		},
 		ExtCommand::New(args) => new_extension(&project, args),
 		ExtCommand::Uninstall(args) => uninstall(&scoped_state, args),
 		ExtCommand::Link(args) => link(&scoped_state, args, json),
@@ -651,24 +754,24 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 			resolve(
 				&scoped_state,
 				args,
-				uv,
-				resolution_indexes,
-				exclude_newer,
-				resolution_targets,
-				locked,
+				environment.uv.clone(),
+				environment.indexes.clone().into_iter().map(Str::new).collect(),
+				environment.exclude_newer.clone(),
+				environment.targets.clone(),
+				environment.locked,
 				missing_source,
 			)
 			.await
 		},
-		ExtCommand::Sync(args) => sync(&state, args, uv.as_deref()).await,
-		ExtCommand::Upgrade(args) => upgrade(&scoped_state, args, uv).await,
+		ExtCommand::Sync(args) => sync(&state, args, environment.uv.as_deref()).await,
+		ExtCommand::Upgrade(args) => upgrade(&scoped_state, args, environment.uv.clone()).await,
 		ExtCommand::Pin { id, version } => pin(&state, id, version),
 		ExtCommand::Unpin { id } => unpin(&state, &id),
 		ExtCommand::Gc(args) => gc(&state, args),
-		ExtCommand::Doctor(args) => doctor(&state, args),
+		ExtCommand::Doctor(args) => doctor(&scoped_state, args),
 		ExtCommand::Trust(args) => trust(&state, args),
 		ExtCommand::Verify(args) => {
-			if offline && args.revocations {
+			if environment.offline != OfflineMode::Online && args.revocations {
 				Err(miette!("cannot refresh revocations while extension networking is offline"))
 			} else {
 				verify(&state, args).await
@@ -685,6 +788,10 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 fn list(state: &StatePaths, args: ExtListArgs, json: bool) -> miette::Result<()> {
 	let client_lock = read_lock_or_empty(&state.client_lock, BackendLayer::Client)?;
 	let workspace_lock = read_lock_or_empty(&state.workspace_lock, BackendLayer::Workspace)?;
+	let catalog = args
+		.outdated
+		.then(|| read_catalog_for_verify(state))
+		.transpose()?;
 	let entries = service::installed_views(state)?
 		.into_iter()
 		.filter(|entry| !args.enabled || entry.enabled)
@@ -700,11 +807,25 @@ fn list(state: &StatePaths, args: ExtListArgs, json: bool) -> miette::Result<()>
 				Scope::Project => &workspace_lock,
 			};
 			let locked = lock.extensions.iter().find(|locked| locked.id == entry.id);
+			let outdated = catalog.as_ref().is_none_or(|catalog| {
+				locked.is_some_and(|locked| {
+					catalog
+						.extensions
+						.iter()
+						.find(|extension| extension.id == locked.id)
+						.and_then(|extension| catalog.latest_release(extension, false))
+						.is_some_and(|release| {
+							compare_versions(release.version.as_str(), locked.version.as_str())
+								.is_ok_and(|ordering| ordering.is_gt())
+						})
+				})
+			});
 			args
 				.pool
 				.as_ref()
 				.is_none_or(|pool| locked.is_some_and(|locked| locked.pool.as_ref() == Some(pool)))
 				&& (!args.unsigned || locked.is_none_or(|locked| locked.signature.trim().is_empty()))
+				&& outdated
 		})
 		.collect::<Vec<_>>();
 	if json {
@@ -735,8 +856,17 @@ fn list(state: &StatePaths, args: ExtListArgs, json: bool) -> miette::Result<()>
 			}
 		});
 		println!(
-			"{} {} {} {} {} {}{} source={}",
-			entry.id, version, entry.scope, entry.tier, signature, status, shadowed, entry.source
+			"{} {} {} {} {} {}{} publisher={} artifact={} generation=- source={}",
+			entry.id,
+			version,
+			entry.scope,
+			entry.tier,
+			signature,
+			status,
+			shadowed,
+			entry.publisher.as_deref().unwrap_or("-"),
+			entry.artifact.as_deref().unwrap_or("-"),
+			entry.source
 		);
 		if args.tree
 			&& let Some(locked) = locked
@@ -751,9 +881,9 @@ fn list(state: &StatePaths, args: ExtListArgs, json: bool) -> miette::Result<()>
 
 fn info(state: &StatePaths, args: ExtInfoArgs, json: bool) -> miette::Result<()> {
 	let client =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.client_installed).map_err(extension_failure)?;
 	let workspace =
-		InstalledRecord::read(&state.workspace_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.workspace_installed).map_err(extension_failure)?;
 	let (installed, scope, lock) =
 		if let Some(installed) = client.extensions.iter().find(|entry| entry.id == args.id) {
 			(installed, Scope::User, read_lock_or_empty(&state.client_lock, BackendLayer::Client)?)
@@ -803,6 +933,9 @@ fn info(state: &StatePaths, args: ExtInfoArgs, json: bool) -> miette::Result<()>
 			"paths": paths,
 			"signature": locked.map(|entry| &entry.signature),
 			"publisher": locked.map(|entry| &entry.publisher),
+			"artifactDigest": locked.map(|entry| &entry.wheel.blake3),
+			"layer": lock.layer,
+			"generation": serde_json::Value::Null,
 		})
 	};
 	if !json {
@@ -824,14 +957,17 @@ async fn install(
 	state: &StatePaths,
 	args: ExtInstallArgs,
 	uv: Option<PathBuf>,
+	grant_request: Option<&str>,
 	json: bool,
 ) -> miette::Result<()> {
 	validate_specs(&args.specs)?;
 	let mut installed =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.client_installed).map_err(extension_failure)?;
+	let mut lock = read_lock_or_empty(&state.client_lock, state.layer)?;
+	let mut signed_install = false;
 	for spec in &args.specs {
 		let (source, bracket_selection) =
-			SourceSpec::parse_install(spec).map_err(|error| miette!("{error}"))?;
+			SourceSpec::parse_install(spec).map_err(extension_failure)?;
 		let selection = requested_features(&args, bracket_selection)?;
 		let existing_id = match &source {
 			SourceSpec::Index { distribution, .. } => Some(
@@ -839,7 +975,7 @@ async fn install(
 					.rsplit_once('@')
 					.map_or(distribution.as_str(), |(id, _)| id),
 			),
-			SourceSpec::Path(path) => path.file_name().and_then(|name| name.to_str()),
+			SourceSpec::Path(_) => None,
 			_ => None,
 		};
 		if !args.force
@@ -853,22 +989,29 @@ async fn install(
 		match source {
 			SourceSpec::Path(path) => {
 				let path = path.canonicalize().into_diagnostic()?;
-				let id = path
-					.file_name()
-					.and_then(|name| name.to_str())
-					.ok_or_else(|| miette!("extension path has no valid identity"))?;
+				let manifest = read_development_manifest(&path)?;
+				let id = manifest.id.clone();
+				if !args.force
+					&& installed
+						.extensions
+						.iter()
+						.any(|entry| entry.id == id)
+				{
+					return Err(miette!(
+						"extension {id} is already installed; pass --force to reinstall"
+					));
+				}
 				let mut source = map::Map::new();
 				source.insert("path".to_owned(), toml::Value::String(path.display().to_string()));
-				let manifest = read_development_manifest(&path)?;
 				let previous = installed
 					.extensions
 					.iter()
 					.find(|entry| entry.id == id)
 					.map(|entry| entry.features.as_slice());
 				let features = concrete_features(&selection, &manifest.features, previous)
-					.map_err(|error| miette!("{error}"))?;
+					.map_err(extension_failure)?;
 				upsert_installed(&mut installed, InstalledExtension {
-					id: Str::new(id),
+					id,
 					features,
 					source: toml::Value::Table(source),
 					tier: tier(args.tier),
@@ -876,16 +1019,18 @@ async fn install(
 				});
 			},
 			source => {
-				install_index_source(
+				signed_install |= install_index_source(
 					state,
 					&args,
 					&mut installed,
+					&mut lock,
 					source,
 					selection,
 					uv.as_deref(),
+					grant_request,
 					json,
 				)
-				.await?
+				.await?;
 			},
 		}
 	}
@@ -900,7 +1045,19 @@ async fn install(
 		}
 		return Ok(());
 	}
-	installed.write(&state.client_installed).into_diagnostic()?;
+	if signed_install {
+		let generation = Generation { lock, installed };
+		omp_ext::upgrade::commit_generation(
+			&state.client_lock,
+			&state.client_installed,
+			&state.generations,
+			&format!("install-{}", omp_core::Ulid::generate()),
+			&generation,
+		)
+		.map_err(extension_failure)?;
+	} else {
+		installed.write(&state.client_installed).into_diagnostic()?;
+	}
 	if json {
 		println!(
 			"{}",
@@ -914,7 +1071,7 @@ async fn install(
 
 fn uninstall(state: &StatePaths, args: ExtUninstallArgs) -> miette::Result<()> {
 	let mut installed =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.client_installed).map_err(extension_failure)?;
 	let mut lock = read_lock_or_empty(&state.client_lock, state.layer)?;
 	let plan = plan_uninstall(&installed, &lock, args.ids, args.keep_lock);
 	println!("remove {} installed and {} locked entries", plan.installed.len(), plan.locked.len());
@@ -925,7 +1082,7 @@ fn uninstall(state: &StatePaths, args: ExtUninstallArgs) -> miette::Result<()> {
 	installed.write(&state.client_installed).into_diagnostic()?;
 	lock.write(&state.client_lock).into_diagnostic()?;
 	if !args.keep_grant {
-		let mut grants = GrantsFile::read(&state.grants).map_err(|error| miette!("{error}"))?;
+		let mut grants = GrantsFile::read(&state.grants).map_err(extension_failure)?;
 		let removed = plan
 			.installed
 			.iter()
@@ -1011,8 +1168,8 @@ packages = ["src/{package}"]
 "#,
 		id = args.id,
 	);
-	let parsed = DeploymentManifest::parse(&manifest).map_err(|error| miette!("{error}"))?;
-	parsed.validate().map_err(|error| miette!("{error}"))?;
+	let parsed = DeploymentManifest::parse(&manifest).map_err(extension_failure)?;
+	parsed.validate().map_err(extension_failure)?;
 	let source = r#"import omp
 
 
@@ -1036,35 +1193,28 @@ async def activated(event, ctx: omp.Context) -> None:
 
 fn link(state: &StatePaths, args: ExtLinkArgs, json: bool) -> miette::Result<()> {
 	let path = args.path.canonicalize().into_diagnostic()?;
-	let id = args.name.unwrap_or_else(|| {
-		Str::new(
-			path
-				.file_name()
-				.and_then(|name| name.to_str())
-				.unwrap_or("extension"),
-		)
-	});
+	let manifest = read_development_manifest(&path)?;
+	let id = args.name.unwrap_or_else(|| manifest.id.clone());
 	let mut source = map::Map::new();
 	source.insert("link".to_owned(), toml::Value::String(path.display().to_string()));
 	let mut installed =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.client_installed).map_err(extension_failure)?;
 	let selection = match args.features.as_deref() {
 		None => FeatureSelection::Absent,
 		Some(features) if features.trim().is_empty() => FeatureSelection::None,
 		Some("*") => FeatureSelection::All,
 		Some(features) => FeatureSelection::Named(csv(features)),
 	};
-	let manifest = read_development_manifest(&path)?;
 	let previous = installed
 		.extensions
 		.iter()
 		.find(|entry| entry.id == id)
 		.map(|entry| entry.features.as_slice());
 	let features = concrete_features(&selection, &manifest.features, previous)
-		.map_err(|error| miette!("{error}"))?;
+		.map_err(extension_failure)?;
 	let requirements = manifest
 		.project(&features)
-		.map_err(|error| miette!("{error}"))?
+		.map_err(extension_failure)?
 		.requires;
 	upsert_installed(&mut installed, InstalledExtension {
 		id: id.clone(),
@@ -1110,7 +1260,7 @@ fn link(state: &StatePaths, args: ExtLinkArgs, json: bool) -> miette::Result<()>
 
 fn unlink(state: &StatePaths, id: &str, json: bool) -> miette::Result<()> {
 	let mut installed =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.client_installed).map_err(extension_failure)?;
 	let before = installed.extensions.len();
 	installed.extensions.retain(|entry| {
 		!(entry.id == id
@@ -1133,12 +1283,12 @@ fn unlink(state: &StatePaths, id: &str, json: bool) -> miette::Result<()> {
 
 pub(crate) fn enable(state: &StatePaths, id: &str, enabled: bool) -> miette::Result<()> {
 	let mut installed =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.client_installed).map_err(extension_failure)?;
 	if enabled && state.client_lock.exists() {
 		let lock =
-			LockFile::read(&state.client_lock, state.layer).map_err(|error| miette!("{error}"))?;
+			LockFile::read(&state.client_lock, state.layer).map_err(extension_failure)?;
 		if let Some(extension) = lock.extensions.iter().find(|extension| extension.id == id) {
-			let grants = GrantsFile::read(&state.grants).map_err(|error| miette!("{error}"))?;
+			let grants = GrantsFile::read(&state.grants).map_err(extension_failure)?;
 			let workspace = (state.layer == BackendLayer::Workspace).then_some(&state.workspace);
 			if !grant_covers(
 				&grants,
@@ -1154,7 +1304,7 @@ pub(crate) fn enable(state: &StatePaths, id: &str, enabled: bool) -> miette::Res
 			}
 		}
 	}
-	set_enabled(&mut installed, id, enabled).map_err(|error| miette!("{error}"))?;
+	set_enabled(&mut installed, id, enabled).map_err(extension_failure)?;
 	installed.write(&state.client_installed).into_diagnostic()?;
 	Ok(())
 }
@@ -1167,15 +1317,15 @@ fn features(_state: &StatePaths, args: ExtFeaturesArgs) -> miette::Result<()> {
 	Err(miette!("feature mutations require a fresh explicit resolve for {}", args.id))
 }
 fn lock(state: &StatePaths, args: ExtLockArgs) -> miette::Result<()> {
-	let mut lock = read_lock_or_empty(&state.client_lock, BackendLayer::Client)?;
-	lock
-		.validate_for(BackendLayer::Client)
-		.map_err(|error| miette!("{error}"))?;
+	let mut lock = read_lock_or_empty(&state.client_lock, state.layer)?;
 	if !args.targets.is_empty() {
 		lock.targets = args.targets;
 		lock.targets.sort();
 		lock.targets.dedup();
 	}
+	lock
+		.validate_for(state.layer)
+		.map_err(|error| miette!("{error}"))?;
 	if let Some(path) = args.export_pylock {
 		lock.export_pylock(&path).into_diagnostic()?;
 	}
@@ -1208,7 +1358,7 @@ async fn resolve(
 		.iter()
 		.enumerate()
 		.map(|(ordinal, spec)| {
-			let source = SourceSpec::parse(spec).map_err(|error| miette!("{error}"))?;
+			let source = SourceSpec::parse(spec).map_err(extension_failure)?;
 			Ok(source_requirement(source, missing_source)?.map(|requirement| ResolveRequirement {
 				extension_id: Str::new(format!("root-{ordinal}")),
 				requirement,
@@ -1230,7 +1380,7 @@ async fn resolve(
 			if !path.exists() {
 				continue;
 			}
-			let lock = LockFile::read(path, layer).map_err(|error| miette!("{error}"))?;
+			let lock = LockFile::read(path, layer).map_err(extension_failure)?;
 			for extension in lock.extensions {
 				for requirement in extension.requires {
 					requirements
@@ -1265,9 +1415,10 @@ async fn resolve(
 		&targets,
 		index_urls.clone(),
 		exclude_newer.clone(),
+		state.offline != OfflineMode::Online,
 		requirements_file.clone(),
 	)
-	.map_err(|error| miette!("{error}"))?;
+	.map_err(extension_failure)?;
 	if args.explain {
 		for argv in plan.explain() {
 			println!(
@@ -1286,7 +1437,17 @@ async fn resolve(
 		.iter()
 		.map(|distribution| (distribution.name.as_str(), distribution.version.as_str()))
 		.collect::<Vec<_>>();
-	let outcomes = match plan.run(&SystemUv, &frozen) {
+	let resolution = tokio::select! {
+		result = plan.run_system(&frozen) => result,
+		_ = tokio::signal::ctrl_c() => {
+			let _ = fs::remove_file(&requirements_file);
+			for request in &plan.requests {
+				let _ = fs::remove_file(&request.output_file);
+			}
+			return Err(extension_interrupt());
+		},
+	};
+	let outcomes = match resolution {
 		Ok(outcomes) => outcomes,
 		Err(error) if args.minimal_core => {
 			let core = minimal_unsat_core(&requirements, 32, |candidate| {
@@ -1297,23 +1458,28 @@ async fn resolve(
 						&targets,
 						index_urls.clone(),
 						exclude_newer.clone(),
+						state.offline != OfflineMode::Online,
 						requirements_file.clone(),
 					)
 					.is_ok_and(|candidate_plan| candidate_plan.run(&SystemUv, &frozen).is_err())
 			});
 			let _ = fs::remove_file(&requirements_file);
-			return Err(miette!(
-				"{error}; minimal unsatisfiable roots: {}",
+			eprintln!(
+				"minimal unsatisfiable roots: {}",
 				core
 					.iter()
 					.map(|requirement| requirement.extension_id.as_str())
 					.collect::<Vec<_>>()
 					.join(", ")
-			));
+			);
+			return Err(extension_failure(error));
 		},
 		Err(error) => {
 			let _ = fs::remove_file(&requirements_file);
-			return Err(miette!("{error}"));
+			for request in &plan.requests {
+				let _ = fs::remove_file(&request.output_file);
+			}
+			return Err(extension_failure(error));
 		},
 	};
 	let _ = fs::remove_file(&requirements_file);
@@ -1333,7 +1499,7 @@ async fn resolve(
 		} else {
 			resolved
 				.union_target(&target_lock)
-				.map_err(|error| miette!("{error}"))?;
+				.map_err(extension_failure)?;
 		}
 	}
 	resolved.targets.sort();
@@ -1341,13 +1507,25 @@ async fn resolve(
 		.packages
 		.sort_by(|left, right| left.name.cmp(&right.name));
 	if locked {
-		if existing != resolved {
-			return Err(miette!("resolution would change the locked extension closure"));
+		let existing_digest = existing
+			.resolution_digest()
+			.map_err(extension_failure)?;
+		let resolved_digest = resolved
+			.resolution_digest()
+			.map_err(extension_failure)?;
+		if existing_digest != resolved_digest {
+			return Err(extension_failure(omp_ext::ExtensionError::new(
+				omp_ext::ExtensionCode::ELockDrift,
+				"resolution would change the locked extension closure",
+			)));
 		}
 		return Ok(());
 	}
-	resolved.write(&state.client_lock).into_diagnostic()?;
-	println!("resolved {} package(s) for {} target(s)", resolved.packages.len(), targets.len());
+	println!(
+		"resolved {} package(s) for {} target(s); no state written",
+		resolved.packages.len(),
+		targets.len()
+	);
 	Ok(())
 }
 
@@ -1456,7 +1634,7 @@ async fn upgrade(
 	if let Some(generation) = args.rollback {
 		let previous =
 			omp_ext::upgrade::load_generation(&state.generations, &generation, state.layer)
-				.map_err(|error| miette!("{error}"))?;
+				.map_err(extension_failure)?;
 		if args.dry_run {
 			println!("would roll back to {generation}");
 			return Ok(());
@@ -1472,7 +1650,7 @@ async fn upgrade(
 		return Ok(());
 	}
 	let installed =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.client_installed).map_err(extension_failure)?;
 	let ids = if args.ids.is_empty() {
 		installed
 			.extensions
@@ -1484,7 +1662,7 @@ async fn upgrade(
 	};
 	let key = fs::read_to_string(&state.index_key).into_diagnostic()?;
 	let catalog =
-		SignedIndex::read(&state.index_snapshot, key.trim()).map_err(|error| miette!("{error}"))?;
+		SignedIndex::read(&state.index_snapshot, key.trim()).map_err(extension_failure)?;
 	let lock = read_lock_or_empty(&state.client_lock, state.layer)?;
 	for id in ids {
 		let extension = catalog
@@ -1513,7 +1691,7 @@ async fn upgrade(
 		let manifest = release.deployment_manifest();
 		let projection = manifest
 			.project(concrete)
-			.map_err(|error| miette!("{error}"))?;
+			.map_err(extension_failure)?;
 		let next_capability_digest = if release.features.is_empty()
 			&& release.capabilities.is_empty()
 			&& release.declarations.is_empty()
@@ -1550,6 +1728,7 @@ async fn upgrade(
 				force:          true,
 			},
 			uv.clone(),
+			None,
 			false,
 		)
 		.await?;
@@ -1558,12 +1737,12 @@ async fn upgrade(
 }
 
 fn pin(state: &StatePaths, id: Str, version: Str) -> miette::Result<()> {
-	let mut pins = PinsFile::read(&state.pins).map_err(|error| miette!("{error}"))?;
+	let mut pins = PinsFile::read(&state.pins).map_err(extension_failure)?;
 	pins.set(&state.pins, id, version).into_diagnostic()
 }
 
 fn unpin(state: &StatePaths, id: &str) -> miette::Result<()> {
-	let mut pins = PinsFile::read(&state.pins).map_err(|error| miette!("{error}"))?;
+	let mut pins = PinsFile::read(&state.pins).map_err(extension_failure)?;
 	if !pins.remove(&state.pins, id).into_diagnostic()? {
 		return Err(miette!("extension {id} is not pinned"));
 	}
@@ -1571,8 +1750,7 @@ fn unpin(state: &StatePaths, id: &str) -> miette::Result<()> {
 }
 
 fn gc(state: &StatePaths, args: ExtGcArgs) -> miette::Result<()> {
-	let report = gc_generations(&state.generations, args.keep_generations, args.apply)
-		.map_err(|error| miette!("{error}"))?;
+	let report = gc_generations(&state.generations, args.keep_generations, args.apply).map_err(extension_failure)?;
 	println!("{} generation(s), {} bytes", report.generations.len(), report.bytes);
 	Ok(())
 }
@@ -1589,22 +1767,33 @@ impl RuntimeHealth for CliHealth {
 }
 
 fn doctor(state: &StatePaths, args: ExtDoctorArgs) -> miette::Result<()> {
+	let foreign_roots = [".claude", ".codex", ".gemini"]
+		.into_iter()
+		.map(|name| state.project.join(name))
+		.collect::<Vec<_>>();
 	let request = DoctorRequest {
-		layer:            BackendLayer::Client,
-		lock_path:        &state.client_lock,
-		installed_path:   &state.client_installed,
-		keys_path:        &state.keys,
-		revocations_path: state
+		layer:                 state.layer,
+		lock_path:             &state.client_lock,
+		installed_path:        &state.client_installed,
+		keys_path:             &state.keys,
+		grants_path:           &state.grants,
+		workspace:             (state.layer == BackendLayer::Workspace).then_some(&state.workspace),
+		revocations_path:      state
 			.revocations
 			.exists()
 			.then_some(state.revocations.as_path()),
-		site_root:        &state.sites,
-		artifact_cache:   &state.artifacts,
-		fix:              args.fix,
+		site_root:             &state.sites,
+		artifact_store:        &state.store,
+		ambient_site_override: state.site_override.as_deref(),
+		foreign_roots:         &foreign_roots,
+		fix:                   args.fix,
 	};
 	let findings = diagnose(&request, &CliHealth);
 	for finding in &findings {
-		println!("{:?}: {}", finding.severity, finding.detail);
+		match finding.code {
+			Some(code) => println!("{:?} {code}: {}", finding.severity, finding.detail),
+			None => println!("{:?}: {}", finding.severity, finding.detail),
+		}
 	}
 	if findings
 		.iter()
@@ -1627,45 +1816,36 @@ async fn bundle(state: &StatePaths, args: ExtBundleArgs) -> miette::Result<()> {
 	fs::write(args.output, encoded).into_diagnostic()
 }
 fn trust(state: &StatePaths, args: ExtTrustArgs) -> miette::Result<()> {
-	let mut grants = GrantsFile::read(&state.grants).map_err(|error| miette!("{error}"))?;
+	let mut grants = GrantsFile::read(&state.grants).map_err(extension_failure)?;
 	if args.show {
-		for path in [&state.client_installed, &state.workspace_installed] {
-			let installed = InstalledRecord::read(path).map_err(|error| miette!("{error}"))?;
-			if let Some(entry) = installed
-				.extensions
-				.iter()
-				.find(|entry| entry.id == args.id)
-			{
+		let keys = KeysFile::read(&state.keys).map_err(extension_failure)?;
+		let key = keys
+			.keys
+			.iter()
+			.find(|pin| pin.id == args.id)
+			.map(|pin| pin.key.as_str())
+			.unwrap_or("-");
+		let matching = grants
+			.grants
+			.iter()
+			.filter(|grant| grant.id == args.id)
+			.collect::<Vec<_>>();
+		if matching.is_empty() {
+			println!("{} ungranted key={key}", args.id);
+		} else {
+			for grant in matching {
 				println!(
-					"{} {} {}; {} grants",
-					entry.id,
-					entry.tier,
-					if entry
-						.source
-						.as_table()
-						.is_some_and(|source| source.contains_key("link"))
-					{
-						"linked"
-					} else {
-						"installed"
-					},
-					grants
-						.grants
-						.iter()
-						.filter(|grant| grant.id == args.id)
-						.count()
+					"{} layer={} tier={} ship={} capability={} publisher={} key={}",
+					grant.id,
+					grant.layer,
+					grant.tier,
+					grant.ship,
+					grant.capability_digest,
+					grant.publisher,
+					key,
 				);
-				return Ok(());
 			}
 		}
-		println!(
-			"{} grants",
-			grants
-				.grants
-				.iter()
-				.filter(|grant| grant.id == args.id)
-				.count()
-		);
 		return Ok(());
 	}
 	if args.revoke {
@@ -1673,23 +1853,50 @@ fn trust(state: &StatePaths, args: ExtTrustArgs) -> miette::Result<()> {
 		grants.write(&state.grants).into_diagnostic()?;
 		return Ok(());
 	}
+	if args.ship == Some(Ship::Pickle) {
+		let tier_after = args.tier.map(tier);
+		if !grants
+			.grants
+			.iter()
+			.filter(|grant| grant.id == args.id)
+			.all(|grant| tier_after.unwrap_or(grant.tier) == omp_ext::TrustTier::Trusted)
+		{
+			return Err(miette!("pickle shipping requires the trusted extension tier"));
+		}
+	}
 	let mut changed = false;
 	if let Some(selected_tier) = args.tier {
-		for path in [&state.client_installed, &state.workspace_installed] {
-			let mut installed = InstalledRecord::read(path).map_err(|error| miette!("{error}"))?;
+		for (installed_path, lock_path, layer) in [
+			(&state.client_installed, &state.client_lock, BackendLayer::Client),
+			(
+				&state.workspace_installed,
+				&state.workspace_lock,
+				BackendLayer::Workspace,
+			),
+		] {
+			let mut installed =
+				InstalledRecord::read(installed_path).map_err(extension_failure)?;
 			let mut installed_changed = false;
-			for entry in installed.extensions.iter_mut().filter(|entry| {
-				entry.id == args.id
-					&& entry
-						.source
-						.as_table()
-						.is_some_and(|source| source.contains_key("link"))
-			}) {
+			for entry in installed
+				.extensions
+				.iter_mut()
+				.filter(|entry| entry.id == args.id)
+			{
 				entry.tier = tier(selected_tier);
 				installed_changed = true;
 			}
 			if installed_changed {
-				installed.write(path).into_diagnostic()?;
+				installed.write(installed_path).into_diagnostic()?;
+				if lock_path.exists() {
+					let mut lock =
+						LockFile::read(lock_path, layer).map_err(extension_failure)?;
+					if let Some(extension) =
+						lock.extensions.iter_mut().find(|entry| entry.id == args.id)
+					{
+						extension.tier = tier(selected_tier);
+						lock.write(lock_path).into_diagnostic()?;
+					}
+				}
 				changed = true;
 			}
 		}
@@ -1705,18 +1912,35 @@ fn trust(state: &StatePaths, args: ExtTrustArgs) -> miette::Result<()> {
 		}
 	}
 	if let Some(key) = args.key {
-		let mut keys = KeysFile::read(&state.keys).map_err(|error| miette!("{error}"))?;
-		keys
-			.verify_or_pin(
+		let version = [&state.client_lock, &state.workspace_lock]
+			.into_iter()
+			.filter(|path| path.exists())
+			.find_map(|path| {
+				let layer = if path == &state.workspace_lock {
+					BackendLayer::Workspace
+				} else {
+					BackendLayer::Client
+				};
+				LockFile::read(path, layer)
+					.ok()
+					.and_then(|lock| {
+						lock.extensions
+							.into_iter()
+							.find(|extension| extension.id == args.id)
+					})
+					.map(|extension| extension.version)
+			})
+			.unwrap_or_else(|| Str::new_static("manual"));
+		let mut keys = KeysFile::read(&state.keys).map_err(extension_failure)?;
+		changed |= keys
+			.accept_operator_key(
 				&args.id,
 				&key,
-				&Str::new_static("manual"),
-				&Str::new_static("manual"),
-				None,
+				&version,
+				&Str::new(jiff::Timestamp::now().to_string()),
 			)
-			.map_err(|error| miette!("{error}"))?;
+			.map_err(extension_failure)?;
 		keys.write(&state.keys).into_diagnostic()?;
-		changed = true;
 	}
 	if !changed {
 		return Err(miette!("no trust mutation was requested for {}", args.id));
@@ -1730,7 +1954,7 @@ async fn verify(state: &StatePaths, args: ExtVerifyArgs) -> miette::Result<()> {
 	let signatures = args.signatures || verify_all;
 	let revocations = args.revocations || verify_all && state.revocations.exists();
 	let lock =
-		LockFile::read(&state.client_lock, state.layer).map_err(|error| miette!("{error}"))?;
+		LockFile::read(&state.client_lock, state.layer).map_err(extension_failure)?;
 	let selected = lock
 		.extensions
 		.iter()
@@ -1743,7 +1967,7 @@ async fn verify(state: &StatePaths, args: ExtVerifyArgs) -> miette::Result<()> {
 	}
 	if signatures && !selected.is_empty() {
 		let catalog = read_catalog_for_verify(state)?;
-		let keys = KeysFile::read(&state.keys).map_err(|error| miette!("{error}"))?;
+		let keys = KeysFile::read(&state.keys).map_err(extension_failure)?;
 		for extension in &selected {
 			let (indexed, release) = catalog
 				.release(extension.id.as_str(), extension.version.as_str())
@@ -1757,7 +1981,7 @@ async fn verify(state: &StatePaths, args: ExtVerifyArgs) -> miette::Result<()> {
 			let manifest = release.deployment_manifest();
 			let projection = manifest
 				.project(&extension.features)
-				.map_err(|error| miette!("{error}"))?;
+				.map_err(extension_failure)?;
 			let effective_capability_digest = if release.features.is_empty()
 				&& release.capabilities.is_empty()
 				&& release.declarations.is_empty()
@@ -1790,13 +2014,13 @@ async fn verify(state: &StatePaths, args: ExtVerifyArgs) -> miette::Result<()> {
 				extension.manifest_capability_digest.as_str(),
 				extension.signature.as_str(),
 			)
-			.map_err(|error| miette!("{error}"))?;
+			.map_err(extension_failure)?;
 		}
 	}
 	if deep && !selected.is_empty() {
 		for extension in &selected {
 			let path = state
-				.artifacts
+				.store
 				.join(extension.wheel.blake3.as_str().trim_start_matches("b3:"));
 			let bytes = fs::read(&path).into_diagnostic()?;
 			if bytes.len() as u64 != extension.wheel.size
@@ -1820,7 +2044,7 @@ async fn verify(state: &StatePaths, args: ExtVerifyArgs) -> miette::Result<()> {
 
 fn read_catalog_for_verify(state: &StatePaths) -> miette::Result<SignedIndex> {
 	let key = fs::read_to_string(&state.index_key).into_diagnostic()?;
-	SignedIndex::read(&state.index_snapshot, key.trim()).map_err(|error| miette!("{error}"))
+	SignedIndex::read(&state.index_snapshot, key.trim()).map_err(extension_failure)
 }
 
 fn verify_site_records(site_root: &Path) -> miette::Result<()> {
@@ -1966,7 +2190,10 @@ fn verify_revocations(state: &StatePaths, extensions: &[&LockedExtension]) -> mi
 	match revocations.freshness(&jiff::Timestamp::now().to_string(), true) {
 		RevocationFreshness::Fresh => {},
 		RevocationFreshness::Warn(code) | RevocationFreshness::Reject(code) => {
-			return Err(miette!("{code}: signed revocation snapshot is stale"));
+			return Err(extension_failure(omp_ext::ExtensionError::new(
+				code,
+				"signed revocation snapshot is stale",
+			)));
 		},
 	}
 	for extension in extensions {
@@ -2073,9 +2300,9 @@ fn search(state: &StatePaths, args: ExtSearchArgs) -> miette::Result<()> {
 
 fn where_paths(state: &StatePaths, args: ExtWhereArgs, json: bool) -> miette::Result<()> {
 	let client =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.client_installed).map_err(extension_failure)?;
 	let workspace =
-		InstalledRecord::read(&state.workspace_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.workspace_installed).map_err(extension_failure)?;
 	let entries = client
 		.extensions
 		.into_iter()
@@ -2088,20 +2315,41 @@ fn where_paths(state: &StatePaths, args: ExtWhereArgs, json: bool) -> miette::Re
 		)
 		.filter(|(_, entry)| args.id.as_ref().is_none_or(|id| *id == entry.id))
 		.collect::<Vec<_>>();
+	let common = serde_json::json!({
+		"store": state.store,
+		"sites": state.sites,
+		"artifacts": state.artifacts,
+		"clientLock": state.client_lock,
+		"workspaceLock": state.workspace_lock,
+		"clientInstalled": state.client_installed,
+		"workspaceInstalled": state.workspace_installed,
+		"grants": state.grants,
+		"keys": state.keys,
+	});
 	if json {
 		println!(
 			"{}",
-			serde_json::to_string_pretty(
-				&entries
+			serde_json::to_string_pretty(&serde_json::json!({
+				"paths": common,
+				"extensions": entries
 					.iter()
 					.map(|(scope, entry)| {
 						serde_json::json!({"id": entry.id, "scope": scope, "source": entry.source})
 					})
-					.collect::<Vec<_>>()
-			)
+					.collect::<Vec<_>>(),
+			}))
 			.into_diagnostic()?
 		);
 	} else {
+		println!("store {}", state.store.display());
+		println!("sites {}", state.sites.display());
+		println!("artifacts {}", state.artifacts.display());
+		println!("client-lock {}", state.client_lock.display());
+		println!("workspace-lock {}", state.workspace_lock.display());
+		println!("client-installed {}", state.client_installed.display());
+		println!("workspace-installed {}", state.workspace_installed.display());
+		println!("grants {}", state.grants.display());
+		println!("keys {}", state.keys.display());
 		for (scope, entry) in entries {
 			println!("{} {} {}", entry.id, scope, entry.source);
 		}
@@ -2131,6 +2379,9 @@ pub(crate) struct StatePaths {
 	marketplace_cache:   PathBuf,
 	user_plugins:        PathBuf,
 	project_plugins:     PathBuf,
+	store:               PathBuf,
+	site_override:       Option<PathBuf>,
+	offline:             OfflineMode,
 	workspace:           omp_ext::WorkspaceUri,
 	layer:               BackendLayer,
 }
@@ -2152,7 +2403,7 @@ impl StatePaths {
 			.map(|url| url.to_string())
 			.unwrap_or_else(|()| sf!("file://{}", project.display()).to_string());
 		let workspace_identity = omp_ext::WorkspaceUri {
-			digest: sf!("sha256:{}", Hash32::sum(workspace_uri.as_bytes()).to_hex()),
+			digest: sf!("b3:{}", blake3::hash(workspace_uri.as_bytes()).to_hex()),
 			uri:    Str::new(workspace_uri),
 		};
 		let workspace = project.join(".omp");
@@ -2169,7 +2420,7 @@ impl StatePaths {
 			revocations:         data_dir.join("ext/revocations.json"),
 			generations:         data_dir.join("ext/generations"),
 			sites:               project_state.join("ext/sites"),
-			artifacts:           data_dir.join("ext/artifacts"),
+			artifacts:           data_dir.join("ext/cache"),
 			indexes:             data_dir.join("ext/indexes.toml"),
 			index_snapshot:      data_dir.join("ext/index.json"),
 			index_key:           data_dir.join("ext/index.key"),
@@ -2177,9 +2428,27 @@ impl StatePaths {
 			marketplace_cache:   data_dir.join("plugins/cache/marketplaces"),
 			user_plugins:        data_dir.join("plugins"),
 			project_plugins:     workspace.join("plugins"),
+			store:               data_dir.join("ext/store"),
+			site_override:       None,
+			offline:             OfflineMode::Online,
 			workspace:           workspace_identity,
 			layer:               BackendLayer::Client,
 		}
+	}
+
+	fn with_environment(mut self, environment: &ExtensionEnvironment) -> Self {
+		if let Some(store) = &environment.store {
+			self.store.clone_from(store);
+		}
+		if let Some(cache) = &environment.cache {
+			self.artifacts.clone_from(cache);
+		}
+		if let Some(index_keys) = &environment.index_keys {
+			self.index_key.clone_from(index_keys);
+		}
+		self.site_override.clone_from(&environment.site_override);
+		self.offline = environment.offline;
+		self
 	}
 
 	fn plugin_root(&self, scope: Scope) -> PathBuf {
@@ -2234,14 +2503,14 @@ async fn sync(state: &StatePaths, args: ExtSyncArgs, uv: Option<&Path>) -> miett
 		.await?;
 	}
 	let lock =
-		LockFile::read(&state.client_lock, state.layer).map_err(|error| miette!("{error}"))?;
+		LockFile::read(&state.client_lock, state.layer).map_err(extension_failure)?;
 	if state.revocations.exists() {
 		let extensions = lock.extensions.iter().collect::<Vec<_>>();
 		verify_revocations(state, &extensions)?;
 	}
 	let catalog = read_catalog_for_verify(state)?;
 	let mut installed =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.client_installed).map_err(extension_failure)?;
 	for locked in &lock.extensions {
 		let (_, release) = catalog
 			.release(locked.id.as_str(), locked.version.as_str())
@@ -2298,7 +2567,7 @@ fn pack_airgap_bundle(targets: Vec<Str>, files: Vec<BundleFile>) -> miette::Resu
 
 fn validate_specs(specs: &[Str]) -> miette::Result<()> {
 	for spec in specs {
-		SourceSpec::parse_install(spec).map_err(|error| miette!("{error}"))?;
+		SourceSpec::parse_install(spec).map_err(extension_failure)?;
 	}
 	Ok(())
 }
@@ -2332,8 +2601,8 @@ fn read_development_manifest(root: &Path) -> miette::Result<DeploymentManifest> 
 		return Ok(DeploymentManifest::default());
 	}
 	let text = fs::read_to_string(path).into_diagnostic()?;
-	let manifest = DeploymentManifest::parse(&text).map_err(|error| miette!("{error}"))?;
-	manifest.validate().map_err(|error| miette!("{error}"))?;
+	let manifest = DeploymentManifest::parse(&text).map_err(extension_failure)?;
+	manifest.validate().map_err(extension_failure)?;
 	Ok(manifest)
 }
 
@@ -2379,11 +2648,13 @@ async fn install_index_source(
 	state: &StatePaths,
 	args: &ExtInstallArgs,
 	installed: &mut InstalledRecord,
+	lock: &mut LockFile,
 	source: SourceSpec,
 	selection: FeatureSelection,
 	uv: Option<&Path>,
+	grant_request: Option<&str>,
 	json: bool,
-) -> miette::Result<()> {
+) -> miette::Result<bool> {
 	let SourceSpec::Index { index, distribution } = source else {
 		return Err(miette!(
 			"signed native installation requires index: or a local path: source; use resolve for \
@@ -2394,8 +2665,7 @@ async fn install_index_source(
 		.rsplit_once('@')
 		.map_or((distribution.as_str(), None), |(id, version)| (id, Some(version)));
 	let index_key = fs::read_to_string(&state.index_key).into_diagnostic()?;
-	let catalog = SignedIndex::read(&state.index_snapshot, index_key.trim())
-		.map_err(|error| miette!("{error}"))?;
+	let catalog = SignedIndex::read(&state.index_snapshot, index_key.trim()).map_err(extension_failure)?;
 	let extension = catalog
 		.extensions
 		.iter()
@@ -2416,11 +2686,10 @@ async fn install_index_source(
 		.iter()
 		.find(|entry| entry.id == extension.id)
 		.map(|entry| entry.features.as_slice());
-	let features = concrete_features(&selection, &manifest.features, previous)
-		.map_err(|error| miette!("{error}"))?;
+	let features = concrete_features(&selection, &manifest.features, previous).map_err(extension_failure)?;
 	let projection = manifest
 		.project(&features)
-		.map_err(|error| miette!("{error}"))?;
+		.map_err(extension_failure)?;
 	let legacy_manifest = release.features.is_empty()
 		&& release.capabilities.is_empty()
 		&& release.declarations.is_empty();
@@ -2430,7 +2699,11 @@ async fn install_index_source(
 		projection.capability_digest.clone()
 	};
 	ensure_not_revoked(state, &extension.id, &release.version)?;
-	let target = args.target.first().map_or("any", Str::as_str);
+	let target = if let Some(target) = args.target.first() {
+		target.as_str()
+	} else {
+		default_resolution_target()
+	};
 	let artifact = release
 		.artifacts
 		.iter()
@@ -2443,15 +2716,53 @@ async fn install_index_source(
 		release.signature_capability_digest().as_str(),
 		artifact.signature.as_str(),
 	)
-	.map_err(|error| miette!("{error}"))?;
+	.map_err(extension_failure)?;
 
-	let mut keys = KeysFile::read(&state.keys).map_err(|error| miette!("{error}"))?;
+	let grant_request = grant_request
+		.map(parse_grant_requests)
+		.transpose()
+		.map_err(extension_failure)?
+		.unwrap_or_default()
+		.into_iter()
+		.find(|request| request.id == extension.id);
+	let environment_consent = grant_request
+		.as_ref()
+		.map(|request| {
+			validate_grant_request(request, projection.capabilities.iter().cloned())
+				.map(|exact| {
+					exact
+						&& request
+							.tier
+							.is_none_or(|approved| approved == tier(args.tier))
+				})
+		})
+		.transpose()
+		.map_err(extension_failure)?
+		.unwrap_or(false);
+	let trusted_tier_consent = grant_request
+		.as_ref()
+		.and_then(|request| request.tier)
+		== Some(omp_ext::TrustTier::Trusted);
+	let interactive_consent =
+		args.yes && (args.tier != Tier::Trusted || trusted_tier_consent);
+	let consented = environment_consent || interactive_consent;
+	if args.tier == Tier::Trusted && !trusted_tier_consent {
+		return Err(extension_failure(omp_ext::ExtensionError::new(
+			omp_ext::ExtensionCode::EConsent,
+			"trusted extension installation requires OMP_EXT_GRANT with tier=trusted",
+		)));
+	}
+
+	let mut keys = KeysFile::read(&state.keys).map_err(extension_failure)?;
 	let first_seen = !keys.keys.iter().any(|pin| pin.id == extension.id);
-	if first_seen && !args.yes {
-		return Err(miette!(
-			"first-seen publisher key for {} requires explicit --yes confirmation",
-			extension.id
-		));
+	if first_seen && !consented {
+		return Err(extension_failure(omp_ext::ExtensionError::new(
+			omp_ext::ExtensionCode::EConsent,
+			format!(
+				"first-seen publisher key for {} requires explicit operator consent",
+				extension.id
+			),
+		)));
 	}
 	keys
 		.verify_or_pin(
@@ -2461,7 +2772,7 @@ async fn install_index_source(
 			&Str::new_static("explicit-install"),
 			None,
 		)
-		.map_err(|error| miette!("{error}"))?;
+		.map_err(extension_failure)?;
 
 	let requested_digest = if let Some(capabilities) = args.capabilities.as_deref() {
 		omp_ext::trust::capability_digest(csv(capabilities), [])
@@ -2475,8 +2786,8 @@ async fn install_index_source(
 	}
 	let ship = Str::new_static("installed");
 	let workspace = (state.layer == BackendLayer::Workspace).then_some(&state.workspace);
-	let mut grants = GrantsFile::read(&state.grants).map_err(|error| miette!("{error}"))?;
-	if args.yes {
+	let mut grants = GrantsFile::read(&state.grants).map_err(extension_failure)?;
+	if consented {
 		grants.grants.retain(|grant| {
 			grant.id != extension.id
 				|| grant.layer != state.layer
@@ -2492,7 +2803,11 @@ async fn install_index_source(
 			tier:              tier(args.tier),
 			ship:              ship.clone(),
 			granted_at:        Str::new(jiff::Timestamp::now().to_string()),
-			granted_by:        Str::new_static("explicit-install"),
+			granted_by:        if environment_consent {
+				Str::new_static("environment")
+			} else {
+				Str::new_static("explicit-install")
+			},
 			duration:          omp_ext::trust::GrantDuration::Persistent,
 		});
 	}
@@ -2506,18 +2821,18 @@ async fn install_index_source(
 		tier(args.tier),
 		&ship,
 	) {
-		return Err(miette!(
-			"no exact operator grant admits {} at {:?} tier with {} shipping",
-			extension.id,
-			args.tier,
-			ship
-		));
+		return Err(extension_failure(omp_ext::ExtensionError::new(
+			omp_ext::ExtensionCode::EConsent,
+			format!(
+				"no exact operator grant admits {} at {:?} tier with {} shipping",
+				extension.id, args.tier, ship
+			),
+		)));
 	}
 	if !args.dry_run {
 		grants.write(&state.grants).into_diagnostic()?;
 	}
 
-	let mut lock = read_lock_or_empty(&state.client_lock, state.layer)?;
 	lock.indexes = vec![if index.is_empty() {
 		catalog.name.to_string()
 	} else {
@@ -2558,12 +2873,7 @@ async fn install_index_source(
 		if !json {
 			println!("would install {} {}", extension.id, release.version);
 		}
-		return Ok(());
-	}
-	if args.no_lock {
-		return Err(miette!(
-			"signed index installation requires the lock-controlled materialized generation"
-		));
+		return Ok(!args.no_lock);
 	}
 	let generation_id = generation_id(extension.id.as_str(), release.version.as_str());
 	let (environment, request, site_root) =
@@ -2581,21 +2891,21 @@ async fn install_index_source(
 		tier: tier(args.tier),
 		enabled: true,
 	});
-	let generation = Generation { lock, installed: installed.clone() };
-	materialize::materialize_and_commit_generation(
-		environment.client(),
-		request,
-		&state.client_lock,
-		&state.client_installed,
-		&state.generations,
-		&generation_id,
-		&generation,
-	)
-	.await
-	.map_err(|error| miette!("{error}"))?;
 	keys.write(&state.keys).into_diagnostic()?;
-	println!("installed {} {}", extension.id, release.version);
-	Ok(())
+	environment
+		.client()
+		.materialize_site(request)
+		.await
+		.into_diagnostic()?;
+	if args.no_lock {
+		eprintln!(
+			"warning[{}]: {} is installed without a reproducible lock entry",
+			omp_ext::ExtensionCode::WNoLock,
+			extension.id
+		);
+	}
+	println!("prepared {} {}", extension.id, release.version);
+	Ok(!args.no_lock)
 }
 
 async fn materialize_signed_wheel(
@@ -2614,6 +2924,15 @@ async fn materialize_signed_wheel(
 	let bytes = if artifact_path.is_file() {
 		fs::read(&artifact_path).into_diagnostic()?
 	} else {
+		if state.offline != OfflineMode::Online {
+			return Err(extension_failure(omp_ext::ExtensionError::new(
+				omp_ext::ExtensionCode::EOffline,
+				format!(
+					"extension artifact {} is absent from the local cache",
+					artifact.blake3
+				),
+			)));
+		}
 		let bytes = fetch_signed_wheel(artifact).await?;
 		let staged = artifact_path.with_extension("download.tmp");
 		fs::write(&staged, &bytes).into_diagnostic()?;
@@ -2621,6 +2940,23 @@ async fn materialize_signed_wheel(
 		bytes
 	};
 	verify_signed_wheel_bytes(&bytes, artifact)?;
+	fs::create_dir_all(&state.store).into_diagnostic()?;
+	let stored_wheel = state
+		.store
+		.join(artifact.blake3.as_str().trim_start_matches("b3:"));
+	let store_matches = stored_wheel
+		.is_file()
+		.then(|| fs::read(&stored_wheel))
+		.transpose()
+		.into_diagnostic()?
+		.is_some_and(|stored| verify_signed_wheel_bytes(&stored, artifact).is_ok());
+	if !store_matches {
+		let staged = state
+			.store
+			.join(format!(".store-{}-{}.tmp", std::process::id(), omp_core::Ulid::generate()));
+		fs::write(&staged, &bytes).into_diagnostic()?;
+		fs::rename(staged, &stored_wheel).into_diagnostic()?;
+	}
 	let staging = state
 		.artifacts
 		.join(format!(".unpack-{site_key}-{}", std::process::id()));
@@ -2629,15 +2965,25 @@ async fn materialize_signed_wheel(
 	}
 	fs::create_dir_all(&staging).into_diagnostic()?;
 	let wheel_input = state.artifacts.join(format!(".wheel-{site_key}.whl"));
-	fs::copy(&artifact_path, &wheel_input).into_diagnostic()?;
-	let output = tokio::process::Command::new(uv.unwrap_or_else(|| Path::new("uv")))
+	fs::copy(&stored_wheel, &wheel_input).into_diagnostic()?;
+	let mut command = tokio::process::Command::new(uv.unwrap_or_else(|| Path::new("uv")));
+	command
 		.args(["pip", "install", "--no-deps", "--no-index", "--target"])
 		.arg(&staging)
 		.arg(&wheel_input)
-		.output()
-		.await;
+		.kill_on_drop(true);
+	let output = tokio::select! {
+		output = command.output() => output.into_diagnostic(),
+		_ = tokio::signal::ctrl_c() => Err(extension_interrupt()),
+	};
 	let _ = fs::remove_file(&wheel_input);
-	let output = output.into_diagnostic()?;
+	let output = match output {
+		Ok(output) => output,
+		Err(error) => {
+			let _ = fs::remove_dir_all(&staging);
+			return Err(error);
+		},
+	};
 	if !output.status.success() {
 		let _ = fs::remove_dir_all(&staging);
 		return Err(miette!(
@@ -2673,15 +3019,7 @@ async fn materialize_signed_wheel(
 	)
 	.await
 	.map_err(|error| miette!("{error}"))?;
-	environment
-		.client()
-		.materialize_site(request.clone())
-		.await
-		.into_diagnostic()?;
-	let site_root = fs::canonicalize(state.sites.join(site_key)).into_diagnostic()?;
-	if !site_root.starts_with(fs::canonicalize(&state.sites).into_diagnostic()?) {
-		return Err(miette!("Environment materialized extension site outside its managed root"));
-	}
+	let site_root = state.sites.join(site_key);
 	Ok((environment, request, site_root))
 }
 
@@ -2692,17 +3030,29 @@ async fn fetch_signed_wheel(artifact: &omp_ext::index::IndexArtifact) -> miette:
 	if !artifact.url.starts_with("https://") {
 		return Err(miette!("signed extension wheel URL must use HTTPS or file://"));
 	}
-	let response = omp_http::default_client()
-		.get(&artifact.url)
-		.send()
-		.await
-		.into_diagnostic()?;
+	let response = tokio::select! {
+		response = omp_http::default_client().get(&artifact.url).send() => {
+			response.into_diagnostic()?
+		},
+		_ = tokio::signal::ctrl_c() => {
+			return Err(extension_interrupt());
+		},
+	};
 	if !response.status().is_success() {
 		return Err(miette!("extension wheel download returned HTTP {}", response.status()));
 	}
 	let mut bytes = Vec::with_capacity(usize::try_from(artifact.size).unwrap_or_default());
 	let mut stream = response.bytes_stream();
-	while let Some(chunk) = stream.next().await {
+	loop {
+		let chunk = tokio::select! {
+			chunk = stream.next() => chunk,
+			_ = tokio::signal::ctrl_c() => {
+				return Err(extension_interrupt());
+			},
+		};
+		let Some(chunk) = chunk else {
+			break;
+		};
 		let chunk = chunk.into_diagnostic()?;
 		if bytes.len().saturating_add(chunk.len()) > MAX_WHEEL_BYTES {
 			return Err(miette!("extension wheel download exceeded the 256 MiB safety ceiling"));
@@ -2774,7 +3124,14 @@ fn site_file_mode(_metadata: &fs::Metadata) -> u32 {
 
 fn ensure_not_revoked(state: &StatePaths, id: &Str, version: &Str) -> miette::Result<()> {
 	if !state.revocations.exists() {
-		return Ok(());
+		return if state.offline == OfflineMode::Strict {
+			Err(extension_failure(omp_ext::ExtensionError::new(
+				omp_ext::ExtensionCode::ERevoked,
+				"strict offline admission requires a signed revocation snapshot",
+			)))
+		} else {
+			Ok(())
+		};
 	}
 	let key = fs::read_to_string(&state.index_key).into_diagnostic()?;
 	let revocations =
@@ -2782,11 +3139,20 @@ fn ensure_not_revoked(state: &StatePaths, id: &Str, version: &Str) -> miette::Re
 	revocations
 		.verify(key.trim())
 		.map_err(|error| miette!("{error}"))?;
-	if !matches!(
-		revocations.freshness(&jiff::Timestamp::now().to_string(), true),
-		RevocationFreshness::Fresh
+	match revocations.freshness(
+		&jiff::Timestamp::now().to_string(),
+		state.offline == OfflineMode::Strict,
 	) {
-		return Err(miette!("signed revocation snapshot is stale"));
+		RevocationFreshness::Fresh => {},
+		RevocationFreshness::Warn(code) => {
+			eprintln!("warning[{code}]: signed revocation snapshot is stale");
+		},
+		RevocationFreshness::Reject(code) => {
+			return Err(extension_failure(omp_ext::ExtensionError::new(
+				code,
+				"signed revocation snapshot is stale",
+			)));
+		},
 	}
 	if let Some(revocation) = revocations
 		.revocation_for(id, version)
@@ -2817,7 +3183,7 @@ fn generation_id(id: &str, version: &str) -> String {
 
 fn read_lock_or_empty(path: &Path, layer: BackendLayer) -> miette::Result<LockFile> {
 	if path.exists() {
-		return LockFile::read(path, layer).map_err(|error| miette!("{error}"));
+		return LockFile::read(path, layer).map_err(extension_failure);
 	}
 	Ok(LockFile {
 		version: omp_ext::lock::LOCK_VERSION,
@@ -2928,6 +3294,7 @@ mod tests {
 				no_lock:        false,
 				force:          false,
 			},
+			None,
 			None,
 			false,
 		)

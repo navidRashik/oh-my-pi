@@ -32,6 +32,7 @@ pub mod debug_logs;
 pub mod diagnostics;
 pub mod dry_balance_cmd;
 pub mod endpoint;
+pub mod exit_diagnostics;
 pub mod ext_cli;
 pub mod gallery_cmd;
 pub mod gateway_rpc;
@@ -44,6 +45,7 @@ mod gui;
 pub mod help_extra;
 pub mod images_cmd;
 pub mod keybindings;
+mod live_path;
 mod live_reachability;
 pub mod models_cmd;
 pub(crate) mod pickers;
@@ -75,6 +77,7 @@ pub mod spec;
 pub mod ssh_cmd;
 pub mod standalone_tool_cmd;
 pub mod startup_notice;
+mod startup_update;
 pub mod theme_watcher;
 pub mod tiny_models_cmd;
 pub mod token_cmd;
@@ -97,7 +100,8 @@ pub use miette::{IntoDiagnostic, Report, Result};
 ///
 /// # Errors
 ///
-/// [`omp_core::dirs::DataDirError::HomeUnset`] when no home directory is set.
+/// Returns a directory error when no home directory is set or the selected
+/// profile is invalid.
 pub fn config_path() -> std::result::Result<PathBuf, omp_core::dirs::DataDirError> {
 	Ok(omp_driver::cfg::CfgFiles::new(None)?.user_path("config"))
 }
@@ -131,7 +135,7 @@ pub fn process_ctx_with(project_root: &Path, builder: omp_con::CtxBuilder) -> Re
 	)
 	.into_diagnostic()?;
 	ctx.seal_bind_defaults();
-	let outcome = ctx.exec_configs(&files, None);
+	let outcome = ctx.exec_configs(&files, None).into_diagnostic()?;
 	if outcome.failed > 0 {
 		tracing::warn!(
 			failed = outcome.failed,

@@ -54,6 +54,68 @@ fn config_migrate_is_idempotent_and_maps_every_schema_key() {
 }
 
 #[test]
+fn config_migrate_moves_legacy_data_mcp_without_overwriting() {
+	let data = tempfile::tempdir().expect("data directory");
+	let config = tempfile::tempdir().expect("config directory");
+	// SAFETY: nextest runs each test in its own process.
+	unsafe { std::env::set_var("OMP_CONFIG_DIR", config.path()) };
+	let project = tempfile::tempdir().expect("project directory");
+	let legacy = data.path().join("mcp.json");
+	fs::write(
+		&legacy,
+		br#"{"mcpServers":{"legacy":{"type":"stdio","command":"legacy"}}}"#,
+	)
+	.expect("legacy MCP config");
+
+	migrate_settings(data.path(), project.path()).expect("migration");
+	let destination = config.path().join("mcp.json");
+	assert!(!legacy.exists());
+	let migrated = fs::read_to_string(&destination).expect("migrated MCP config");
+	assert!(migrated.contains("\"legacy\""));
+
+	fs::write(
+		&legacy,
+		br#"{"mcpServers":{"replacement":{"type":"stdio","command":"replacement"}}}"#,
+	)
+	.expect("replacement MCP config");
+	migrate_settings(data.path(), project.path()).expect("repeat migration");
+	assert!(legacy.exists());
+	assert_eq!(
+		fs::read_to_string(destination).expect("preserved MCP config"),
+		migrated
+	);
+}
+
+#[test]
+fn config_migrate_preserves_output_limit_kibibyte_values() {
+	let data = tempfile::tempdir().expect("data directory");
+	let config = tempfile::tempdir().expect("config directory");
+	// SAFETY: nextest runs each test in its own process.
+	unsafe { std::env::set_var("OMP_CONFIG_DIR", config.path()) };
+	let project = tempfile::tempdir().expect("project directory");
+	fs::write(
+		data.path().join("config.toml"),
+		r#"
+[tools]
+artifactSpillThreshold = 50
+artifactTailBytes = 2.5
+artifactHeadBytes = 20
+outputMaxColumns = 768
+artifactTailLines = 500
+"#,
+	)
+	.expect("legacy TOML");
+
+	let path = migrate_settings(data.path(), project.path()).expect("migration");
+	let script = fs::read_to_string(path).expect("config.cfg");
+	assert!(script.contains("sv_tools_output_spill_bytes 51200"));
+	assert!(script.contains("sv_tools_artifact_tail_bytes 2560"));
+	assert!(script.contains("sv_tools_artifact_head_bytes 20480"));
+	assert!(script.contains("sv_tools_output_max_columns 768"));
+	assert!(script.contains("sv_tools_artifact_tail_lines 500"));
+}
+
+#[test]
 fn keybinding_migration_replaces_action_defaults_without_erasing_unrelated_binds() {
 	let data = tempfile::tempdir().expect("data directory");
 	let config = tempfile::tempdir().expect("config directory");
@@ -215,4 +277,50 @@ fn config_set_persists_and_get_reads_back() {
 	assert!(script.contains("cl_showthinking false"));
 	let ctx = omp_app::process_ctx(project.path()).expect("reload context");
 	assert_eq!(ctx.get_typed::<bool>("cl_showthinking").expect("convar"), false);
+}
+
+#[test]
+fn explicit_default_survives_schema_default_changes() {
+	let config = tempfile::tempdir().expect("config directory");
+	// SAFETY: nextest runs each test in its own process.
+	unsafe { std::env::set_var("OMP_CONFIG_DIR", config.path()) };
+	let project = tempfile::tempdir().expect("project directory");
+	set_persisted(project.path(), ConfigScope::Global, "cl_showthinking", "true")
+		.expect("persist explicit current default");
+	let script = fs::read_to_string(config.path().join("config.cfg")).expect("config.cfg");
+	assert!(
+		script.contains("cl_showthinking true"),
+		"an explicit value must not disappear merely because it equals this build's default"
+	);
+}
+
+#[test]
+fn concurrent_config_updates_preserve_distinct_assignments() {
+	let config = tempfile::tempdir().expect("config directory");
+	// SAFETY: nextest runs each test in its own process.
+	unsafe { std::env::set_var("OMP_CONFIG_DIR", config.path()) };
+	let project = tempfile::tempdir().expect("project directory");
+	let project_path = project.path().to_path_buf();
+	let first = std::thread::spawn({
+		let project = project_path.clone();
+		move || {
+			set_persisted(&project, ConfigScope::Global, "cl_showthinking", "false")
+				.expect("first update")
+		}
+	});
+	let second = std::thread::spawn(move || {
+		set_persisted(
+			&project_path,
+			ConfigScope::Global,
+			"sv_worktree_base",
+			"/tmp/concurrent-worktrees",
+		)
+		.expect("second update")
+	});
+	first.join().expect("first updater");
+	second.join().expect("second updater");
+
+	let script = fs::read_to_string(config.path().join("config.cfg")).expect("config.cfg");
+	assert!(script.contains("cl_showthinking false"), "{script}");
+	assert!(script.contains("sv_worktree_base /tmp/concurrent-worktrees"), "{script}");
 }

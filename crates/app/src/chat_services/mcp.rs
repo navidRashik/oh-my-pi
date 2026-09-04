@@ -2,20 +2,28 @@
 //! authorities — the persisted config stores (`~/.o2/mcp.json`,
 //! `.omp/mcp.json`, `.mcp.json`) for `add`/`remove`/`enable`/`disable`,
 //! the live manager for `list`/`test`/`reconnect`/`reload`/`resources`/
-//! `prompts`/`notifications`, and the OAuth authority for
-//! `reauth`/`unauth`. Every operation settles a report line on a pending
-//! receiver so the host's loader panel never blocks.
+//! `prompts`/`notifications`, the OAuth authority for `reauth`/`unauth`, and
+//! the authenticated Smithery registry/device-flow authority for search,
+//! login, logout, and connect. Every operation settles a report line on a
+//! pending receiver so the host's loader panel never blocks.
 
 use std::{fmt::Write as _, path::Path, time::Duration};
 
-use omp_chat::overlays::services::{McpAdd, McpOp, McpRun, McpScope, ServiceError, ServiceResult};
+use omp_chat::overlays::services::{
+	McpAdd, McpOp, McpRun, McpScope, ServiceError, ServiceResult, SmitheryConnect, SmitherySearch,
+};
 use omp_core::{Str, dirs::DataDirError, sf};
 use omp_envd::mcp::{
 	McpConfigPaths,
-	config::{McpServerConfig, TransportKind},
+	config::{McpServerConfig, TransportKind, validate_server_name},
 	config_store::{McpConfigStore, set_server_enabled},
 	manager::{McpInspectorHealth, McpInspectorSnapshot},
+	smithery::{
+		SmitheryClient, SmitheryError, SmitheryInputKind, SmitherySearchMode, SmitherySearchResult,
+		SmitheryTransport, smithery_config_name,
+	},
 };
+use tokio_util::sync::CancellationToken;
 
 use super::ServiceState;
 
@@ -90,7 +98,7 @@ pub(super) fn run(state: &ServiceState, op: McpOp) -> ServiceResult<McpRun> {
 		McpOp::Test(name) => {
 			let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
 			let mcp = state.mcp.clone();
-			let declared = declared_config(state, &name);
+			let declared = declared_config(state, &name)?;
 			state.runtime.spawn(async move {
 				let test = test_server(&mcp, &name, declared);
 				let cancelled = cancel_rx.recv_async();
@@ -133,24 +141,41 @@ pub(super) fn run(state: &ServiceState, op: McpOp) -> ServiceResult<McpRun> {
 			});
 		},
 		McpOp::Reauth(name) => {
+			let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
 			let mcp = state.mcp.clone();
 			let con = std::sync::Arc::clone(&state.con);
-			let declared = declared_config(state, &name);
+			let declared = declared_config(state, &name)?;
 			state.runtime.spawn(async move {
+				let cancel = CancellationToken::new();
+				let cancellation = cancel.clone();
+				let cancel_task = tokio::spawn(async move {
+					let _ = cancel_rx.recv_async().await;
+					cancellation.cancel();
+				});
 				let result = match declared {
 					None => Err(ServiceError::Failed(sf!("Server \"{name}\" not found."))),
 					Some(config) if !config.enabled => Err(ServiceError::Failed(sf!(
 						"Server \"{name}\" is disabled. Run /mcp enable {name} first."
 					))),
 					Some(_) => match mcp
-						.reauthorize(&name, |url| {
-							// The URL reaches the actor through the console reply sink
-							// (a status notice) while the grant waits for the browser.
-							con.reply(
-								omp_con::Severity::Info,
-								&format!("Authorize \"{name}\" in your browser: {url}"),
-							);
-						})
+						.reauthorize(
+							&name,
+							|presentation| {
+								// The URL and optional RFC 8628 code reach the actor
+								// while the grant waits for browser or device approval.
+								let message = presentation.user_code.map_or_else(
+									|| format!("Authorize \"{name}\" in your browser: {}", presentation.url),
+									|code| {
+										format!(
+											"Authorize \"{name}\" at {} with code {code}",
+											presentation.url
+										)
+									},
+								);
+								con.reply(omp_con::Severity::Info, &message);
+							},
+							cancel,
+						)
 						.await
 					{
 						Ok(true) => Ok(sf!("Reauthorized \"{name}\".")),
@@ -160,12 +185,14 @@ pub(super) fn run(state: &ServiceState, op: McpOp) -> ServiceResult<McpRun> {
 						},
 					},
 				};
+				cancel_task.abort();
 				let _ = tx.send(result);
 			});
+			return Ok(McpRun { done: rx, cancel: Some(cancel_tx) });
 		},
 		McpOp::Unauth(name) => {
 			let mcp = state.mcp.clone();
-			let declared = declared_config(state, &name);
+			let declared = declared_config(state, &name)?;
 			state.runtime.spawn(async move {
 				let result = match declared {
 					None => Err(ServiceError::Failed(sf!("Server \"{name}\" not found."))),
@@ -178,16 +205,410 @@ pub(super) fn run(state: &ServiceState, op: McpOp) -> ServiceResult<McpRun> {
 				let _ = tx.send(result);
 			});
 		},
+		McpOp::SmitherySearch(search) => {
+			let client = smithery_client()?;
+			let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
+			state.runtime.spawn(async move {
+				let cancel = CancellationToken::new();
+				let cancellation = cancel.clone();
+				let cancel_task = tokio::spawn(async move {
+					let _ = cancel_rx.recv_async().await;
+					cancellation.cancel();
+				});
+				let result = client
+					.search(
+						&search.keyword,
+						search.limit,
+						if search.semantic {
+							SmitherySearchMode::Semantic
+						} else {
+							SmitherySearchMode::Identity
+						},
+						&cancel,
+					)
+					.await
+					.map(|results| smithery_report(&search, &results))
+					.map_err(smithery_failure);
+				cancel_task.abort();
+				let _ = tx.send(result);
+			});
+			return Ok(McpRun { done: rx, cancel: Some(cancel_tx) });
+		},
+		McpOp::SmitheryLogin => {
+			let client = smithery_client()?;
+			let con = std::sync::Arc::clone(&state.con);
+			let environment_active = smithery_environment_key_active();
+			let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
+			state.runtime.spawn(async move {
+				let cancel = CancellationToken::new();
+				let cancellation = cancel.clone();
+				let cancel_task = tokio::spawn(async move {
+					let _ = cancel_rx.recv_async().await;
+					cancellation.cancel();
+				});
+				let result = client
+					.login(&cancel, |url| {
+						con.reply(
+							omp_con::Severity::Info,
+							&format!(
+								"Complete Smithery authorization in your browser. If it did not open, \
+								 visit: {url}"
+							),
+						);
+					})
+					.await
+					.map(|()| {
+						if environment_active {
+							Str::new_static(
+								"Smithery API key saved. An environment key still takes precedence.",
+							)
+						} else {
+							Str::new_static("Smithery API key saved.")
+						}
+					})
+					.map_err(smithery_failure);
+				cancel_task.abort();
+				let _ = tx.send(result);
+			});
+			return Ok(McpRun { done: rx, cancel: Some(cancel_tx) });
+		},
+		McpOp::SmitheryLogout => {
+			let client = smithery_client()?;
+			let file_removed = client.credentials().clear().map_err(smithery_failure)?;
+			let environment_active = smithery_environment_key_active();
+			let report = match (file_removed, environment_active) {
+				(true, true) => Str::new_static(
+					"Saved Smithery API key removed. An environment key remains active for this \
+					 process.",
+				),
+				(true, false) => Str::new_static("Smithery API key removed."),
+				(false, true) => Str::new_static(
+					"No saved Smithery API key found. An environment key remains active.",
+				),
+				(false, false) => Str::new_static("No saved Smithery API key found."),
+			};
+			let _ = tx.send(Ok(report));
+		},
+		McpOp::SmitheryConnect(connect) => {
+			let client = smithery_client()?;
+			let store = store_for(state, connect.scope)?;
+			let mcp = state.mcp.clone();
+			let con = std::sync::Arc::clone(&state.con);
+			let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
+			state.runtime.spawn(async move {
+				let cancel = CancellationToken::new();
+				let cancellation = cancel.clone();
+				let cancel_task = tokio::spawn(async move {
+					let _ = cancel_rx.recv_async().await;
+					cancellation.cancel();
+				});
+				let result = connect_smithery(&client, &store, &mcp, &con, &connect, &cancel).await;
+				cancel_task.abort();
+				let _ = tx.send(result);
+			});
+			return Ok(McpRun { done: rx, cancel: Some(cancel_tx) });
+		},
 	}
 	Ok(McpRun { done: rx, cancel: None })
 }
 
-/// The declaration for `name` from the first store that has it.
-fn declared_config(state: &ServiceState, name: &str) -> Option<McpServerConfig> {
-	let (user, project, root) = stores(state).ok()?;
-	[project, root, user]
+fn smithery_environment_key_active() -> bool {
+	["OMP_SMITHERY_API_KEY", "SMITHERY_API_KEY"]
+		.into_iter()
+		.any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+fn smithery_client() -> ServiceResult<SmitheryClient> {
+	let root = omp_core::dirs::user_config_root().map_err(failed)?;
+	SmitheryClient::production(&root).map_err(smithery_failure)
+}
+
+fn smithery_failure(error: SmitheryError) -> ServiceError {
+	if matches!(error, SmitheryError::Cancelled) {
+		return ServiceError::Failed(Str::new_static("Smithery operation cancelled."));
+	}
+	if error.needs_login() {
+		return ServiceError::Failed(Str::new_static(
+			"Smithery authentication is required or expired. Run /mcp smithery-login.",
+		));
+	}
+	if error.is_rate_limited() {
+		return ServiceError::Failed(Str::new_static(
+			"Smithery rate limit reached. Wait before retrying.",
+		));
+	}
+	ServiceError::Failed(Str::new(error.to_string()))
+}
+
+fn smithery_report(search: &SmitherySearch, results: &[SmitherySearchResult]) -> Str {
+	if results.is_empty() {
+		return sf!("No Smithery results found for \"{}\".", markdown_text(&search.keyword));
+	}
+	let query = markdown_text(&search.keyword);
+	let mut out = format!(
+		"# Smithery registry\n\n{} result{} for **{}**\n",
+		results.len(),
+		if results.len() == 1 { "" } else { "s" },
+		query
+	);
+	for result in results {
+		let transport = match &result.transport {
+			SmitheryTransport::Http { .. } => "HTTP",
+			SmitheryTransport::Stdio { .. } => "stdio",
+		};
+		let verified = if result.verified { " · verified" } else { "" };
+		let deployed = if result.deployed { " · deployed" } else { "" };
+		let display_name = markdown_text(&result.display_name);
+		let description = markdown_text(&result.description);
+		let _ = write!(
+			out,
+			"\n## {display_name}\n\n`@{}` · {transport} · {} \
+			 uses{verified}{deployed}\n\n{description}\n",
+			result.name, result.use_count
+		);
+		if !result.tools.is_empty() {
+			out.push_str("\nTools: ");
+			for (index, tool) in result.tools.iter().take(8).enumerate() {
+				if index > 0 {
+					out.push_str(", ");
+				}
+				let _ = write!(out, "`{}`", code_text(&tool.name));
+			}
+			if result.tools.len() > 8 {
+				let _ = write!(out, " and {} more", result.tools.len() - 8);
+			}
+			out.push('\n');
+		}
+		if !result.required_inputs.is_empty() {
+			let names = result
+				.required_inputs
+				.iter()
+				.filter(|input| input.required)
+				.map(|input| code_text(&input.key))
+				.collect::<Vec<_>>()
+				.join(", ");
+			if !names.is_empty() {
+				let _ = writeln!(out, "\nRequired configuration: `{names}`");
+			}
+		}
+		let _ = writeln!(
+			out,
+			"\nConnect: `/mcp smithery-connect @{} --scope {}`",
+			result.name, search.scope
+		);
+	}
+	Str::new(out)
+}
+
+fn markdown_text(value: &str) -> String {
+	let mut out = String::with_capacity(value.len());
+	for character in value.chars() {
+		if matches!(
+			character,
+			'\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '<' | '>' | '#' | '|' | '~'
+		) {
+			out.push('\\');
+		}
+		out.push(character);
+	}
+	out
+}
+
+fn code_text(value: &str) -> String {
+	value.replace('`', "'")
+}
+
+async fn connect_smithery(
+	client: &SmitheryClient,
+	store: &McpConfigStore,
+	mcp: &omp_envd::McpInspectorHandle,
+	con: &omp_con::Ctx,
+	request: &SmitheryConnect,
+	cancel: &CancellationToken,
+) -> ServiceResult<Str> {
+	let query = request.target.trim_start_matches('@');
+	let results = client
+		.search(query, 100, SmitherySearchMode::Identity, cancel)
+		.await
+		.map_err(smithery_failure)?;
+	let result = results
+		.into_iter()
+		.find(|result| result.name.eq_ignore_ascii_case(query))
+		.ok_or_else(|| {
+			ServiceError::Failed(sf!(
+				"Smithery server \"{}\" was not found. Run /mcp smithery-search first.",
+				request.target
+			))
+		})?;
+	if result
+		.required_inputs
 		.iter()
-		.find_map(|store| store.get(name).ok().flatten())
+		.any(|input| input.required && registry_default_value(input).is_none())
+	{
+		return Err(smithery_failure(SmitheryError::ConfigurationRequired));
+	}
+	let transport = apply_registry_defaults(result.transport, &result.required_inputs)?;
+	let base_name = request
+		.name
+		.clone()
+		.unwrap_or_else(|| smithery_config_name(&result.name));
+	let server_name = available_name(store, &base_name, request.name.is_some())?;
+	validate_server_name(&server_name)
+		.map_err(|error| ServiceError::Failed(sf!("Invalid MCP server name: {error}")))?;
+	let transport = match transport {
+		SmitheryTransport::Http { url } => {
+			let connected = client
+				.connect(&url, Some(&server_name), cancel, |authorization_url| {
+					con.reply(
+						omp_con::Severity::Info,
+						&format!(
+							"Authorize Smithery connection \"{server_name}\" in your browser: \
+							 {authorization_url}"
+						),
+					);
+				})
+				.await
+				.map_err(smithery_failure)?;
+			SmitheryTransport::Http { url: connected.mcp_url }
+		},
+		transport => transport,
+	};
+	let mut config = empty_server_config();
+	match transport {
+		SmitheryTransport::Http { url } => config.url = Some(url),
+		SmitheryTransport::Stdio { command, args } => {
+			config.command = Some(command);
+			config.args = args;
+		},
+	}
+	store
+		.add(&server_name, config)
+		.map_err(|error| ServiceError::Failed(sf!("Failed to save Smithery server: {error}")))?;
+	mcp.reload().await.map_err(|error| {
+		ServiceError::Failed(sf!("Smithery server saved, but MCP refresh failed: {error}"))
+	})?;
+	mcp.reconnect(&server_name).await.map_err(|error| {
+		ServiceError::Failed(sf!("Smithery server saved, but its first connection failed: {error}"))
+	})?;
+	let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+	loop {
+		match mcp
+			.snapshots()
+			.into_iter()
+			.find(|server| server.server.as_str() == server_name.as_str())
+			.map(|server| server.health)
+		{
+			Some(McpInspectorHealth::Connected) => break,
+			Some(McpInspectorHealth::Failed) => {
+				return Err(ServiceError::Failed(Str::new_static(
+					"Smithery server was saved, but its first MCP connection failed.",
+				)));
+			},
+			_ if tokio::time::Instant::now() >= deadline => {
+				return Err(ServiceError::Failed(Str::new_static(
+					"Smithery server was saved, but its MCP catalog refresh timed out.",
+				)));
+			},
+			_ => tokio::time::sleep(TEST_POLL).await,
+		}
+	}
+	Ok(sf!(
+		"Connected Smithery server \"{server_name}\" in {} config and refreshed MCP tools.",
+		request.scope
+	))
+}
+
+fn apply_registry_defaults(
+	transport: SmitheryTransport,
+	inputs: &[omp_envd::mcp::smithery::SmitheryInput],
+) -> ServiceResult<SmitheryTransport> {
+	let SmitheryTransport::Stdio { command, mut args } = transport else {
+		return Ok(transport);
+	};
+	let values = inputs
+		.iter()
+		.filter_map(|input| Some((input.key.to_string(), registry_default_value(input)?)))
+		.collect::<serde_json::Map<_, _>>();
+	if values.is_empty() {
+		return Ok(SmitheryTransport::Stdio { command, args });
+	}
+	let encoded = serde_json::to_string(&values).map_err(|error| {
+		ServiceError::Failed(sf!("Smithery defaults could not be encoded: {error}"))
+	})?;
+	if let Some(index) = args.iter().position(|arg| arg.as_str() == "--config") {
+		if let Some(value) = args.get_mut(index + 1) {
+			*value = Str::new(encoded);
+		} else {
+			args.push(Str::new(encoded));
+		}
+	} else {
+		args.push(Str::new_static("--config"));
+		args.push(Str::new(encoded));
+	}
+	Ok(SmitheryTransport::Stdio { command, args })
+}
+
+fn registry_default_value(
+	input: &omp_envd::mcp::smithery::SmitheryInput,
+) -> Option<serde_json::Value> {
+	let default = input.default_value.as_deref()?;
+	match input.kind {
+		SmitheryInputKind::String => Some(serde_json::Value::String(default.to_owned())),
+		SmitheryInputKind::Number => default
+			.parse::<serde_json::Number>()
+			.ok()
+			.map(serde_json::Value::Number),
+		SmitheryInputKind::Boolean => default.parse::<bool>().ok().map(serde_json::Value::Bool),
+	}
+}
+
+fn available_name(store: &McpConfigStore, base: &str, explicit: bool) -> ServiceResult<Str> {
+	let existing = store.list().map_err(failed)?;
+	if !existing.iter().any(|name| name.as_str() == base) {
+		return Ok(Str::new(base));
+	}
+	if explicit {
+		return Err(ServiceError::Failed(sf!("MCP server \"{base}\" already exists in this scope.")));
+	}
+	for suffix in 2..=999 {
+		let candidate = sf!("{base}-{suffix}");
+		if !existing.iter().any(|name| name == &candidate) {
+			return Ok(candidate);
+		}
+	}
+	Err(ServiceError::Failed(sf!("No available MCP server name derived from \"{base}\".")))
+}
+
+fn empty_server_config() -> McpServerConfig {
+	McpServerConfig {
+		transport:         None,
+		enabled:           true,
+		command:           None,
+		args:              Vec::new(),
+		env:               Default::default(),
+		env_policy:        None,
+		env_literal_keys:  Default::default(),
+		cwd:               None,
+		url:               None,
+		headers:           Default::default(),
+		header_policy:     None,
+		timeout:           None,
+		request_id_format: None,
+		auth:              None,
+		oauth:             None,
+		protocol_versions: Vec::new(),
+	}
+}
+
+/// The declaration for `name` from the highest-precedence writable store.
+fn declared_config(state: &ServiceState, name: &str) -> ServiceResult<Option<McpServerConfig>> {
+	let (user, project, root) = stores(state)?;
+	for store in [project, user, root] {
+		if let Some(config) = store.get(name).map_err(failed)? {
+			return Ok(Some(config));
+		}
+	}
+	Ok(None)
 }
 
 /// pi `#handleList`: user-level, project-level, then discovered servers,
@@ -206,7 +627,7 @@ fn list(state: &ServiceState) -> ServiceResult<Str> {
 	for (label, store) in
 		[("User level", &user), ("Project level", &project), ("Project root", &root)]
 	{
-		let Ok(file) = store.read() else { continue };
+		let file = store.read().map_err(failed)?;
 		if file.mcp_servers.is_empty() {
 			continue;
 		}
@@ -263,23 +684,7 @@ fn shorten(path: &Path, project: &Path) -> String {
 /// pi `#handleAdd` (non-interactive form): validate, write, report.
 fn add_server(state: &ServiceState, add: &McpAdd) -> ServiceResult<Str> {
 	let store = store_for(state, add.scope)?;
-	let mut config = McpServerConfig {
-		transport:         None,
-		enabled:           true,
-		command:           None,
-		args:              Vec::new(),
-		env:               Default::default(),
-		env_policy:        None,
-		cwd:               None,
-		url:               None,
-		headers:           Default::default(),
-		header_policy:     None,
-		timeout:           None,
-		request_id_format: None,
-		auth:              None,
-		oauth:             None,
-		protocol_versions: Vec::new(),
-	};
+	let mut config = empty_server_config();
 	if let Some(url) = &add.url {
 		config.url = Some(url.clone());
 	} else if let Some((command, args)) = add.command.split_first() {
@@ -313,7 +718,7 @@ fn remove_server(state: &ServiceState, name: &str, scope: McpScope) -> ServiceRe
 
 /// pi `#handleSetEnabled`.
 fn set_enabled(state: &ServiceState, name: &str, enabled: bool) -> ServiceResult<Str> {
-	let known = declared_config(state, name).is_some()
+	let known = declared_config(state, name)?.is_some()
 		|| state
 			.mcp
 			.snapshots()
@@ -323,7 +728,7 @@ fn set_enabled(state: &ServiceState, name: &str, enabled: bool) -> ServiceResult
 		return Err(ServiceError::Failed(sf!("Server \"{name}\" not found.")));
 	}
 	let (user, project, root) = stores(state)?;
-	set_server_enabled(&user, &project, Some((&root, true)), name, enabled).map_err(|error| {
+	set_server_enabled(&user, &project, Some(&root), name, enabled).map_err(|error| {
 		ServiceError::Failed(sf!(
 			"Failed to {} server: {error}",
 			if enabled { "enable" } else { "disable" }

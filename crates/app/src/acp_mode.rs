@@ -568,7 +568,9 @@ where
 					output_tx.send(success(id, json!({}))).into_diagnostic()?;
 				}
 				if let Some(turn) = active.take() {
-					let _ = mailbox.send(Up::Interrupt);
+					// ACP shutdown is graceful: pi waits for the active prompt's
+					// delivery handlers before disposing the session. EOF remains
+					// the abrupt transport-loss path that interrupts the turn.
 					restore_turn(
 						turn.await.into_diagnostic()?,
 						&mut controller,
@@ -600,7 +602,9 @@ where
 		.take()
 		.expect("ACP controller owns its kernel and session after active turn completion");
 	if !closed {
-		session.process_exit().into_diagnostic()?;
+		session
+			.record_exit(omp_session::ExitCause::Normal)
+			.into_diagnostic()?;
 		home.unregister(&session);
 	}
 	drop(session);

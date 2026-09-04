@@ -40,7 +40,7 @@ pub(super) fn rows(state: &ServiceState) -> ServiceResult<Vec<ExtensionRow>> {
 pub(super) fn set_enabled(state: &ServiceState, id: &str, enabled: bool) -> ServiceResult<()> {
 	if let Some(name) = id.strip_prefix(MCP_PREFIX) {
 		let (user, project, root) = super::mcp::stores(state)?;
-		return set_server_enabled(&user, &project, Some((&root, true)), name, enabled)
+		return set_server_enabled(&user, &project, Some(&root), name, enabled)
 			.map_err(ServiceError::failed);
 	}
 	if let Some(extension) = id.strip_prefix(EXT_PREFIX) {
@@ -87,16 +87,18 @@ pub(super) fn reload(state: &ServiceState) -> ServiceResult<Pending<Str>> {
 fn mcp_rows(state: &ServiceState) -> ServiceResult<Vec<ExtensionRow>> {
 	let (user, project, root) = super::mcp::stores(state)?;
 	let sources: Vec<ConfigSource> = [
-		(ConfigSourceKind::User, user),
 		(ConfigSourceKind::Project, project),
+		(ConfigSourceKind::User, user),
 		(ConfigSourceKind::Root, root),
 	]
 	.into_iter()
-	.filter_map(|(kind, store)| {
-		let file = store.read().ok()?;
-		Some(ConfigSource { path: store.path().to_path_buf(), kind, file })
+	.map(|(kind, store)| {
+		store
+			.read()
+			.map(|file| ConfigSource { path: store.path().to_path_buf(), kind, file })
+			.map_err(ServiceError::failed)
 	})
-	.collect();
+	.collect::<ServiceResult<Vec<_>>>()?;
 	let resolved = resolve_sources(&sources, true);
 	let mut declared: BTreeMap<Str, (bool, Str)> = BTreeMap::new();
 	for source in &sources {
@@ -201,6 +203,8 @@ fn python_rows(state: &ServiceState, paths: &StatePaths) -> ServiceResult<Vec<Ex
 				.find(|evidence| evidence.provenance.extension_id() == view.id.as_str());
 			let status = if !view.enabled {
 				ExtensionStatus::Disabled
+			} else if !view.admitted {
+				ExtensionStatus::Failed
 			} else if live.is_some() {
 				ExtensionStatus::Ready
 			} else {
@@ -221,9 +225,20 @@ fn python_rows(state: &ServiceState, paths: &StatePaths) -> ServiceResult<Vec<Ex
 				Scope::Project => "project",
 			};
 			let mut description = sf!("{scope} · {} · {}", view.tier, view.source);
+			if let (Some(publisher), Some(artifact)) = (&view.publisher, &view.artifact) {
+				description = sf!("{description} · publisher={publisher} · artifact={artifact}");
+			}
+			if let Some(capability) = &view.capability {
+				description = sf!("{description} · capability={capability}");
+			}
 			if view.shadowed {
 				description = sf!("{description} · shadowed by the project install");
 			}
+			let error = (!view.admitted).then(|| {
+				Str::new_static(
+					"E-CONSENT: current publisher, capability digest, tier, or shipping level is ungranted",
+				)
+			});
 			ExtensionRow {
 				id: sf!("{EXT_PREFIX}{}", view.id),
 				name: view.id,
@@ -235,7 +250,7 @@ fn python_rows(state: &ServiceState, paths: &StatePaths) -> ServiceResult<Vec<Ex
 				tools,
 				resources: Vec::new(),
 				prompts: Vec::new(),
-				error: None,
+				error,
 			}
 		})
 		.collect())

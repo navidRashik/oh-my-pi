@@ -10,17 +10,16 @@
 //! owns the request). Facts that only the actor knows (viewport, charset,
 //! appearance) are read through a `PanelCall` round-trip.
 
-use std::{sync::Arc, task::Poll};
+use std::{future::Future, pin::Pin, sync::Arc, task::Poll};
 
 use async_trait::async_trait;
 use omp_chat::{
-	ExtensionStatusEvent, HostAction, HostMailbox,
+	ExtensionStatus, HostAction, HostMailbox,
 	overlays::{
 		PanelCall, PanelEvent, PanelOpener,
 		ask::AskDialog,
 		ext_input::{FIELD, InputDialog, InputSpec},
 	},
-	status_text_from_tml,
 };
 use omp_con::{Ctx, RegItem};
 use omp_core::{Str, Ulid};
@@ -30,7 +29,9 @@ use omp_envd::exthost::{
 	UiControlOwner, UiControlRequest, UiControlResult,
 	control::{ControlConnectionIdentity, ControlProtocolError, ControlRequestContext},
 };
-use omp_tools::ask::{Answer, AskPresenter as _, Fault as AskFault, OptionItem, Question};
+use omp_tools::ask::{
+	AskPresenter, Fault as AskFault, OptionItem, Presentation, Question, Selection,
+};
 use serde_json::{Map, Value, json};
 
 const YES: &str = "Yes";
@@ -41,8 +42,9 @@ const REQUEST_PREFIX: &str = "ext-ui:";
 /// Chat-owned UI authority handed to the Environment for the chat's
 /// lifetime.
 pub struct ChatUiOwner {
-	con: Arc<Ctx>,
-	ask: AskRoute,
+	con:         Arc<Ctx>,
+	ask:         AskRoute,
+	dialog_gate: tokio::sync::Mutex<()>,
 }
 
 impl ChatUiOwner {
@@ -50,7 +52,7 @@ impl ChatUiOwner {
 	/// environment's `ask` route.
 	#[must_use]
 	pub fn new(con: Arc<Ctx>, ask: AskRoute) -> Self {
-		Self { con, ask }
+		Self { con, ask, dialog_gate: tokio::sync::Mutex::new(()) }
 	}
 
 	/// Factory the Environment binds per authenticated extension connection.
@@ -92,6 +94,7 @@ impl ChatUiOwner {
 	/// `None` when the user dismissed it.
 	async fn dialog(
 		&self,
+		id: Str,
 		questions: Vec<Question>,
 		open: impl Fn(
 			Str,
@@ -101,9 +104,9 @@ impl ChatUiOwner {
 		+ Send
 		+ Sync
 		+ 'static,
-	) -> Result<Option<Vec<Answer>>, ControlProtocolError> {
+	) -> Result<Option<Vec<Selection>>, ControlProtocolError> {
+		let _gate = self.dialog_gate.lock().await;
 		let mailbox = self.mailbox()?;
-		let id = Str::new(format!("{REQUEST_PREFIX}{}", Ulid::generate()));
 		let mut present = self.ask.present(&questions, Some(id.as_str()));
 		// The route registers the id on first poll; the dialog must not be
 		// able to answer before that.
@@ -121,11 +124,15 @@ impl ChatUiOwner {
 	async fn ask_dialog(
 		&self,
 		questions: Vec<Question>,
-	) -> Result<Option<Vec<Answer>>, ControlProtocolError> {
+	) -> Result<Option<Vec<Selection>>, ControlProtocolError> {
 		self
-			.dialog(questions, |id, questions, cx| {
-				Box::new(AskDialog::open(id, questions, None, cx.ui.now, cx.viewport, cx.ui))
-			})
+			.dialog(
+				Str::new(format!("{REQUEST_PREFIX}{}", Ulid::generate())),
+				questions,
+				|id, questions, cx| {
+					Box::new(AskDialog::open(id, questions, None, cx.ui.now, cx.viewport, cx.ui))
+				},
+			)
 			.await
 	}
 
@@ -139,9 +146,11 @@ impl ChatUiOwner {
 			recommended: None,
 		};
 		let answers = self
-			.dialog(vec![question], move |id, _, cx| {
-				Box::new(InputDialog::open(id, spec.clone(), cx.viewport, cx.ui))
-			})
+			.dialog(
+				Str::new(format!("{REQUEST_PREFIX}{}", Ulid::generate())),
+				vec![question],
+				move |id, _, cx| Box::new(InputDialog::open(id, spec.clone(), cx.viewport, cx.ui)),
+			)
 			.await?;
 		Ok(answers.map(|answers| {
 			answers
@@ -259,6 +268,37 @@ impl ChatUiOwner {
 			},
 			other => Err(protocol("unknown_operation", format!("unknown dialog kind `{other}`"))),
 		}
+	}
+}
+
+impl AskPresenter for ChatUiOwner {
+	fn present<'p>(
+		&'p self,
+		questions: &'p [Question],
+		invocation: Option<&'p str>,
+	) -> Pin<Box<dyn Future<Output = Result<Presentation, AskFault>> + Send + 'p>> {
+		let Some(invocation) = invocation.filter(|id| id.starts_with("dyn-")) else {
+			return self.ask.present(questions, invocation);
+		};
+		let id = Str::new(invocation);
+		let questions = questions.to_vec();
+		Box::pin(async move {
+			let selections = self
+				.dialog(id, questions, |id, questions, cx| {
+					Box::new(AskDialog::open(
+						id,
+						questions,
+						omp_chat::overlays::ask::timeout(cx),
+						cx.ui.now,
+						cx.viewport,
+						cx.ui,
+					))
+				})
+				.await
+				.map_err(|error| AskFault::Presenter { message: Str::new(error.to_string()) })?
+				.ok_or_else(AskFault::cancelled)?;
+			Ok(Presentation { selections })
+		})
 	}
 }
 
@@ -392,6 +432,19 @@ impl UiControlOwner for ChatUiOwner {
 					.post(HostAction::Reply { severity, text: Str::new(text) });
 				Ok(())
 			},
+			"set_title" => {
+				let title = effect
+					.get("body")
+					.and_then(|body| body.get("title"))
+					.and_then(Value::as_str)
+					.ok_or_else(|| {
+						protocol("invalid_effect", "set_title requires a string body.title")
+					})?;
+				self
+					.mailbox()?
+					.post(HostAction::ExtensionTitle(Str::new(title)));
+				Ok(())
+			},
 			"set_status" => {
 				let body = effect
 					.get("body")
@@ -405,7 +458,7 @@ impl UiControlOwner for ChatUiOwner {
 						protocol("invalid_effect", "set_status requires a non-empty body.key")
 					})?;
 				let event = match body.get("content") {
-					Some(Value::Null) => ExtensionStatusEvent::Clear { key: Str::new(key) },
+					Some(Value::Null) => ExtensionStatus::clear(key),
 					Some(Value::Object(content)) => {
 						let source = content
 							.get("source")
@@ -416,10 +469,9 @@ impl UiControlOwner for ChatUiOwner {
 									"set_status body.content requires a string source",
 								)
 							})?;
-						let text = status_text_from_tml(source).map_err(|_| {
+						ExtensionStatus::from_tml(key, source).map_err(|_| {
 							protocol("invalid_effect", "set_status body.content.source is invalid TML")
-						})?;
-						ExtensionStatusEvent::Set { key: Str::new(key), text }
+						})?
 					},
 					_ => {
 						return Err(protocol(
@@ -508,7 +560,7 @@ impl FormField {
 		}
 	}
 
-	fn value(&self, answer: Option<&Answer>) -> Value {
+	fn value(&self, answer: Option<&Selection>) -> Value {
 		let Some(answer) = answer else {
 			return self.value.clone();
 		};
@@ -561,7 +613,7 @@ impl AskUserQuestion {
 		}
 	}
 
-	fn answer(&self, answer: Option<&Answer>) -> Value {
+	fn answer(&self, answer: Option<&Selection>) -> Value {
 		let Some(answer) = answer else {
 			return json!({ "selected": [], "freeform": null, "note": null, "timed_out": false });
 		};
@@ -576,9 +628,9 @@ impl AskUserQuestion {
 
 fn finish(
 	settled: Result<omp_tools::ask::Presentation, AskFault>,
-) -> Result<Option<Vec<Answer>>, ControlProtocolError> {
+) -> Result<Option<Vec<Selection>>, ControlProtocolError> {
 	match settled {
-		Ok(presentation) => Ok(Some(presentation.answers)),
+		Ok(presentation) => Ok(Some(presentation.selections)),
 		Err(AskFault::Cancelled { .. }) => Ok(None),
 		Err(error) => Err(protocol("dialog_failed", error.to_string())),
 	}
@@ -590,7 +642,7 @@ fn option(label: &str, description: Option<Str>) -> OptionItem {
 
 /// Selected labels mapped back to item values; a free-text `Other` reply
 /// stands in as the value when nothing was picked.
-fn selected_values(answer: &Answer, items: &[SelectItem]) -> Vec<Str> {
+fn selected_values(answer: &Selection, items: &[SelectItem]) -> Vec<Str> {
 	let mut values = answer
 		.selected
 		.iter()
@@ -836,6 +888,25 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn dynamic_ask_opens_the_typed_chat_dialog_and_returns_selection() {
+		let (owner, ctx, ask) = owner();
+		let questions = vec![Question {
+			id:          Str::new_static("region"),
+			question:    Str::new_static("Which region?"),
+			header:      Some(Str::new_static("Region")),
+			options:     vec![option("us", None), option("eu", Some(Str::new_static("Frankfurt")))],
+			multi:       false,
+			recommended: Some(1),
+		}];
+		let present = owner.present(&questions, Some("dyn-7"));
+		let host = settle(ctx, ask, |mut panel| panel.key(Key::Enter));
+		let (presentation, ()) = tokio::join!(present, host);
+		let presentation = presentation.expect("dynamic ask answered");
+		assert_eq!(presentation.selections[0].id, "region");
+		assert_eq!(presentation.selections[0].selected, [Str::new_static("eu")]);
+	}
+
+	#[tokio::test]
 	async fn confirm_dialog_reports_the_chosen_button() {
 		let (owner, ctx, ask) = owner();
 		let request = owner.request(context(), UiControlRequest::Dialog {
@@ -957,6 +1028,31 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn set_title_effect_posts_a_distinct_extension_title_action() {
+		let (owner, ctx, _ask) = owner();
+		owner
+			.effect(
+				context(),
+				json!({"kind": "set_title", "body": {"title": "extension: exact title"}}),
+			)
+			.await
+			.expect("extension title");
+		let actions = ctx
+			.user::<HostMailbox>()
+			.expect("mailbox")
+			.drain()
+			.collect::<Vec<_>>();
+		assert_eq!(actions, [HostAction::ExtensionTitle(Str::new_static("extension: exact title"))]);
+		assert!(
+			owner
+				.effect(context(), json!({"kind": "set_title", "body": {"title": null}}))
+				.await
+				.is_err(),
+			"a missing extension title is rejected before it reaches the actor",
+		);
+	}
+
+	#[tokio::test]
 	async fn set_status_effect_posts_sanitized_set_and_clear() {
 		let (owner, ctx, _ask) = owner();
 		owner
@@ -967,7 +1063,7 @@ mod tests {
 					"body": {
 						"key": "build",
 						"content": {
-							"source": "<row><text fg=error>failed</text><text>\\n  safely</text></row>",
+							"source": "<row gap=1><text fg=error>failed</text><text>safely</text></row>",
 						},
 					},
 				}),
@@ -986,14 +1082,17 @@ mod tests {
 			.expect("mailbox")
 			.drain()
 			.collect::<Vec<_>>();
-		assert!(matches!(
-			actions.first(),
-			Some(HostAction::ExtensionStatus(ExtensionStatusEvent::Set { key, text }))
-				if key == "build" && text == "failed safely"
-		));
+		assert!(
+			matches!(
+				actions.first(),
+				Some(HostAction::ExtensionStatus(ExtensionStatus::Set { key, text }))
+					if key == "build" && text == "failed safely"
+			),
+			"{actions:?}",
+		);
 		assert!(matches!(
 			actions.get(1),
-			Some(HostAction::ExtensionStatus(ExtensionStatusEvent::Clear { key }))
+			Some(HostAction::ExtensionStatus(ExtensionStatus::Clear { key }))
 				if key == "build"
 		));
 		assert!(

@@ -236,25 +236,33 @@ pub async fn run(project: &Path, layer: Option<Layer>, _args: ExtConfigArgs) -> 
 	};
 	if accepted {
 		if model.dirty_user {
-			persist(&user_path, &user_cfg, Some(&model.user))?;
+			persist(&user_path, Some(&model.user))?;
 		}
 		if model.dirty_workspace {
-			persist(&workspace_path, &workspace_cfg, model.workspace.as_ref())?;
+			persist(&workspace_path, model.workspace.as_ref())?;
 		}
 	}
 	Ok(())
 }
 
-/// Writes `list` into the loaded cfg's `cl_disabled_extensions` (or resets
-/// it to the default when `None`) and dumps the cfg back to `path`.
-fn persist(path: &Path, cfg: &Ctx, list: Option<&BTreeSet<Str>>) -> miette::Result<()> {
-	let value = list.map_or_else(
-		|| (CL_DISABLED_EXTENSIONS.spec().default)(),
-		|list| Value::List(list.iter().cloned().map(Value::Str).collect()),
-	);
-	cfg.set(CL_DISABLED_EXTENSIONS.name(), value, Origin::Archive)
-		.map_err(|error| miette!("{error}"))?;
-	crate::config_cmd::persist_cfg(path, cfg)
+/// Writes `list` into the latest on-disk cfg's `cl_disabled_extensions` (or
+/// resets it to the default when `None`). The fresh read and replacement share
+/// the config transaction, so changes made while the selector was open survive.
+fn persist(path: &Path, list: Option<&BTreeSet<Str>>) -> miette::Result<()> {
+	crate::config_cmd::update_cfg(path, |cfg| {
+		let value = list.map_or_else(
+			|| (CL_DISABLED_EXTENSIONS.spec().default)(),
+			|list| Value::List(list.iter().cloned().map(Value::Str).collect()),
+		);
+		let origin = if list.is_some() {
+			Origin::Archive
+		} else {
+			Origin::Default
+		};
+		cfg.set(CL_DISABLED_EXTENSIONS.name(), value, origin)
+			.map_err(|error| miette!("{error}"))?;
+		Ok(())
+	})
 }
 
 fn disabled_list(cfg: &Ctx) -> BTreeSet<Str> {
@@ -419,15 +427,14 @@ mod tests {
 	fn persisted_list_round_trips_through_the_cfg_loader() {
 		let tree = tempfile::tempdir().unwrap();
 		let path = tree.path().join("config.cfg");
-		let cfg = crate::config_cmd::load_cfg(&path).unwrap();
-		persist(&path, &cfg, Some(&set(&["skill:review", "acme.reviewer"]))).unwrap();
+		persist(&path, Some(&set(&["skill:review", "acme.reviewer"]))).unwrap();
 		let script = std::fs::read_to_string(&path).unwrap();
 		assert!(script.contains("cl_disabled_extensions"), "{script}");
 		let reloaded = crate::config_cmd::load_cfg(&path).unwrap();
 		assert_eq!(disabled_list(&reloaded), set(&["acme.reviewer", "skill:review"]));
 		let policy = omp_driver::discovery::skills::SkillPolicy::from_con(&reloaded);
 		assert_eq!(policy.disabled, set(&["review"]));
-		persist(&path, &reloaded, None).unwrap();
+		persist(&path, None).unwrap();
 		let cleared = crate::config_cmd::load_cfg(&path).unwrap();
 		assert!(disabled_list(&cleared).is_empty());
 	}

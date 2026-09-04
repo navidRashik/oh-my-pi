@@ -17,6 +17,8 @@ use omp_driver::{
 
 use crate::cli::{ChatArgs, InvocationExtensionMode, LaunchExtensions, PromptArgs};
 
+pub(crate) mod launch_input;
+
 omp_con::var! {
 	/// Model selector prewalk hands off to at the first edit (`--prewalk-into`);
 	/// empty selects the `smol` role. Journaled with the session so a resumed
@@ -33,6 +35,38 @@ const SMOL_ROLE: &str = "@smol";
 /// Sandbox root allow-lists `--add-dir` extends (envd `exec_settings`).
 const SANDBOX_READABLE_ROOTS: &str = "sv_sandbox_readable_roots";
 const SANDBOX_WRITABLE_ROOTS: &str = "sv_sandbox_writable_roots";
+
+/// Waits for the first process-termination signal the session owner can
+/// journal before teardown.
+#[cfg(unix)]
+pub(crate) async fn process_signal() -> std::io::Result<omp_session::ExitSignal> {
+	use tokio::signal::unix::{SignalKind, signal};
+
+	let mut interrupt = signal(SignalKind::interrupt())?;
+	let mut terminate = signal(SignalKind::terminate())?;
+	let mut hangup = signal(SignalKind::hangup())?;
+	let mut quit = signal(SignalKind::quit())?;
+	tokio::select! {
+		_ = interrupt.recv() => Ok(omp_session::ExitSignal::new("SIGINT", Some(libc::SIGINT))),
+		_ = terminate.recv() => Ok(omp_session::ExitSignal::new("SIGTERM", Some(libc::SIGTERM))),
+		_ = hangup.recv() => Ok(omp_session::ExitSignal::new("SIGHUP", Some(libc::SIGHUP))),
+		_ = quit.recv() => Ok(omp_session::ExitSignal::new("SIGQUIT", Some(libc::SIGQUIT))),
+	}
+}
+
+/// Waits for the first console interrupt the session owner can journal before
+/// teardown.
+#[cfg(windows)]
+pub(crate) async fn process_signal() -> std::io::Result<omp_session::ExitSignal> {
+	tokio::signal::ctrl_c().await?;
+	Ok(omp_session::ExitSignal::new("CTRL_C", None))
+}
+
+/// No process signal integration is available on this target.
+#[cfg(not(any(unix, windows)))]
+pub(crate) async fn process_signal() -> std::io::Result<omp_session::ExitSignal> {
+	std::future::pending().await
+}
 
 /// Initial surface selected by the command boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,7 +218,7 @@ pub(crate) struct Launch {
 	pub resuming:      bool,
 	pub ephemeral:     bool,
 	pub max_time:      Option<Duration>,
-	/// Initial prompt words.
+	/// Ordered positional launch messages and `@file` references.
 	pub prompt:        Vec<Str>,
 	/// Prompt templates (`/name` slash commands): the discovered directories
 	/// unless `--no-prompt-templates`, plus every `--prompt-template` path.
@@ -271,6 +305,12 @@ impl Launch {
 			prompt_settings,
 			prompt,
 		} = args;
+		let session_dir = session_dir.or_else(|| {
+			env::var_os("OMP_CODING_AGENT_SESSION_DIR")
+				.filter(|value| !value.is_empty())
+				.map(PathBuf::from)
+		});
+		let no_pty = no_pty || env::var_os("OMP_NO_PTY").is_some_and(|value| value == "1");
 		if from_claude || from_codex {
 			return Err(miette!(
 				"foreign session imports must be resolved before launch (interactive chat only)"
@@ -278,7 +318,11 @@ impl Launch {
 		}
 		let LaunchEnv { data_dir, home, catalog } = env;
 		let project = fs::canonicalize(&project).into_diagnostic()?;
-		for overlay in &config {
+		let environment_config = env::var_os("OMP_CONFIG_FILES")
+			.filter(|value| !value.is_empty())
+			.map(|value| env::split_paths(&value).collect::<Vec<_>>())
+			.unwrap_or_default();
+		for overlay in environment_config.iter().chain(&config) {
 			let script = fs::read_to_string(overlay).into_diagnostic()?;
 			ctx.exec(&script, omp_con::Source::Config(Str::new(overlay.to_string_lossy())))
 				.into_diagnostic()?;
@@ -311,7 +355,7 @@ impl Launch {
 			add_dir: &add_dir,
 		})
 		.into_diagnostic()?;
-		let config_root = omp_core::dirs::profile_config_dir(&home);
+		let config_root = omp_core::dirs::profile_config_dir(&home).into_diagnostic()?;
 		let templates =
 			PromptTemplates::discover(&project, &config_root, &prompt_template, !no_prompt_templates);
 		for warning in &templates.warnings {
@@ -475,34 +519,27 @@ impl Launch {
 		})
 	}
 
-	/// A leading `/skill:<name>` launch prompt expanded through the same
+	/// A leading `/skill:<name>` positional message expanded through the same
 	/// discovered skill snapshot as the interactive console.
 	pub(crate) fn initial_skill_prompt(&self) -> Option<omp_journal::data::SkillPrompt> {
-		let command = self.prompt.first()?.strip_prefix("/skill:")?;
+		let command = self
+			.prompt
+			.iter()
+			.find(|argument| !argument.starts_with('@'))?
+			.strip_prefix("/skill:")?;
 		if command.is_empty() {
 			return None;
 		}
-		self.skills.prompt(command.as_str(), &self.prompt[1..])
+		self.skills.prompt(command.as_str(), &[])
 	}
 
-	/// The initial prompt words joined, with a leading `/template` expanded
-	/// (pi `expandPromptTemplate` runs on every submitted prompt).
-	pub(crate) fn initial_prompt(&self) -> Option<Str> {
-		if self.prompt.is_empty() {
-			return None;
-		}
-		let text = self
-			.prompt
-			.iter()
-			.map(Str::as_str)
-			.collect::<Vec<_>>()
-			.join(" ");
-		Some(
-			self
-				.templates
-				.expand_line(&text)
-				.unwrap_or_else(|| Str::new(text)),
-		)
+	/// Expands one positional message through the invocation's prompt-template
+	/// snapshot. Positional boundaries remain turn boundaries.
+	pub(crate) fn expand_prompt(&self, text: &str) -> Str {
+		self
+			.templates
+			.expand_line(text)
+			.unwrap_or_else(|| Str::new(text))
 	}
 
 	/// Composes the kernel and applies the session-scoped launch overrides
@@ -851,6 +888,9 @@ pub(crate) async fn run(
 		&project,
 		omp_chat::HostMailbox::new().attach(omp_con::Ctx::builder()),
 	)?);
+	// Observer-only, due-coalesced, and intentionally outside every launch
+	// dependency: the first frame and first prompt never await the network.
+	let _startup_update = crate::startup_update::schedule(Arc::clone(&ctx));
 	let env = LaunchEnv::production(&project, args.gateway.is_some())?;
 	let launch = Launch::prepare(args, ctx, env).await?;
 	let Launch {
@@ -881,6 +921,7 @@ pub(crate) async fn run(
 			eprintln!("warning: skill command `{reserved}` shadows a built-in command; skipped");
 		}
 	}
+	let launch_inputs = launch_input::prepare(&launch, None, Vec::new())?;
 	let (mut kernel, session) = launch.compose().await?;
 	let live_auth = kernel
 		.inference()
@@ -894,10 +935,6 @@ pub(crate) async fn run(
 	// The interactive `ask` presenter: the tool waits on the host, which
 	// answers the call identity through the controller.
 	let ask_route = omp_driver::headless::AskRoute::new();
-	kernel
-		.inference()
-		.environment()
-		.bind_ask_presenter(Arc::new(ask_route.clone()));
 	// `/trace` reads the notifications the journal never carries.
 	let trace = crate::chat_services::trace::TraceLog::record(
 		kernel.subscribe(),
@@ -1036,19 +1073,23 @@ pub(crate) async fn run(
 	.into_diagnostic()?
 	.with_facts_of(&session);
 	let env = kernel.inference().environment_client().clone();
-	// Extension `omp.ui.*` requests (dialogs, presentation facts) are owned
-	// by this chat for its lifetime; dropping the lease at exit revokes it.
+	// Extension `omp.ui.*` requests (dialogs, presentation facts) and dynamic
+	// `ask` invocations are owned by this chat for its lifetime. Direct ask
+	// slots still project from their journaled element; nested `dyn ask`
+	// requests open through the same typed owner.
+	let chat_ui_owner = Arc::new(crate::chat_services::extension_ui::ChatUiOwner::new(
+		Arc::clone(ctx),
+		ask_route.clone(),
+	));
+	kernel
+		.inference()
+		.environment()
+		.bind_ask_presenter(Arc::clone(&chat_ui_owner) as Arc<dyn omp_tools::ask::AskPresenter>);
 	let _extension_ui = kernel
 		.inference()
 		.environment()
 		.bind_domain_control_factories(omp_envd::exthost::ExternalDomainControlFactories {
-			ui: Some(
-				Arc::new(crate::chat_services::extension_ui::ChatUiOwner::new(
-					Arc::clone(ctx),
-					ask_route.clone(),
-				))
-				.factory(),
-			),
+			ui: Some(chat_ui_owner.factory()),
 			..omp_envd::exthost::ExternalDomainControlFactories::default()
 		});
 	let (controller, snapshot) = crate::chat_control::Controller::new(
@@ -1087,13 +1128,27 @@ pub(crate) async fn run(
 		ui: omp_tui::UiContext::default().with_palette(launch.theme.clone()),
 		speech,
 	};
-	if let Some(prompt) = launch.initial_skill_prompt() {
+	let skill_prompt = (!launch_inputs.has_files)
+		.then(|| launch.initial_skill_prompt())
+		.flatten();
+	if let Some(prompt) = skill_prompt {
 		commands
 			.send(omp_chat::HostCommand::SkillPrompt(prompt))
 			.into_diagnostic()?;
-	} else if let Some(text) = launch.initial_prompt() {
+	} else if let Some(first) = launch_inputs.first {
+		let command = if first.attachments.is_empty() {
+			omp_chat::HostCommand::Submit(first.text)
+		} else {
+			omp_chat::HostCommand::SubmitWithAttachments {
+				text:        first.text,
+				attachments: first.attachments,
+			}
+		};
+		commands.send(command).into_diagnostic()?;
+	}
+	for follow_up in launch_inputs.follow_ups {
 		commands
-			.send(omp_chat::HostCommand::Submit(text))
+			.send(omp_chat::HostCommand::Queue { prompt: follow_up, attachments: Vec::new() })
 			.into_diagnostic()?;
 	}
 
@@ -1115,23 +1170,36 @@ pub(crate) async fn run(
 		return Err(miette!("native GUI support was not included in this build"));
 	}
 
+	let signal_commands = commands.clone();
+	let signal_task = tokio::spawn(async move {
+		if let Ok(signal) = process_signal().await {
+			let _ = signal_commands.send(omp_chat::HostCommand::ProcessSignal(signal));
+		}
+	});
 	let host = omp_chat::Host::new(options).run();
 	tokio::pin!(host);
 	tokio::pin!(controller);
-	tokio::select! {
-		host_result = &mut host => {
-			host_result.into_diagnostic()?;
-			let _ = commands.send(omp_chat::HostCommand::Quit);
-			controller.await?;
+	let terminal_result: miette::Result<()> = tokio::select! {
+		host_result = &mut host => match host_result.into_diagnostic() {
+			Ok(()) => {
+				let _ = commands.send(omp_chat::HostCommand::Quit);
+				controller.await
+			},
+			Err(error) => Err(error),
 		},
 		controller_result = &mut controller => {
-			controller_result?;
-			host.await.into_diagnostic()?;
+			// Dropping the controller closes the DOM/kernel feeds. Always let
+			// the host observe that edge and restore the tty before propagating
+			// a typed signal status.
+			let host_result = host.await.into_diagnostic();
+			controller_result.and(host_result)
 		},
-	}
+	};
+	signal_task.abort();
 	if let Some(path) = ephemeral_path {
 		let _ = fs::remove_file(path);
 	}
+	terminal_result?;
 	// `/restart` (pi `interactive-mode.ts` `restart()`): the terminal is
 	// restored and the session journaled its exit, so replace the process
 	// image with the launch argv resuming this session. Returns only on
@@ -1329,6 +1397,34 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn launch_inputs_keep_positional_turns_and_context_boundaries() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("note.txt"), "file body").unwrap();
+		let mut args = ChatArgs::default_interactive();
+		args.model = Some(Str::new_static("openai/gpt-5"));
+		args.project = dir.path().to_path_buf();
+		args.prompt =
+			vec![Str::new_static("@note.txt"), Str::new_static("first"), Str::new_static("second")];
+		let launch = Launch::prepare(args, Arc::new(omp_con::Ctx::new()), test_env(dir.path()))
+			.await
+			.expect("launch lowers");
+		let inputs =
+			launch_input::prepare(&launch, Some(Str::new_static("pipe body")), vec![Str::new_static(
+				"third",
+			)])
+			.expect("launch inputs");
+		let path = fs::canonicalize(dir.path().join("note.txt")).unwrap();
+		assert_eq!(
+			inputs.first.expect("first").text,
+			Str::new(format!(
+				"pipe body\n<file name=\"{}\">\nfile body\n</file>\nfirst",
+				path.display()
+			))
+		);
+		assert_eq!(inputs.follow_ups, [Str::new_static("second"), Str::new_static("third")]);
+	}
+
+	#[tokio::test]
 	async fn prompt_templates_are_discovered_and_expand_the_initial_prompt() {
 		let dir = tempfile::tempdir().unwrap();
 		fs::create_dir_all(dir.path().join("home/.o2/agent/prompts")).unwrap();
@@ -1338,12 +1434,16 @@ mod tests {
 		let mut args = ChatArgs::default_interactive();
 		args.model = Some(Str::new_static("openai/gpt-5"));
 		args.project = dir.path().to_path_buf();
-		args.prompt =
-			vec![Str::new_static("/fix"), Str::new_static("lib.rs"), Str::new_static("tests")];
+		args.prompt = vec![Str::new_static("/fix lib.rs tests"), Str::new_static("follow-up")];
 		let launch = Launch::prepare(args, Arc::new(omp_con::Ctx::new()), test_env(dir.path()))
 			.await
 			.expect("launch lowers");
-		assert_eq!(launch.initial_prompt().as_deref(), Some("Fix lib.rs then run tests"));
+		let inputs = launch_input::prepare(&launch, None, Vec::new()).expect("launch inputs");
+		assert_eq!(
+			inputs.first.as_ref().map(|input| input.text.as_str()),
+			Some("Fix lib.rs then run tests")
+		);
+		assert_eq!(inputs.follow_ups, [Str::new_static("follow-up")]);
 		assert_eq!(
 			launch
 				.templates

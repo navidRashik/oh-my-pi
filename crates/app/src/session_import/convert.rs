@@ -173,7 +173,9 @@ pub(super) fn import_file(
 		ForeignFormat::Claude => import_claude(&mut session, &records, base, &mut state)?,
 		ForeignFormat::Codex => import_codex(&mut session, &records, base, &mut state)?,
 	}
-	session.process_exit().into_diagnostic()?;
+	session
+		.record_exit(omp_session::ExitCause::Normal)
+		.into_diagnostic()?;
 	Ok(state.messages)
 }
 

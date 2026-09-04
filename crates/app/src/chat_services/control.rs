@@ -59,8 +59,9 @@ const SESSION_SOURCE_FLAGS: &[&str] =
 	&["--continue", "-c", "--no-session", "--from-claude", "--from-codex"];
 
 /// pi `restartArgv`: the launch argv minus session-source flags and the
-/// positional prompt words clap parsed (`prompts`, removed once each from
-/// the end), plus `--resume <path>` when the journal exists.
+/// positional prompt messages and `@file` arguments clap parsed (`prompts`,
+/// removed once each from the end), plus `--resume <path>` when the journal
+/// exists.
 pub(crate) fn restart_argv(
 	argv: &[OsString],
 	prompts: &[&str],

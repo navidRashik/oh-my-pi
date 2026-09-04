@@ -552,8 +552,6 @@ impl ParentSessionHost for TestEvalParent {
 		Ok(EvalSessionConfig {
 			cwd:              self.cwd.clone(),
 			local_roots_json: None,
-			artifacts_dir:    None,
-			session_file:     None,
 		})
 	}
 
@@ -924,7 +922,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 			"properties": {
 				"pattern": {"type": "string", "description": "regex pattern"},
 				"i": {"type": "string", "description": "Short present-participle intent for this call."},
-				"notrunc": {"type": "boolean", "description": "Return complete output inline without central truncation."},
+				"notrunc": {"type": "boolean", "description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."},
 				"path": {"type": "string", "description": "file, directory, glob, internal URL, or \"<file>:<lines>\" selector to search; pass several as a semicolon-delimited list (\"src; tests\"). Omitted -> searches the workspace root (\".\")"},
 				"case": {"type": "boolean", "description": "case-sensitive search"},
 				"gitignore": {"type": "boolean", "description": "respect gitignore"},
@@ -941,7 +939,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 			"properties": {
 				"path": {"type": "string", "description": "glob, file, or directory to search — a single path or a semicolon-delimited list (\"src/**/*.ts; test/**/*.ts\"). Omitted -> searches the workspace root (\".\")"},
 				"i": {"type": "string", "description": "Short present-participle intent for this call."},
-				"notrunc": {"type": "boolean", "description": "Return complete output inline without central truncation."},
+				"notrunc": {"type": "boolean", "description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."},
 				"hidden": {"type": "boolean", "description": "include hidden files"},
 				"gitignore": {"type": "boolean", "description": "respect gitignore"},
 				"limit": {"type": "number", "description": "max results"}
@@ -958,7 +956,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 				"path": {"type": "string", "description": "Local path, internal URI (e.g. skill://), or URL. Inline selectors are supported."},
 				"question": {"type": "string", "description": "Optional question about one image. The active model vision route receives the question and materialized image together."},
 				"i": {"type": "string", "description": "Short present-participle intent for this call."},
-				"notrunc": {"type": "boolean", "description": "Return complete output inline without central truncation."}
+				"notrunc": {"type": "boolean", "description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."}
 			}
 		})
 	);
@@ -971,7 +969,7 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 			"properties": {
 				"input": {"type": "string"},
 				"i": {"type": "string", "description": "Short present-participle intent for this call."},
-				"notrunc": {"type": "boolean", "description": "Return complete output inline without central truncation."}
+				"notrunc": {"type": "boolean", "description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."}
 			}
 		})
 	);
@@ -1380,6 +1378,33 @@ async fn production_eval_covers_bridge_persistence_reset_timeout_cancellation_an
 	};
 	assert!(seed.had_output);
 	assert_eq!(seed.status.outcome, omp_tools::eval::CellOutcome::Complete);
+
+	let rich = invoke_builtin(
+		harness.client(),
+		"eval-await-display",
+		"eval",
+		"1",
+		json!({
+			"language":"py",
+			"code":"import asyncio\nclass Bundle:\n    def _repr_mimebundle_(self):\n        return {'application/json': {'bundle': True}, 'text/plain': 'bundle'}\ndisplay(Bundle())\nawait asyncio.sleep(0, result=state + 2)"
+		}),
+	)
+	.await;
+	assert!(!rich.is_error, "top-level await or MIME bundle display failed");
+	let rich: CallOutcome<eval::Payload, eval::Fault> =
+		serde_json::from_slice(&rich.json).expect("typed rich eval verdict");
+	let CallOutcome::Ok(rich) = rich else {
+		panic!("rich Python eval returned a fault");
+	};
+	assert_eq!(
+		rich.result.and_then(|result| result.json),
+		Some(json!(42)),
+		"top-level await did not preserve the persistent namespace"
+	);
+	assert_eq!(
+		rich.display_outputs,
+		vec![omp_tools::eval::DisplayOutput::Json { data: json!({"bundle": true}) }]
+	);
 
 	let (unrelated, unrelated_task) = harness.connect("eval-unrelated-owner").await;
 	let isolated = invoke_builtin_as(
@@ -2585,10 +2610,23 @@ async fn worker_cancel_forwards_effects_unknown_once_and_respawn_serves_next_req
 	assert_eq!(next_terminal.invocation_id, "worker-next");
 	assert!(!next_terminal.is_error);
 	assert!(!next_terminal.useless);
-	assert_eq!(
-		next_terminal.json,
-		Bytes::from_static(br#"{"kind":"ok","value":{"message":"after cancellation"}}"#,),
-	);
+	let expected = Bytes::from_static(br#"{"kind":"ok","value":{"message":"after cancellation"}}"#);
+	assert_eq!(next_terminal.json, expected);
+	let details = next_terminal
+		.details_blob
+		.as_ref()
+		.expect("worker success retains its canonical outcome artifact");
+	assert_eq!(details.mime, "application/json");
+	assert!(details.inline.is_empty());
+	assert_eq!(details.size, u64::try_from(expected.len()).expect("verdict length fits u64"));
+	let projection = next_terminal
+		.projection
+		.as_ref()
+		.expect("worker success reports exact projection facts");
+	assert_eq!(projection.source_bytes, details.size);
+	assert_eq!(projection.inline_bytes, details.size);
+	assert!(!projection.omitted);
+	assert_eq!(projection.artifact.as_ref(), Some(details));
 	let verdict: CallOutcome<Value, Value> =
 		serde_json::from_slice(&next_terminal.json).expect("decode worker success verdict");
 	assert_eq!(verdict, CallOutcome::Ok(json!({"message": "after cancellation"})));

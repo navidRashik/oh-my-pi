@@ -130,15 +130,29 @@ async fn main() -> ExitCode {
 	match result {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(error) => {
-			// Usage diagnostics are intentionally stack-free and follow the
-			// conventional exit status 2; other execution failures remain 1.
-			eprintln!("{error:?}");
-			if error
-				.downcast_ref::<omp_app::usage_error::CliUsageError>()
-				.is_some()
+			// A signal already committed its durable exit diagnostic. Preserve
+			// the shell status without printing a second, misleading failure.
+			// Usage diagnostics are stack-free and carry their explicit status.
+			if let Some(signal) = error.downcast_ref::<omp_app::exit_diagnostics::SignalExit>() {
+				ExitCode::from(signal.exit_code())
+			} else if let Some(usage) = error.downcast_ref::<omp_app::usage_error::CliUsageError>() {
+				if usage.lowercase() {
+					eprintln!("error: {usage}");
+				} else {
+					eprintln!("Error: {usage}");
+				}
+				ExitCode::from(usage.exit_code())
+			} else if let Some(extension) =
+				error.downcast_ref::<omp_app::ext_cli::ExtensionCliFailure>()
 			{
-				ExitCode::from(2)
+				eprintln!("{error:?}");
+				ExitCode::from(extension.exit_code())
+			} else if let Some(interrupt) =
+				error.downcast_ref::<omp_app::ext_cli::ExtensionInterrupt>()
+			{
+				ExitCode::from(interrupt.exit_code())
 			} else {
+				eprintln!("{error:?}");
 				ExitCode::FAILURE
 			}
 		},

@@ -250,7 +250,7 @@ pub fn compile_search_patterns(
 ) -> Result<SmallVec<Pattern, 2>, PatternError> {
 	let mut compiled = SmallVec::new();
 	match Pattern::try_new(pattern, language) {
-		Ok(pattern) => compiled.push(pattern),
+		Ok(compiled_pattern) => compiled.push(compiled_pattern),
 		// Multi-node fragments (e.g. `"key": $V`) get the same auto-wrap fallback
 		// as the edit path; other errors propagate unchanged.
 		Err(err @ PatternError::MultipleNode(_)) => {
@@ -266,6 +266,9 @@ pub fn compile_search_patterns(
 		if let Some(contextual) = compile_rust_contextual_pattern(trimmed) {
 			compiled.push(contextual);
 		}
+	}
+	if compiled.iter().any(Pattern::has_error) {
+		return Err(PatternError::Parse(pattern.to_owned()));
 	}
 	Ok(compiled)
 }
@@ -349,24 +352,40 @@ pub fn rewrite_source(
 	language: SupportLang,
 	ops: &[CompiledRewrite],
 ) -> Result<(String, u32)> {
-	let mut ast = language.ast_grep(source);
-	let mut replacements = 0_u32;
+	rewrite_source_with_parse_status(source, language, ops)
+		.map(|(source, replacements, _)| (source, replacements))
+}
+
+/// Applies compiled rewrite operations and reports whether the original syntax
+/// tree contained parser error nodes.
+///
+/// Rewrites still apply to structurally valid subtrees when the surrounding
+/// file has parser errors; callers can surface the parse status separately
+/// from the exact replacement result.
+pub fn rewrite_source_with_parse_status(
+	source: &str,
+	language: SupportLang,
+	ops: &[CompiledRewrite],
+) -> Result<(String, u32, bool)> {
+	let ast = language.ast_grep(source);
+	let has_parse_errors = ast.root().dfs().any(|node| node.is_error());
+	let mut edits = Vec::new();
 	for op in ops {
 		for pattern in &op.patterns {
-			let edits = ast.root().replace_all(pattern.clone(), op.out.as_str());
-			if edits.is_empty() {
-				continue;
-			}
-			replacements = replacements.saturating_add(edits.len() as u32);
-			let updated = apply_edits(ast.root().text().as_ref(), &edits)?;
-			ast = language.ast_grep(updated);
+			edits.extend(ast.root().replace_all(pattern.clone(), op.out.as_str()));
 		}
 	}
-	Ok((ast.root().text().into_owned(), replacements))
+	let (updated, replacements) = apply_edits_count(source, &edits)?;
+	Ok((updated, replacements, has_parse_errors))
 }
 
 /// Applies deterministic, non-overlapping ast-grep edits to UTF-8 content.
 pub fn apply_edits(content: &str, edits: &[Edit<String>]) -> Result<String> {
+	apply_edits_count(content, edits).map(|(output, _)| output)
+}
+
+/// Applies deterministic edits and returns the number of unique replacements.
+fn apply_edits_count(content: &str, edits: &[Edit<String>]) -> Result<(String, u32)> {
 	let mut sorted: SmallVec<&Edit<String>, 8> = edits.iter().collect();
 	sorted.sort_unstable_by(|a, b| {
 		a.position
@@ -383,8 +402,9 @@ pub fn apply_edits(content: &str, edits: &[Edit<String>]) -> Result<String> {
 			&& a.inserted_text == b.inserted_text
 	});
 	let mut prev_end = 0usize;
+	let mut prev_start = None;
 	for edit in &sorted {
-		if edit.position < prev_end {
+		if prev_start == Some(edit.position) || edit.position < prev_end {
 			return Err(AstError::OverlappingReplacements);
 		}
 		let end = edit
@@ -399,9 +419,11 @@ pub fn apply_edits(content: &str, edits: &[Edit<String>]) -> Result<String> {
 		}
 		str::from_utf8(&edit.inserted_text)
 			.map_err(|source| AstError::NonUtf8Replacement { source })?;
+		prev_start = Some(edit.position);
 		prev_end = end;
 	}
 
+	let replacements = u32::try_from(sorted.len()).unwrap_or(u32::MAX);
 	let mut output = content.to_string();
 	for edit in sorted.into_iter().rev() {
 		let end = edit.position + edit.deleted_length;
@@ -409,7 +431,7 @@ pub fn apply_edits(content: &str, edits: &[Edit<String>]) -> Result<String> {
 			.expect("replacement UTF-8 was validated before applying edits");
 		output.replace_range(edit.position..end, replacement);
 	}
-	Ok(output)
+	Ok((output, replacements))
 }
 
 /// Walks files, directories, and glob targets, optionally intersecting every
@@ -597,7 +619,10 @@ mod tests {
 	use ast_grep_core::source::Edit;
 	use omp_core::Str;
 
-	use super::{SupportLang, apply_edits, compile_search_patterns};
+	use super::{
+		SupportLang, apply_edits, compile_rewrite_rules, compile_search_patterns,
+		rewrite_source_with_parse_status,
+	};
 
 	#[test]
 	fn compile_search_patterns_compiles_rust_patterns() {
@@ -620,11 +645,72 @@ mod tests {
 	}
 
 	#[test]
+	fn repeated_metavariable_requires_identical_structure_during_rewrite() {
+		let rules = compile_rewrite_rules(
+			&[("$A && $A()".to_owned(), "$A?.()".to_owned())],
+			SupportLang::TypeScript,
+		)
+		.expect("rewrite compiles");
+		let (updated, replacements, parse_errors) = rewrite_source_with_parse_status(
+			"same && same(); left && right();",
+			SupportLang::TypeScript,
+			&rules,
+		)
+		.expect("rewrite succeeds");
+		assert_eq!(updated, "same?.(); left && right();");
+		assert_eq!(replacements, 1);
+		assert!(!parse_errors);
+	}
+
+	#[test]
+	fn rewrite_ops_are_one_exact_non_cascading_transaction() {
+		let rules = compile_rewrite_rules(
+			&[
+				("old($A)".to_owned(), "middle($A)".to_owned()),
+				("middle($A)".to_owned(), "new($A)".to_owned()),
+			],
+			SupportLang::TypeScript,
+		)
+		.expect("rewrites compile");
+		let (updated, replacements, _) =
+			rewrite_source_with_parse_status("old(1);", SupportLang::TypeScript, &rules)
+				.expect("rewrite succeeds");
+		assert_eq!(updated, "middle(1);");
+		assert_eq!(replacements, 1);
+	}
+
+	#[test]
+	fn rewrite_reports_original_parser_error_nodes() {
+		let rules = compile_rewrite_rules(
+			&[("old($A)".to_owned(), "new($A)".to_owned())],
+			SupportLang::TypeScript,
+		)
+		.expect("rewrite compiles");
+		let (_, _, parse_errors) = rewrite_source_with_parse_status(
+			"old(1); const broken = ;",
+			SupportLang::TypeScript,
+			&rules,
+		)
+		.expect("valid subtree rewrites");
+		assert!(parse_errors);
+	}
+
+	#[test]
 	fn apply_edits_rejects_overlaps() {
 		let source = "abcdef";
 		let edits = vec![
 			Edit::<String> { position: 1, deleted_length: 3, inserted_text: b"x".to_vec() },
 			Edit::<String> { position: 2, deleted_length: 1, inserted_text: b"y".to_vec() },
+		];
+		assert!(apply_edits(source, &edits).is_err());
+	}
+
+	#[test]
+	fn apply_edits_rejects_divergent_insertions_at_one_position() {
+		let source = "ab";
+		let edits = vec![
+			Edit::<String> { position: 1, deleted_length: 0, inserted_text: b"x".to_vec() },
+			Edit::<String> { position: 1, deleted_length: 0, inserted_text: b"y".to_vec() },
 		];
 		assert!(apply_edits(source, &edits).is_err());
 	}

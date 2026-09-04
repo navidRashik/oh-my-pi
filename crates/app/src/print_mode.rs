@@ -18,14 +18,13 @@
 
 use std::{
 	fs,
-	io::IsTerminal as _,
 	path::Path,
 	sync::Arc,
 	time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use miette::{IntoDiagnostic as _, miette};
-use omp_agent::{KernelEvent, RunControl, TurnInput, TurnStop, Up};
+use omp_agent::{DispatchError, KernelError, KernelEvent, RunControl, TurnInput, TurnStop, Up};
 use omp_catalog::{ModelKey, RouteId, snapshot::Catalog};
 use omp_core::{FastHashMap, Str, encoding::base64};
 use omp_dom::{Dom, Event, Handle, KnownTag, Node, Op, PropId, PropKey, Sid, StreamOp, Tag, Value};
@@ -34,8 +33,9 @@ use omp_journal::{
 	blob::{BlobRef, BlobStore},
 	data::{Attachment, Genesis},
 };
+use omp_session::{ExitCause, ExitStatus, latest_session_exit};
 use omp_tool::Part;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::AsyncWriteExt as _;
 use tokio_util::sync::CancellationToken;
 use xutf::IntoAnsiStripped as _;
 
@@ -46,11 +46,11 @@ use crate::{
 };
 
 /// Runs prompts through the new durable headless kernel.
-pub async fn run(args: PrintArgs) -> miette::Result<()> {
+pub async fn run(args: PrintArgs, piped_input: Option<Str>) -> miette::Result<()> {
 	// The kernel owns the deadline and journals the terminal assistant before
 	// returning. Wrapping the whole adapter in `timeout` could cancel stdout
 	// between `turn_end` and `agent_end`, producing an invalid NDJSON tail.
-	run_inner(args).await
+	run_inner(args, piped_input).await
 }
 
 /// Output shaping selected by the print flags that are not launch flags.
@@ -59,8 +59,9 @@ struct PrintOptions {
 	print_thoughts: bool,
 }
 
-async fn run_inner(args: PrintArgs) -> miette::Result<()> {
+async fn run_inner(args: PrintArgs, piped_input: Option<Str>) -> miette::Result<()> {
 	let PrintArgs { launch, mode, print_thoughts, follow_ups, shape_transcript: _ } = args;
+	let print_thoughts = print_thoughts && !launch.hide_thinking;
 	let args = PrintOptions { mode, print_thoughts };
 	if launch.from_claude || launch.from_codex {
 		return Err(miette!("print mode does not accept interactive legacy session imports"));
@@ -69,8 +70,8 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 	let ctx = Arc::new(crate::process_ctx(&project)?);
 	let env = LaunchEnv::production(&project, launch.gateway.is_some())?;
 	let launch = Launch::prepare(launch, ctx, env).await?;
-	let initial = initial_prompt(&launch).await?;
-	if initial.is_empty() {
+	let inputs = crate::chat_cmd::launch_input::prepare(&launch, piped_input, follow_ups)?;
+	if inputs.first.is_none() {
 		return Err(
 			CliUsageError::new("print mode requires a prompt or piped standard input").into(),
 		);
@@ -99,9 +100,38 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 		write_json_line(&mut stdout, &session_header_from_path(session.journal_path(), &session_id)?)
 			.await?;
 	}
-	let mut prompts = Vec::with_capacity(1 + follow_ups.len());
-	prompts.push(initial);
-	prompts.extend(follow_ups);
+	if let Some((_, exit)) = latest_session_exit(session.dom())
+		&& exit.status != ExitStatus::Clean
+	{
+		if args.mode == "json" {
+			write_json_line(&mut stdout, &serde_json::json!({"type": "session_exit", "exit": exit}))
+				.await?;
+		} else {
+			let mut stderr = tokio::io::stderr();
+			let message = omp_chat::notices::session_exit::text(&exit)
+				.expect("non-clean exits have a transcript projection");
+			stderr
+				.write_all(message.as_bytes())
+				.await
+				.into_diagnostic()?;
+			stderr.write_all(b"\n").await.into_diagnostic()?;
+			stderr.flush().await.into_diagnostic()?;
+		}
+	}
+	let mut prompts = Vec::with_capacity(1 + inputs.follow_ups.len());
+	let first = inputs.first.expect("print input checked above");
+	prompts.push(TurnInput {
+		text:        first.text,
+		attachments: session
+			.store_attachments(first.attachments)
+			.into_diagnostic()?,
+	});
+	prompts.extend(
+		inputs
+			.follow_ups
+			.into_iter()
+			.map(|text| TurnInput { text, attachments: Vec::new() }),
+	);
 	let first_turn = replica.children(replica.body()).len();
 
 	if args.mode == "text" {
@@ -115,37 +145,48 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 		if args.mode == "json" {
 			write_json_line(&mut stdout, &serde_json::json!({"type":"agent_start"})).await?;
 		}
-		let deadline = launch.max_time.map(|duration| Instant::now() + duration);
-		let control = RunControl::new(CancellationToken::new(), deadline);
-		let turn = kernel.run_turn(
-			&mut session,
-			TurnInput { text: prompt, attachments: Vec::new() },
-			control,
-		);
-		tokio::pin!(turn);
-		let result = loop {
-			tokio::select! {
-				biased;
-				event = events.recv_async() => {
-					if let Ok(event) = event {
-						print_event(&mut stdout, &args, &mut replica, &mut json, event).await?;
-					}
-				},
-				event = kernel_events.recv_async() => {
-					if let Ok(event) = event {
-						print_kernel_event(
-							&mut stdout,
-							&args,
-							&replica,
-							&mut json,
-							&mailbox,
-							event,
-						)
-						.await?;
-					}
-				},
-				result = &mut turn => break result,
-			}
+		let (result, exit_signal) = {
+			let deadline = launch.max_time.map(|duration| Instant::now() + duration);
+			let cancellation = CancellationToken::new();
+			let control = RunControl::new(cancellation.clone(), deadline);
+			let turn = kernel.run_turn(&mut session, prompt, control);
+			tokio::pin!(turn);
+			let signal = crate::chat_cmd::process_signal();
+			tokio::pin!(signal);
+			let mut exit_signal = None;
+			let mut signal_active = true;
+			let result = loop {
+				tokio::select! {
+					biased;
+					event = events.recv_async() => {
+						if let Ok(event) = event {
+							print_event(&mut stdout, &args, &mut replica, &mut json, event).await?;
+						}
+					},
+					signal = &mut signal, if signal_active => {
+						signal_active = false;
+						if let Ok(signal) = signal {
+							cancellation.cancel();
+							exit_signal = Some(signal);
+						}
+					},
+					event = kernel_events.recv_async() => {
+						if let Ok(event) = event {
+							print_kernel_event(
+								&mut stdout,
+								&args,
+								&replica,
+								&mut json,
+								&mailbox,
+								event,
+							)
+							.await?;
+						}
+					},
+					result = &mut turn => break result,
+				}
+			};
+			(result, exit_signal)
 		};
 		// The kernel journals how a turn ended (assistant close + notice)
 		// before returning; those patches are still queued here and the
@@ -164,13 +205,40 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 				.await?;
 		}
 		stdout.flush().await.into_diagnostic()?;
+		if let Some(signal) = exit_signal {
+			session
+				.record_exit(ExitCause::Signal { signal: signal.clone() })
+				.into_diagnostic()?;
+			return Err(crate::exit_diagnostics::SignalExit::new(signal).into());
+		}
 		let stop = match result {
 			Ok(outcome) => outcome.stop,
-			Err(error) => return Err(miette::Report::from_err(error)),
+			Err(error) => {
+				let cause = kernel_exit_cause(&error, launch.model.as_str());
+				session.record_exit(cause).into_diagnostic()?;
+				return Err(miette::Report::from_err(error));
+			},
 		};
 		if stop != TurnStop::Completed {
 			let message = turn_error_message(&replica, submission_turn)
 				.unwrap_or_else(|| Str::new(format!("Request {}", stop_reason_name(stop))));
+			let cause = match stop {
+				TurnStop::Failed => {
+					let (provider, model) = launch
+						.model
+						.as_str()
+						.split_once('/')
+						.map_or((None, Some(launch.model.as_str())), |(provider, model)| {
+							(Some(provider), Some(model))
+						});
+					ExitCause::provider(provider, model, None, Some(message.clone()))
+				},
+				TurnStop::Cancelled | TurnStop::Steered => {
+					ExitCause::Process { exit_code: None, detail: Some(message.clone()) }
+				},
+				TurnStop::Completed => ExitCause::Normal,
+			};
+			session.record_exit(cause).into_diagnostic()?;
 			return Err(miette!("{}", sanitize_text(message.as_str())));
 		}
 		if args.mode == "text"
@@ -194,11 +262,29 @@ async fn run_inner(args: PrintArgs) -> miette::Result<()> {
 		stdout.flush().await.into_diagnostic()?;
 	}
 
+	session.record_exit(ExitCause::Normal).into_diagnostic()?;
 	drop(session);
 	if let Some(path) = ephemeral_path {
 		let _ = fs::remove_file(path);
 	}
 	Ok(())
+}
+
+fn kernel_exit_cause(error: &KernelError, model: &str) -> ExitCause {
+	let detail = Some(Str::new(error.to_string()));
+	let (provider, model) = model
+		.split_once('/')
+		.map_or((None, Some(model)), |(provider, model)| (Some(provider), Some(model)));
+	match error {
+		KernelError::Inference(_) => ExitCause::provider(provider, model, None, detail),
+		KernelError::Dispatch(DispatchError::Join(_)) => {
+			ExitCause::worker(None::<Str>, None, None, detail)
+		},
+		KernelError::Dispatch(_) | KernelError::Registry(_) => {
+			ExitCause::tool(None::<Str>, None::<Str>, detail)
+		},
+		_ => ExitCause::Process { exit_code: None, detail },
+	}
 }
 
 /// pi's stop-reason vocabulary for a turn that did not complete.
@@ -1303,16 +1389,11 @@ fn message_value_impl(dom: &Dom, handle: Handle, state: Option<&JsonState>) -> s
 	if prop_text(Some(node), PropId::StopReason).is_some() {
 		message["completedAt"] = serde_json::json!(node_timestamp_ms(node, PropId::Order));
 	}
-	if matches!(reason, "error" | "aborted") {
-		let text = dom
+	if matches!(reason, "error" | "aborted")
+		&& let Some(text) = dom
 			.parent(handle)
 			.and_then(|turn| turn_failure_notice(dom, turn))
-			.unwrap_or_else(|| {
-				Str::new(format!(
-					"Request {}",
-					prop_text(Some(node), PropId::StopReason).unwrap_or(reason)
-				))
-			});
+	{
 		message["errorMessage"] = serde_json::json!(text);
 	}
 	message
@@ -1720,23 +1801,6 @@ fn tool_name(node: Option<&Node>) -> Option<&str> {
 	}
 }
 
-/// The prompt words (a leading `/template` expanded, pi
-/// `expandPromptTemplate`), else piped standard input.
-async fn initial_prompt(launch: &Launch) -> miette::Result<Str> {
-	if let Some(text) = launch.initial_prompt() {
-		return Ok(text);
-	}
-	if std::io::stdin().is_terminal() {
-		return Ok(Str::default());
-	}
-	let mut input = String::new();
-	tokio::io::stdin()
-		.read_to_string(&mut input)
-		.await
-		.into_diagnostic()?;
-	Ok(Str::new(input))
-}
-
 /// Projects the plain headless transcript from the authoritative session DOM.
 #[must_use]
 pub fn transcript_text(dom: &Dom) -> String {
@@ -1785,6 +1849,7 @@ pub fn transcript_text(dom: &Dom) -> String {
 #[cfg(test)]
 mod tests {
 	use omp_dom::{NodeSpec, Txn};
+	use omp_session::{CrashTail, SessionExit};
 	use serde_json::value::RawValue;
 	use tempfile::tempdir;
 
@@ -1796,6 +1861,29 @@ mod tests {
 			.children(session.dom().body())
 			.last()
 			.expect("turn node")
+	}
+
+	#[test]
+	fn prior_exit_text_keeps_typed_signal_and_tail_detail() {
+		let exit = SessionExit {
+			status:             ExitStatus::Interrupted,
+			cause:              ExitCause::Signal {
+				signal: omp_session::ExitSignal::new("SIGTERM", Some(15)),
+			},
+			recorded_at_ms:     1,
+			crash_tail:         vec![CrashTail::Tool {
+				call_id:       Str::new_static("call-1"),
+				name:          Str::new_static("bash"),
+				intent:        Some(Str::new_static("inspect logs")),
+				argument:      Some(Str::new_static("journalctl -n 20")),
+				started_at_ms: 2,
+			}],
+			crash_tail_omitted: 0,
+		};
+		let text = omp_chat::notices::session_exit::text(&exit).expect("abnormal exit");
+		assert!(text.contains("SIGTERM"));
+		assert!(text.contains("Pending tool bash call-1"));
+		assert!(text.contains("journalctl -n 20"));
 	}
 
 	fn assistant_with(

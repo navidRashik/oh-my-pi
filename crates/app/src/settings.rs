@@ -2,6 +2,30 @@
 
 use omp_core::Str;
 
+/// Release stream selected by the native self-updater.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+	strum::VariantNames,
+)]
+#[strum(serialize_all = "lowercase")]
+pub enum UpdateChannel {
+	/// Published production releases.
+	#[default]
+	Stable,
+	/// Published prerelease builds.
+	Canary,
+}
+
+omp_con::con_enum!(UpdateChannel);
+
 omp_con::var! {
 	/// pi `setupVersion` (number, default: 0).
 	pub static CL_SETUP_VERSION = cl_setup_version: i64 {
@@ -48,8 +72,8 @@ omp_con::var! {
 		flags: archive,
 	};
 	/// pi `update.channel` (enum, default: "stable").
-	pub static CL_UPDATE_CHANNEL = cl_update_channel: Str {
-		default: Str::new_static("stable"),
+	pub static CL_UPDATE_CHANNEL = cl_update_channel: UpdateChannel {
+		default: UpdateChannel::Stable,
 		flags: archive,
 	};
 	/// pi `marketplace.autoUpdate` (enum, default: "notify").

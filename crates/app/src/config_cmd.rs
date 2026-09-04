@@ -8,7 +8,9 @@ use std::{
 };
 
 use miette::IntoDiagnostic as _;
-use omp_con::{Ctx, Origin, RegItem, Source, Span, TypeSpec, Value, ValueKind, VarFlags};
+use omp_con::{
+	Ctx, DumpOptions, Origin, RegItem, Source, Span, TypeSpec, Value, ValueKind, VarFlags,
+};
 use omp_core::Str;
 use omp_envd::mcp::{
 	McpConfigPaths,
@@ -45,16 +47,17 @@ pub fn run(data_dir: &Path, command: &ConfigCommand) -> miette::Result<()> {
 		ConfigCommand::Set { key, value, scope } => set_persisted(&project, *scope, key, value),
 		ConfigCommand::Unset { key, scope } => {
 			let destination = path(&project, *scope)?;
-			let ctx = load_cfg(&destination)?;
-			let RegItem::Var(spec) = ctx
-				.find(key)
-				.ok_or_else(|| miette::miette!("unknown convar `{key}`; run `omp config list`"))?
-			else {
-				return Err(miette::miette!("`{key}` is not a convar"));
-			};
-			ctx.set(spec.name, (spec.default)(), Origin::Archive)
-				.into_diagnostic()?;
-			persist_cfg(&destination, &ctx)
+			update_cfg(&destination, |ctx| {
+				let RegItem::Var(spec) = ctx
+					.find(key)
+					.ok_or_else(|| miette::miette!("unknown convar `{key}`; run `omp config list`"))?
+				else {
+					return Err(miette::miette!("`{key}` is not a convar"));
+				};
+				ctx.set(spec.name, (spec.default)(), Origin::Default)
+					.into_diagnostic()?;
+				Ok(())
+			})
 		},
 		ConfigCommand::Path { scope } => {
 			println!("{}", path(&project, *scope)?.display());
@@ -92,6 +95,18 @@ fn init_xdg(data_dir: &Path, json: bool) -> miette::Result<()> {
 		moved:   Vec::new(),
 		skipped: Vec::new(),
 	};
+	let legacy_mcp = legacy.join("mcp.json");
+	if legacy_mcp.exists() {
+		let destination = omp_core::dirs::config_dir(&home).join("mcp.json");
+		if McpConfigStore::new(destination)
+			.migrate_from(&legacy_mcp)
+			.into_diagnostic()?
+		{
+			report.moved.push(legacy_mcp);
+		} else {
+			report.skipped.push(legacy_mcp);
+		}
+	}
 	for (source, destination) in [
 		(legacy.join("data"), roots.data.clone()),
 		(legacy.join("state"), roots.state.clone()),
@@ -250,7 +265,7 @@ fn run_mcp(user_root: &Path, project: &Path, command: &McpConfigCommand) -> miet
 		McpConfigCommand::Enable { name } | McpConfigCommand::Disable { name } => set_server_enabled(
 			&user,
 			&project_store,
-			Some((&root, true)),
+			Some(&root),
 			name,
 			matches!(command, McpConfigCommand::Enable { .. }),
 		)
@@ -313,6 +328,11 @@ pub fn path(project: &Path, scope: ConfigScope) -> miette::Result<PathBuf> {
 /// reported and dropped, so an edit never fails on a stale variable and the
 /// re-dumped file no longer carries it.
 pub(crate) fn load_cfg(path: &Path) -> miette::Result<Ctx> {
+	let script = omp_driver::cfg::read_config(path).into_diagnostic()?;
+	load_cfg_text(path, script.as_deref())
+}
+
+fn load_cfg_text(path: &Path, script: Option<&str>) -> miette::Result<Ctx> {
 	let ctx = Ctx::new();
 	// The default bind cfg is the baseline the persisted script diffs
 	// against; without it a dump would `unbindall` the defaults away.
@@ -322,11 +342,10 @@ pub(crate) fn load_cfg(path: &Path) -> miette::Result<Ctx> {
 	)
 	.into_diagnostic()?;
 	ctx.seal_bind_defaults();
-	if path.is_file() {
-		let script =
-			omp_driver::cfg::migrate_generated_preamble(&fs::read_to_string(path).into_diagnostic()?);
-		let outcome =
-			ctx.exec_configs(&|name: &str| (name == "config.cfg").then(|| Str::new(&script)), None);
+	if let Some(script) = script {
+		let outcome = ctx
+			.exec_configs(&|name: &str| Ok((name == "config.cfg").then(|| Str::new(script))), None)
+			.into_diagnostic()?;
 		if outcome.failed > 0 {
 			eprintln!(
 				"warning: {} skipped {} statement(s) this build does not understand",
@@ -338,17 +357,37 @@ pub(crate) fn load_cfg(path: &Path) -> miette::Result<Ctx> {
 	Ok(ctx)
 }
 
-pub(crate) fn persist_cfg(path: &Path, ctx: &Ctx) -> miette::Result<()> {
-	if let Some(parent) = path.parent() {
-		fs::create_dir_all(parent).into_diagnostic()?;
-	}
-	let temporary = path.with_extension(format!("cfg.tmp.{}", std::process::id()));
-	fs::write(&temporary, ctx.dump().as_bytes()).into_diagnostic()?;
-	if let Err(source) = fs::rename(&temporary, path) {
-		let _ = fs::remove_file(&temporary);
-		return Err(source).into_diagnostic();
-	}
-	Ok(())
+fn persist_cfg_with_options(path: &Path, ctx: &Ctx, options: DumpOptions) -> miette::Result<()> {
+	let transaction =
+		omp_driver::cfg::ConfigFileLock::acquire(path.to_path_buf()).into_diagnostic()?;
+	transaction
+		.replace(ctx.dump_with_options(options).as_str())
+		.into_diagnostic()
+}
+
+pub(crate) fn update_cfg(
+	path: &Path,
+	update: impl FnOnce(&Ctx) -> miette::Result<()>,
+) -> miette::Result<()> {
+	let transaction =
+		omp_driver::cfg::ConfigFileLock::acquire(path.to_path_buf()).into_diagnostic()?;
+	let current = transaction.read().into_diagnostic()?;
+	let migrated = current
+		.as_deref()
+		.map(|script| omp_driver::cfg::migrate_config_script(path, script))
+		.transpose()
+		.into_diagnostic()?;
+	let ctx = load_cfg_text(path, migrated.as_deref())?;
+	update(&ctx)?;
+	transaction
+		.replace(
+			ctx.dump_with_options(DumpOptions {
+				include_archived_defaults: true,
+				..DumpOptions::default()
+			})
+			.as_str(),
+		)
+		.into_diagnostic()
 }
 
 fn assignment(ctx: &Ctx, name: &str, input: &str) -> miette::Result<String> {
@@ -437,8 +476,9 @@ fn value_at<'a>(document: &'a toml::Table, path: &str) -> Option<&'a toml::Value
 /// stream, scope for scope (ADR 0012): the user `config.toml` (plus
 /// `OMP_CONFIG_FILES` overlays) and legacy keybindings become the user
 /// `config.cfg`; `<project>/.omp/config.toml` becomes
-/// `<project>/.omp/config.cfg`, never a global setting. Returns the user
-/// cfg path.
+/// `<project>/.omp/config.cfg`, never a global setting. A legacy data-root
+/// `mcp.json` moves into the selected user/profile configuration root without
+/// overwriting an existing destination. Returns the user cfg path.
 ///
 /// Re-running migration over unchanged inputs writes identical bytes.
 pub fn migrate_settings(data_dir: &Path, project: &Path) -> miette::Result<PathBuf> {
@@ -455,14 +495,21 @@ pub fn migrate_settings(data_dir: &Path, project: &Path) -> miette::Result<PathB
 		.into_diagnostic()?;
 	user.seal_bind_defaults();
 	migrate_keybindings(data_dir, &user)?;
+	let migration_dump = DumpOptions { include_archived_defaults: true, ..DumpOptions::default() };
 	let destination = crate::config_path().into_diagnostic()?;
-	persist_cfg(&destination, &user)?;
+	persist_cfg_with_options(&destination, &user, migration_dump)?;
+	let user_root = destination
+		.parent()
+		.ok_or_else(|| miette::miette!("user configuration path has no parent directory"))?;
+	McpConfigStore::new(user_root.join("mcp.json"))
+		.migrate_from(&data_dir.join("mcp.json"))
+		.into_diagnostic()?;
 
 	let project_source = project.join(".omp/config.toml");
 	if project_source.is_file() {
 		let scoped = migrate_toml_sources(std::slice::from_ref(&project_source))?;
 		scoped.seal_bind_defaults();
-		persist_cfg(&project.join(".omp/config.cfg"), &scoped)?;
+		persist_cfg_with_options(&project.join(".omp/config.cfg"), &scoped, migration_dump)?;
 	}
 	Ok(destination)
 }
@@ -505,7 +552,7 @@ fn migrate_toml_sources(sources: &[PathBuf]) -> miette::Result<Ctx> {
 			else {
 				return Err(miette::miette!("migration target `{name}` is not a convar"));
 			};
-			ctx.set(spec.name, toml_to_value(value, spec.ty)?, Origin::Archive)
+			ctx.set(spec.name, legacy_toml_value(legacy_path, value, spec.ty)?, Origin::Archive)
 				.into_diagnostic()?;
 		}
 	}
@@ -533,11 +580,12 @@ pub fn set_persisted(
 	value: &str,
 ) -> miette::Result<()> {
 	let destination = path(project, scope)?;
-	let ctx = load_cfg(&destination)?;
-	let assignment = assignment(&ctx, name, value)?;
-	ctx.exec(&assignment, Source::Config(Str::new_static("config.cfg")))
-		.into_diagnostic()?;
-	persist_cfg(&destination, &ctx)
+	update_cfg(&destination, |ctx| {
+		let assignment = assignment(ctx, name, value)?;
+		ctx.exec(&assignment, Source::Config(Str::new_static("config.cfg")))
+			.into_diagnostic()?;
+		Ok(())
+	})
 }
 
 fn migrate_keybindings(data_dir: &Path, ctx: &Ctx) -> miette::Result<()> {
@@ -603,6 +651,24 @@ fn remove_bound_command(ctx: &Ctx, command: &str) -> miette::Result<()> {
 
 fn legacy_action_command(action: &str) -> Option<&'static str> {
 	crate::keybindings::pi_action_command(action)
+}
+
+fn legacy_toml_value(path: &str, value: &toml::Value, ty: &TypeSpec) -> miette::Result<Value> {
+	if matches!(
+		path,
+		"tools.artifactSpillThreshold" | "tools.artifactTailBytes" | "tools.artifactHeadBytes"
+	) {
+		let kibibytes = value
+			.as_float()
+			.or_else(|| value.as_integer().map(|value| value as f64))
+			.ok_or_else(|| miette::miette!("expected numeric kilobyte migration value"))?;
+		let bytes = kibibytes * 1024.0;
+		if !bytes.is_finite() || bytes < 0.0 || bytes > i64::MAX as f64 {
+			return Err(miette::miette!("kilobyte migration value is out of range"));
+		}
+		return Ok(Value::Int(bytes.round() as i64));
+	}
+	toml_to_value(value, ty)
 }
 
 fn toml_to_value(value: &toml::Value, ty: &TypeSpec) -> miette::Result<Value> {

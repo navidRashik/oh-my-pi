@@ -22,7 +22,8 @@ use std::{
 use omp_chat::{
 	HostAction, HostMailbox, SttFailureKind, SttUiEvent,
 	overlays::live::{
-		LiveControl, LiveDevice, LivePhase, LiveTranscript, LiveTranscriptRole, LiveUiEvent,
+		LiveControl, LiveDevice, LiveIceCandidateClass, LiveIcePathFacts, LiveIcePathKind, LivePhase,
+		LiveTranscript, LiveTranscriptRole, LiveUiEvent,
 		MicrophonePermission as LiveMicrophonePermission, level_percent,
 	},
 };
@@ -41,7 +42,11 @@ use omp_voice::{
 		self, AudioDevice, DeviceSnapshot, DeviceWatcher,
 		MicrophonePermission as DeviceMicrophonePermission,
 	},
-	live::{LiveCallbacks, LiveMediaFailure, LiveMediaSession},
+	live::{
+		LiveCallbacks, LiveIceCandidateClass as NativeIceCandidateClass,
+		LiveIcePath as NativeIcePath, LiveIcePathKind as NativeIcePathKind, LiveMediaFailure,
+		LiveMediaSession,
+	},
 	transport::{
 		EventDeduplicator, LiveClientMessage, LiveDelegationAdmission, LiveDelegationBridge,
 		LiveDelegationSettlement, LiveDelegationTerminal, LiveOAuthAccess, LiveProxy, LiveProxyError,
@@ -57,7 +62,8 @@ use url::Url;
 
 use crate::{
 	audio_coordinator::InteractiveAudioController,
-	live_reachability::{LiveFailureClass, diagnose_live_failure},
+	live_path::{LivePathMonitor, LivePathUpdate},
+	live_reachability::{LiveFailureClass, annotate_ice_path, diagnose_live_failure},
 	voice::settings::{
 		CL_LIVE_INPUT_DEVICE, CL_LIVE_OUTPUT_DEVICE, CL_LIVE_VOICE, CL_STT_LANGUAGE, CL_STT_MODEL,
 		CL_STT_SUBMIT_TRIGGER, CL_VOICE_STT_ENABLED, LiveVoice, SttModel, SttSubmitTrigger,
@@ -454,12 +460,14 @@ impl PushToTalk {
 	/// Changes the live-session identity after the controller admits a session
 	/// switch. The old transport is closed because it was authenticated for
 	/// the previous session.
-	pub fn switch_session(&mut self, session_id: Str) -> Option<Str> {
+	pub fn switch_session(&mut self, session_id: Str, ctx: &Ctx) -> Option<Str> {
 		if let Some(runtime) = self.stt.take() {
 			runtime.cancel();
 		}
 		let active = self.delegation.cancel_all();
 		if let Some(live) = self.live.take() {
+			post_live(ctx, LiveUiEvent::IcePath(None));
+			post_live(ctx, LiveUiEvent::Phase(LivePhase::Closing));
 			live.close();
 		}
 		self.session_id = session_id;
@@ -1272,8 +1280,9 @@ impl LiveAttemptFailure {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LiveReconnectSchedule {
-	attempt: u8,
-	delay:   Duration,
+	attempt:  u8,
+	delay:    Duration,
+	deadline: tokio::time::Instant,
 }
 
 #[derive(Default)]
@@ -1304,7 +1313,11 @@ impl LiveReconnectPolicy {
 			.checked_div(1_000)
 			.unwrap_or(LIVE_RECONNECT_MAX_DELAY)
 			.min(LIVE_RECONNECT_MAX_DELAY);
-		Some(LiveReconnectSchedule { attempt: self.attempts, delay })
+		Some(LiveReconnectSchedule {
+			attempt: self.attempts,
+			delay,
+			deadline: tokio::time::Instant::now() + delay,
+		})
 	}
 }
 
@@ -1896,6 +1909,43 @@ impl LiveTranscripts {
 	}
 }
 
+fn post_live_path_update(mailbox: &HostMailbox, update: &LivePathUpdate) {
+	post_mailbox(mailbox, LiveUiEvent::Path(update.facts.clone()));
+}
+
+const fn project_ice_path(path: NativeIcePath) -> LiveIcePathFacts {
+	const fn candidate(candidate: NativeIceCandidateClass) -> LiveIceCandidateClass {
+		match candidate {
+			NativeIceCandidateClass::Host => LiveIceCandidateClass::Host,
+			NativeIceCandidateClass::ServerReflexive => LiveIceCandidateClass::ServerReflexive,
+			NativeIceCandidateClass::PeerReflexive => LiveIceCandidateClass::PeerReflexive,
+			NativeIceCandidateClass::Relay => LiveIceCandidateClass::Relay,
+		}
+	}
+	LiveIcePathFacts {
+		local:  candidate(path.local),
+		remote: candidate(path.remote),
+		kind:   match path.kind {
+			NativeIcePathKind::Direct => LiveIcePathKind::Direct,
+			NativeIcePathKind::Relay => LiveIcePathKind::Relay,
+		},
+	}
+}
+
+fn post_live_ice_path(mailbox: &HostMailbox, path: Option<NativeIcePath>) {
+	post_mailbox(mailbox, LiveUiEvent::IcePath(path.map(project_ice_path)));
+}
+
+fn apply_selected_ice_path(
+	mailbox: &HostMailbox,
+	selected: &mut Option<NativeIcePath>,
+	path: NativeIcePath,
+) {
+	if selected.replace(path) != Some(path) {
+		post_live_ice_path(mailbox, Some(path));
+	}
+}
+
 fn schedule_live_reconnect(
 	mailbox: &HostMailbox,
 	policy: &mut LiveReconnectPolicy,
@@ -1907,8 +1957,10 @@ fn schedule_live_reconnect(
 	}
 	let schedule = policy.schedule(failure, rand::random())?;
 	post_mailbox(mailbox, LiveUiEvent::Reconnect {
-		attempt: schedule.attempt,
-		maximum: LIVE_RECONNECT_ATTEMPTS,
+		attempt:  schedule.attempt,
+		maximum:  LIVE_RECONNECT_ATTEMPTS,
+		delay:    schedule.delay,
+		deadline: schedule.deadline.into_std(),
 	});
 	Some(schedule)
 }
@@ -1942,22 +1994,33 @@ async fn run_live_transport(
 	let mut reconnect = LiveReconnectPolicy::default();
 	let mut pending_retry: Option<LiveReconnectSchedule> = None;
 	let mut ever_established = false;
+	let path_monitor = LivePathMonitor::start();
 
 	loop {
+		if pending_retry.is_none() {
+			while let Some(update) = path_monitor.try_changed() {
+				post_live_path_update(&mailbox, &update);
+			}
+		}
 		speaking.store(false, Ordering::Release);
 		if let Some(schedule) = pending_retry.take() {
 			let baseline = LiveNetworkSignature::capture();
-			let deadline = tokio::time::Instant::now() + schedule.delay;
-			let sleep = tokio::time::sleep_until(deadline);
+			let sleep = tokio::time::sleep_until(schedule.deadline);
 			tokio::pin!(sleep);
 			let mut network_poll = tokio::time::interval(LIVE_NETWORK_POLL);
 			network_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-			'retry_wait: loop {
+			let interrupted = 'retry_wait: loop {
 				tokio::select! {
-					() = &mut sleep => break 'retry_wait,
+					() = &mut sleep => break 'retry_wait false,
 					_ = network_poll.tick() => {
 						if LiveNetworkSignature::capture() != baseline {
-							break 'retry_wait;
+							break 'retry_wait true;
+						}
+					},
+					path = path_monitor.changed() => {
+						post_live_path_update(&mailbox, &path);
+						if path.route_changed && path.facts.available {
+							break 'retry_wait true;
 						}
 					},
 					command = commands.recv_async() => match command {
@@ -1966,20 +2029,23 @@ async fn run_live_transport(
 						Ok(LiveRuntimeCommand::SelectInputDevice(next)) => {
 							rollback_selection = committed.clone();
 							selected.input = next;
-							break 'retry_wait;
+							break 'retry_wait true;
 						},
 						Ok(LiveRuntimeCommand::SelectOutputDevice(next)) => {
 							rollback_selection = committed.clone();
 							selected.output = next;
-							break 'retry_wait;
+							break 'retry_wait true;
 						},
-						Ok(LiveRuntimeCommand::Reconnect) => break 'retry_wait,
+						Ok(LiveRuntimeCommand::Reconnect) => break 'retry_wait true,
 						Ok(LiveRuntimeCommand::Close) | Err(_) => {
 							post_mailbox(&mailbox, LiveUiEvent::Closed);
 							return;
 						},
 					},
 				}
+			};
+			if interrupted {
+				post_mailbox(&mailbox, LiveUiEvent::Phase(LivePhase::Reconnecting));
 			}
 		}
 
@@ -2071,6 +2137,9 @@ async fn run_live_transport(
 			}),
 		);
 
+		post_live_ice_path(&mailbox, None);
+		let mut selected_ice_path = None;
+		let (ice_paths, ice_path_rx) = flume::unbounded();
 		let (events, event_rx) = flume::unbounded();
 		let event_tx = events.clone();
 		let input_tx = events.clone();
@@ -2085,6 +2154,9 @@ async fn run_live_transport(
 			}),
 			output_level: Box::new(move |level| {
 				let _ = output_tx.send(LiveRuntimeEvent::OutputLevel(level));
+			}),
+			ice_path:     Box::new(move |path| {
+				let _ = ice_paths.send(path);
 			}),
 			failure:      Box::new(move |failure| {
 				let _ = failure_tx.send(LiveRuntimeEvent::Failure(failure));
@@ -2132,10 +2204,7 @@ async fn run_live_transport(
 					post_device_snapshot(Some(&mailbox), &snapshot, &selected);
 					reconnect.reset();
 					reconnect.attempts = 1;
-					post_mailbox(&mailbox, LiveUiEvent::Reconnect {
-						attempt: 1,
-						maximum: LIVE_RECONNECT_ATTEMPTS,
-					});
+					post_mailbox(&mailbox, LiveUiEvent::Phase(LivePhase::Reconnecting));
 					continue;
 				}
 				let class = classify_voice_failure(&error);
@@ -2231,6 +2300,18 @@ async fn run_live_transport(
 						break None;
 					}
 				},
+				path = path_monitor.changed() => {
+					post_live_path_update(&mailbox, &path);
+					if path.route_changed {
+						network_reconnect_requested = true;
+						break None;
+					}
+				},
+				path = ice_path_rx.recv_async() => {
+					if let Ok(path) = path {
+						apply_selected_ice_path(&mailbox, &mut selected_ice_path, path);
+					}
+				},
 				changed = watcher.changed() => match changed {
 					Some(Ok(next)) if next != snapshot => {
 						let previous = snapshot.clone();
@@ -2286,11 +2367,13 @@ async fn run_live_transport(
 		drop(establishing);
 		if close_requested {
 			media.close().await;
+			post_live_ice_path(&mailbox, None);
 			post_mailbox(&mailbox, LiveUiEvent::Closed);
 			return;
 		}
 		if let Some(failure) = setup_failure {
 			media.close().await;
+			post_live_ice_path(&mailbox, None);
 			if let Some(schedule) =
 				schedule_live_reconnect(&mailbox, &mut reconnect, &failure, ever_established)
 			{
@@ -2302,13 +2385,11 @@ async fn run_live_transport(
 		}
 		let Some(established) = established else {
 			media.close().await;
+			post_live_ice_path(&mailbox, None);
 			if manual_reconnect || device_restart_requested || network_reconnect_requested {
 				reconnect.reset();
 				reconnect.attempts = 1;
-				post_mailbox(&mailbox, LiveUiEvent::Reconnect {
-					attempt: 1,
-					maximum: LIVE_RECONNECT_ATTEMPTS,
-				});
+				post_mailbox(&mailbox, LiveUiEvent::Phase(LivePhase::Reconnecting));
 			}
 			if device_restart_requested {
 				post_device_snapshot(Some(&mailbox), &snapshot, &selected);
@@ -2324,6 +2405,8 @@ async fn run_live_transport(
 				let class = classify_transport_failure(&error);
 				let diagnostic =
 					diagnose_live_failure(&destination, options.proxy.as_ref(), class).await;
+				let diagnostic = annotate_ice_path(diagnostic, selected_ice_path);
+				post_live_ice_path(&mailbox, None);
 				let failure = LiveAttemptFailure::new(diagnostic.class, diagnostic.message);
 				if let Some(schedule) =
 					schedule_live_reconnect(&mailbox, &mut reconnect, &failure, ever_established)
@@ -2411,6 +2494,17 @@ async fn run_live_transport(
 					_ = network_poll.tick() => {
 						if LiveNetworkSignature::capture() != network_signature {
 							break LiveAttemptExit::Reconnect;
+						}
+					},
+					path = path_monitor.changed() => {
+						post_live_path_update(&mailbox, &path);
+						if path.route_changed {
+							break LiveAttemptExit::Reconnect;
+						}
+					},
+					path = ice_path_rx.recv_async() => {
+						if let Ok(path) = path {
+							apply_selected_ice_path(&mailbox, &mut selected_ice_path, path);
 						}
 					},
 					changed = watcher.changed() => match changed {
@@ -2558,22 +2652,17 @@ async fn run_live_transport(
 		}
 		let _ = tokio::time::timeout(LIVE_CLOSE_TIMEOUT, transport.sideband_mut().close(None)).await;
 		transport.close().await;
+		post_live_ice_path(&mailbox, None);
 		match exit {
 			LiveAttemptExit::Reconnect => {
 				reconnect.reset();
 				reconnect.attempts = 1;
-				post_mailbox(&mailbox, LiveUiEvent::Reconnect {
-					attempt: 1,
-					maximum: LIVE_RECONNECT_ATTEMPTS,
-				});
+				post_mailbox(&mailbox, LiveUiEvent::Phase(LivePhase::Reconnecting));
 			},
 			LiveAttemptExit::RestartDevices => {
 				reconnect.reset();
 				reconnect.attempts = 1;
-				post_mailbox(&mailbox, LiveUiEvent::Reconnect {
-					attempt: 1,
-					maximum: LIVE_RECONNECT_ATTEMPTS,
-				});
+				post_mailbox(&mailbox, LiveUiEvent::Phase(LivePhase::Reconnecting));
 				post_device_snapshot(Some(&mailbox), &snapshot, &selected);
 			},
 			LiveAttemptExit::Close => {
@@ -2583,6 +2672,7 @@ async fn run_live_transport(
 			LiveAttemptExit::Failed(failure) => {
 				let diagnostic =
 					diagnose_live_failure(&destination, options.proxy.as_ref(), failure.class).await;
+				let diagnostic = annotate_ice_path(diagnostic, selected_ice_path);
 				let failure = LiveAttemptFailure::new(diagnostic.class, diagnostic.message);
 				if let Some(schedule) =
 					schedule_live_reconnect(&mailbox, &mut reconnect, &failure, ever_established)
@@ -2761,6 +2851,50 @@ mod tests {
 		policy.reset();
 		assert!(policy.schedule(&terminal, 0).is_none());
 		assert_eq!(policy.attempts, 0);
+	}
+
+	#[test]
+	fn native_ice_path_projection_retains_only_classes_and_aggregate() {
+		let projected = project_ice_path(NativeIcePath {
+			local:  NativeIceCandidateClass::ServerReflexive,
+			remote: NativeIceCandidateClass::Relay,
+			kind:   NativeIcePathKind::Relay,
+		});
+		assert_eq!(projected, LiveIcePathFacts {
+			local:  LiveIceCandidateClass::ServerReflexive,
+			remote: LiveIceCandidateClass::Relay,
+			kind:   LiveIcePathKind::Relay,
+		});
+		let debug = format!("{projected:?}");
+		for sensitive in ["192.0.2.", ":3478", "credential", "password", "ssid"] {
+			assert!(!debug.to_ascii_lowercase().contains(sensitive));
+		}
+	}
+
+	#[tokio::test]
+	async fn session_switch_resets_the_selected_ice_path_before_closing() {
+		let ctx = Arc::new(HostMailbox::new().attach(omp_con::Ctx::builder()).build());
+		let audio = InteractiveAudioController::new(Arc::clone(&ctx));
+		let mut controller =
+			PushToTalk::new(audio, Arc::clone(&ctx), None, Str::new_static("old-session"));
+		let (commands, command_rx) = flume::unbounded();
+		controller.live = Some(LiveRuntime {
+			commands,
+			task: tokio::spawn(async {}),
+			muted: false,
+			speaking: Arc::new(AtomicBool::new(false)),
+		});
+
+		controller.switch_session(Str::new_static("new-session"), &ctx);
+		let mailbox = ctx.user::<HostMailbox>().expect("attached mailbox");
+		let events = mailbox.drain().collect::<Vec<_>>();
+		assert_eq!(events.len(), 2);
+		assert!(matches!(events.first(), Some(HostAction::LiveEvent(LiveUiEvent::IcePath(None)))));
+		assert!(matches!(
+			events.get(1),
+			Some(HostAction::LiveEvent(LiveUiEvent::Phase(LivePhase::Closing)))
+		));
+		assert!(matches!(command_rx.try_recv().expect("close command"), LiveRuntimeCommand::Close));
 	}
 
 	#[test]

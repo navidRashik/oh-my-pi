@@ -10,15 +10,16 @@ use omp_core::Str;
 use omp_ext::{
 	Layer as BackendLayer,
 	index::SignedIndex,
-	lock::{InstalledRecord, LockFile},
+	lock::InstalledRecord,
 	marketplace::{
 		MarketplaceCatalog, MarketplacePlugin, PluginSource, contained_plugin_path, parse_catalog,
 	},
 	resolver::compare_versions,
+	trust::{GrantsFile, grant_covers},
 };
 use serde::{Deserialize, Serialize};
 
-use super::{Scope, StatePaths};
+use super::{Scope, StatePaths, read_lock_or_empty};
 
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 
@@ -115,6 +116,10 @@ pub(crate) struct InstalledExtensionView {
 	pub(crate) tier:        omp_ext::TrustTier,
 	pub(crate) source:      toml::Value,
 	pub(crate) features:    Vec<Str>,
+	pub(crate) publisher:   Option<Str>,
+	pub(crate) artifact:    Option<Str>,
+	pub(crate) capability:  Option<Str>,
+	pub(crate) admitted:    bool,
 }
 
 /// One committed extension upgrade.
@@ -853,6 +858,10 @@ fn plugin_views(state: &StatePaths) -> miette::Result<Vec<InstalledExtensionView
 					tier: omp_ext::TrustTier::Sandboxed,
 					source: toml::Value::String(entry.install_path.display().to_string()),
 					features: Vec::new(),
+					publisher: None,
+					artifact: None,
+					capability: None,
+					admitted: entry.enabled,
 				});
 			}
 		}
@@ -898,28 +907,62 @@ fn project_catalog(
 
 fn read_catalog(state: &StatePaths) -> miette::Result<SignedIndex> {
 	let key = fs::read_to_string(&state.index_key).into_diagnostic()?;
-	SignedIndex::read(&state.index_snapshot, key.trim()).map_err(|error| miette!("{error}"))
+	SignedIndex::read(&state.index_snapshot, key.trim()).map_err(super::extension_failure)
 }
 
 pub(crate) fn installed_views(state: &StatePaths) -> miette::Result<Vec<InstalledExtensionView>> {
 	let client =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
+		InstalledRecord::read(&state.client_installed).map_err(super::extension_failure)?;
 	let workspace =
-		InstalledRecord::read(&state.workspace_installed).map_err(|error| miette!("{error}"))?;
-	let client_versions = versions(&state.client_lock, BackendLayer::Client)?;
-	let workspace_versions = versions(&state.workspace_lock, BackendLayer::Workspace)?;
+		InstalledRecord::read(&state.workspace_installed).map_err(super::extension_failure)?;
+	let client_lock = read_lock_or_empty(&state.client_lock, BackendLayer::Client)?;
+	let workspace_lock = read_lock_or_empty(&state.workspace_lock, BackendLayer::Workspace)?;
+	let grants = GrantsFile::read(&state.grants).map_err(super::extension_failure)?;
 	let project_ids = workspace
 		.extensions
 		.iter()
-		.filter(|entry| entry.enabled)
+		.filter(|entry| {
+			entry.enabled
+				&& workspace_lock
+					.extensions
+					.iter()
+					.find(|locked| locked.id == entry.id)
+					.is_none_or(|locked| {
+						grant_covers(
+							&grants,
+							&locked.id,
+							&locked.publisher,
+							BackendLayer::Workspace,
+							Some(&state.workspace),
+							&locked.capability_digest,
+							locked.tier,
+							&locked.ship,
+						)
+					})
+		})
 		.map(|entry| entry.id.clone())
 		.collect::<std::collections::BTreeSet<_>>();
 	let mut entries = Vec::with_capacity(client.extensions.len() + workspace.extensions.len());
 	entries.extend(client.extensions.into_iter().map(|entry| {
-		let version = client_versions
-			.get(&entry.id)
-			.cloned()
+		let locked = client_lock
+			.extensions
+			.iter()
+			.find(|locked| locked.id == entry.id);
+		let version = locked
+			.map(|locked| locked.version.clone())
 			.or_else(|| source_version(&entry.source));
+		let admitted = !entry.enabled || locked.is_none_or(|locked| {
+			grant_covers(
+				&grants,
+				&locked.id,
+				&locked.publisher,
+				BackendLayer::Client,
+				None,
+				&locked.capability_digest,
+				locked.tier,
+				&locked.ship,
+			)
+		});
 		InstalledExtensionView {
 			version,
 			marketplace: source_index(&entry.source),
@@ -930,13 +973,32 @@ pub(crate) fn installed_views(state: &StatePaths) -> miette::Result<Vec<Installe
 			tier: entry.tier,
 			source: entry.source,
 			features: entry.features,
+			publisher: locked.map(|locked| locked.publisher.clone()),
+			artifact: locked.map(|locked| locked.wheel.blake3.clone()),
+			capability: locked.map(|locked| locked.capability_digest.clone()),
+			admitted,
 		}
 	}));
 	entries.extend(workspace.extensions.into_iter().map(|entry| {
-		let version = workspace_versions
-			.get(&entry.id)
-			.cloned()
+		let locked = workspace_lock
+			.extensions
+			.iter()
+			.find(|locked| locked.id == entry.id);
+		let version = locked
+			.map(|locked| locked.version.clone())
 			.or_else(|| source_version(&entry.source));
+		let admitted = !entry.enabled || locked.is_none_or(|locked| {
+			grant_covers(
+				&grants,
+				&locked.id,
+				&locked.publisher,
+				BackendLayer::Workspace,
+				Some(&state.workspace),
+				&locked.capability_digest,
+				locked.tier,
+				&locked.ship,
+			)
+		});
 		InstalledExtensionView {
 			version,
 			marketplace: source_index(&entry.source),
@@ -947,6 +1009,10 @@ pub(crate) fn installed_views(state: &StatePaths) -> miette::Result<Vec<Installe
 			tier: entry.tier,
 			source: entry.source,
 			features: entry.features,
+			publisher: locked.map(|locked| locked.publisher.clone()),
+			artifact: locked.map(|locked| locked.wheel.blake3.clone()),
+			capability: locked.map(|locked| locked.capability_digest.clone()),
+			admitted,
 		}
 	}));
 	entries.sort_by(|left, right| {
@@ -972,18 +1038,6 @@ const fn scope_order(scope: Scope) -> u8 {
 		Scope::User => 1,
 		Scope::Project => 0,
 	}
-}
-
-fn versions(path: &Path, layer: BackendLayer) -> miette::Result<BTreeMap<Str, Str>> {
-	if !path.exists() {
-		return Ok(BTreeMap::new());
-	}
-	let lock = LockFile::read(path, layer).map_err(|error| miette!("{error}"))?;
-	Ok(lock
-		.extensions
-		.into_iter()
-		.map(|entry| (entry.id, entry.version))
-		.collect())
 }
 
 fn source_version(source: &toml::Value) -> Option<Str> {
