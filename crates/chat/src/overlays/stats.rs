@@ -536,6 +536,7 @@ mod tests {
 				duration_ms:                 Some(1_500),
 				premium_requests_millionths: 0,
 				identity:                    None,
+				recoveries:                  Vec::new(),
 			})
 			.unwrap();
 		let _ = assistant;

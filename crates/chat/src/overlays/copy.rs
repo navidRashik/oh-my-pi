@@ -24,6 +24,7 @@ use crate::{
 	cards::{Component, result_image},
 	markdown::extract_links,
 	notices::{
+		custom,
 		divider::{SummaryDivider, turn_compactions},
 		file_mentions, irc, local, misc, skill,
 	},
@@ -530,28 +531,44 @@ fn notice_copy(kind: &str, node: &Node) -> Option<(Str, Str)> {
 	let content = node.content.as_deref().unwrap_or_default().trim();
 	match kind {
 		"advisor" => {
-			let mut body = StrMut::new("");
-			if let Some(summary) = prop_text(node, PropId::Label) {
-				body.push_str(summary.as_str().trim());
-			}
-			if !content.is_empty() {
-				if !body.is_empty() {
-					body.push_str("\n");
-				}
-				body.push_str(content);
-			}
-			let title = match prop_text(node, PropId::Severity) {
-				Some(severity) => sf!("Advisor [{severity}]"),
-				None => Str::new_static("Advisor"),
+			let message = misc::advisor_message(node)?;
+			let blockers = message
+				.notes
+				.iter()
+				.filter(|entry| entry.severity == omp_journal::data::AdvisorSeverity::Blocker)
+				.count();
+			let title = if blockers == 0 {
+				sf!(
+					"Advisor · {} {}",
+					message.notes.len(),
+					if message.notes.len() == 1 {
+						"note"
+					} else {
+						"notes"
+					}
+				)
+			} else {
+				sf!(
+					"Advisor · {} {} · {blockers} {}",
+					message.notes.len(),
+					if message.notes.len() == 1 {
+						"note"
+					} else {
+						"notes"
+					},
+					if blockers == 1 { "blocker" } else { "blockers" }
+				)
 			};
-			Some((title, body.freeze()))
+			Some((title, misc::advisor_message_text(&message)))
 		},
 		"diagnostics" => {
 			let title = match prop_text(node, PropId::Name) {
 				Some(server) => sf!("Late diagnostics · {server}"),
 				None => Str::new_static("Late diagnostics"),
 			};
-			Some((title, Str::new(content)))
+			let body = omp_session::late_diagnostics::LateDiagnostics::from_node(node)
+				.map_or_else(|| Str::new(content), |diagnostics| diagnostics.body());
+			Some((title, body))
 		},
 		"tangent" => {
 			let body = if content.is_empty() {
@@ -910,10 +927,12 @@ pub fn collect_targets(
 				},
 				// pi `targetCopy` `custom | hookMessage`: the framed message is
 				// its own outline target labeled `message`.
-				Tag::Known(KnownTag::Notice)
-					if prop_text(node, PropId::Kind)
-						.is_some_and(|kind| matches!(kind.as_str(), "custom" | "hook")) =>
+				Tag::Known(KnownTag::Notice | KnownTag::Developer)
+					if custom::message_kind(node).is_some() =>
 				{
+					if !custom::displayed(node) {
+						continue;
+					}
 					targets.extend(open.take());
 					let body = node.content.clone().unwrap_or_default();
 					if body.trim().is_empty() {
@@ -931,7 +950,7 @@ pub fn collect_targets(
 				// pi `custom` messages with their own cards (advisor notes,
 				// late diagnostics, `/tan` breadcrumbs): outline targets
 				// labeled `message` whose clipboard text is the card's text.
-				Tag::Known(KnownTag::Notice) => {
+				Tag::Known(KnownTag::Notice | KnownTag::Developer) => {
 					let Some((title, body)) =
 						prop_text(node, PropId::Kind).and_then(|kind| notice_copy(kind.as_str(), node))
 					else {
@@ -1312,6 +1331,7 @@ mod tests {
 		ASSISTANT_CONTENT_TAG, ComponentRegistry, PROVIDER_BLOCK_INDEX_PROP, Session,
 	};
 	use omp_tui::{Mods, Mouse, MouseButton, frame_text};
+	use smallvec::smallvec;
 
 	use super::*;
 
@@ -1704,6 +1724,45 @@ mod tests {
 	/// displayed transcript entry is an outline target the picker can reach
 	/// and copy, in transcript order (the divider lands after its turn).
 	#[test]
+	fn typed_advisor_copy_preserves_every_note_and_attribution() {
+		let message = omp_journal::data::AdvisorMessage {
+			notes: vec![
+				omp_journal::data::AdvisorNote {
+					advisor:  Str::new_static("security"),
+					severity: omp_journal::data::AdvisorSeverity::Blocker,
+					note:     Str::new_static("Do not expose the token."),
+				},
+				omp_journal::data::AdvisorNote {
+					advisor:  Str::new_static("performance"),
+					severity: omp_journal::data::AdvisorSeverity::Concern,
+					note:     Str::new_static("Keep append cost linear."),
+				},
+			],
+		};
+		let node = Node {
+			tag:     Tag::Known(KnownTag::Notice),
+			props:   smallvec![
+				(PropId::Kind.into(), Value::Str(Str::new_static("advisor"))),
+				(
+					PropId::Data.into(),
+					Value::Json(
+						serde_json::value::to_raw_value(&message).expect("advisor payload serializes"),
+					),
+				),
+			],
+			kids:    Vec::new(),
+			content: Some(Str::new_static("fallback")),
+		};
+		let (title, body) = notice_copy("advisor", &node).expect("advisor is copyable");
+		assert_eq!(title, "Advisor · 2 notes · 1 blocker");
+		assert_eq!(
+			body,
+			"[blocker] [security] Do not expose the token.\n[concern] [performance] Keep append cost \
+			 linear."
+		);
+	}
+
+	#[test]
 	fn summary_dividers_and_custom_notices_are_copy_targets() {
 		use omp_dom::{NodeSpec, Op, Txn};
 		use omp_journal::{blob::BlobStore, data::Compaction};
@@ -1731,6 +1790,7 @@ mod tests {
 				tokens_before: Some(256_000),
 				tokens_after: Some(20_000),
 				warning: None,
+				frames: Vec::new(),
 			})
 			.expect("compaction");
 		let mut notice = |kind: &'static str, props: &[(PropId, &str)], content: Option<&str>| {
@@ -1786,7 +1846,8 @@ mod tests {
 		assert!(targets[1].blocks.is_empty());
 		assert_eq!(
 			targets[3].content,
-			"Tests are missing\nThe parser change has no coverage.\nSee [the plan](https://example.com/plan)."
+			"[concern] Tests are missing\nThe parser change has no coverage.\nSee [the \
+			 plan](https://example.com/plan)."
 		);
 		assert_eq!(
 			targets[3]
@@ -1815,6 +1876,56 @@ mod tests {
 			PanelEvent::Copy(Str::new_static("Earlier: wired the parser.")),
 			"enter copies the outlined summary"
 		);
+	}
+
+	#[test]
+	fn normalized_legacy_handoff_is_copied_as_a_handoff_summary() {
+		use omp_dom::{NodeSpec, Op, PropKey, Txn};
+
+		let directory = tempfile::tempdir().expect("temp directory");
+		let mut session =
+			Session::create(directory.path().join("handoff.oms"), ComponentRegistry::standard())
+				.expect("session");
+		session.begin_turn().expect("turn starts");
+		session
+			.user("old context", Vec::new())
+			.expect("user appends");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		session
+			.patch(Txn {
+				cause: session.head().expect("head"),
+				label: Some(Str::new_static("legacy.custom-message")),
+				ops:   vec![Op::Ins {
+					parent: turn,
+					after:  session.dom().children(turn).last().copied(),
+					node:   NodeSpec::new(KnownTag::Developer)
+						.with_prop(PropId::Kind, Value::Str(Str::new_static("custom")))
+						.with_prop(PropId::Name, Value::Str(Str::new_static("handoff")))
+						.with_prop(
+							PropKey::Custom(Str::new_static(omp_session::custom_message::DISPLAY_PROP)),
+							Value::Bool(true),
+						)
+						.with_content(
+							"preamble<handoff-context>\n# Goal\nKeep the \
+							 branch.\n</handoff-context>trailer",
+						),
+				}],
+			})
+			.expect("legacy handoff appends");
+
+		let targets = collect_targets(session.dom(), false, true, true);
+		let handoff = targets.last().expect("handoff target");
+		assert_eq!(handoff.label, "summary");
+		assert_eq!(handoff.content, "# Goal\nKeep the branch.");
+		let Segment::Summary(divider) = &handoff.segments[0] else {
+			panic!("handoff projects through the ordinary summary segment");
+		};
+		assert_eq!(divider.label, "handed-off");
+		assert_eq!(divider.detail, "**Handoff context**\n\n# Goal\nKeep the branch.");
 	}
 
 	/// pi `extractBlocks`: an unclosed fence is ordinary text — no phantom

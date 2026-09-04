@@ -1,4 +1,4 @@
-//! Typed card for `ast_edit@1`.
+//! Typed card for `ast_edit@2`.
 
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
@@ -58,8 +58,13 @@ impl Card for AstEditCard {
 				|| value.get("applied").and_then(Value::as_bool) == Some(true)
 			{
 				"applied"
-			} else {
+			} else if value
+				.get("pending_proposal")
+				.is_some_and(|proposal| !proposal.is_null())
+			{
 				"proposed"
+			} else {
+				"no changes"
 			}
 		});
 		let scope = result
@@ -68,6 +73,7 @@ impl Card for AstEditCard {
 			.and_then(Value::as_str)
 			.unwrap_or_else(|| target.trim_end_matches("/**/*.ts"))
 			.to_owned();
+		let notices = ast_edit_notices(result.as_ref());
 		let fault = diag_text(view).unwrap_or_default();
 		let proposal = state.unwrap_or("proposed");
 		let summary = format!("{replacements} replacements · {file_count} files · in {scope}");
@@ -81,7 +87,9 @@ impl Card for AstEditCard {
 				},
 				CardStatus::Done => {
 					<box border=round bc=border bg=panel bleed pad-x=1 title_pad=3>
-						<row kind=title gap=0><i:success fg=ok/><text>{" "}</text><text fg=accent>{"AST Edit"}</text><text>{":"}</text>
+						<row kind=title gap=0>
+							if notices.is_empty() { <i:success fg=ok/> } else { <i:warning fg=warn/> }
+							<text>{" "}</text><text fg=accent>{"AST Edit"}</text><text>{":"}</text>
 							<text fg=output wrap=pre>{format!(" {pattern}")}</text><text>{" "}</text><text fg=warn>{format!("⟨{proposal}⟩")}</text>
 							<text fg=muted grow truncate>{format!(" {summary}")}</text><text>{" "}</text>
 						</row>
@@ -101,6 +109,9 @@ impl Card for AstEditCard {
 							if !expanded && file_count > 1 {
 								<row gap=1 fg=muted><text>{"…"}</text><text>{(file_count - 1).to_string()}</text><text>{"more"}</text><text>{"change"}</text></row>
 							}
+							for notice in &notices {
+								<row gap=1 fg=warn><i:warning/><text wrap=word>{notice}</text></row>
+							}
 						</col>
 					</box>
 				},
@@ -115,6 +126,63 @@ impl Card for AstEditCard {
 		}
 		.into_component()
 	}
+}
+
+fn ast_edit_notices(result: Option<&Value>) -> Vec<String> {
+	let Some(result) = result else {
+		return Vec::new();
+	};
+	let mut notices = Vec::new();
+	for advisory in result
+		.get("advisories")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+	{
+		let path = advisory
+			.get("path")
+			.and_then(Value::as_str)
+			.unwrap_or_default();
+		let message = advisory
+			.get("message")
+			.and_then(Value::as_str)
+			.unwrap_or_default();
+		notices.push(format!("{path}: {message}"));
+	}
+	for diagnostic in result
+		.get("parse_errors")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(Value::as_str)
+	{
+		notices.push(diagnostic.to_owned());
+	}
+	let visible_advisories = result
+		.get("advisories")
+		.and_then(Value::as_array)
+		.map_or(0, Vec::len) as u64;
+	let visible_parse_errors = result
+		.get("parse_errors")
+		.and_then(Value::as_array)
+		.map_or(0, Vec::len) as u64;
+	let advisory_count = result
+		.get("advisories_total")
+		.and_then(Value::as_u64)
+		.unwrap_or(visible_advisories);
+	let parse_count = result
+		.get("parse_errors_total")
+		.and_then(Value::as_u64)
+		.unwrap_or(visible_parse_errors);
+	let visible_count = visible_advisories + visible_parse_errors;
+	let total_count = advisory_count.saturating_add(parse_count);
+	if total_count > visible_count {
+		notices.push(format!("{} additional diagnostics omitted", total_count - visible_count));
+	}
+	if let Some(id) = result.get("pending_proposal").and_then(Value::as_str) {
+		notices.push(format!("Pending proposal {id}; resolve or reject this exact id"));
+	}
+	notices
 }
 
 fn file_path(file: &Value) -> &str {
@@ -181,4 +249,39 @@ fn diag_text(view: &CardView<'_>) -> Option<String> {
 			.filter(|text| !text.is_empty())
 			.map(str::to_owned)
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use serde_json::json;
+
+	use super::ast_edit_notices;
+
+	#[test]
+	fn notices_preserve_parse_diagnostics_and_exact_proposal_identity() {
+		let result = json!({
+			"advisories": [{"path": "src/unknown", "message": "language unavailable"}],
+			"advisories_total": 2,
+			"parse_errors": ["src/broken.ts: parse error"],
+			"parse_errors_total": 3,
+			"pending_proposal": "pending-action:ast_edit:7"
+		});
+		let notices = ast_edit_notices(Some(&result));
+		assert!(notices.iter().any(|notice| notice.contains("src/unknown")));
+		assert!(
+			notices
+				.iter()
+				.any(|notice| notice.contains("src/broken.ts"))
+		);
+		assert!(
+			notices
+				.iter()
+				.any(|notice| notice == "3 additional diagnostics omitted")
+		);
+		assert!(
+			notices
+				.iter()
+				.any(|notice| notice.contains("pending-action:ast_edit:7"))
+		);
+	}
 }

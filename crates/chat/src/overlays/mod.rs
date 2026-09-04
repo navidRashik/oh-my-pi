@@ -16,17 +16,17 @@ use std::{
 
 use omp_agent::{ApprovalDecision, ApprovalScope, ApprovalSource};
 use omp_con::Ctx;
-use omp_core::{Str, StrMut, sf};
+use omp_core::{FastHashSet, Str, StrMut, sf};
 use omp_dom::{Dom, KnownTag, PropId, PropKey, Tag, Value};
 use omp_tui::{
 	Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, assets::provider_logo, dom,
 };
 
-use crate::host::HostCommand;
+use crate::{history::HistoryEntry, host::HostCommand};
 
 /// `/agents` agent-definition browser.
 pub mod agents;
-/// `ask@1` dialog projected from the running tool element.
+/// `ask@2` dialog projected from the running tool element.
 pub mod ask;
 /// `/copy` transcript picker.
 pub mod copy;
@@ -162,8 +162,8 @@ pub enum PanelEvent {
 	Ask {
 		/// `<ask id>` the dialog was projected from.
 		id:      Str,
-		/// Answers in question order; `None` cancels the tool.
-		answers: Option<Vec<omp_tools::ask::Answer>>,
+		/// Selections in question order; `None` cancels the tool.
+		answers: Option<Vec<omp_tools::ask::Selection>>,
 	},
 	/// Ask the controller for a mutation (ADR 0005: actor input travels back
 	/// as commands; views never own mutations). The panel stays open and
@@ -201,8 +201,15 @@ pub enum PanelNote<'a> {
 	Dom(&'a Dom),
 	/// A controller-run mutation settled.
 	Outcome(&'a Outcome),
-	/// Observer-only realtime voice state changed.
-	Live(&'a live::LiveUiEvent),
+	/// A synchronous settings command settled while its editor remains open.
+	SettingResult {
+		/// Convar named by the originating [`PanelEvent::RunSetting`].
+		convar: &'a str,
+		/// User-facing validation failure, or `None` after a successful write.
+		error:  Option<&'a str>,
+	},
+	/// Observer-only realtime voice state changed at `now` on the host clock.
+	Live(&'a live::LiveUiEvent, Duration),
 }
 
 /// pi panel chords the host lowers before handing a panel the raw key
@@ -389,7 +396,8 @@ const MODEL_HINT: &str =
 const MODEL_ROLE_HINT: &str = "↑/↓ roles · Enter apply role model · type to search · Esc close";
 const MODEL_TASK_HINT: &str =
 	"↑/↓ models · Enter use for task subagents · type to search · Alt+P session model · Esc close";
-const HISTORY_HINT: &str = "↑/↓ prompts · Enter edit · type to search · Esc close";
+const HISTORY_HINT: &str =
+	"↑/↓ prompts · Enter edit · Ctrl+Enter submit · Ctrl+C copy · type search · Esc close";
 const FRAME_ROWS: u16 = 6;
 const CONTEXT_WIDTH: u16 = 62;
 const INPUT_PRICE_WIDTH: u16 = 76;
@@ -480,6 +488,10 @@ pub enum PickerEvent {
 	PickRole(usize),
 	/// Put this prompt text back into the composer.
 	Recall(Str),
+	/// Submit this prompt directly from history.
+	SubmitHistory(Str),
+	/// Copy this prompt while keeping history open.
+	CopyHistory(Str),
 }
 
 /// Retained filterable model picker (pi `app.model.selectTemporary`).
@@ -902,21 +914,33 @@ fn compact_count(value: u64) -> Str {
 
 /// Retained prompt-history picker (pi `app.history.search`, Ctrl+R).
 pub struct HistoryPicker {
-	ui:      Ui,
-	prompts: Vec<Str>,
-	ctx:     UiContext,
-	query:   Str,
-	width:   u16,
-	rows:    u16,
+	ui:       Ui,
+	source:   Vec<HistoryEntry>,
+	entries:  Vec<HistoryEntry>,
+	services: Option<Arc<dyn Services>>,
+	selected: Option<usize>,
+	ctx:      UiContext,
+	query:    Str,
+	width:    u16,
+	rows:     u16,
 }
 
 impl HistoryPicker {
-	/// Opens the picker over `prompts`, newest first.
+	/// Opens the picker over durable entries, newest first.
 	#[must_use]
-	pub fn open(prompts: Vec<Str>, width: u16, ctx: &UiContext) -> Self {
+	pub fn open(
+		entries: Vec<HistoryEntry>,
+		services: Option<Arc<dyn Services>>,
+		width: u16,
+		ctx: &UiContext,
+	) -> Self {
+		let selected = (!entries.is_empty()).then_some(0);
 		let mut picker = Self {
 			ui: Ui::from_root(dom! { <col/> }, width, ctx.clone()),
-			prompts,
+			source: entries.clone(),
+			entries,
+			services,
+			selected,
 			ctx: ctx.clone(),
 			query: Str::default(),
 			width,
@@ -926,14 +950,22 @@ impl HistoryPicker {
 		picker
 	}
 
-	/// Prompts in picker order (newest first).
+	/// Entries in current query order.
 	#[must_use]
-	pub fn prompts(&self) -> &[Str] {
-		&self.prompts
+	pub fn entries(&self) -> &[HistoryEntry] {
+		&self.entries
 	}
 
 	/// Routes a key into the filter and list.
 	pub fn key(&mut self, key: Key) -> PickerEvent {
+		if matches!(key, Key::Ctrl('c') | Key::Copy) {
+			return self.selected_prompt().map_or(PickerEvent::Consumed, PickerEvent::CopyHistory);
+		}
+		if key == Key::FollowUp {
+			return self
+				.selected_prompt()
+				.map_or(PickerEvent::Consumed, PickerEvent::SubmitHistory);
+		}
 		let event = self.ui.handle_key(key);
 		self.route(event)
 	}
@@ -966,51 +998,118 @@ impl HistoryPicker {
 		self.ui.frame()
 	}
 
+	fn selected_prompt(&self) -> Option<Str> {
+		self
+			.selected
+			.and_then(|index| self.entries.get(index))
+			.map(|entry| entry.prompt.clone())
+	}
+
 	fn route(&mut self, event: UiEvent) -> PickerEvent {
 		match event {
 			UiEvent::Cancel => PickerEvent::Close,
+			UiEvent::Highlighted { id, value } if id.as_str() == "prompts" => {
+				self.selected = value.as_str().parse::<usize>().ok();
+				PickerEvent::Consumed
+			},
 			UiEvent::Changed { id, value } if id.as_str() == "prompts" => value
 				.as_str()
 				.parse::<usize>()
 				.ok()
-				.and_then(|index| self.prompts.get(index).cloned())
+				.and_then(|index| self.entries.get(index))
+				.map(|entry| entry.prompt.clone())
 				.map_or(PickerEvent::Consumed, PickerEvent::Recall),
 			UiEvent::Filtered { id, query, .. } if id.as_str() == "prompts" => {
 				self.query = query;
+				self.refresh_entries();
+				// pi resets the cursor to the highest-ranked result after
+				// every query edit.
+				self.selected = (!self.entries.is_empty()).then_some(0);
+				self.rebuild();
 				PickerEvent::Consumed
 			},
 			_ => PickerEvent::Consumed,
 		}
 	}
 
+	fn refresh_entries(&mut self) {
+		let query = self.query.trim();
+		let tokens = history_query_tokens(&query);
+		let mut entries = if query.is_empty() {
+			self
+				.services
+				.as_ref()
+				.and_then(|services| services.history_recent(100).ok())
+				.unwrap_or_default()
+		} else {
+			self
+				.services
+				.as_ref()
+				.and_then(|services| services.history_search(&query, 100).ok())
+				.unwrap_or_default()
+		};
+		let mut seen = entries
+			.iter()
+			.map(|entry| entry.prompt.clone())
+			.collect::<FastHashSet<_>>();
+		for entry in &self.source {
+			if entries.len() == 100 {
+				break;
+			}
+			let matches = query.is_empty()
+				|| (!tokens.is_empty() && {
+					let prompt = entry.prompt.to_lowercase();
+					tokens.iter().all(|token| prompt.contains(token))
+				});
+			if matches && seen.insert(entry.prompt.clone()) {
+				entries.push(entry.clone());
+			}
+		}
+		self.entries = entries;
+	}
+
 	fn rebuild(&mut self) {
 		let seed = self.query.clone();
 		let height = self.rows.saturating_add(1);
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.ok()
+			.and_then(|duration| i64::try_from(duration.as_secs()).ok())
+			.unwrap_or_default();
 		let options = self
-			.prompts
+			.entries
 			.iter()
 			.enumerate()
-			.map(|(index, prompt)| {
-				let first = prompt.lines().next().unwrap_or_default();
-				let more = prompt.lines().count().saturating_sub(1);
+			.map(|(index, entry)| {
+				let first = entry.prompt.lines().next().unwrap_or_default();
+				let more = entry.prompt.lines().count().saturating_sub(1);
 				let label = if more > 0 {
 					sf!("{first} (+{more} lines)")
 				} else {
 					Str::new(first)
 				};
-				(sf!("{index}"), label, prompt.clone())
+				let age = relative_history_time(now, entry.created_at);
+				(sf!("{index}"), label, entry.prompt.clone(), age)
 			})
 			.collect::<Vec<_>>();
+		let empty = options.is_empty();
+		let empty_message = if self.query.is_empty() {
+			"No history yet"
+		} else {
+			"No matching history"
+		};
 		let tree = dom! {
 			<box border=round title="Search History" pad-x=1>
 				<col>
 					<select id="prompts" filter={seed} h={height}>
-						for (value, label, search) in options {
+						for (value, label, search, age) in options {
 							<option value={value} label={search}>
 								<td truncate grow><pre>{label}</pre></td>
+								if let Some(age) = age { <td><pre fg=muted>{age}</pre></td> }
 							</option>
 						}
 					</select>
+					if empty { <text fg=muted>{empty_message}</text> }
 					<hr border=round/>
 					<text fg=muted truncate>{HISTORY_HINT}</text>
 				</col>
@@ -1018,6 +1117,36 @@ impl HistoryPicker {
 		};
 		self.ui = Ui::from_root(tree, self.width, self.ctx.clone());
 	}
+}
+
+fn history_query_tokens(query: &str) -> Vec<String> {
+	query
+		.split(|character: char| !character.is_alphanumeric())
+		.filter(|token| !token.is_empty())
+		.map(str::to_lowercase)
+		.collect()
+}
+
+fn relative_history_time(now: i64, then: i64) -> Option<Str> {
+	if then <= 0 {
+		return None;
+	}
+	let seconds = now.saturating_sub(then).max(0);
+	Some(if seconds < 60 {
+		Str::new_static("now")
+	} else if seconds < 3_600 {
+		sf!("{}m", seconds / 60)
+	} else if seconds < 86_400 {
+		sf!("{}h", seconds / 3_600)
+	} else if seconds < 604_800 {
+		sf!("{}d", seconds / 86_400)
+	} else if seconds < 2_592_000 {
+		sf!("{}w", seconds / 604_800)
+	} else if seconds < 31_536_000 {
+		sf!("{}mo", seconds / 2_592_000)
+	} else {
+		sf!("{}y", seconds / 31_536_000)
+	})
 }
 
 /// Local overlay kind. Overlay state never enters the authoritative DOM.
@@ -1420,17 +1549,77 @@ mod tests {
 	}
 
 	#[test]
-	fn history_picker_recalls_the_selected_prompt() {
-		let prompts = vec![Str::new_static("newest"), Str::new_static("older\nsecond line")];
-		let mut picker = HistoryPicker::open(prompts, 80, &UiContext::default());
+	fn history_picker_searches_recalls_copies_and_submits() {
+		let entries = vec![
+			HistoryEntry {
+				id: 2,
+				prompt: Str::new_static("newest deploy"),
+				created_at: i64::MAX,
+				cwd: None,
+				session_id: Some(Str::new_static("two")),
+			},
+			HistoryEntry {
+				id: 1,
+				prompt: Str::new_static("older\nsecond line"),
+				created_at: 0,
+				cwd: None,
+				session_id: Some(Str::new_static("one")),
+			},
+		];
+		use omp_tui::{Mods, Mouse, MouseButton};
+
+		let mut pointer_picker =
+			HistoryPicker::open(entries.clone(), None, 80, &UiContext::default());
+		let frame = omp_tui::frame_text(pointer_picker.frame(Size::new(80, 30)));
+		let (col, row) = frame
+			.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				let byte = line.find("older")?;
+				Some((omp_tui::cell_width(&line[..byte]), u16::try_from(row).unwrap()))
+			})
+			.expect("older prompt row is painted");
+		assert_eq!(
+			pointer_picker.mouse(MouseReport {
+				kind: Mouse::Click,
+				col,
+				row,
+				button: MouseButton::Left,
+				mods: Mods::default(),
+				pressed: true,
+			}),
+			PickerEvent::Recall(Str::new_static("older\nsecond line"))
+		);
+
+		let mut picker = HistoryPicker::open(entries, None, 80, &UiContext::default());
+		assert_eq!(
+			picker.key(Key::Ctrl('c')),
+			PickerEvent::CopyHistory(Str::new_static("newest deploy"))
+		);
+		assert_eq!(
+			picker.key(Key::FollowUp),
+			PickerEvent::SubmitHistory(Str::new_static("newest deploy"))
+		);
 		assert_eq!(picker.key(Key::Down), PickerEvent::Consumed);
 		assert_eq!(
 			picker.key(Key::Enter),
 			PickerEvent::Recall(Str::new_static("older\nsecond line"))
 		);
+		for character in "deploy".chars() {
+			assert_eq!(picker.key(Key::Char(character)), PickerEvent::Consumed);
+		}
+		assert_eq!(picker.entries().len(), 1);
 		let text = omp_tui::frame_text(picker.frame(Size::new(80, 30)));
 		assert!(text.contains("Search History"), "{text}");
-		assert!(text.contains("(+1 lines)"), "{text}");
+		assert!(text.contains("newest deploy"), "{text}");
+		assert!(!text.contains("(+1 lines)"), "{text}");
+
+		picker.key(Key::Ctrl('u'));
+		for character in "zzzz".chars() {
+			picker.key(Key::Char(character));
+		}
+		let text = omp_tui::frame_text(picker.frame(Size::new(80, 30)));
+		assert!(text.contains("No matching history"), "{text}");
 	}
 
 	#[test]

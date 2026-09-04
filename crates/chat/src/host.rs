@@ -55,7 +55,7 @@ use crate::{
 		Composer, ComposerAction, ComposerEscape, ComposerSettings, DoubleEscapeTarget, PasteOptions,
 		PasteOutcome, PrefixMode, SpaceHold, SpaceHoldEvent,
 	},
-	extension_status::{ExtensionStatusEvent, ExtensionStatuses},
+	extension_status::{ExtensionStatus, ExtensionStatuses},
 	gitwatch::{GitFacts, GitWatch},
 	media::read_attachments,
 	notices::{
@@ -65,7 +65,7 @@ use crate::{
 	},
 	overlays::{
 		HistoryPicker, ModelPicker, ModelRow, Overlay, Overlays, PanelAnchor, PanelCx, PanelEvent,
-		PanelOpener, PickerEvent, QuickRoleRow, Services,
+		PanelNote, PanelOpener, PickerEvent, QuickRoleRow, Services,
 		paste_menu::{PasteChoice, PasteMenu, save_paste_file, wrap_in_attachment_block},
 		services::ActiveUsageRequest,
 	},
@@ -92,6 +92,24 @@ use crate::{
 /// `MAX_URL_SUGGESTIONS`); the provider ranks and trims them.
 const URL_COMPLETION_ROWS: usize = 25;
 
+/// The objective-bearing `/goal` forms that current pi submits as a prompt
+/// after engaging the goal Director. Media remains positional against the
+/// markers in this returned text.
+fn goal_media_prompt(statement: &str) -> Option<Str> {
+	let (command, words) = statement.trim().split_once(char::is_whitespace)?;
+	if command != "goal" {
+		return None;
+	}
+	let words = words.trim();
+	let objective = match words.split_once(char::is_whitespace) {
+		Some(("set", objective)) => objective.trim(),
+		Some(("show" | "pause" | "resume" | "drop" | "budget", _)) => return None,
+		_ if matches!(words, "show" | "pause" | "resume" | "drop" | "budget") => return None,
+		_ => words,
+	};
+	(!objective.is_empty()).then(|| Str::new(objective))
+}
+
 /// Live `<meta><jobs>` agents (`id`, agent class) for `agent://`
 /// completion; the presenter refreshes it as the replica changes.
 type AgentRoster = Arc<Mutex<Vec<(Str, Option<Str>)>>>;
@@ -104,14 +122,15 @@ type AgentRoster = Arc<Mutex<Vec<(Str, Option<Str>)>>>;
 fn url_completer(services: &Arc<dyn Services>, agents: &AgentRoster) -> UrlCompleter {
 	let services = Arc::clone(services);
 	let agents = Arc::clone(agents);
-	Arc::new(move |scheme: &str| {
-		match services.url_completions(&sf!("{scheme}://"), URL_COMPLETION_ROWS) {
+	Arc::new(move |scheme: &str, query: &str| {
+		match services.url_completions(&sf!("{scheme}://{query}"), URL_COMPLETION_ROWS) {
 			Ok(rows) => {
 				return Some(
 					rows
 						.into_iter()
 						.map(|row| UrlCandidate {
 							value:       row.value,
+							label:       row.label,
 							description: (!row.description.is_empty()).then_some(row.description),
 						})
 						.collect(),
@@ -126,7 +145,13 @@ fn url_completer(services: &Arc<dyn Services>, agents: &AgentRoster) -> UrlCompl
 					.list_local("")
 					.ok()?
 					.into_iter()
-					.map(|value| UrlCandidate { value, description: None })
+					.filter_map(|value| {
+						value.strip_prefix("local://").map(|value| UrlCandidate {
+							value,
+							label: None,
+							description: None,
+						})
+					})
 					.collect(),
 			),
 			"agent" => Some(
@@ -134,7 +159,8 @@ fn url_completer(services: &Arc<dyn Services>, agents: &AgentRoster) -> UrlCompl
 					.lock()
 					.iter()
 					.map(|(id, agent)| UrlCandidate {
-						value:       sf!("agent://{id}"),
+						value:       id.clone(),
+						label:       None,
 						description: agent.clone(),
 					})
 					.collect(),
@@ -385,8 +411,8 @@ pub enum HostCommand {
 	AskAnswer {
 		/// `<ask id>` of the waiting call.
 		id:      Str,
-		/// Answers in question order, or `None` when the user pressed Esc.
-		answers: Option<Vec<omp_tools::ask::Answer>>,
+		/// Selections in question order, or `None` when the user pressed Esc.
+		answers: Option<Vec<omp_tools::ask::Selection>>,
 	},
 	/// Mutate the project checkout on behalf of the Git workbench (stage,
 	/// unstage, apply a patch, discard, commit). The controller runs it and
@@ -417,7 +443,11 @@ pub enum HostCommand {
 		/// Requested operation.
 		op: crate::overlays::hub::AgentOp,
 	},
-	/// Stop the application-owned controller loop.
+	/// Stop the application-owned controller loop because the host received a
+	/// process signal. Unlike [`HostCommand::Quit`], this is journaled as an
+	/// interrupted exit with the exact signal identity.
+	ProcessSignal(omp_session::ExitSignal),
+	/// Stop the application-owned controller loop normally.
 	Quit,
 }
 
@@ -500,6 +530,13 @@ pub enum HostError {
 	/// Terminal lifecycle or geometry failed.
 	#[error(transparent)]
 	Io(#[from] io::Error),
+	/// Leaving terminal application modes failed.
+	#[error("failed to restore the terminal: {source}")]
+	TerminalRestore {
+		/// Underlying terminal failure.
+		#[source]
+		source: io::Error,
+	},
 	/// A controller event could not be applied to the replica.
 	#[error(transparent)]
 	Dom(#[from] omp_dom::DomError),
@@ -630,6 +667,8 @@ pub(crate) struct Presenter {
 	/// Text the composer asked to copy; the terminal loop drains it into
 	/// the clipboard (OSC 52 / native).
 	pub(crate) clipboard: Option<Str>,
+	/// Editor command resolved before terminal ownership is released.
+	pending_editor: Option<Str>,
 	/// Live git facts for the band; `None` outside a checkout. The watch is
 	/// a drop guard: it runs for the presenter's lifetime.
 	#[expect(dead_code, reason = "drop guard keeping the git watcher task alive")]
@@ -908,6 +947,14 @@ enum Pause {
 	DisplayReset,
 }
 
+fn finish_terminal_epoch(
+	run: Result<Pause, HostError>,
+	restore: io::Result<()>,
+) -> Result<Pause, HostError> {
+	restore.map_err(|source| HostError::TerminalRestore { source })?;
+	run
+}
+
 /// pi `handleCtrlC` during shutdown: once the chat has quit and the tty is
 /// restored, a further Ctrl+C (SIGINT) exits the process with 130 at once
 /// instead of waiting for a hanging teardown (a wedged tool, a slow
@@ -921,16 +968,47 @@ fn arm_hard_abort() {
 	});
 }
 
-/// pi `handleCtrlZ`: job-control suspend of the whole process group. A
-/// no-op on platforms without POSIX job control.
-fn suspend_process() {
+/// Failure to suspend the foreground process group.
+#[derive(Debug, Error)]
+enum SuspendError {
+	/// This platform has no POSIX job-control suspend.
+	#[cfg(not(unix))]
+	#[error("Suspend (Ctrl+Z) is not supported on this platform")]
+	Unsupported,
+	/// The operating system refused the uncatchable stop signal.
+	#[cfg(unix)]
+	#[error("Failed to suspend: {source}")]
+	Signal {
+		/// Underlying signal-delivery failure.
+		#[source]
+		source: nix::errno::Errno,
+	},
+}
+
+/// pi `handleCtrlZ`: stop the whole foreground process group with `SIGSTOP`.
+///
+/// `SIGTSTP` is intentionally not used: any Tokio listener installed by a
+/// child-process waiter replaces its default stop action process-wide.
+/// `SIGSTOP` cannot be caught or ignored, so re-entry happens only after the
+/// shell actually resumes the job.
+fn suspend_process() -> Result<(), SuspendError> {
 	#[cfg(unix)]
 	{
-		use nix::{sys::signal, unistd::Pid};
-		if let Err(error) = signal::kill(Pid::from_raw(0), signal::Signal::SIGTSTP) {
-			tracing::warn!(%error, "failed to suspend process group");
-		}
+		use nix::sys::signal;
+		suspend_process_with(|pid, stop| signal::kill(pid, stop))
 	}
+	#[cfg(not(unix))]
+	{
+		Err(SuspendError::Unsupported)
+	}
+}
+
+#[cfg(unix)]
+fn suspend_process_with(
+	send: impl FnOnce(nix::unistd::Pid, nix::sys::signal::Signal) -> Result<(), nix::errno::Errno>,
+) -> Result<(), SuspendError> {
+	send(nix::unistd::Pid::from_raw(0), nix::sys::signal::Signal::SIGSTOP)
+		.map_err(|source| SuspendError::Signal { source })
 }
 
 impl Presenter {
@@ -977,15 +1055,28 @@ impl Presenter {
 			width,
 			options.ui.clone(),
 			facts,
-			slash::roster(&options.con),
+			slash::with_service_completions(
+				slash::roster(&options.con),
+				Arc::clone(&options.services),
+			),
 			url_completer(&options.services, &agents),
 			project_root(&replica).as_deref(),
 		);
-		// pi `setHistoryStorage`: a resumed session's prompts are already
-		// Up/Down history, newest first.
+		// pi `setHistoryStorage`: every editor starts from durable history.
+		// Merge the live session's journal-derived prompts without writing
+		// them back, so a migrated/empty database still recalls a resumed
+		// session and transcript rebuilds never duplicate persistent rows.
+		let mut prompt_history = options
+			.services
+			.history_recent(100)
+			.unwrap_or_default()
+			.into_iter()
+			.map(|entry| entry.prompt)
+			.collect::<Vec<_>>();
 		if resuming {
-			composer.seed_history(crate::overlays::prompt_history(&replica));
+			prompt_history.extend(crate::overlays::prompt_history(&replica));
 		}
+		composer.seed_history(prompt_history);
 		composer.set_spelling_features(spelling_features(&options.con));
 		// A resumed or already-running session starts active (pi derives
 		// `isStreaming` from the session, never from a local edge).
@@ -1044,6 +1135,7 @@ impl Presenter {
 			cycle: options.cycle,
 			last_prompt: None,
 			clipboard: None,
+			pending_editor: None,
 			git_watch,
 			git_facts,
 			welcome: options.welcome,
@@ -1251,12 +1343,7 @@ impl Presenter {
 		let Some(id) = id else {
 			return;
 		};
-		// pi: `ask.timeout` seconds, never inside plan mode.
-		let timeout = (!self.director_engaged(PLAN_DIRECTOR))
-			.then(|| crate::overlays::ask::CL_ASK_TIMEOUT.get(&self.con))
-			.and_then(|seconds| u64::try_from(seconds).ok())
-			.filter(|seconds| *seconds > 0)
-			.map(Duration::from_secs);
+		let timeout = crate::overlays::ask::timeout(&self.panel_cx(self.viewport()));
 		let dialog = crate::overlays::ask::AskDialog::open(
 			id,
 			questions,
@@ -1452,7 +1539,7 @@ impl Presenter {
 			self.superseded.clear();
 			self.dismissed_error = None;
 			self.ask_notified = None;
-			self.extension_status.apply(ExtensionStatusEvent::Reset);
+			self.extension_status.apply(ExtensionStatus::reset());
 			if self.ask_open.take().is_some() {
 				self.overlays.close_id(crate::overlays::ask::ID);
 			}
@@ -1497,7 +1584,7 @@ impl Presenter {
 		self.set_turn_active(active);
 		// pi `sessionName || "Oh My Pi"` / `setSessionTerminalTitle`: a
 		// rename, `/new`, or `/resume` retitles later toasts and the tab.
-		if Self::sets_meta_prop(event, self.replica.meta()) {
+		if Self::sets_session_title(event, self.replica.meta()) {
 			self.sync_session_name();
 		}
 		if was_active
@@ -1516,16 +1603,27 @@ impl Presenter {
 		Ok(())
 	}
 
-	/// Whether `event` replaced the document or set a prop on `<meta>` (the
-	/// session name and prompt facts live there).
-	fn sets_meta_prop(event: &Event, meta: Handle) -> bool {
+	/// Whether `event` establishes an authoritative session title. A reset is
+	/// a session switch; within one session only `<meta name>` is
+	/// authoritative. Ordinary model, cwd, status, and run-state mutations
+	/// must not clear an extension-owned title.
+	fn sets_session_title(event: &Event, meta: Handle) -> bool {
 		match event {
 			Event::Reset { .. } => true,
-			Event::Patch(patch) => patch
-				.ops
-				.iter()
-				.any(|op| matches!(op, Op::Set { h, .. } if *h == meta)),
-			Event::Stream { node, .. } => *node == Some(meta),
+			Event::Patch(patch) => patch.ops.iter().any(|op| {
+				matches!(
+					op,
+					Op::Set {
+						h,
+						prop: PropKey::Known(PropId::Name),
+						..
+					} if *h == meta
+				)
+			}),
+			Event::Stream { node: Some(node), prop: Some(PropKey::Known(PropId::Name)), .. } => {
+				*node == meta
+			},
+			Event::Stream { .. } => false,
 		}
 	}
 
@@ -1713,6 +1811,11 @@ impl Presenter {
 		if key == Key::Ctrl('c') && self.ask_open.is_some() {
 			return Ok(self.interrupt_turn());
 		}
+		if matches!(key, Key::Ctrl('c') | Key::Copy | Key::FollowUp)
+			&& matches!(self.overlays.active(), Some(Overlay::History(_)))
+		{
+			return self.route_unbound_key(key);
+		}
 		if key == Key::Esc && self.ask_open.is_some() {
 			return self.route_unbound_key(key);
 		}
@@ -1742,6 +1845,12 @@ impl Presenter {
 		}
 		if event.pressed && event.key == Some(Key::Ctrl('c')) && self.ask_open.is_some() {
 			return Ok(self.interrupt_turn());
+		}
+		if event.pressed
+			&& matches!(self.overlays.active(), Some(Overlay::History(_)))
+			&& let Some(key @ (Key::Ctrl('c') | Key::Copy | Key::FollowUp)) = event.key
+		{
+			return self.route_unbound_key(key);
 		}
 		if event.pressed && event.key == Some(Key::Esc) && self.ask_open.is_some() {
 			return self.route_unbound_key(Key::Esc);
@@ -2083,6 +2192,22 @@ impl Presenter {
 		self.preview_composer_action(action)
 	}
 
+	/// Commits an accepted editor submission to local recall and the
+	/// controller-owned durable prompt index in one host transition.
+	fn commit_submission(&mut self) -> bool {
+		let history = Str::new(self.composer.text());
+		let committed = self.composer.commit_submission();
+		if committed {
+			let _ = self.services.history_add(history.as_str());
+		}
+		committed
+	}
+
+	fn composer_mouse(&mut self, report: MouseReport) -> Result<Routed, HostError> {
+		let action = self.composer.mouse(report);
+		self.preview_composer_action(action)
+	}
+
 	/// Validates a submission while its exact editor buffer and attachment
 	/// atoms remain staged, then commits only an accepted action.
 	fn preview_composer_action(&mut self, action: ComposerAction) -> Result<Routed, HostError> {
@@ -2100,7 +2225,7 @@ impl Presenter {
 					if self.collab_guest {
 						// Pi consumes host-only local input from a guest rather
 						// than leaving an executable command in its editor.
-						let _ = self.composer.commit_submission();
+						let _ = self.commit_submission();
 						return Ok(self.notice("Local execution is host-only during a collab session"));
 					}
 					if omp_agent::pause_state(&self.replica).active {
@@ -2118,7 +2243,7 @@ impl Presenter {
 						return Ok(self.notice(reason));
 					}
 				}
-				let _ = self.composer.commit_submission();
+				let _ = self.commit_submission();
 				Ok(self.submit(text))
 			},
 			ComposerAction::SubmitWithMedia { text, media } => {
@@ -2132,17 +2257,30 @@ impl Presenter {
 					Ok(attachments) => attachments,
 					Err(error) => return Ok(self.notice(error.to_string())),
 				};
-				let _ = self.composer.commit_submission();
+				let _ = self.commit_submission();
 				Ok(self.submit_with_attachments(text, attachments))
 			},
 			ComposerAction::Command { statement, media } => {
 				if !media.is_empty() {
-					if let Err(error) = read_attachments(&media) {
-						return Ok(self.notice(error.to_string()));
+					let attachments = match read_attachments(&media) {
+						Ok(attachments) => attachments,
+						Err(error) => return Ok(self.notice(error.to_string())),
+					};
+					let Some(prompt) = goal_media_prompt(statement.as_str()) else {
+						return Ok(self.notice("Slash commands do not accept media attachments"));
+					};
+					if self.plan_engaged()
+						|| crate::commands::director_active(&self.replica, crate::commands::VIBE)
+					{
+						// Let the ordinary command path report the exact
+						// conflicting mode while the draft and chips remain staged.
+						return self.run_console(statement.as_str());
 					}
-					return Ok(self.notice("Slash commands do not accept media attachments"));
+					let _ = self.commit_submission();
+					let routed = self.run_console(statement.as_str())?;
+					return Ok(routed.max(self.submit_with_attachments(prompt, attachments)));
 				}
-				let _ = self.composer.commit_submission();
+				let _ = self.commit_submission();
 				self.run_console(statement.as_str())
 			},
 			ComposerAction::Queue { text, media } => {
@@ -2153,7 +2291,7 @@ impl Presenter {
 					Ok(attachments) => attachments,
 					Err(error) => return Ok(self.notice(error.to_string())),
 				};
-				let _ = self.composer.commit_submission();
+				let _ = self.commit_submission();
 				Ok(self.queue_with_attachments(text, attachments))
 			},
 			ComposerAction::Copy(text) => {
@@ -2519,6 +2657,20 @@ impl Presenter {
 		Routed::Repaint
 	}
 
+	fn finish_external_editor(
+		&mut self,
+		result: Result<Option<String>, crate::editor::EditorError>,
+	) {
+		match result {
+			Ok(Some(edited)) => self.composer.replace_edited(&edited),
+			Ok(None) => {},
+			Err(error) => {
+				self.notice(error.to_string());
+			},
+		}
+		self.composer.restore_focus();
+	}
+
 	fn set_collab_status(&mut self, status: Option<CollabStatus>) -> Routed {
 		let guest = status
 			.as_ref()
@@ -2676,14 +2828,34 @@ impl Presenter {
 				}
 			},
 			HostAction::Exit => Routed::Quit,
-			HostAction::Suspend => Routed::Suspend,
+			HostAction::Suspend => {
+				#[cfg(unix)]
+				{
+					Routed::Suspend
+				}
+				#[cfg(not(unix))]
+				{
+					self.notice("Suspend (Ctrl+Z) is not supported on this platform")
+				}
+			},
 			HostAction::DisplayReset => Routed::DisplayReset,
+			HostAction::UpdateAvailable(update) => {
+				if self.transcript.update_available(update) {
+					Routed::RebuildProjection
+				} else {
+					Routed::Ignored
+				}
+			},
 			HostAction::ExtensionStatus(event) => {
 				if self.extension_status.apply(event) && self.sync_status() {
 					Routed::Repaint
 				} else {
 					Routed::Ignored
 				}
+			},
+			HostAction::ExtensionTitle(title) => {
+				self.title.set_extension_title(title.as_str());
+				Routed::Ignored
 			},
 			HostAction::ThinkingCycle => self.cycle_thinking(),
 			HostAction::ModelCycle { backward } => self.cycle_model(backward),
@@ -2753,7 +2925,7 @@ impl Presenter {
 					ComposerAction::Submit(text)
 						if self.turn_active && crate::composer::parse_local_input(&text).is_none() =>
 					{
-						let _ = self.composer.commit_submission();
+						let _ = self.commit_submission();
 						self.queue_with_attachments(text, Vec::new())
 					},
 					// Media chips queue with their text instead of steering
@@ -2764,7 +2936,7 @@ impl Presenter {
 					{
 						match read_attachments(&media) {
 							Ok(attachments) => {
-								let _ = self.composer.commit_submission();
+								let _ = self.commit_submission();
 								self.queue_with_attachments(text, attachments)
 							},
 							Err(error) => self.notice(error.to_string()),
@@ -2806,15 +2978,47 @@ impl Presenter {
 				})
 			},
 			HostAction::HistorySearch => {
-				let prompts = crate::overlays::prompt_history(&self.replica);
-				if prompts.is_empty() {
-					return Ok(self.notice("No prompt history in this session"));
+				let mut entries = self.services.history_recent(100).unwrap_or_default();
+				for (index, prompt) in crate::overlays::prompt_history(&self.replica)
+					.into_iter()
+					.enumerate()
+				{
+					if entries.len() == 100 {
+						break;
+					}
+					if entries.iter().any(|entry| entry.prompt == prompt) {
+						continue;
+					}
+					entries.push(crate::history::HistoryEntry {
+						id: i64::try_from(index)
+							.ok()
+							.and_then(|index| index.checked_add(1))
+							.map_or(i64::MIN, |index| -index),
+						prompt,
+						created_at: 0,
+						cwd: None,
+						session_id: None,
+					});
 				}
-				let picker = HistoryPicker::open(prompts, self.composer.frame().size().width, &self.ui);
+				if entries.is_empty() {
+					return Ok(self.notice("No prompt history yet"));
+				}
+				let picker = HistoryPicker::open(
+					entries,
+					Some(Arc::clone(&self.services)),
+					self.composer.frame().size().width,
+					&self.ui,
+				);
 				self.overlays.show(Overlay::History(picker));
 				Routed::Repaint
 			},
-			HostAction::ExternalEditor => Routed::ExternalEditor,
+			HostAction::ExternalEditor => match crate::editor::configured_editor_command() {
+				Ok(command) => {
+					self.pending_editor = Some(command);
+					Routed::ExternalEditor
+				},
+				Err(error) => self.notice(error.to_string()),
+			},
 			HostAction::Dequeue => self.restore_queued(false),
 			HostAction::PasteImage => {
 				self.clipboard_read = Some(ClipboardRead::Smart);
@@ -2902,9 +3106,10 @@ impl Presenter {
 							.send(HostCommand::LiveVoice(crate::overlays::live::LiveControl::Stop));
 					}
 				}
+				let now = self.clock.elapsed();
 				let panel_event = self
 					.overlays
-					.notify_panels(crate::overlays::PanelNote::Live(&event));
+					.notify_panels(crate::overlays::PanelNote::Live(&event, now));
 				match panel_event {
 					PanelEvent::Ignored => Routed::Repaint,
 					event => self.apply_panel_event(event)?,
@@ -3164,11 +3369,27 @@ impl Presenter {
 			PanelEvent::Run(line) => self.run_console(line.as_str())?.max(Routed::Repaint),
 			PanelEvent::PreviewSetting { convar, value } => self.preview_setting(convar, value),
 			PanelEvent::CancelSettingPreview { convar } => self.cancel_setting_preview(&convar),
-			PanelEvent::RunSetting { convar, line } => {
-				self.commit_setting_preview(&convar);
-				self
-					.run_console(line.as_str())?
-					.max(Routed::RebuildProjection)
+			PanelEvent::RunSetting { convar, line } => match self.run_console(line.as_str()) {
+				Ok(routed) => {
+					self.commit_setting_preview(&convar);
+					let _ = self.overlays.notify_panels(PanelNote::SettingResult {
+						convar: convar.as_str(),
+						error:  None,
+					});
+					routed.max(Routed::RebuildProjection)
+				},
+				Err(error) => {
+					let message = error.to_string();
+					let event = self.overlays.notify_panels(PanelNote::SettingResult {
+						convar: convar.as_str(),
+						error:  Some(&message),
+					});
+					match event {
+						PanelEvent::Ignored => self.notice(message),
+						PanelEvent::Notice(message) => self.notice(message),
+						_ => Routed::Repaint,
+					}
+				},
 			},
 			PanelEvent::Finish(line) => {
 				self.close_overlay();
@@ -3285,6 +3506,16 @@ impl Presenter {
 				self.close_overlay();
 				self.composer.set_text(text.as_str());
 				Routed::Repaint
+			},
+			PickerEvent::SubmitHistory(text) => {
+				self.close_overlay();
+				self.composer.set_text(text.as_str());
+				let action = self.composer.preview_submission();
+				self.preview_composer_action(action)?
+			},
+			PickerEvent::CopyHistory(text) => {
+				self.clipboard = Some(text);
+				self.notice("Copied history prompt")
 			},
 		})
 	}
@@ -3637,6 +3868,18 @@ impl Presenter {
 	}
 }
 
+fn localize_composer_mouse(
+	report: MouseReport,
+	top: u16,
+	width: u16,
+	height: u16,
+) -> Option<MouseReport> {
+	if report.col >= width || report.row < top || report.row >= top.saturating_add(height) {
+		return None;
+	}
+	Some(MouseReport { row: report.row - top, ..report })
+}
+
 /// Projection actor retaining only presentation state and a detached DOM
 /// replica.
 pub struct Host {
@@ -3663,8 +3906,12 @@ impl Host {
 	/// closure.
 	pub async fn run(mut self) -> Result<(), HostError> {
 		loop {
+			// `Terminal::leave` restores the shell title and clears native
+			// progress. These delivery caches belong to one ownership epoch.
+			self.presenter.title.reset_delivery();
+			self.presenter.progress_shown = false;
 			let (caps, probe) = negotiate_async(Duration::from_millis(120)).await;
-			self.presenter.ui = self.presenter.ui.with_terminal_caps(&caps);
+			self.presenter.ui = self.presenter.ui.clone().with_terminal_caps(&caps);
 			self
 				.presenter
 				.composer
@@ -3678,6 +3925,7 @@ impl Host {
 			let mut renderer = Renderer::new(TtyOut::new()?);
 			renderer.apply_caps(&caps)?;
 			let size = terminal.size()?;
+			self.presenter.composer.restore_focus();
 			self.presenter.composer.resize(size.width, size.height);
 			// First entry creates the ledger; re-entry after a suspend, an
 			// external editor, or a display reset keeps it — rows already in
@@ -3687,12 +3935,7 @@ impl Host {
 			}
 			self.reconcile_projection(size);
 			let result = self.event_loop(&mut terminal, &mut renderer, size).await;
-			let leave = terminal.leave();
-			let pause = match (result, leave) {
-				(Err(error), _) => return Err(error),
-				(Ok(_), Err(error)) => return Err(error.into()),
-				(Ok(pause), Ok(())) => pause,
-			};
+			let pause = finish_terminal_epoch(result, terminal.leave())?;
 			// The terminal is fully restored here: the shell, a child editor,
 			// or a fresh probe owns it until the loop re-enters.
 			match pause {
@@ -3700,21 +3943,26 @@ impl Host {
 					arm_hard_abort();
 					return Ok(());
 				},
-				Pause::Suspend => suspend_process(),
+				Pause::Suspend => {
+					if let Err(error) = suspend_process() {
+						self.presenter.notice(error.to_string());
+					}
+				},
 				Pause::ExternalEditor => {
 					// pi `handleExternalEditor`: chips expand to their pasted text
 					// before the draft reaches `$EDITOR`; the result lands verbatim.
 					let draft = self.presenter.composer.text();
-					match crate::editor::edit_draft_detached(
-						&draft,
-						crate::editor::EditorOptions::default(),
-					) {
-						Ok(Some(edited)) => self.presenter.composer.replace_edited(&edited),
-						Ok(None) => {},
-						Err(error) => {
-							self.presenter.notice(error.to_string());
-						},
-					}
+					let editor = self
+						.presenter
+						.pending_editor
+						.take()
+						.expect("external-editor route carries a resolved command");
+					let result =
+						crate::editor::edit_draft(&editor, &draft, crate::editor::EditorOptions {
+							extension: "omp.md",
+							..crate::editor::EditorOptions::default()
+						});
+					self.presenter.finish_external_editor(result);
 				},
 				Pause::DisplayReset => {},
 			}
@@ -3734,7 +3982,8 @@ impl Host {
 		let mut clipboard: Option<(oneshot::Receiver<ClipboardReadOutcome>, bool, Instant)> = None;
 		let mailbox = Arc::clone(&self.presenter.mailbox);
 		loop {
-			terminal.set_mouse(self.presenter.overlays.pointer())?;
+			terminal
+				.set_mouse(self.presenter.overlays.pointer() || self.presenter.composer.popup_open())?;
 			self.sync_terminal_state(terminal)?;
 			let deadline = self.next_deadline();
 			if let Some(scope) = self.presenter.clipboard_read.take() {
@@ -3874,8 +4123,6 @@ impl Host {
 				},
 			}
 		}
-		let _ = self.presenter.up.send(Up::Cancel);
-		let _ = self.presenter.commands.send(HostCommand::Quit);
 		Ok(Pause::Quit)
 	}
 
@@ -3917,7 +4164,7 @@ impl Host {
 			self.sync_terminal_state(terminal)?;
 			return Ok(None);
 		}
-		let routed = self.input(event, submit_after_paste)?;
+		let routed = self.input(event, submit_after_paste, size)?;
 		if let Some(text) = self.presenter.clipboard.take() {
 			self.clipboard_write = Some(terminal.copy_to_clipboard(&text)?);
 		}
@@ -3932,11 +4179,7 @@ impl Host {
 		size: Size,
 	) -> Result<Option<Pause>, HostError> {
 		match routed {
-			Routed::Quit => {
-				let _ = self.presenter.up.send(Up::Cancel);
-				let _ = self.presenter.commands.send(HostCommand::Quit);
-				Ok(Some(Pause::Quit))
-			},
+			Routed::Quit => Ok(Some(Pause::Quit)),
 			Routed::Suspend => Ok(Some(Pause::Suspend)),
 			Routed::ExternalEditor => Ok(Some(Pause::ExternalEditor)),
 			Routed::DisplayReset => Ok(Some(Pause::DisplayReset)),
@@ -4151,7 +4394,12 @@ impl Host {
 		}
 	}
 
-	fn input(&mut self, event: InputEvent, submit_after_paste: bool) -> Result<Routed, HostError> {
+	fn input(
+		&mut self,
+		event: InputEvent,
+		submit_after_paste: bool,
+		size: Size,
+	) -> Result<Routed, HostError> {
 		match event {
 			InputEvent::Key(key) => self.presenter.route_key(key),
 			InputEvent::Chord(event) => self.presenter.route_chord(event),
@@ -4166,9 +4414,39 @@ impl Host {
 					.presenter
 					.route_paste_with_options(text.as_str(), PasteOptions { submit_after_paste })
 			},
-			InputEvent::Mouse(report) => self.presenter.route_mouse(report),
+			InputEvent::Mouse(report) => self.route_mouse(report, size),
 			InputEvent::Focus(_) | InputEvent::Response(_) => Ok(Routed::Ignored),
 		}
+	}
+
+	fn route_mouse(&mut self, report: MouseReport, size: Size) -> Result<Routed, HostError> {
+		if self.presenter.overlays.active().is_some() || self.presenter.overlays.approval().is_some()
+		{
+			return self.presenter.route_mouse(report);
+		}
+		let composer_rows = self.presenter.composer.height().min(size.height);
+		if composer_rows == 0 {
+			return Ok(Routed::Ignored);
+		}
+		let chrome = self.presenter.chrome_frame(size.width);
+		let banner_rows = chrome.size().height.saturating_sub(composer_rows);
+		let top = self
+			.projection
+			.as_ref()
+			.expect("projection initialized before event loop")
+			.composer_top(chrome.size().height, size)
+			.saturating_add(banner_rows);
+		let Some(report) = localize_composer_mouse(report, top, size.width, composer_rows) else {
+			if report.kind == omp_tui::Mouse::Move && self.presenter.composer.popup_open() {
+				return self.presenter.composer_mouse(MouseReport {
+					col: u16::MAX,
+					row: u16::MAX,
+					..report
+				});
+			}
+			return Ok(Routed::Ignored);
+		};
+		self.presenter.composer_mouse(report)
 	}
 
 	const fn projection_mut(&mut self) -> &mut Projection {
@@ -4299,6 +4577,16 @@ impl Host {
 	}
 }
 
+impl Drop for Host {
+	fn drop(&mut self) {
+		// One teardown owner covers clean quit, terminal/read failure, and a
+		// cancelled `run` future. Suspend and external-editor pauses retain
+		// the host and therefore do not tear the controller down.
+		let _ = self.presenter.up.send(Up::Cancel);
+		let _ = self.presenter.commands.send(HostCommand::Quit);
+	}
+}
+
 /// Effect requested by the detached native-window actor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeEffect {
@@ -4357,6 +4645,14 @@ impl NativeHost {
 		while let Ok(event) = self.presenter.kernel_events.try_recv() {
 			changed |= self.presenter.apply_kernel_event(&event) != Routed::Ignored;
 		}
+		match self.presenter.drain_mailbox()? {
+			Routed::Quit => return Ok(NativeEffect::Quit),
+			Routed::Ignored => {},
+			routed @ (Routed::ExternalEditor | Routed::Suspend) => {
+				return Ok(self.finish_native_input(routed));
+			},
+			Routed::Repaint | Routed::RebuildProjection | Routed::DisplayReset => changed = true,
+		}
 		while let Some(git) = self
 			.presenter
 			.git_facts
@@ -4390,6 +4686,7 @@ impl NativeHost {
 	pub fn resize(&mut self, size: Size) {
 		self.size = size;
 		self.presenter.composer.resize(size.width, size.height);
+		self.presenter.composer.restore_focus();
 		self.refresh();
 	}
 
@@ -4407,7 +4704,25 @@ impl NativeHost {
 
 	/// Routes a native pointer report through the active overlay hit map.
 	pub fn mouse(&mut self, report: MouseReport) -> Result<NativeEffect, HostError> {
-		let routed = self.presenter.route_mouse(report)?;
+		let routed = if self.presenter.overlays.active().is_some()
+			|| self.presenter.overlays.approval().is_some()
+		{
+			self.presenter.route_mouse(report)?
+		} else {
+			let composer_rows = self.presenter.composer.height();
+			let top = self.frame.size().height.saturating_sub(composer_rows);
+			match localize_composer_mouse(report, top, self.size.width, composer_rows) {
+				Some(report) => self.presenter.composer_mouse(report)?,
+				None if report.kind == omp_tui::Mouse::Move && self.presenter.composer.popup_open() => {
+					self.presenter.composer_mouse(MouseReport {
+						col: u16::MAX,
+						row: u16::MAX,
+						..report
+					})?
+				},
+				None => Routed::Ignored,
+			}
+		};
 		Ok(self.finish_native_input(routed))
 	}
 
@@ -4419,20 +4734,28 @@ impl NativeHost {
 			// place, suspend and display reset degrade to a repaint.
 			Routed::ExternalEditor => {
 				let draft = self.presenter.composer.text();
-				match crate::editor::edit_draft_detached(
-					&draft,
-					crate::editor::EditorOptions::default(),
-				) {
-					Ok(Some(edited)) => self.presenter.composer.replace_edited(&edited),
-					Ok(None) => {},
-					Err(error) => {
-						self.presenter.notice(error.to_string());
-					},
-				}
+				let editor = self
+					.presenter
+					.pending_editor
+					.take()
+					.expect("external-editor route carries a resolved command");
+				let result = crate::editor::edit_draft(&editor, &draft, crate::editor::EditorOptions {
+					extension: "omp.md",
+					..crate::editor::EditorOptions::default()
+				});
+				self.presenter.finish_external_editor(result);
 				self.refresh();
 				NativeEffect::Consumed
 			},
-			Routed::Repaint | Routed::RebuildProjection | Routed::Suspend | Routed::DisplayReset => {
+			Routed::Suspend => {
+				self
+					.presenter
+					.notice("Suspend is only available in terminal chat");
+				self.presenter.composer.restore_focus();
+				self.refresh();
+				NativeEffect::Consumed
+			},
+			Routed::Repaint | Routed::RebuildProjection | Routed::DisplayReset => {
 				self.refresh();
 				NativeEffect::Consumed
 			},
@@ -4507,10 +4830,10 @@ impl NativeHost {
 	}
 
 	/// Whether the terminal is asked to report mouse input: any stacked
-	/// overlay, side panels included, takes pointer reports.
+	/// overlay or composer completion popup takes pointer reports.
 	#[must_use]
 	pub fn mouse_tracking(&self) -> bool {
-		self.presenter.overlays.pointer()
+		self.presenter.overlays.pointer() || self.presenter.composer.popup_open()
 	}
 
 	/// Frame of the open picker or panel, when one is showing.
@@ -4543,6 +4866,12 @@ impl NativeHost {
 	#[must_use]
 	pub fn composer_text(&self) -> String {
 		self.presenter.composer.text()
+	}
+
+	/// Caret position inside the retained composer frame.
+	#[must_use]
+	pub fn composer_cursor(&mut self) -> Option<(u16, u16)> {
+		self.presenter.composer.frame().cursor()
 	}
 
 	/// Native spelling gates the composer's editor currently applies
@@ -4756,7 +5085,7 @@ fn ask_questions(dom: &Dom, ask: Handle) -> Option<Vec<omp_tools::ask::Question>
 		.filter_map(|handle| dom.get(*handle))
 		.find(|node| node.tag == Tag::Known(KnownTag::Input))
 		.and_then(|input| input.content.as_deref())?;
-	serde_json::from_str::<omp_tools::ask::Params>(args)
+	omp_tool::decode_params::<omp_tools::ask::Params>(args)
 		.ok()
 		.map(|params| params.questions)
 		.filter(|questions| !questions.is_empty())
@@ -5151,8 +5480,14 @@ pub fn render_surface(
 		&statuses,
 	);
 	let plan = facts.mode == Some(ModeChip::Plan);
-	let mut composer =
-		Composer::new(size.width, ui.clone(), facts, Vec::new(), Arc::new(|_: &str| None), None);
+	let mut composer = Composer::new(
+		size.width,
+		ui.clone(),
+		facts,
+		Vec::new(),
+		Arc::new(|_: &str, _: &str| None),
+		None,
+	);
 	let _ = composer.set_plan_mode(plan);
 	let status = StatusLine::from_dom(&replica);
 	let welcome = || RenderedBlock {
@@ -5230,5 +5565,66 @@ fn overlay_options(anchor: PanelAnchor, width: u16, composer_rows: u16) -> (Over
 				.z(20),
 			true,
 		),
+	}
+}
+
+#[cfg(test)]
+mod terminal_title_tests {
+	use super::*;
+
+	fn meta_set(meta: Handle, prop: PropId) -> Event {
+		Event::Patch(omp_dom::Patch {
+			cause: EntryId::default(),
+			prior: None,
+			label: None,
+			ops:   vec![Op::Set {
+				h:     meta,
+				prop:  prop.into(),
+				value: Value::Str(Str::new_static("changed")),
+			}],
+		})
+	}
+
+	#[test]
+	fn terminal_restore_failure_is_typed_even_after_an_event_loop_failure() {
+		let run = Err(HostError::Io(io::Error::other("input failed")));
+		let restore = Err(io::Error::other("restore failed"));
+		let error = finish_terminal_epoch(run, restore).expect_err("restore must win");
+		assert!(matches!(error, HostError::TerminalRestore { .. }));
+		assert!(error.to_string().contains("restore failed"));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn suspend_targets_the_foreground_group_with_uncatchable_sigstop() {
+		let mut delivered = None;
+		suspend_process_with(|pid, signal| {
+			delivered = Some((pid.as_raw(), signal));
+			Ok(())
+		})
+		.expect("signal accepted");
+		assert_eq!(delivered, Some((0, nix::sys::signal::Signal::SIGSTOP)));
+
+		let error = suspend_process_with(|_, _| Err(nix::errno::Errno::EPERM))
+			.expect_err("signal refusal remains typed");
+		assert!(matches!(error, SuspendError::Signal { source: nix::errno::Errno::EPERM }));
+	}
+
+	#[test]
+	fn only_session_identity_events_clear_an_extension_title() {
+		let dom = Dom::new();
+		let meta = dom.meta();
+		assert!(
+			!Presenter::sets_session_title(&meta_set(meta, PropId::Model), meta),
+			"ordinary model/status facts are not authoritative terminal titles",
+		);
+		assert!(
+			Presenter::sets_session_title(&meta_set(meta, PropId::Name), meta),
+			"a session rename is authoritative",
+		);
+		assert!(
+			Presenter::sets_session_title(&Event::Reset { snapshot: dom.snapshot() }, meta),
+			"a session switch is authoritative",
+		);
 	}
 }

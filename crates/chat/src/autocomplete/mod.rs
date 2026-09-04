@@ -76,6 +76,13 @@ impl EditorCompletion for CompletionChain {
 		}
 	}
 
+	fn allow_builtin_emoji(&mut self, text: &str, cursor: usize) -> bool {
+		self
+			.sources
+			.iter_mut()
+			.all(|source| source.allow_builtin_emoji(text, cursor))
+	}
+
 	fn accepted(&mut self, replaced: &str, suggestion: &Suggestion) {
 		if let Some(source) = self.active.and_then(|index| self.sources.get_mut(index)) {
 			source.accepted(replaced, suggestion);
@@ -91,10 +98,11 @@ impl EditorCompletion for CompletionChain {
 #[must_use]
 pub fn composer_chain(
 	roster: Vec<omp_tui::Command>,
-	actions: PromptActions,
+	mut actions: PromptActions,
 	urls: UrlCompleter,
 	project_root: Option<&Path>,
 ) -> CompletionChain {
+	actions.suppress_in_command_args(roster.iter().map(omp_tui::Command::name));
 	let chain = CompletionChain::new()
 		.source(omp_tui::SlashCommands::new(roster))
 		.source(github_refs::GithubRefs)

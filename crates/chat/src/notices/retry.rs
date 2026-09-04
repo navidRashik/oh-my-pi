@@ -16,7 +16,7 @@ use omp_core::{Str, StrMut};
 use omp_dom::{Dom, Handle, KnownTag, Node, PropId, Tag};
 use omp_tui::{Component, PaintCtx, Props, Rect, Slot, UiContext, cell_width, next_slot};
 
-use crate::notices::{format_duration, prop_text};
+use crate::notices::prop_text;
 
 /// pi `#maintenanceEscHint`: appended while the primary agent is focused.
 const ESC_HINT: &str = " (esc to cancel)";
@@ -76,13 +76,9 @@ impl RetryState {
 
 	fn write_label(&self, out: &mut impl std::fmt::Write, now: Duration, esc_hint: bool) {
 		// pi: `${retryLabel} in ${formatDuration(remaining)}…${escHint}`.
-		let _ = write!(
-			out,
-			"Retrying ({}/{}) in {}…",
-			self.attempt,
-			self.max_attempts,
-			format_duration(self.remaining_ms(now))
-		);
+		let _ = write!(out, "Retrying ({}/{}) in ", self.attempt, self.max_attempts);
+		let _ = crate::notices::write_duration(out, self.remaining_ms(now));
+		let _ = out.write_char('…');
 		if esc_hint {
 			let _ = out.write_str(ESC_HINT);
 		}

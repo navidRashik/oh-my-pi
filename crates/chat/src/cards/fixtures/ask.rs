@@ -14,8 +14,8 @@ const ARGS: &str = r#"{"questions":[
 	]}
 ]}"#;
 const RESULT: &str = r#"{"answers":[
-	{"question":"db","options":["Postgres"]},
-	{"question":"features","options":["Email + password","OAuth (Google, GitHub)"]}
+	{"id":"db","question":"Which database should the new service use?","options":["Postgres","SQLite","MongoDB"],"multi":false,"selected":["Postgres"],"timed_out":false},
+	{"id":"features","question":"Which auth flows should ship in v1?","options":["Email + password","OAuth (Google, GitHub)","Magic links","SAML SSO"],"multi":true,"selected":["Email + password","OAuth (Google, GitHub)"],"timed_out":false}
 ]}"#;
 
 pub(super) const FIXTURES: &[CardFixture] = &[CardFixture {

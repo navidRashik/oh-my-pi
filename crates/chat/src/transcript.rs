@@ -10,8 +10,8 @@
 //!
 //! [`Local`] holds what pi keeps in its controllers: when each tool call was
 //! first seen executing (the elapsed badge), the streaming speed gauge and
-//! reasoning-token counter behind the hidden-thinking pulse, and the
-//! transcript row a session reset leaves behind.
+//! reasoning-token counter behind the hidden-thinking pulse, the transcript
+//! row a session reset leaves behind, and validated startup advisories.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -26,6 +26,7 @@ use omp_tui::{
 };
 
 use crate::{
+	notices::update::UpdateAvailable,
 	project::{BlockKind, BlockView, RenderedBlock},
 	status_line::StatusLine,
 };
@@ -66,7 +67,9 @@ pub struct Local {
 	head:            Option<StreamHead>,
 	/// Observer-local transcript row left behind by a session reset.
 	banner:          Option<Banner>,
-	/// Distinguishes successive banners so a new one mounts fresh.
+	/// Observer-local validated startup update availability.
+	update:          Option<UpdateBanner>,
+	/// Distinguishes successive observer rows so a new one mounts fresh.
 	banner_serial:   u64,
 }
 
@@ -90,6 +93,15 @@ pub struct Banner {
 	pub key:  u64,
 	/// Row text without the leading success icon.
 	pub text: Str,
+}
+
+/// Observer-local update card identity and typed payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UpdateBanner {
+	/// Stable observer-local block key.
+	pub(crate) key:    u64,
+	/// Validated presentation payload.
+	pub(crate) notice: UpdateAvailable,
 }
 
 /// What a `Reset` snapshot meant for the transcript.
@@ -140,6 +152,27 @@ impl Local {
 	#[must_use]
 	pub const fn banner(&self) -> Option<&Banner> {
 		self.banner.as_ref()
+	}
+
+	/// Observer-local validated update card, if one is pending.
+	#[must_use]
+	pub(crate) const fn update(&self) -> Option<&UpdateBanner> {
+		self.update.as_ref()
+	}
+
+	/// Records a validated update notice. Repeated cache and network results
+	/// for the same channel/version are coalesced in the observer.
+	#[must_use]
+	pub fn update_available(&mut self, update: UpdateAvailable) -> bool {
+		if self.update.as_ref().is_some_and(|banner| banner.notice.eq(&update)) {
+			return false;
+		}
+		self.banner_serial = self.banner_serial.wrapping_add(1);
+		self.update = Some(UpdateBanner {
+			key: Self::BANNER_KEY_BASE + self.banner_serial,
+			notice: update,
+		});
+		true
 	}
 
 	/// Records first-seen instants for executing tool elements in the newest
@@ -619,7 +652,7 @@ impl Projection {
 #[cfg(test)]
 mod tests {
 	use omp_dom::PropId;
-	use omp_tui::{IntoComponent as _, slots::Delivered};
+	use omp_tui::{IntoComponent as _, UiContext, slots::Delivered};
 
 	use super::*;
 	use crate::{cards::CardRegistry, project::project};
@@ -674,6 +707,51 @@ mod tests {
 		projection.retire_under_pressure(3, 1);
 		assert!(projection.blocks[1].retired);
 		assert!(!projection.blocks[2].retired);
+	}
+
+	#[test]
+	fn retired_welcome_survives_height_and_width_resize_exactly_once() {
+		let build = || {
+			vec![
+				block(1, BlockKind::Welcome, "Welcome back!", true),
+				block(2, BlockKind::Assistant, "working", false),
+			]
+		};
+		let mut projection = Projection::new(
+			Size::new(20, 4),
+			ResizePolicy::Rebuild,
+			&UiContext::default(),
+			build(),
+			build(),
+			Duration::ZERO,
+		);
+		projection.retire_under_pressure(3, 4);
+		let plan = projection.slots.plan();
+		projection.slots.commit(plan, Delivered::All);
+		let welcome_rows = |projection: &Projection| {
+			projection
+				.slots
+				.logical_history()
+				.filter(|row| row.text().contains("Welcome back!"))
+				.count()
+		};
+		assert_eq!(welcome_rows(&projection), 1);
+
+		projection.resize(Size::new(20, 12));
+		let height = projection.slots.plan();
+		assert!(!height.rebuild(), "height-only resize preserves native history");
+		projection.slots.commit(height, Delivered::All);
+		assert_eq!(welcome_rows(&projection), 1);
+
+		projection.resize(Size::new(32, 12));
+		let width = projection.slots.plan();
+		assert!(width.rebuild(), "configured rebuild starts a new physical width epoch");
+		projection.slots.commit(width, Delivered::All);
+		assert_eq!(
+			welcome_rows(&projection),
+			1,
+			"physical replay does not duplicate logical welcome history"
+		);
 	}
 
 	#[test]
@@ -1175,6 +1253,35 @@ mod tests {
 			local.on_reset(&titled, &reset_dom(Some("other"), 0)),
 			ResetKind::NewSession,
 			"a different title is a different session"
+		);
+	}
+
+	#[test]
+	fn update_availability_is_observer_local_and_deduplicated() {
+		let mut local = Local::default();
+		let notice = UpdateAvailable::new("19.0.0", "stable").expect("valid notice");
+		assert!(local.update_available(notice.clone()));
+		let first_key = local.update().expect("update").key;
+		let dom = Dom::new();
+		let blocks = project(
+			&dom,
+			&CardRegistry::standard(),
+			&UiContext::default(),
+			&crate::project::Options::new(&local),
+		);
+		assert_eq!(blocks.len(), 1);
+		assert_eq!(blocks[0].view.kind, BlockKind::Notice);
+		assert_eq!(blocks[0].view.text, notice.text());
+		assert!(dom.children(dom.body()).is_empty(), "the card never enters session state");
+		assert!(!local.update_available(notice));
+		assert_eq!(local.update().expect("same update").key, first_key);
+		assert!(local.update_available(
+			UpdateAvailable::new("19.0.1", "stable").expect("valid notice")
+		));
+		assert_ne!(local.update().expect("new update").key, first_key);
+		assert_eq!(
+			local.update().expect("text").notice.text(),
+			"Update Available\nNew version 19.0.1 is available on the stable channel. Run: omp update"
 		);
 	}
 

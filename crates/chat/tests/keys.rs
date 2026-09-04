@@ -778,18 +778,48 @@ fn commands_with_media_refuse_without_losing_draft_or_chip() {
 	std::fs::write(&path, png).expect("write png");
 	let source = path.to_str().expect("utf-8 path");
 
-	for (draft, notice) in [
-		("/goal inspect ", "Slash commands do not accept media attachments"),
-		("!echo hi ", "Local commands do not accept media attachments"),
-		("$print('hi') ", "Local commands do not accept media attachments"),
-	] {
+	let mut goal = harness(idle_session());
+	type_text(&mut goal.host, "/goal inspect ");
+	goal.host.paste(source);
+	goal.host.key(Key::Enter).expect("submit goal with media");
+	assert!(matches!(
+		goal.commands.recv().expect("goal engagement"),
+		HostCommand::Director { id, engage: true, .. } if id == "goal"
+	));
+	let (text, attachments) = match goal.commands.recv().expect("goal prompt") {
+		HostCommand::SubmitWithAttachments { text, attachments } => (text, attachments),
+		other => panic!("goal media becomes the objective prompt, got {other:?}"),
+	};
+	assert_eq!(text, "inspect [Image #1, 200x200]");
+	assert_eq!(attachments.len(), 1);
+	assert!(goal.host.composer_text().is_empty());
+
+	// pi's Python command grammar requires ASCII whitespace after `$`;
+	// `$print(...)` is prose and must remain eligible for ordinary media
+	// submission.
+	for draft in ["!echo hi ", "$ print('hi') "] {
 		let mut h = harness(idle_session());
 		type_text(&mut h.host, draft);
 		h.host.paste(source);
 		let before = h.host.composer_text();
+		let before_caret = h.host.composer_cursor();
+		let image = omp_tui::Charset::default().icon(omp_tui::Icon::Image);
+		let chip = format!("{image} #1");
+		assert!(omp_tui::frame_text(h.host.frame()).contains(&chip), "media chip is staged");
+
 		h.host.key(Key::Enter).expect("submit command with media");
-		assert_eq!(h.host.notice(), Some(notice));
-		assert_eq!(h.host.composer_text(), before);
+
+		assert_eq!(
+			h.host.notice(),
+			Some("Local commands do not accept media attachments"),
+			"{draft:?} must take the local-command refusal path"
+		);
+		assert_eq!(h.host.composer_text(), before, "{draft:?} keeps the exact wire-marker draft");
+		assert_eq!(h.host.composer_cursor(), before_caret, "{draft:?} keeps the caret");
+		assert!(
+			omp_tui::frame_text(h.host.frame()).contains(&chip),
+			"{draft:?} keeps the staged media chip"
+		);
 		assert!(h.commands.try_recv().is_err(), "refused command emits nothing");
 	}
 }
@@ -1019,7 +1049,7 @@ fn extension_status_actions_project_sorted_hide_by_config_and_reset() {
 	let mut h = harness(idle_session());
 	for (key, text) in [("z", "zed-hook"), ("a", "alpha-hook")] {
 		h.host
-			.act(HostAction::ExtensionStatus(omp_chat::ExtensionStatusEvent::Set {
+			.act(HostAction::ExtensionStatus(omp_chat::ExtensionStatus::Set {
 				key:  Str::new(key),
 				text: Str::new(text),
 			}))

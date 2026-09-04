@@ -5,12 +5,15 @@
 //! [`LiveUiEvent`] values and emits typed [`LiveControl`] requests; it never
 //! reads or mutates controller state (ADR 0005).
 
-use std::time::Duration;
+use std::{
+	fmt::Write as _,
+	time::{Duration, Instant},
+};
 
-use omp_core::{Str, sf};
+use omp_core::{Str, StrMut, sf};
 use omp_tui::{
 	Component, Frame, Key, MouseReport, PaintCtx, Prop, Props, Rect, Size, Slot, Style, Ui,
-	UiContext, UiEvent, dom, next_slot,
+	UiContext, UiEvent, cell_width, dom, next_slot,
 };
 use strum::{Display, IntoStaticStr};
 
@@ -83,6 +86,82 @@ pub struct LiveTranscript {
 	pub finalized: bool,
 }
 
+/// Privacy-safe operating-system network-interface class.
+#[derive(Clone, Copy, Debug, Display, Eq, IntoStaticStr, PartialEq)]
+pub enum LivePathClass {
+	/// Wi-Fi interface.
+	#[strum(serialize = "Wi-Fi")]
+	Wifi,
+	/// Cellular interface.
+	Cellular,
+	/// Wired Ethernet interface.
+	#[strum(serialize = "Ethernet")]
+	Wired,
+	/// Loopback interface.
+	Loopback,
+	/// Another operating-system interface class.
+	Other,
+}
+
+/// Privacy-safe class of one candidate in the selected ICE pair.
+#[derive(Clone, Copy, Debug, Display, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "kebab-case")]
+pub enum LiveIceCandidateClass {
+	/// Candidate gathered from a local interface.
+	Host,
+	/// Candidate discovered through a STUN binding.
+	ServerReflexive,
+	/// Candidate discovered from the remote peer during connectivity checks.
+	PeerReflexive,
+	/// Candidate allocated through a relay.
+	Relay,
+}
+
+/// Aggregate routing mode of the selected ICE pair.
+#[derive(Clone, Copy, Debug, Display, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
+pub enum LiveIcePathKind {
+	/// Neither selected candidate uses a relay.
+	Direct,
+	/// At least one selected candidate uses a relay.
+	Relay,
+}
+
+/// Privacy-redacted selected ICE candidate pair.
+///
+/// This type is deliberately closed over candidate classes and aggregate
+/// routing; it cannot carry addresses, ports, credentials, interface names,
+/// or SSIDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveIcePathFacts {
+	/// Local candidate class.
+	pub local:  LiveIceCandidateClass,
+	/// Remote candidate class.
+	pub remote: LiveIceCandidateClass,
+	/// Aggregate relay/direct routing mode.
+	pub kind:   LiveIcePathKind,
+}
+
+/// Redacted facts from the operating system's active network path.
+///
+/// This deliberately cannot carry addresses, SSIDs, gateways, proxy values,
+/// or native path handles.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LivePathFacts {
+	/// Whether the operating system currently has a satisfied path.
+	pub available:   bool,
+	/// Sanitized operating-system interface identity, such as `en0`.
+	pub interface:   Option<Str>,
+	/// Native interface class.
+	pub class:       Option<LivePathClass>,
+	/// Native constrained-data flag, when the platform exposes it.
+	pub constrained: Option<bool>,
+	/// Native metered-network flag, when the platform exposes it.
+	pub metered:     Option<bool>,
+	/// Native expensive-network flag, when the platform exposes it.
+	pub expensive:   Option<bool>,
+}
+
 /// One selectable audio endpoint published by the application's device host.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveDevice {
@@ -138,12 +217,20 @@ pub enum LiveUiEvent {
 		/// Speaker endpoints.
 		output: Vec<LiveDevice>,
 	},
+	/// Privacy-redacted operating-system network-path facts changed.
+	Path(LivePathFacts),
+	/// Privacy-redacted selected ICE path changed or was reset.
+	IcePath(Option<LiveIcePathFacts>),
 	/// A recoverable reconnect attempt is scheduled or underway.
 	Reconnect {
 		/// One-based attempt number.
-		attempt: u8,
+		attempt:  u8,
 		/// Maximum attempts before the error becomes terminal.
-		maximum: u8,
+		maximum:  u8,
+		/// Exact backoff selected by the controller.
+		delay:    Duration,
+		/// The controller's authoritative retry deadline.
+		deadline: Instant,
 	},
 	/// Classified controller failure.
 	Error {
@@ -226,6 +313,34 @@ struct TranscriptState {
 	finalized: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiveReconnectState {
+	attempt:  u8,
+	maximum:  u8,
+	delay:    Duration,
+	deadline: Duration,
+}
+
+impl LiveReconnectState {
+	fn remaining(self, now: Duration) -> Duration {
+		self.deadline.saturating_sub(now).min(self.delay)
+	}
+
+	fn remaining_ms(self, now: Duration) -> u64 {
+		u64::try_from(self.remaining(now).as_millis()).unwrap_or(u64::MAX)
+	}
+
+	fn write_label(self, out: &mut impl std::fmt::Write, now: Duration) {
+		let _ = write!(out, "Reconnecting · attempt {} of {}", self.attempt, self.maximum);
+		let remaining = self.remaining_ms(now);
+		if remaining > 0 {
+			let _ = out.write_str(" · retrying in ");
+			let _ = crate::notices::write_duration(out, remaining);
+			let _ = out.write_char('…');
+		}
+	}
+}
+
 /// Pure retained reducer for the `/live` actor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveViewState {
@@ -241,9 +356,50 @@ pub struct LiveViewState {
 	input_devices:  Vec<LiveDevice>,
 	output_devices: Vec<LiveDevice>,
 	voice:          Str,
-	reconnect:      Option<(u8, u8)>,
+	path_label:     Option<Str>,
+	ice_path_label: Option<Str>,
+	reconnect:      Option<LiveReconnectState>,
 	error:          Option<(Str, bool)>,
 	closed:         bool,
+}
+
+fn ice_path_label(facts: LiveIcePathFacts) -> Str {
+	let mut label = StrMut::with_capacity(72);
+	let _ = write!(label, "ICE · {} · local {} · remote {}", facts.kind, facts.local, facts.remote);
+	label.freeze()
+}
+
+fn path_label(facts: &LivePathFacts) -> Str {
+	let mut label = StrMut::with_capacity(80);
+	let _ = label.write_str("Network · ");
+	if !facts.available {
+		let _ = label.write_str("unavailable");
+		return label.freeze();
+	}
+	match (facts.class, facts.interface.as_deref()) {
+		(Some(class), Some(interface)) => {
+			let _ = write!(label, "{class} ({interface})");
+		},
+		(Some(class), None) => {
+			let _ = write!(label, "{class}");
+		},
+		(None, Some(interface)) => {
+			let _ = label.write_str(interface);
+		},
+		(None, None) => {
+			let _ = label.write_str("system default");
+		},
+	}
+	if facts.constrained == Some(true) {
+		let _ = label.write_str(" · constrained");
+	}
+	if facts.metered == Some(true) {
+		let _ = label.write_str(" · metered");
+	}
+	if facts.expensive == Some(true) {
+		let _ = label.write_str(" · expensive");
+	}
+	label.freeze()
 }
 
 impl LiveViewState {
@@ -269,6 +425,8 @@ impl LiveViewState {
 			input_devices: Vec::new(),
 			output_devices: Vec::new(),
 			voice,
+			path_label: None,
+			ice_path_label: None,
 			reconnect: None,
 			error: None,
 			closed: false,
@@ -278,17 +436,23 @@ impl LiveViewState {
 	/// Applies one controller event. Stale role-local transcript updates are
 	/// ignored so an async final cannot replace a newer turn.
 	pub fn apply(&mut self, event: &LiveUiEvent) {
+		self.apply_at(event, Duration::ZERO, Instant::now());
+	}
+
+	fn apply_at(&mut self, event: &LiveUiEvent, now: Duration, observed_at: Instant) {
 		match event {
 			LiveUiEvent::Phase(phase) => {
 				self.phase = *phase;
+				self.reconnect = None;
+				if matches!(phase, LivePhase::Reconnecting | LivePhase::Closing) {
+					self.ice_path_label = None;
+				}
 				if *phase != LivePhase::Error {
 					self.error = None;
 				}
-				if *phase != LivePhase::Reconnecting {
-					self.reconnect = None;
-				}
 			},
 			LiveUiEvent::Permission(permission) => {
+				self.reconnect = None;
 				self.permission = Some(*permission);
 				self.phase = match permission {
 					MicrophonePermission::Unknown | MicrophonePermission::Requesting => {
@@ -341,6 +505,7 @@ impl LiveViewState {
 				slot.finalized = update.finalized;
 			},
 			LiveUiEvent::Muted(muted) => {
+				self.reconnect = None;
 				self.muted = *muted;
 				self.input_level = 0;
 				self.input_peak = 0;
@@ -354,21 +519,103 @@ impl LiveViewState {
 				self.input_devices.clone_from(input);
 				self.output_devices.clone_from(output);
 			},
-			LiveUiEvent::Reconnect { attempt, maximum } => {
-				self.reconnect = Some((*attempt, *maximum));
+			LiveUiEvent::Path(facts) => {
+				self.path_label = Some(path_label(facts));
+			},
+			LiveUiEvent::IcePath(facts) => {
+				if !self.closed && self.phase != LivePhase::Closing {
+					self.ice_path_label = facts.map(ice_path_label);
+				}
+			},
+			LiveUiEvent::Reconnect { attempt, maximum, delay, deadline } => {
+				let remaining = deadline.saturating_duration_since(observed_at).min(*delay);
+				self.ice_path_label = None;
+				self.reconnect = Some(LiveReconnectState {
+					attempt:  *attempt,
+					maximum:  *maximum,
+					delay:    *delay,
+					deadline: now.saturating_add(remaining),
+				});
 				self.phase = LivePhase::Reconnecting;
 				self.error = None;
 			},
 			LiveUiEvent::Error { message, recoverable } => {
+				self.reconnect = None;
 				self.error = Some((message.clone(), *recoverable));
 				self.phase = LivePhase::Error;
 			},
 			LiveUiEvent::Closed => {
+				self.reconnect = None;
+				self.ice_path_label = None;
 				self.closed = true;
 				self.phase = LivePhase::Closing;
 				self.input_level = 0;
 				self.output_level = 0;
 			},
+		}
+	}
+}
+
+/// Countdown projected from the controller's retry deadline.
+///
+/// This component only schedules paints. It cannot start, delay, or cancel a
+/// reconnect, so the transport retains the sole retry timer.
+struct LiveReconnectCountdown {
+	props: Props,
+	slot:  Slot,
+	state: LiveReconnectState,
+	label: StrMut,
+}
+
+impl LiveReconnectCountdown {
+	fn new(state: LiveReconnectState, now: Duration) -> Self {
+		let mut label = StrMut::with_capacity(72);
+		state.write_label(&mut label, now);
+		Self { props: Props::new(), slot: next_slot(), state, label }
+	}
+
+	fn refresh(&mut self, now: Duration) {
+		self.label.truncate(0);
+		self.state.write_label(&mut self.label, now);
+	}
+}
+
+impl Component for LiveReconnectCountdown {
+	fn props(&self) -> &Props {
+		&self.props
+	}
+
+	fn props_mut(&mut self) -> &mut Props {
+		&mut self.props
+	}
+
+	fn slot(&self) -> Slot {
+		self.slot
+	}
+
+	fn measure(&mut self, _ctx: &UiContext) -> (u16, u16) {
+		(1, cell_width(self.label.as_str()))
+	}
+
+	fn height(&mut self, _ctx: &UiContext, _width: u16) -> u16 {
+		1
+	}
+
+	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
+		if rect.y >= pc.clip || rect.width == 0 {
+			return;
+		}
+		self.refresh(pc.now);
+		pc.frame.put(
+			rect.x,
+			rect.y,
+			self.label.as_str(),
+			self.props.style(&pc.ctx.theme).fg(pc.ctx.theme.warn),
+		);
+		if pc.now < self.state.deadline {
+			// The wake is presentation-only and is always capped by the exact
+			// controller deadline; it never schedules or authorizes transport work.
+			pc.wake(self.slot, (pc.now + FRAME_INTERVAL).min(self.state.deadline));
 		}
 	}
 }
@@ -459,6 +706,7 @@ pub struct LivePanel {
 	ui:        Ui,
 	ctx:       UiContext,
 	size:      Size,
+	now:       Duration,
 	next_wake: Option<Duration>,
 	pending:   Option<LiveControl>,
 }
@@ -474,6 +722,7 @@ impl LivePanel {
 			ui:        Ui::from_root(dom! { <col/> }, cx.viewport.width, cx.ui.clone()),
 			ctx:       cx.ui.clone(),
 			size:      cx.viewport,
+			now:       Duration::ZERO,
 			next_wake: Some(Duration::ZERO),
 			pending:   Some(LiveControl::Start),
 		};
@@ -606,8 +855,13 @@ impl LivePanel {
 		let user_final = self.state.user.finalized;
 		let assistant = self.state.assistant.text.clone();
 		let assistant_final = self.state.assistant.finalized;
-		let reconnect = self.state.reconnect;
+		let reconnect = self
+			.state
+			.reconnect
+			.map(|state| LiveReconnectCountdown::new(state, self.now));
 		let error = self.state.error.clone();
+		let path_label = self.state.path_label.clone();
+		let ice_path_label = self.state.ice_path_label.clone();
 		let can_retry = error.as_ref().is_some_and(|(_, recoverable)| *recoverable);
 		let input_name = (!self.state.input_devices.is_empty()).then(|| {
 			self
@@ -674,8 +928,14 @@ impl LivePanel {
 							if !assistant_final { <spinner kind=status/> }
 						</row>
 					}
-					if let Some((attempt, maximum)) = reconnect {
-						<row gap=1><spinner kind=status/><text fg=warn>{sf!("Reconnecting · attempt {attempt} of {maximum}")}</text></row>
+					if let Some(path_label) = path_label {
+						<text fg=muted>{path_label}</text>
+					}
+					if let Some(ice_path_label) = ice_path_label {
+						<text fg=muted>{ice_path_label}</text>
+					}
+					if let Some(reconnect) = reconnect {
+						<row gap=1><spinner kind=status/>{reconnect}</row>
 					}
 											if let Some((message, _)) = error {
 							<callout kind=error>{message}</callout>
@@ -706,6 +966,7 @@ impl LivePanel {
 			</box>
 		};
 		self.ui = Ui::from_root(tree, self.size.width, self.ctx.clone());
+		let _ = self.ui.tick(self.now);
 	}
 }
 
@@ -779,10 +1040,11 @@ impl Panel for LivePanel {
 	}
 
 	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
-		let PanelNote::Live(event) = note else {
+		let PanelNote::Live(event, now) = note else {
 			return PanelEvent::Ignored;
 		};
-		self.state.apply(event);
+		self.now = now;
+		self.state.apply_at(event, now, Instant::now());
 		if let Some(picker) = self.picker {
 			self.selection = self
 				.selection
@@ -804,13 +1066,18 @@ impl Panel for LivePanel {
 		if self.state.closed {
 			return false;
 		}
-		self.next_wake = Some(now + FRAME_INTERVAL);
+		self.now = now;
+		self.next_wake = None;
 		let start_due = self.pending.is_some();
 		start_due | self.ui.tick(now)
 	}
 
 	fn next_wake(&self) -> Option<Duration> {
-		self.next_wake
+		match (self.next_wake, self.ui.next_wake()) {
+			(Some(panel), Some(ui)) => Some(panel.min(ui)),
+			(Some(panel), None) => Some(panel),
+			(None, ui) => ui,
+		}
 	}
 
 	fn finished(&self) -> bool {
@@ -825,6 +1092,48 @@ impl Panel for LivePanel {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn reconnect_countdown_uses_the_controller_deadline_and_clears_on_lifecycle_edges() {
+		let controller_now = Instant::now();
+		let host_now = Duration::from_secs(10);
+		let delay = Duration::from_millis(3_200);
+		let reconnect =
+			LiveUiEvent::Reconnect { attempt: 2, maximum: 5, delay, deadline: controller_now + delay };
+		let mut state = LiveViewState::new("sol");
+		state.apply_at(&reconnect, host_now, controller_now);
+		let scheduled = state.reconnect.expect("scheduled countdown");
+		assert_eq!(scheduled.attempt, 2);
+		assert_eq!(scheduled.maximum, 5);
+		assert_eq!(scheduled.delay, delay);
+		assert_eq!(scheduled.deadline, host_now + delay);
+		let mut label = String::new();
+		scheduled.write_label(&mut label, host_now + Duration::from_millis(200));
+		assert_eq!(label, "Reconnecting · attempt 2 of 5 · retrying in 3.0s…");
+		let mut countdown =
+			Ui::from_root(LiveReconnectCountdown::new(scheduled, host_now), 72, UiContext::default());
+		assert!(countdown.tick(host_now));
+		assert_eq!(
+			omp_tui::frame_text(countdown.frame()),
+			"Reconnecting · attempt 2 of 5 · retrying in 3.2s…"
+		);
+		assert_eq!(countdown.next_wake(), Some(host_now + FRAME_INTERVAL));
+		assert!(countdown.tick(scheduled.deadline));
+		assert_eq!(omp_tui::frame_text(countdown.frame()), "Reconnecting · attempt 2 of 5");
+		assert_eq!(countdown.next_wake(), None);
+
+		state.apply(&LiveUiEvent::Phase(LivePhase::Listening));
+		assert!(state.reconnect.is_none(), "a connected phase clears the countdown");
+		state.apply_at(&reconnect, host_now, controller_now);
+		state.apply(&LiveUiEvent::Phase(LivePhase::Reconnecting));
+		assert!(state.reconnect.is_none(), "manual retry has no scheduled countdown");
+		state.apply_at(&reconnect, host_now, controller_now);
+		state.apply(&LiveUiEvent::Phase(LivePhase::Closing));
+		assert!(state.reconnect.is_none(), "session switch clears while the controller closes");
+		state.apply_at(&reconnect, host_now, controller_now);
+		state.apply(&LiveUiEvent::Closed);
+		assert!(state.reconnect.is_none(), "controller close clears the countdown");
+	}
 
 	#[test]
 	fn permission_states_preserve_recovery_policy() {
@@ -850,6 +1159,112 @@ mod tests {
 		state.apply(&LiveUiEvent::Permission(MicrophonePermission::Granted));
 		assert_eq!(state.phase, LivePhase::Connecting);
 		assert!(state.error.is_none());
+	}
+
+	#[test]
+	fn path_facts_are_redacted_and_do_not_disturb_the_retry_deadline() {
+		let facts = LivePathFacts {
+			available:   true,
+			interface:   Some(Str::new_static("en0")),
+			class:       Some(LivePathClass::Wifi),
+			constrained: Some(true),
+			metered:     None,
+			expensive:   Some(true),
+		};
+		assert_eq!(path_label(&facts).as_str(), "Network · Wi-Fi (en0) · constrained · expensive");
+
+		let controller_now = Instant::now();
+		let delay = Duration::from_secs(2);
+		let mut state = LiveViewState::new("sol");
+		state.apply_at(
+			&LiveUiEvent::Reconnect {
+				attempt: 1,
+				maximum: 5,
+				delay,
+				deadline: controller_now + delay,
+			},
+			Duration::from_secs(4),
+			controller_now,
+		);
+		let deadline = state.reconnect.expect("retry deadline").deadline;
+		state.apply(&LiveUiEvent::Path(facts));
+		assert_eq!(
+			state
+				.reconnect
+				.expect("path presentation cannot own retry")
+				.deadline,
+			deadline
+		);
+		assert_eq!(
+			state.path_label.as_deref(),
+			Some("Network · Wi-Fi (en0) · constrained · expensive")
+		);
+	}
+
+	#[test]
+	fn selected_ice_path_is_redacted_and_resets_without_disturbing_reconnect() {
+		let facts = LiveIcePathFacts {
+			local:  LiveIceCandidateClass::Relay,
+			remote: LiveIceCandidateClass::Host,
+			kind:   LiveIcePathKind::Relay,
+		};
+		assert_eq!(ice_path_label(facts).as_str(), "ICE · relay · local relay · remote host");
+
+		let controller_now = Instant::now();
+		let delay = Duration::from_secs(2);
+		let mut state = LiveViewState::new("sol");
+		state.apply_at(
+			&LiveUiEvent::Reconnect {
+				attempt: 1,
+				maximum: 5,
+				delay,
+				deadline: controller_now + delay,
+			},
+			Duration::from_secs(4),
+			controller_now,
+		);
+		let deadline = state.reconnect.expect("retry deadline").deadline;
+		state.apply(&LiveUiEvent::IcePath(Some(facts)));
+		assert_eq!(
+			state
+				.reconnect
+				.expect("ICE presentation cannot own retry")
+				.deadline,
+			deadline
+		);
+		assert_eq!(state.ice_path_label.as_deref(), Some("ICE · relay · local relay · remote host"));
+
+		state.apply(&LiveUiEvent::IcePath(None));
+		assert!(state.ice_path_label.is_none());
+		assert_eq!(
+			state
+				.reconnect
+				.expect("ICE reset cannot own retry")
+				.deadline,
+			deadline
+		);
+
+		state.apply(&LiveUiEvent::IcePath(Some(facts)));
+		state.apply(&LiveUiEvent::Closed);
+		assert!(state.ice_path_label.is_none(), "session close cannot retain an old ICE path");
+		state.apply(&LiveUiEvent::IcePath(Some(facts)));
+		assert!(
+			state.ice_path_label.is_none(),
+			"a late native callback cannot repopulate a closed call"
+		);
+	}
+
+	#[test]
+	fn unavailable_path_has_recovery_wording_without_network_identifiers() {
+		let facts = LivePathFacts {
+			available:   false,
+			interface:   None,
+			class:       None,
+			constrained: Some(false),
+			metered:     None,
+			expensive:   Some(false),
+		};
+		assert_eq!(path_label(&facts).as_str(), "Network · unavailable");
 	}
 
 	#[test]

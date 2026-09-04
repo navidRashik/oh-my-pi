@@ -156,9 +156,10 @@ impl NativeLspSupervisor {
 
 	/// Re-runs configuration discovery, admitting new or changed declarations.
 	///
-	/// Slots whose server is already starting or running keep their live
-	/// state; declarations that disappeared from configuration are dropped
-	/// only while still `Available`.
+	/// Every prior declaration is evicted and shut down, including unchanged
+	/// ones: `reload` is an explicit restart boundary, not only a config-cache
+	/// refresh. Fresh declarations return to `Available` for eager or lazy
+	/// startup chosen by the caller.
 	///
 	/// # Errors
 	/// Returns configuration read, parse, or validation failures.
@@ -166,21 +167,32 @@ impl NativeLspSupervisor {
 	pub fn reload(&self) -> Result<(), LspConfigError> {
 		let fresh = discover_roster(&self.inner.root, self.inner.user_root.as_deref())?;
 		let mut roster = self.inner.roster.lock();
-		roster
-			.retain(|name, slot| slot.state != LspServerState::Available || fresh.contains_key(name));
+		let mut previous = std::mem::take(&mut *roster);
+		let mut next = BTreeMap::new();
+		let mut superseded = Vec::new();
 		for (name, slot) in fresh {
-			match roster.get_mut(&name) {
-				Some(existing) if existing.state == LspServerState::Available => {
-					*existing = slot;
-				},
-				Some(existing) => existing.config = slot.config,
-				None => {
-					roster.insert(name, slot);
-				},
+			if let Some(existing) = previous.remove(&name) {
+				superseded.push(pool_key(&name, &existing.config, &self.inner.root));
+			}
+			next.insert(name, slot);
+		}
+		for (name, slot) in previous {
+			superseded.push(pool_key(&name, &slot.config, &self.inner.root));
+		}
+		let server_count = next.len();
+		*roster = next;
+		drop(roster);
+		for key in superseded {
+			if let Some(process) = self.inner.pool.evict(&key)
+				&& let Ok(process) = Arc::try_unwrap(process)
+			{
+				tokio::spawn(async move {
+					if let Err(error) = process.shutdown().await {
+						tracing::warn!(server = %key.server, %error, "superseded LSP shutdown failed");
+					}
+				});
 			}
 		}
-		let server_count = roster.len();
-		drop(roster);
 		tracing::info!(server_count, "LSP roster reloaded");
 		Ok(())
 	}
@@ -314,22 +326,61 @@ impl NativeLspSupervisor {
 		let result = self
 			.inner
 			.pool
-			.get_or_try_init(key, || {
+			.get_or_try_init(key.clone(), || {
 				LspProcess::start(config.to_process_config(), &environment, cancel.clone())
 			})
 			.await;
 		match result {
 			Ok(process) => {
+				let current = self
+					.inner
+					.roster
+					.lock()
+					.get(name)
+					.map(|slot| pool_key(name, &slot.config, &self.inner.root));
+				if current.as_ref() != Some(&key) {
+					drop(self.inner.pool.evict(&key));
+					if let Ok(process) = Arc::try_unwrap(process)
+						&& let Err(error) = process.shutdown().await
+					{
+						tracing::warn!(server = %name, %error, "superseded LSP startup shutdown failed");
+					}
+					return;
+				}
 				self.set_state(name, LspServerState::Indexing, None);
 				let _ = environment
 					.lsp()
 					.wait_for_binding_ready(process.binding_id(), cancel)
 					.await;
+				let current = self
+					.inner
+					.roster
+					.lock()
+					.get(name)
+					.map(|slot| pool_key(name, &slot.config, &self.inner.root));
+				if current.as_ref() != Some(&key) {
+					drop(self.inner.pool.evict(&key));
+					if let Ok(process) = Arc::try_unwrap(process)
+						&& let Err(error) = process.shutdown().await
+					{
+						tracing::warn!(server = %name, %error, "superseded indexing shutdown failed");
+					}
+					return;
+				}
 				self.set_state(name, LspServerState::Ready, None);
 				self.publish(name, LspStartupStage::Ready);
 				tracing::info!(server = %name, "LSP server ready");
 			},
 			Err(error) => {
+				let current = self
+					.inner
+					.roster
+					.lock()
+					.get(name)
+					.map(|slot| pool_key(name, &slot.config, &self.inner.root));
+				if current.as_ref() != Some(&key) {
+					return;
+				}
 				self.set_state(name, LspServerState::Failed, Some(Str::from(error.to_string())));
 				self.publish(name, LspStartupStage::Failed);
 				tracing::warn!(server = %name, %error, "LSP server failed to start");

@@ -1,8 +1,8 @@
 //! Typed cards for approval resolution tools.
 //!
-//! `resolve` applies and `reject` discards the latest staged proposal
-//! (`envd::devices_host` `finalize_proposal`); both take one `reason`
-//! argument. pi (`tools/resolve.ts` `resolveRenderer`) paints the verb from
+//! `resolve` applies and `reject` discards one exact staged proposal
+//! (`envd::devices_host` `finalize_proposal`); both take `proposal_id` and
+//! `reason`. pi (`tools/resolve.ts` `resolveRenderer`) paints the verb from
 //! the action — `Accept` / `Discard`, `Failed` for an apply that errored —
 //! then the proposal label and the reason the caller gave.
 
@@ -66,7 +66,12 @@ fn reason(view: &CardView<'_>) -> Option<Str> {
 	let from = |value: Option<Value>| {
 		value
 			.as_ref()
-			.and_then(|value| value.get("reason"))
+			.and_then(|value| {
+				value
+					.get("reason")
+					.or_else(|| value.pointer("/decision/resolve/reason"))
+					.or_else(|| value.pointer("/decision/reject/requested/reason"))
+			})
 			.and_then(Value::as_str)
 			.map(str::trim)
 			.filter(|reason| !reason.is_empty())
@@ -84,8 +89,23 @@ fn reason(view: &CardView<'_>) -> Option<Str> {
 		})
 }
 
-/// The proposal's label (`<source tool>: <summary>` in pi) when the settled
-/// payload names it; pi's `pending action` otherwise.
+/// The exact proposal identity from invocation arguments or the settled
+/// transaction envelope.
+fn proposal_id(view: &CardView<'_>) -> Option<Str> {
+	let from = |value: Option<Value>| {
+		value
+			.as_ref()
+			.and_then(|value| value.get("proposal_id").or_else(|| value.get("id")))
+			.and_then(Value::as_str)
+			.map(str::trim)
+			.filter(|id| !id.is_empty())
+			.map(Str::new)
+	};
+	from(view.args_json()).or_else(|| from(view.result_json()))
+}
+
+/// The proposal's label (`<source tool>: <summary>` in pi) when a legacy
+/// settled payload names it; otherwise its exact transaction id.
 fn label(view: &CardView<'_>) -> Str {
 	view
 		.result_json()
@@ -94,17 +114,21 @@ fn label(view: &CardView<'_>) -> Str {
 		.and_then(Value::as_str)
 		.map(str::trim)
 		.filter(|label| !label.is_empty())
-		.map_or_else(|| Str::new_static("pending action"), Str::new)
+		.map(Str::new)
+		.or_else(|| proposal_id(view))
+		.unwrap_or_else(|| Str::new_static("pending action"))
 }
 
 fn render_resolution(view: &CardView<'_>, action: Action, _ui: &UiContext) -> Component {
 	match view.status {
 		CardStatus::StreamingArgs | CardStatus::InProgress => {
 			let reason = reason(view);
+			let proposal = proposal_id(view);
 			dom! {
 				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Resolve"}</text><text>{":"}</text>
 					<text fg=output wrap=pre>{format!(" {}", action.name())}</text><text>{" "}</text>
 					<text fg={if action == Action::Apply { "ok" } else { "warn" }} wrap=pre>{action.badge()}</text>
+					if let Some(proposal) = proposal { <text fg=muted wrap=pre>{sf!(" {proposal}")}</text> }
 					if let Some(reason) = reason { <text fg=output wrap=pre>{sf!(" {reason}")}</text> }
 					if let Some(badge) = elapsed_badge(view) { {badge} }
 				</row>

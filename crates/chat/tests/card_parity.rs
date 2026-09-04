@@ -185,7 +185,7 @@ fn edit_card_renders_every_section_of_a_transaction() {
 	assert!(text.contains("ECHO"), "{text}");
 	assert!(text.contains("Delete:"), "{text}");
 	assert!(text.contains("Move:"), "{text}");
-	assert_eq!(text.matches("⟨+1/-1⟩").count(), 2, "{text}");
+	assert_eq!(text.matches("⟨+1 -1⟩").count(), 2, "{text}");
 }
 
 #[test]
@@ -206,6 +206,18 @@ fn resolution_cards_paint_the_action_and_the_reason() {
 	let labelled = node(KnownTag::Result, r#"{"label":"ast_edit: rename 3 symbols"}"#);
 	let text = render("resolve", &input, Some(&labelled), None, CardStatus::Done, false);
 	assert!(text.contains("Accept: ast_edit: rename 3 symbols"), "{text}");
+
+	let exact_input = node(
+		KnownTag::Input,
+		r#"{"proposal_id":"pending-action:ast_edit:7","reason":"Apply reviewed rewrite."}"#,
+	);
+	let exact_result = node(
+		KnownTag::Result,
+		r#"{"id":"pending-action:ast_edit:7","decision":{"resolve":{"reason":"Apply reviewed rewrite."}},"payload":{}}"#,
+	);
+	let text = render("resolve", &exact_input, Some(&exact_result), None, CardStatus::Done, false);
+	assert!(text.contains("Accept: pending-action:ast_edit:7"), "{text}");
+	assert!(text.contains("Apply reviewed rewrite."), "{text}");
 
 	let diag = fault_node("revision changed");
 	let text = render("resolve", &input, None, Some(&diag), CardStatus::Failed, false);
@@ -293,11 +305,10 @@ fn ask_card_shows_custom_input_note_and_timeout() {
 		"ask",
 		&args.to_string(),
 		json!({"answers":[{
-			"id":"db","selected":[],
-			"customInput":"CockroachDB\nwith the serverless tier",
-			"note":"decided with ops",
-			"timed_out":false
-		}],"headless":false}),
+			"id":"db","question":"Which database?","options":["Postgres","SQLite"],"multi":false,
+			"selected":[],"customInput":"CockroachDB\nwith the serverless tier",
+			"note":"decided with ops","timed_out":false
+		}]}),
 		false,
 	);
 	assert!(text.contains("CockroachDB"), "{text}");
@@ -308,7 +319,10 @@ fn ask_card_shows_custom_input_note_and_timeout() {
 	let text = render_done::<omp_tools::ask::Payload>(
 		"ask",
 		&args.to_string(),
-		json!({"answers":[{"id":"db","selected":["Postgres"],"timed_out":true}],"headless":true}),
+		json!({"answers":[{
+			"id":"db","question":"Which database?","options":["Postgres","SQLite"],"multi":false,
+			"selected":["Postgres"],"timed_out":true
+		}]}),
 		false,
 	);
 	assert!(text.contains("auto-selected after timeout"), "{text}");
@@ -353,6 +367,66 @@ fn glob_card_folds_the_listing_when_collapsed() {
 		false,
 	);
 	assert!(!small.contains("more files"), "{small}");
+}
+
+#[test]
+fn glob_card_distinguishes_empty_from_incomplete_and_surfaces_warnings() {
+	let timed_out = render_done::<omp_tools::glob::Payload>(
+		"glob",
+		r#"{"path":"cache/**/*.bin"}"#,
+		json!({
+			"matches": [],
+			"missing_paths": ["gone"],
+			"timed_out": true,
+			"truncated": true,
+			"result_limit_reached": null,
+			"partial_match_count": 0,
+			"timeout_ms": 5000
+		}),
+		false,
+	);
+	assert!(
+		timed_out.contains("No matches before timeout (scan incomplete)"),
+		"{timed_out}"
+	);
+	assert!(timed_out.contains("timed out; results are incomplete"), "{timed_out}");
+	assert!(timed_out.contains("skipped missing: gone"), "{timed_out}");
+	assert!(!timed_out.contains("No files found"), "{timed_out}");
+
+	let empty = render_done::<omp_tools::glob::Payload>(
+		"glob",
+		r#"{"path":"src/*.zig"}"#,
+		json!({
+			"matches": [],
+			"missing_paths": [],
+			"timed_out": false,
+			"truncated": false,
+			"result_limit_reached": null,
+			"partial_match_count": 0,
+			"timeout_ms": 5000
+		}),
+		false,
+	);
+	assert!(empty.contains("No files found"), "{empty}");
+	assert!(!empty.contains("incomplete"), "{empty}");
+
+	let limited = render_done::<omp_tools::glob::Payload>(
+		"glob",
+		r#"{"path":"src/*.rs","limit":1}"#,
+		json!({
+			"matches": [{"path":"src/lib.rs","modified_ms":1,"is_dir":false}],
+			"missing_paths": [],
+			"timed_out": false,
+			"truncated": true,
+			"result_limit_reached": 1,
+			"partial_match_count": 2,
+			"timeout_ms": 5000
+		}),
+		false,
+	);
+	assert!(limited.contains("1 file · in src"), "{limited}");
+	assert!(limited.contains("truncated: limit 1 results"), "{limited}");
+	assert!(!limited.contains("2 files"), "{limited}");
 }
 
 #[test]
@@ -522,10 +596,26 @@ fn lsp_card_shows_the_output_projection_when_there_are_no_references() {
 		"lsp",
 		r#"{"action":"references","file":"src/lib.rs","line":4}"#,
 		json!({"action": "references", "servers": ["rust-analyzer"], "output": "",
-			"data": {"references": []}}),
+			"data": []}),
 		false,
 	);
 	assert!(none.contains("No output"), "{none}");
+
+	let references = render_done::<omp_tools::lsp::Payload>(
+		"lsp",
+		r#"{"action":"references","file":"src/lib.rs","line":4,"symbol":"parse"}"#,
+		json!({"action": "references", "servers": ["rust-analyzer"],
+		"output": "Found 2 references:\n  /tmp/src/lib.rs:4:8\n  /tmp/src/lib.rs:12:3",
+		"data": [
+			{"uri":"file:///tmp/src/lib.rs","range":{"start":{"line":3,"character":7},"end":{"line":3,"character":12}}},
+			{"uri":"file:///tmp/src/lib.rs","range":{"start":{"line":11,"character":2},"end":{"line":11,"character":7}}}
+		]}),
+		true,
+	);
+	assert!(references.contains("2 found"), "{references}");
+	assert!(references.contains("/tmp/src/lib.rs"), "{references}");
+	assert!(references.contains("line 4, col 8"), "{references}");
+	assert!(references.contains("at /tmp/src/lib.rs:12:3"), "{references}");
 
 	let many = (1..=8)
 		.map(|line| format!("row {line}"))
@@ -649,7 +739,10 @@ fn ast_grep_card_previews_directory_groups_that_fit_when_collapsed() {
 			ast_match("src/a.rs", 1, "hit_1()"),
 			ast_match("src/a.rs", 2, "hit_2()"),
 			ast_match("src/b.rs", 3, "hit_3()"),
-		], "advisories": [], "total": 3, "next_skip": null}),
+		], "advisories": [], "advisories_total": 0, "parse_errors": [],
+			"parse_errors_total": 0, "total": 3, "files_with_matches": 2,
+			"files_searched": 2, "skip": 0, "limit": 100, "limit_reached": false,
+			"next_skip": null}),
 		false,
 	);
 	assert!(small.contains("# src/"), "{small}");
@@ -663,7 +756,10 @@ fn ast_grep_card_previews_directory_groups_that_fit_when_collapsed() {
 		ast_match("src/a.rs", 2, "hit_2()"),
 		ast_match("lib/b.rs", 3, "hit_3()"),
 		ast_match("lib/b.rs", 4, "hit_4()"),
-	], "advisories": [], "total": 4, "next_skip": null});
+	], "advisories": [], "advisories_total": 0, "parse_errors": [],
+		"parse_errors_total": 0, "total": 4, "files_with_matches": 2,
+		"files_searched": 2, "skip": 0, "limit": 100, "limit_reached": false,
+		"next_skip": null});
 	let collapsed = render_done::<omp_tools::ast_grep::Payload>(
 		"ast_grep",
 		r#"{"pat":"hit_$N()","path":"."}"#,
@@ -676,7 +772,7 @@ fn ast_grep_card_previews_directory_groups_that_fit_when_collapsed() {
 	assert!(collapsed.contains("hit_3()"), "{collapsed}");
 	assert!(collapsed.contains("hit_4()"), "{collapsed}");
 	assert!(!collapsed.contains("hit_1()"), "{collapsed}");
-	assert!(collapsed.contains("… 1 more match"), "{collapsed}");
+	assert!(collapsed.contains("… 1 more group"), "{collapsed}");
 	let expanded = render_done::<omp_tools::ast_grep::Payload>(
 		"ast_grep",
 		r#"{"pat":"hit_$N()","path":"."}"#,
@@ -685,7 +781,7 @@ fn ast_grep_card_previews_directory_groups_that_fit_when_collapsed() {
 	);
 	assert!(expanded.contains("# src/"), "{expanded}");
 	assert!(expanded.contains("hit_1()"), "{expanded}");
-	assert!(!expanded.contains("more match"), "{expanded}");
+	assert!(!expanded.contains("more group"), "{expanded}");
 }
 
 fn grep_file(path: &str, lines: &[u32]) -> Value {
@@ -705,6 +801,22 @@ fn grep_payload(files: Vec<Value>) -> Value {
 		"per_file_limit_reached": false, "notes": [], "projected_text": "",
 		"output_blob": null, "output_artifact_uri": null,
 		"output_shown_lines": 0, "output_total_lines": 0})
+}
+
+#[test]
+fn grep_card_renders_empty_and_partial_diagnostics() {
+	let empty = render_done::<omp_tools::grep::Payload>(
+		"grep",
+		r#"{"pattern":"absent"}"#,
+		json!({"files": [], "total_files": 0, "total_files_lower_bound": false,
+			"multi_scope": true, "skip": 0, "file_limit_reached": false,
+			"per_file_limit_reached": false,
+			"notes": ["Skipped missing paths: gone"]}),
+		false,
+	);
+	assert!(empty.contains("0 matches · in ."), "{empty}");
+	assert!(empty.contains("No matches found"), "{empty}");
+	assert!(empty.contains("Skipped missing paths: gone"), "{empty}");
 }
 
 #[test]
@@ -746,8 +858,47 @@ fn grep_card_hidden_count_matches_the_rows_it_paints() {
 		grep_payload(vec![grep_file("src/a.tsx", &lines)]),
 		true,
 	);
-	assert_eq!(expanded.matches("useState(").count(), 30, "{expanded}");
-	assert!(!expanded.contains("more match"), "{expanded}");
+	assert_eq!(expanded.matches("useState(").count(), 21, "{expanded}");
+	assert!(expanded.contains("… 9 more matches"), "{expanded}");
+}
+
+#[test]
+fn grep_card_expansion_reveals_context_without_repeating_overlaps() {
+	let file = json!({
+		"path": "src/context.rs",
+		"source_key": "src/context.rs",
+		"snapshot_tag": null,
+		"matches": [
+			{"line_number": 3, "line": "needle one", "truncated": false,
+			 "context_before": [{"line_number": 2, "line": "before"}],
+			 "context_after": [{"line_number": 4, "line": "shared"}]},
+			{"line_number": 5, "line": "needle two", "truncated": false,
+			 "context_before": [{"line_number": 4, "line": "shared"}],
+			 "context_after": [{"line_number": 8, "line": "after gap"}]}
+		]
+	});
+	let payload = grep_payload(vec![file]);
+	let collapsed = render_done::<omp_tools::grep::Payload>(
+		"grep",
+		r#"{"pattern":"needle","path":"src/context.rs"}"#,
+		payload.clone(),
+		false,
+	);
+	assert!(collapsed.contains("*3│needle one"), "{collapsed}");
+	assert!(collapsed.contains("*5│needle two"), "{collapsed}");
+	assert!(!collapsed.contains("before"), "{collapsed}");
+	assert!(!collapsed.contains("shared"), "{collapsed}");
+
+	let expanded = render_done::<omp_tools::grep::Payload>(
+		"grep",
+		r#"{"pattern":"needle","path":"src/context.rs"}"#,
+		payload,
+		true,
+	);
+	assert!(expanded.contains(" 2│before"), "{expanded}");
+	assert_eq!(expanded.matches(" 4│shared").count(), 1, "{expanded}");
+	assert!(expanded.contains("..."), "{expanded}");
+	assert!(expanded.contains(" 8│after gap"), "{expanded}");
 }
 
 fn todo_phase(name: &str, tasks: &[(&str, &str)]) -> Value {

@@ -7,8 +7,10 @@
 use std::sync::Arc;
 
 use omp_con::{Ctx, RegItem};
-use omp_core::{Str, StrMut};
+use omp_core::{Str, StrMut, sf};
 use omp_tui::{Command, CommandArgument, Icon};
+
+use crate::overlays::{Services, services::ExtensionKind};
 
 /// Palette icons for the host's console-level commands that no command
 /// module declares in its `PALETTE`; anything else shows no type
@@ -28,6 +30,65 @@ const ICONS: [(&str, Icon); 14] = [
 	("help", Icon::Help),
 	("find", Icon::Search),
 	("exec", Icon::Config),
+];
+
+struct McpSubcommand {
+	name:        &'static str,
+	description: &'static str,
+	usage:       &'static str,
+}
+
+const MCP_SUBCOMMANDS: &[McpSubcommand] = &[
+	McpSubcommand { name: "add", description: "Add a new MCP server", usage: "<name>" },
+	McpSubcommand {
+		name:        "list",
+		description: "List configured MCP servers",
+		usage:       "",
+	},
+	McpSubcommand {
+		name:        "remove",
+		description: "Remove an MCP server",
+		usage:       "<name>",
+	},
+	McpSubcommand { name: "test", description: "Test an MCP server", usage: "<name>" },
+	McpSubcommand { name: "reauth", description: "Reauthorize OAuth", usage: "<name>" },
+	McpSubcommand {
+		name:        "unauth",
+		description: "Remove OAuth authorization",
+		usage:       "<name>",
+	},
+	McpSubcommand {
+		name:        "enable",
+		description: "Enable an MCP server",
+		usage:       "<name>",
+	},
+	McpSubcommand {
+		name:        "disable",
+		description: "Disable an MCP server",
+		usage:       "<name>",
+	},
+	McpSubcommand {
+		name:        "reconnect",
+		description: "Reconnect an MCP server",
+		usage:       "<name>",
+	},
+	McpSubcommand {
+		name:        "reload",
+		description: "Reload MCP runtime tools",
+		usage:       "",
+	},
+	McpSubcommand { name: "resources", description: "List MCP resources", usage: "" },
+	McpSubcommand { name: "prompts", description: "List MCP prompts", usage: "" },
+	McpSubcommand {
+		name:        "notifications",
+		description: "Show MCP notification capabilities",
+		usage:       "",
+	},
+	McpSubcommand {
+		name:        "help",
+		description: "Show MCP server management help",
+		usage:       "",
+	},
 ];
 
 /// Builds the slash palette from `con`'s registered commands: the link-time
@@ -82,6 +143,76 @@ pub fn roster(con: &Arc<Ctx>) -> Vec<Command> {
 		.collect()
 }
 
+/// Attaches live service-backed argument sources after the console registry
+/// has been projected. Extension and template command names are already
+/// present through `Ctx::dynamic_cmds`; MCP additionally completes its
+/// subcommands and the current MCP server roster.
+#[must_use]
+pub fn with_service_completions(
+	mut roster: Vec<Command>,
+	services: Arc<dyn Services>,
+) -> Vec<Command> {
+	for command in &mut roster {
+		if command.name() != "mcp" {
+			continue;
+		}
+		let services = Arc::clone(&services);
+		*command = command
+			.clone()
+			.with_dynamic_args(move |partial| mcp_arguments(services.as_ref(), partial));
+		break;
+	}
+	roster
+}
+
+fn mcp_arguments(services: &dyn Services, partial: &str) -> Box<[CommandArgument]> {
+	let Some((raw_subcommand, name_prefix)) = partial.split_once(' ') else {
+		let prefix = partial.to_ascii_lowercase();
+		return MCP_SUBCOMMANDS
+			.iter()
+			.filter(|subcommand| subcommand.name.starts_with(&prefix))
+			.map(|subcommand| CommandArgument {
+				value:       Str::new_static(subcommand.name),
+				description: Str::new_static(subcommand.description),
+				usage:       (!subcommand.usage.is_empty()).then(|| Str::new_static(subcommand.usage)),
+			})
+			.collect();
+	};
+	if name_prefix.contains(char::is_whitespace) {
+		return Box::default();
+	}
+	let subcommand = raw_subcommand.to_ascii_lowercase();
+	if !matches!(
+		subcommand.as_str(),
+		"enable" | "disable" | "test" | "remove" | "reconnect" | "reauth" | "unauth"
+	) {
+		return Box::default();
+	}
+	let Ok(rows) = services.extensions() else {
+		return Box::default();
+	};
+	let prefix = name_prefix.to_ascii_lowercase();
+	let mut names = rows
+		.into_iter()
+		.filter(|row| row.kind == ExtensionKind::Mcp)
+		.filter(|row| row.name.to_ascii_lowercase().starts_with(&prefix))
+		.map(|row| {
+			let description = row
+				.description
+				.unwrap_or_else(|| Str::new_static("MCP server"));
+			CommandArgument { value: sf!("{raw_subcommand} {}", row.name), description, usage: None }
+		})
+		.collect::<Vec<_>>();
+	names.sort_by(|left, right| {
+		left
+			.value
+			.to_ascii_lowercase()
+			.cmp(&right.value.to_ascii_lowercase())
+	});
+	names.dedup_by(|left, right| left.value.eq_ignore_ascii_case(&right.value));
+	names.into_boxed_slice()
+}
+
 /// First line of a doc-comment description, without its leading space.
 fn first_line(desc: &str) -> &str {
 	desc.lines().next().unwrap_or_default().trim()
@@ -104,10 +235,57 @@ fn usage(args: &[omp_con::ArgSpec]) -> Str {
 
 #[cfg(test)]
 mod tests {
-	use omp_con::CtxBuilder;
+	use omp_con::{CtxBuilder, DynamicCmdSpec};
 	use omp_tui::{EditorCompletion, SlashCommands, SuggestionDisplay};
 
 	use super::*;
+
+	struct McpServices;
+
+	impl Services for McpServices {
+		fn extensions(
+			&self,
+		) -> crate::overlays::services::ServiceResult<Vec<crate::overlays::services::ExtensionRow>>
+		{
+			use crate::overlays::services::{ExtensionKind, ExtensionRow, ExtensionStatus};
+			Ok(vec![
+				ExtensionRow {
+					id:          "alpha".into(),
+					name:        "Alpha".into(),
+					kind:        ExtensionKind::Mcp,
+					status:      ExtensionStatus::Ready,
+					enabled:     true,
+					version:     None,
+					description: Some("Primary server".into()),
+					tools:       Vec::new(),
+					resources:   Vec::new(),
+					prompts:     Vec::new(),
+					error:       None,
+				},
+				ExtensionRow {
+					id:          "python".into(),
+					name:        "Alpha Python".into(),
+					kind:        ExtensionKind::Python,
+					status:      ExtensionStatus::Ready,
+					enabled:     true,
+					version:     None,
+					description: None,
+					tools:       Vec::new(),
+					resources:   Vec::new(),
+					prompts:     Vec::new(),
+					error:       None,
+				},
+			])
+		}
+	}
+
+	#[allow(
+		clippy::unnecessary_wraps,
+		reason = "dynamic command handlers use the fallible console signature"
+	)]
+	fn dynamic_command(_ctx: &Ctx, _name: &str, _args: &[omp_con::Arg]) -> omp_con::ConResult<()> {
+		Ok(())
+	}
 
 	fn labels(suggestions: &omp_tui::Suggestions) -> Vec<&str> {
 		suggestions
@@ -162,5 +340,40 @@ mod tests {
 		let mut slash = SlashCommands::new(roster(&con));
 		let rows = slash.suggest("/help fi", 8).expect("argument rows");
 		assert!(labels(&rows).iter().any(|label| *label == "find"), "{:?}", labels(&rows));
+	}
+
+	#[test]
+	fn dynamic_extension_and_template_names_join_the_slash_roster() {
+		// This test owns only the runtime source. Static builtins have their
+		// own roster proof above and intentionally fuzzy-match `/ext`.
+		let con = Arc::new(CtxBuilder::default().isolated().build());
+		con.register_dynamic_cmd(DynamicCmdSpec {
+			name:    "extension-action".into(),
+			desc:    "Extension command".into(),
+			handler: dynamic_command,
+		})
+		.expect("extension command");
+		con.register_dynamic_cmd(DynamicCmdSpec {
+			name:    "review-template".into(),
+			desc:    "Prompt template".into(),
+			handler: dynamic_command,
+		})
+		.expect("template command");
+		let mut slash = SlashCommands::new(roster(&con));
+		assert_eq!(labels(&slash.suggest("/ext", 4).expect("extension row")), ["extension-action"]);
+		assert_eq!(labels(&slash.suggest("/review", 7).expect("template row")), ["review-template"]);
+	}
+
+	#[test]
+	fn mcp_completes_subcommands_then_live_server_names() {
+		let con = Arc::new(CtxBuilder::default().build());
+		let roster = with_service_completions(roster(&con), Arc::new(McpServices));
+		let mut slash = SlashCommands::new(roster);
+		let subcommands = slash.suggest("/mcp te", 7).expect("MCP subcommands");
+		assert_eq!(labels(&subcommands), ["test"]);
+		assert_eq!(subcommands.items[0].value(), "test ");
+		let servers = slash.suggest("/mcp test al", 12).expect("MCP server names");
+		assert_eq!(servers.items.len(), 1, "non-MCP extension rows stay hidden");
+		assert_eq!(servers.items[0].value(), "test Alpha ");
 	}
 }

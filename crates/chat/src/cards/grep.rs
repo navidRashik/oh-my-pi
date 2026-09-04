@@ -56,22 +56,75 @@ fn render_done(
 			groups
 				.iter()
 				.flat_map(|group| &group.files)
-				.map(|file| file.matches.len() as u64)
-				.sum()
+				.flat_map(|file| &file.rows)
+				.filter(|row| row.matched)
+				.count() as u64
 		});
-	let file_count = result
-		.get("total_files")
-		.and_then(Value::as_u64)
-		.unwrap_or_else(|| groups.iter().map(|group| group.files.len() as u64).sum());
+	let file_count = groups.iter().map(|group| group.files.len() as u64).sum::<u64>();
+	let truncated = ["total_files_lower_bound", "file_limit_reached", "per_file_limit_reached"]
+		.into_iter()
+		.any(|field| result.get(field).and_then(Value::as_bool).unwrap_or(false));
+	let scope = path.unwrap_or(".");
+	let notes = result
+		.get("notes")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(Value::as_str)
+		.collect::<Vec<_>>();
+	if match_count == 0 {
+		return dom! {
+			<col pad-x=1 w="100%">
+				<row gap=1>
+					<i:warning fg=warn/><text>{"Grep:"}</text><text fg=output>{query}</text>
+					<text fg=muted>{format!("0 matches · in {scope}")}</text>
+				</row>
+				<text fg=muted>{"No matches found"}</text>
+				for note in notes { <text fg=warn>{note}</text> }
+			</col>
+		}
+		.into_component();
+	}
 	let plan = plan_rows(&groups, expanded);
-	let shown_matches: u64 = plan.iter().flatten().map(|shown| *shown as u64).sum();
-	let hidden = match_count.saturating_sub(shown_matches);
+	let mut shown_matches = 0_u64;
+	let mut shown_rows = 0_u64;
+	for (group_index, files_shown) in plan.iter().enumerate() {
+		let Some(group) = groups.get(group_index) else {
+			continue;
+		};
+		for (file_index, rows_shown) in files_shown.iter().enumerate() {
+			let Some(file) = group.files.get(file_index) else {
+				continue;
+			};
+			let visible = display_rows(file, expanded).take(*rows_shown);
+			for row in visible {
+				shown_rows = shown_rows.saturating_add(1);
+				if row.matched {
+					shown_matches = shown_matches.saturating_add(1);
+				}
+			}
+		}
+	}
+	let total_rows = groups
+		.iter()
+		.flat_map(|group| &group.files)
+		.map(|file| display_rows(file, expanded).count() as u64)
+		.sum::<u64>();
+	let hidden_matches = match_count.saturating_sub(shown_matches);
+	let hidden_rows = total_rows.saturating_sub(shown_rows);
+	let hidden = if hidden_matches > 0 {
+		hidden_matches
+	} else {
+		hidden_rows
+	};
 	dom! {
 		<col pad-x=1 w="100%">
 			<row gap=1>
-				<i:search fg=default/><text>{"Grep:"}</text><text fg=output>{query}</text>
+				if truncated { <i:warning fg=warn/> } else { <i:search fg=default/> }
+				<text>{"Grep:"}</text><text fg=output>{query}</text>
 				<text fg=muted>{format!("{match_count} matches · {file_count} files · in")}</text>
-				if let Some(path) = path { <text fg=muted href={super::file_link(path)}>{path}</text> }
+				<text fg=muted href={super::file_link(scope)}>{scope}</text>
+				if truncated { <text fg=warn>{"truncated"}</text> }
 			</row>
 			<col>
 				for (group_index, files_shown) in plan.iter().enumerate() {
@@ -87,10 +140,10 @@ fn render_done(
 								} else {
 									<text fg=muted href={super::file_link(&format!("{}/{}", group.dir, file.name))}>{sf!("{}  ## {}", icon(ui, "tree-vertical"), file.name)}</text>
 								}
-								for row in file.matches.iter().take(*matches_shown) {
+								for row in display_rows(file, expanded).take(*matches_shown) {
 									if group_index + 1 == plan.len() && hidden == 0 {
 										<text fg=output href={super::file_link(&format!("{}/{}", group.dir, file.name))} pad_x={3_u16.saturating_add(line_padding(file, row))} w="100%">
-											{sf!("*{}│{}", row.line, row.text)}
+											{compact_match_line(row)}
 										</text>
 									} else {
 										<text fg=output href={super::file_link(&format!("{}/{}", group.dir, file.name))} w="100%">{match_line(file, row, icon(ui, "tree-vertical"))}</text>
@@ -101,8 +154,17 @@ fn render_done(
 					}
 				}
 				if hidden > 0 {
-					<row gap=1><i:tree-last fg=muted/><text fg=output>{"…"}</text><text fg=muted>{&hidden}</text><text fg=muted>{if hidden == 1 { "more match" } else { "more matches" }}</text></row>
+					<row gap=1><i:tree-last fg=muted/><text fg=output>{"…"}</text><text fg=muted>{&hidden}</text><text fg=muted>{
+						if hidden_matches > 0 {
+							if hidden == 1 { "more match" } else { "more matches" }
+						} else if hidden == 1 {
+							"more line"
+						} else {
+							"more lines"
+						}
+					}</text></row>
 				}
+				for note in notes { <text fg=warn>{note}</text> }
 			</col>
 		</col>
 	}
@@ -115,30 +177,29 @@ fn render_done(
 /// whenever the tree overflows.
 const COLLAPSED_ROWS: usize = 6;
 
+/// Expanded previews remain bounded like pi's
+/// `PREVIEW_LIMITS.EXPANDED_LINES * 2`.
+const EXPANDED_ROWS: usize = 24;
+
 /// Rows to paint per group and file: `plan[group][file]` is the number of
-/// matches shown for that file, and only the leading groups/files that fit
-/// the budget appear. Hidden matches are then exactly `total - shown`.
+/// source rows shown for that file, and only the leading groups/files that fit
+/// the budget appear. Collapsed mode omits context; expanded mode includes it.
 fn plan_rows(groups: &[Group], expanded: bool) -> Vec<Vec<usize>> {
-	if expanded {
-		return groups
-			.iter()
-			.map(|group| group.files.iter().map(|file| file.matches.len()).collect())
-			.collect();
-	}
+	let row_limit = if expanded { EXPANDED_ROWS } else { COLLAPSED_ROWS };
 	let total_rows: usize = groups
 		.iter()
 		.map(|group| {
 			1 + group
 				.files
 				.iter()
-				.map(|file| 1 + file.matches.len())
+				.map(|file| 1 + display_rows(file, expanded).count())
 				.sum::<usize>()
 		})
 		.sum();
-	let mut budget = if total_rows > COLLAPSED_ROWS {
-		COLLAPSED_ROWS - 1
+	let mut budget = if total_rows > row_limit {
+		row_limit - 1
 	} else {
-		COLLAPSED_ROWS
+		row_limit
 	};
 	let mut plan = Vec::with_capacity(groups.len());
 	for group in groups {
@@ -152,7 +213,7 @@ fn plan_rows(groups: &[Group], expanded: bool) -> Vec<Vec<usize>> {
 				break;
 			}
 			budget -= 1;
-			let shown = file.matches.len().min(budget);
+			let shown = display_rows(file, expanded).count().min(budget);
 			budget -= shown;
 			files.push(shown);
 		}
@@ -165,20 +226,41 @@ fn icon<'a>(ui: &'a UiContext, name: &str) -> &'a str {
 	ui.charset.icon_named(name).unwrap_or_default()
 }
 
+fn display_rows(file: &FileMatches, expanded: bool) -> impl Iterator<Item = &Match> {
+	file
+		.rows
+		.iter()
+		.filter(move |row| expanded || row.matched)
+}
+
 fn line_padding(file: &FileMatches, row: &Match) -> u16 {
 	let padding = file
-		.matches
+		.rows
 		.iter()
+		.filter(|row| row.line > 0)
 		.map(|row| decimal_width(row.line))
 		.max()
 		.unwrap_or(1)
-		.saturating_sub(decimal_width(row.line));
+		.saturating_sub(decimal_width(row.line.max(1)));
 	u16::try_from(padding).unwrap_or(u16::MAX)
 }
 
+fn compact_match_line(row: &Match) -> Str {
+	if row.line == 0 {
+		Str::new_static("...")
+	} else {
+		let marker = if row.matched { '*' } else { ' ' };
+		sf!("{marker}{}│{}", row.line, row.text)
+	}
+}
+
 fn match_line(file: &FileMatches, row: &Match, rail: &str) -> Str {
+	if row.line == 0 {
+		return sf!("{rail}  ...");
+	}
 	let padding = usize::from(line_padding(file, row));
-	sf!("{rail}  {}*{}│{}", " ".repeat(padding), row.line, row.text)
+	let marker = if row.matched { '*' } else { ' ' };
+	sf!("{rail}  {}{marker}{}│{}", " ".repeat(padding), row.line, row.text)
 }
 
 const fn decimal_width(mut value: u64) -> usize {
@@ -204,14 +286,15 @@ struct Group {
 }
 
 struct FileMatches {
-	path:    Str,
-	name:    Str,
-	matches: Vec<Match>,
+	path: Str,
+	name: Str,
+	rows: Vec<Match>,
 }
 
 struct Match {
-	line: u64,
-	text: Str,
+	line:    u64,
+	text:    Str,
+	matched: bool,
 }
 
 fn normalize_groups(result: &Value) -> Vec<Group> {
@@ -225,44 +308,90 @@ fn normalize_groups(result: &Value) -> Vec<Group> {
 				&mut files[index]
 			} else {
 				files.push(FileMatches {
-					path:    Str::new(path),
-					name:    Str::new(name),
-					matches: Vec::new(),
+					path: Str::new(path),
+					name: Str::new(name),
+					rows: Vec::new(),
 				});
 				files.last_mut().expect("file was just inserted")
 			};
-			file.matches.push(Match {
+			file.rows.push(Match {
 				line: row.get("line").and_then(Value::as_u64).unwrap_or_default(),
 				text: Str::new(string_at(row, "text").unwrap_or_default()),
+				matched: true,
 			});
 		}
 	} else if let Some(files) = result.get("files").and_then(Value::as_array) {
 		for value in files {
 			let path = string_at(value, "path").unwrap_or_default();
 			let (dir, name) = path.rsplit_once('/').unwrap_or((".", path));
-			let matches = value
+			let mut rows = Vec::new();
+			for matched in value
 				.get("matches")
 				.and_then(Value::as_array)
 				.into_iter()
 				.flatten()
-				.map(|row| Match {
-					line: row
+			{
+				for context in matched
+					.get("context_before")
+					.and_then(Value::as_array)
+					.into_iter()
+					.flatten()
+				{
+					push_source_row(
+						&mut rows,
+						context.get("line_number").and_then(Value::as_u64).unwrap_or_default(),
+						string_at(context, "line").unwrap_or_default(),
+						false,
+					);
+				}
+				push_source_row(
+					&mut rows,
+					matched
 						.get("line_number")
 						.and_then(Value::as_u64)
 						.unwrap_or_default(),
-					text: Str::new(string_at(row, "line").unwrap_or_default()),
-				})
-				.collect();
+					string_at(matched, "line").unwrap_or_default(),
+					true,
+				);
+				for context in matched
+					.get("context_after")
+					.and_then(Value::as_array)
+					.into_iter()
+					.flatten()
+				{
+					push_source_row(
+						&mut rows,
+						context.get("line_number").and_then(Value::as_u64).unwrap_or_default(),
+						string_at(context, "line").unwrap_or_default(),
+						false,
+					);
+				}
+			}
 			by_dir
 				.entry(format!("{dir}/"))
 				.or_default()
-				.push(FileMatches { path: Str::new(path), name: Str::new(name), matches });
+				.push(FileMatches { path: Str::new(path), name: Str::new(name), rows });
 		}
 	}
 	by_dir
 		.into_iter()
 		.map(|(dir, files)| Group { dir: Str::new(dir), files })
 		.collect()
+}
+
+fn push_source_row(rows: &mut Vec<Match>, line: u64, text: &str, matched: bool) {
+	let previous = rows
+		.iter()
+		.rev()
+		.find(|row| row.line > 0)
+		.map(|row| row.line);
+	if line == 0 || previous.is_some_and(|previous| line <= previous) {
+		return;
+	}
+	if previous.is_some_and(|previous| line > previous.saturating_add(1)) {
+		rows.push(Match { line: 0, text: Str::new_static(""), matched: false });
+	}
+	rows.push(Match { line, text: Str::new(text), matched });
 }
 
 fn string_at<'a>(value: &'a Value, key: &str) -> Option<&'a str> {

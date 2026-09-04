@@ -29,9 +29,22 @@ pub struct Range {
 
 /// Normalized diagnostic severity, ordered most to least severe.
 #[derive(
-	Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Deserialize,
+	Eq,
+	Hash,
+	Ord,
+	PartialEq,
+	PartialOrd,
+	Serialize,
+	strum::Display,
+	strum::IntoStaticStr,
 )]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Severity {
 	/// Compilation or analysis error.
 	#[default]

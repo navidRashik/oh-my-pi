@@ -1332,7 +1332,9 @@ impl Panel for AgentHub {
 					Err(error) => PanelEvent::Notice(sf!("{error}")),
 				}
 			},
-			PanelNote::Outcome(_) | PanelNote::Live(_) => PanelEvent::Ignored,
+			PanelNote::Outcome(_) | PanelNote::Live(..) | PanelNote::SettingResult { .. } => {
+				PanelEvent::Ignored
+			},
 		}
 	}
 
@@ -1847,7 +1849,9 @@ impl Panel for TranscriptViewer {
 					Err(error) => PanelEvent::Notice(sf!("{error}")),
 				}
 			},
-			PanelNote::Outcome(_) | PanelNote::Live(_) => PanelEvent::Ignored,
+			PanelNote::Outcome(_) | PanelNote::Live(..) | PanelNote::SettingResult { .. } => {
+				PanelEvent::Ignored
+			},
 		}
 	}
 

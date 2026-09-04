@@ -9,7 +9,6 @@ use std::{
 	process::{Command, ExitStatus, Stdio},
 };
 
-use omp_tui::components::editor::{ExternalEditorSuspension, ExternalEditorTerminal};
 use thiserror::Error;
 
 /// External editor launch options.
@@ -36,16 +35,65 @@ pub enum EditorError {
 	/// Temporary extension contains a path separator or unsupported character.
 	#[error("external editor temporary extension is invalid")]
 	InvalidExtension,
-	/// Temporary draft creation, child launch, or edited read failed.
-	#[error("external editor {operation} failed for {path}")]
-	Io {
-		/// Operation being performed.
-		operation: &'static str,
-		/// Affected path or executable.
-		path:      PathBuf,
+	/// Unique temporary draft names were exhausted.
+	#[error("external editor could not allocate a temporary draft in {directory}")]
+	TemporaryNameExhausted {
+		/// Directory in which drafts were attempted.
+		directory: PathBuf,
+	},
+	/// Temporary draft creation failed.
+	#[error("external editor could not create temporary draft {path}: {source}")]
+	TemporaryCreate {
+		/// Draft path.
+		path:   PathBuf,
 		/// Underlying operating-system failure.
 		#[source]
-		source:    io::Error,
+		source: io::Error,
+	},
+	/// Writing the initial draft failed.
+	#[error("external editor could not write temporary draft {path}: {source}")]
+	DraftWrite {
+		/// Draft path.
+		path:   PathBuf,
+		/// Underlying operating-system failure.
+		#[source]
+		source: io::Error,
+	},
+	/// Syncing the initial draft failed.
+	#[error("external editor could not sync temporary draft {path}: {source}")]
+	DraftSync {
+		/// Draft path.
+		path:   PathBuf,
+		/// Underlying operating-system failure.
+		#[source]
+		source: io::Error,
+	},
+	/// Starting or waiting for the configured editor failed.
+	#[error("external editor command failed to launch ({command}): {source}")]
+	Launch {
+		/// Configured editor command line.
+		command: omp_core::Str,
+		/// Underlying operating-system failure.
+		#[source]
+		source:  io::Error,
+	},
+	/// Reopening the edited draft failed.
+	#[error("external editor could not reopen temporary draft {path}: {source}")]
+	DraftReopen {
+		/// Draft path.
+		path:   PathBuf,
+		/// Underlying operating-system failure.
+		#[source]
+		source: io::Error,
+	},
+	/// Reading the edited draft failed.
+	#[error("external editor could not read temporary draft {path}: {source}")]
+	DraftRead {
+		/// Draft path.
+		path:   PathBuf,
+		/// Underlying operating-system failure.
+		#[source]
+		source: io::Error,
 	},
 }
 
@@ -73,53 +121,26 @@ pub fn resolve_editor_command_from(visual: Option<&str>, editor: Option<&str>) -
 		.map(str::to_owned)
 }
 
-/// Opens `content` in the selected editor and returns a replacement only after
-/// a successful child exit. Terminal restoration and temporary cleanup are
-/// guaranteed on every path.
-pub fn edit_draft<T: ExternalEditorTerminal + ?Sized>(
-	terminal: &mut T,
-	content: &str,
-	options: EditorOptions<'_>,
-) -> Result<Option<String>, EditorError> {
-	let editor = resolve_editor_command().ok_or(EditorError::NotConfigured)?;
-	edit_draft_with(terminal, &editor, content, options)
+/// Resolves the editor before the host releases terminal ownership.
+pub(crate) fn configured_editor_command() -> Result<omp_core::Str, EditorError> {
+	resolve_editor_command()
+		.map(omp_core::Str::new)
+		.ok_or(EditorError::NotConfigured)
 }
 
-/// Runs one already resolved editor command line. This is useful when a
-/// settings owner has frozen environment-derived editor configuration for
-/// the session.
-pub fn edit_draft_with<T: ExternalEditorTerminal + ?Sized>(
-	terminal: &mut T,
+/// Opens a draft after the caller has restored terminal modes.
+///
+/// Terminal ownership has one lifecycle owner: [`crate::host::Host`] leaves
+/// before calling this function and reconstructs after it returns. Keeping
+/// that boundary outside the editor runner guarantees every launch, child
+/// exit, and read failure follows the same terminal restoration path.
+pub fn edit_draft(
 	editor: &str,
 	content: &str,
 	options: EditorOptions<'_>,
 ) -> Result<Option<String>, EditorError> {
 	let mut draft = prepared_draft(content, options.extension)?;
-	let suspension = ExternalEditorSuspension::new(terminal).map_err(|source| EditorError::Io {
-		operation: "terminal suspend",
-		path: PathBuf::from("<terminal>"),
-		source,
-	})?;
 	let status = launch_editor(editor, draft.path())?;
-	suspension.restore().map_err(|source| EditorError::Io {
-		operation: "terminal restore",
-		path: PathBuf::from("<terminal>"),
-		source,
-	})?;
-	finish_draft(&mut draft, status, options.trim_trailing_newline)
-}
-
-/// Opens a draft after the terminal host has already restored terminal modes.
-///
-/// GUI hosts and terminal lifecycle owners use this at a reconstruction
-/// boundary, so no second suspension or raw-mode transition occurs.
-pub fn edit_draft_detached(
-	content: &str,
-	options: EditorOptions<'_>,
-) -> Result<Option<String>, EditorError> {
-	let editor = resolve_editor_command().ok_or(EditorError::NotConfigured)?;
-	let mut draft = prepared_draft(content, options.extension)?;
-	let status = launch_editor(&editor, draft.path())?;
 	finish_draft(&mut draft, status, options.trim_trailing_newline)
 }
 
@@ -139,11 +160,9 @@ fn launch_editor(editor: &str, path: &Path) -> Result<ExitStatus, EditorError> {
 		.stdin(Stdio::inherit())
 		.stdout(Stdio::inherit())
 		.stderr(Stdio::inherit());
-	child.status().map_err(|source| EditorError::Io {
-		operation: "launch",
-		path: PathBuf::from(editor),
-		source,
-	})
+	child
+		.status()
+		.map_err(|source| EditorError::Launch { command: omp_core::Str::new(editor), source })
 }
 
 #[cfg(not(windows))]
@@ -194,10 +213,12 @@ impl DraftFile {
 	fn create(extension: &str) -> Result<Self, EditorError> {
 		let extension = extension.trim().trim_start_matches('.');
 		if extension.is_empty()
-			|| !extension
-				.bytes()
-				.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-		{
+			|| extension.split('.').any(|segment| {
+				segment.is_empty()
+					|| !segment
+						.bytes()
+						.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+			}) {
 			return Err(EditorError::InvalidExtension);
 		}
 		let directory = env::temp_dir();
@@ -214,14 +235,10 @@ impl DraftFile {
 			match options.open(&path) {
 				Ok(file) => return Ok(Self { path, file }),
 				Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-				Err(source) => return Err(io_error("temporary creation", path, source)),
+				Err(source) => return Err(EditorError::TemporaryCreate { path, source }),
 			}
 		}
-		Err(io_error(
-			"temporary creation",
-			directory,
-			io::Error::new(io::ErrorKind::AlreadyExists, "temporary name collision"),
-		))
+		Err(EditorError::TemporaryNameExhausted { directory })
 	}
 
 	fn path(&self) -> &Path {
@@ -232,21 +249,21 @@ impl DraftFile {
 		self
 			.file
 			.write_all(bytes)
-			.map_err(|source| io_error("draft write", self.path.clone(), source))?;
+			.map_err(|source| EditorError::DraftWrite { path: self.path.clone(), source })?;
 		self
 			.file
 			.sync_all()
-			.map_err(|source| io_error("draft sync", self.path.clone(), source))
+			.map_err(|source| EditorError::DraftSync { path: self.path.clone(), source })
 	}
 
 	fn read_to_string(&mut self) -> Result<String, EditorError> {
 		self.file = File::open(&self.path)
-			.map_err(|source| io_error("draft reopen", self.path.clone(), source))?;
+			.map_err(|source| EditorError::DraftReopen { path: self.path.clone(), source })?;
 		let mut output = String::new();
 		self
 			.file
 			.read_to_string(&mut output)
-			.map_err(|source| io_error("draft read", self.path.clone(), source))?;
+			.map_err(|source| EditorError::DraftRead { path: self.path.clone(), source })?;
 		Ok(output)
 	}
 }
@@ -257,32 +274,9 @@ impl Drop for DraftFile {
 	}
 }
 
-fn io_error(operation: &'static str, path: PathBuf, source: io::Error) -> EditorError {
-	EditorError::Io { operation, path, source }
-}
-
 #[cfg(test)]
 mod tests {
-	use std::sync::atomic::{AtomicUsize, Ordering};
-
 	use super::*;
-
-	struct TerminalProbe {
-		suspended: AtomicUsize,
-		restored:  AtomicUsize,
-	}
-
-	impl ExternalEditorTerminal for TerminalProbe {
-		fn suspend_for_external_editor(&mut self) -> io::Result<()> {
-			self.suspended.fetch_add(1, Ordering::Relaxed);
-			Ok(())
-		}
-
-		fn restore_after_external_editor(&mut self) -> io::Result<()> {
-			self.restored.fetch_add(1, Ordering::Relaxed);
-			Ok(())
-		}
-	}
 
 	#[test]
 	fn resolution_prefers_visual_then_editor_then_windows_default() {
@@ -297,22 +291,45 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn omp_markdown_suffix_is_accepted_and_temporary_draft_is_removed() {
+		let draft = DraftFile::create(".omp.md").expect("multi-segment extension");
+		let path = draft.path().to_owned();
+		assert!(path.to_string_lossy().ends_with(".omp.md"));
+		assert!(path.exists());
+		drop(draft);
+		assert!(!path.exists(), "draft teardown removes the temporary file");
+
+		for extension in ["", ".", "..", "../md", "omp/.md", "omp..md"] {
+			assert!(
+				matches!(DraftFile::create(extension), Err(EditorError::InvalidExtension)),
+				"unsafe extension accepted: {extension:?}"
+			);
+		}
+	}
+
 	#[cfg(unix)]
 	#[test]
-	fn successful_round_trip_restores_terminal_and_replaces_draft() {
+	fn successful_round_trip_replaces_draft_and_trims_one_newline() {
 		use std::os::unix::fs::PermissionsExt as _;
 		let directory = tempfile::tempdir().unwrap();
 		let executable = directory.path().join("editor");
 		fs::write(&executable, "#!/bin/sh\nprintf 'edited\\n' > \"$1\"\n").unwrap();
 		fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 		let editor = executable.to_string_lossy().into_owned();
-		let mut terminal =
-			TerminalProbe { suspended: AtomicUsize::new(0), restored: AtomicUsize::new(0) };
-		let result =
-			edit_draft_with(&mut terminal, &editor, "initial", EditorOptions::default()).unwrap();
+		let result = edit_draft(&editor, "initial", EditorOptions::default()).unwrap();
 		assert_eq!(result.as_deref(), Some("edited"));
-		assert_eq!(terminal.suspended.load(Ordering::Relaxed), 1);
-		assert_eq!(terminal.restored.load(Ordering::Relaxed), 1);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn deleted_editor_draft_returns_a_typed_read_failure() {
+		let error = edit_draft("rm", "draft", EditorOptions {
+			extension:             "omp.md",
+			trim_trailing_newline: true,
+		})
+		.expect_err("editor removed its draft");
+		assert!(matches!(error, EditorError::DraftReopen { .. }));
 	}
 
 	/// pi `resolveEditorSpawnCommand`: `$EDITOR` is a shell command line, not
@@ -331,20 +348,16 @@ mod tests {
 			),
 			log.display()
 		);
-		let mut terminal =
-			TerminalProbe { suspended: AtomicUsize::new(0), restored: AtomicUsize::new(0) };
-		let result =
-			edit_draft_with(&mut terminal, &editor, "kept", EditorOptions::default()).unwrap();
+		let result = edit_draft(&editor, "kept", EditorOptions::default()).unwrap();
 		assert_eq!(result.as_deref(), Some("kept"), "the draft survives an editor that leaves it");
 		assert_eq!(fs::read_to_string(&log).unwrap(), "1\ntwo words\n");
 
 		let editor = format!("cp \"$1\" '{}' && printf 'replaced\\n' >", log.display());
-		let result =
-			edit_draft_with(&mut terminal, &editor, "draft body", EditorOptions::default()).unwrap();
+		let result = edit_draft(&editor, "draft body", EditorOptions::default()).unwrap();
 		assert_eq!(result.as_deref(), Some("replaced"), "`\"$1\"` is the draft path");
 		assert_eq!(fs::read_to_string(&log).unwrap(), "draft body");
 
-		let failing = edit_draft_with(&mut terminal, "false", "draft", EditorOptions::default());
+		let failing = edit_draft("false", "draft", EditorOptions::default());
 		assert!(
 			matches!(failing, Ok(None)),
 			"a non-zero shell exit keeps the original draft: {failing:?}"

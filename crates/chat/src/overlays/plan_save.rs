@@ -302,11 +302,12 @@ mod tests {
 		text
 			.lines()
 			.enumerate()
-			.find_map(|(row, line)| {
+			.filter_map(|(row, line)| {
 				line
 					.find(needle)
 					.map(|col| (u16::try_from(col).expect("col"), u16::try_from(row).expect("row")))
 			})
+			.last()
 			.expect("needle in frame")
 	}
 

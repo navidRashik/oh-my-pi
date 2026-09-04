@@ -628,7 +628,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let mut panel = DebugSelector::open(&ctx, 72);
 		let text = omp_tui::frame_text(panel.frame(Size { width: 72, height: 20 }));
-		assert!(text.contains("Debug tools"), "title missing:\n{text}");
+		assert!(text.contains("Debug Tools"), "title missing:\n{text}");
 		assert!(text.contains("Open session artifacts"), "row missing:\n{text}");
 		assert!(text.contains(DEBUG_HINT), "hint missing:\n{text}");
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Finish(sf!("debug open-artifacts")));

@@ -7,8 +7,9 @@
 
 use std::{fmt::Write as _, iter};
 
-use omp_core::{Str, StrMut, Ulid};
+use omp_core::{Str, StrMut, Ulid, sf};
 use omp_dom::{Dom, Handle, KnownTag, Node, PropId, Tag};
+use omp_journal::data::Attachment;
 use omp_tui::{
 	IntoComponent as _, PaintCtx, Props, Rect, Slot, UiContext, cell_width, dom, next_slot,
 };
@@ -85,6 +86,8 @@ pub struct SummaryDivider {
 	pub detail:   Str,
 	/// Whether the detail box is shown.
 	pub expanded: bool,
+	/// Oldest-to-newest snapcompact frame references rendered with the detail.
+	pub frames:   Vec<Attachment>,
 }
 
 impl SummaryDivider {
@@ -98,6 +101,8 @@ impl SummaryDivider {
 		let after = prop_u64(node, PropId::TokensAfter);
 		let warning = prop_text(node, PropId::Warning);
 		let summary = prop_text(node, PropId::Summary).unwrap_or_default();
+		let frames = omp_session::compaction_frames(node);
+		let frame_count = omp_session::compaction_frame_count(node);
 		let mut label = StrMut::new(method.label());
 		let detail = match method {
 			// Branch and handoff banners carry no amount badge
@@ -108,7 +113,7 @@ impl SummaryDivider {
 				detail.freeze()
 			},
 			Method::Handoff => {
-				let document = handoff_document(&summary);
+				let document = omp_session::custom_message::extract_handoff_document(summary.as_str());
 				let mut detail = StrMut::new("**Handoff context**\n\n");
 				detail.push_str(if document.is_empty() {
 					"_No handoff content._"
@@ -122,7 +127,7 @@ impl SummaryDivider {
 				if before > 0 && after > 0 {
 					let _ = write!(label, " · {}→{}", format_number(before), format_number(after));
 				}
-				compaction_detail(before, after, warning.as_deref(), &summary)
+				compaction_detail(before, after, warning.as_deref(), &summary, frame_count)
 			},
 		};
 		Self {
@@ -131,20 +136,24 @@ impl SummaryDivider {
 			warning: warning.is_some(),
 			detail,
 			expanded,
+			frames,
 		}
 	}
 
-	/// Renders the banner, plus the tinted detail box when expanded
-	/// (`SummaryDividerComponent.render`, `:50-52`; `#detailBox`, `:79-91`).
+	/// Renders the banner, plus the tinted detail box and retained
+	/// snapcompact frames when expanded (`SummaryDividerComponent.render`,
+	/// `:50-52`; `#detailBox`, `:79-91`).
 	#[must_use]
 	pub fn into_component(self) -> Component {
-		let divider = Divider::new(self.icon, self.label, self.warning);
-		let detail = self.detail;
-		if self.expanded {
+		let Self { icon, label, warning, detail, expanded, frames } = self;
+		let divider = Divider::new(icon, label, warning);
+		if expanded {
+			let frames = snapcompact_frame_components(frames);
 			dom! {
 				<col gap=1>
 					{divider}
 					<md bg=surface pad="1 1">{detail}</md>
+					for frame in frames { {frame} }
 				</col>
 			}
 			.into_component()
@@ -158,7 +167,13 @@ impl SummaryDivider {
 /// token line, the optional warning paragraph, then the summary. The warning
 /// glyph pi prefixes lives on the banner as `<icon name="warning">` instead;
 /// Markdown bodies built from props cannot host icon markup.
-fn compaction_detail(before: u64, after: u64, warning: Option<&str>, summary: &str) -> Str {
+fn compaction_detail(
+	before: u64,
+	after: u64,
+	warning: Option<&str>,
+	summary: &str,
+	frame_count: usize,
+) -> Str {
 	let mut detail = StrMut::new("**");
 	match (before > 0, after > 0) {
 		(true, true) => {
@@ -184,7 +199,28 @@ fn compaction_detail(before: u64, after: u64, warning: Option<&str>, summary: &s
 	}
 	detail.push_str("\n\n");
 	detail.push_str(summary);
+	if frame_count > 0 {
+		let suffix = if frame_count == 1 { "" } else { "s" };
+		let _ = write!(detail, "\n\n_{frame_count} snapcompact frame{suffix} attached_");
+	}
 	detail.freeze()
+}
+
+fn snapcompact_frame_components(frames: Vec<Attachment>) -> Vec<Component> {
+	frames
+		.into_iter()
+		.map(|frame| {
+			let source = sf!("artifact://sha256/{}", frame.blob);
+			dom! {
+				<img
+					src={source}
+					w={crate::cards::INLINE_IMAGE_MAX_COLS}
+					max-rows={crate::cards::INLINE_IMAGE_MAX_ROWS}
+				/>
+			}
+			.into_component()
+		})
+		.collect()
 }
 
 /// `toLocaleString()` for token counts: `256,000`.
@@ -198,18 +234,6 @@ fn group_thousands(value: u64) -> String {
 		text.push(char::from(digit));
 	}
 	text
-}
-
-/// pi `extractHandoffDocument` (`compaction-summary-message.ts:255-265`):
-/// the trimmed body of `<handoff-context>`, or the whole trimmed text.
-fn handoff_document(text: &str) -> &str {
-	const OPEN: &str = "<handoff-context>";
-	const CLOSE: &str = "</handoff-context>";
-	let Some(open) = text.find(OPEN) else {
-		return text.trim();
-	};
-	let body = &text[open + OPEN.len()..];
-	body.find(CLOSE).map_or(body, |close| &body[..close]).trim()
 }
 
 /// Every `<compaction>` under `<meta>` whose `boundary` entry was journaled
@@ -407,8 +431,12 @@ impl omp_tui::Component for Divider {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::Hash32;
 	use omp_dom::{PropKey, Value};
-	use omp_journal::{blob::BlobStore, data::Compaction};
+	use omp_journal::{
+		blob::{BlobRef, BlobStore},
+		data::{Attachment, Compaction},
+	};
 	use omp_session::{ComponentRegistry, Session};
 	use omp_tui::{Ui, frame_text};
 	use smallvec::smallvec;
@@ -443,6 +471,24 @@ mod tests {
 	fn render(divider: SummaryDivider, width: u16) -> String {
 		let ui = Ui::from_root(divider.into_component(), width, UiContext::default());
 		frame_text(ui.frame())
+	}
+
+	fn with_frames(mut node: Node, count: usize) -> Node {
+		let frames = (0..count)
+			.map(|index| Attachment {
+				blob: BlobRef { hash: Hash32::sum(&index.to_le_bytes()), size: 1_024 },
+				mime: Str::new_static("image/png"),
+			})
+			.collect::<Vec<_>>();
+		node.props.push((
+			PropId::Frames.into(),
+			Value::Json(serde_json::value::to_raw_value(&frames).expect("frame json")),
+		));
+		node.props.push((
+			PropId::FrameCount.into(),
+			Value::Int(i64::try_from(frames.len()).expect("fixture count")),
+		));
+		node
 	}
 
 	#[test]
@@ -538,6 +584,32 @@ mod tests {
 	}
 
 	#[test]
+	fn snapcompact_detail_counts_and_renders_retained_frames_with_missing_fallback() {
+		let one = SummaryDivider::compaction(
+			&with_frames(compaction_node(Some("snapcompact"), 84_000, 12_000, None), 1),
+			true,
+		);
+		assert!(one.detail.ends_with("_1 snapcompact frame attached_"), "{:?}", one.detail);
+		let rendered = render(one, 72);
+		assert!(rendered.contains("1 snapcompact frame attached"), "{rendered:?}");
+		assert!(
+			rendered.contains("[img:"),
+			"missing CAS frame uses the image fallback: {rendered:?}"
+		);
+
+		let two = SummaryDivider::compaction(
+			&with_frames(compaction_node(Some("snapcompact"), 84_000, 12_000, None), 2),
+			true,
+		);
+		assert!(two.detail.ends_with("_2 snapcompact frames attached_"), "{:?}", two.detail);
+		let collapsed = SummaryDivider::compaction(
+			&with_frames(compaction_node(Some("snapcompact"), 84_000, 12_000, None), 2),
+			false,
+		);
+		assert!(!render(collapsed, 72).contains("snapcompact frames attached"));
+	}
+
+	#[test]
 	fn branch_and_handoff_dividers_use_their_icons() {
 		let branch =
 			SummaryDivider::compaction(&compaction_node(Some("branch"), 9_000, 1_000, None), false);
@@ -588,6 +660,7 @@ mod tests {
 				tokens_before: Some(256_000),
 				tokens_after: Some(20_000),
 				warning: None,
+				frames: Vec::new(),
 			})
 			.expect("compaction");
 		let dom = session.dom();

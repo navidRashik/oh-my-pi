@@ -1,8 +1,7 @@
-//! Agent reactions (pi `modes/components/reaction.ts`). A reply whose first
-//! line contains only an emoji grapheme reacts to the transcript block before
-//! it: the emoji and its line ending are lifted out of the prose and shown as
-//! a badge on that block instead. An emoji followed by prose remains prose.
-//! While the reply streams, an
+//! Agent reactions (pi `modes/components/reaction.ts`). A reply that opens
+//! with a complete emoji grapheme reacts to the transcript block before it:
+//! the emoji and immediately following whitespace are lifted out of the prose
+//! and shown as a badge on that block instead. While the reply streams, an
 //! incomplete emoji run is withheld until it resolves or proves to be ordinary
 //! text, so the emoji never flashes inside the reply.
 //!
@@ -56,9 +55,10 @@ pub struct ReactionSplit<'a> {
 	pub pending: bool,
 }
 
-/// Splits a standalone opening reaction emoji off assistant text.
-/// Leading whitespace is tolerated. The emoji must occupy the whole first
-/// line; an emoji followed by prose remains part of the assistant body.
+/// Splits a complete opening reaction emoji off assistant text.
+///
+/// Leading whitespace is tolerated. Horizontal whitespace or one line ending
+/// immediately after the emoji is consumed before the remaining body.
 #[must_use]
 pub fn split_reaction(text: &str) -> ReactionSplit<'_> {
 	let start = text.len() - text.trim_start().len();
@@ -71,13 +71,7 @@ pub fn split_reaction(text: &str) -> ReactionSplit<'_> {
 	};
 	if REACTION.is_match(emoji) {
 		let rest = &head[emoji.len()..];
-		if let Some(body) = standalone_reaction_body(rest) {
-			return ReactionSplit { emoji: Some(emoji), body, pending: false };
-		}
-		// An emoji followed by prose is prose, not a reaction badge. Keeping
-		// the whole input also lets a streamed `👍 ` grow into `👍 sure`
-		// without silently deleting its first grapheme.
-		return ReactionSplit { emoji: None, body: text, pending: false };
+		return ReactionSplit { emoji: Some(emoji), body: reaction_body(rest), pending: false };
 	}
 	ReactionSplit {
 		emoji:   None,
@@ -86,21 +80,17 @@ pub fn split_reaction(text: &str) -> ReactionSplit<'_> {
 	}
 }
 
-/// Returns the body after a standalone opening emoji: the emoji may occupy
-/// the whole reply or its own line, with horizontal padding around the line.
-/// Horizontal whitespace followed by prose does not make the emoji a reaction.
-fn standalone_reaction_body(rest: &str) -> Option<&str> {
+/// Removes the whitespace current pi associates with an opening reaction.
+fn reaction_body(rest: &str) -> &str {
 	let horizontal = rest
 		.bytes()
 		.take_while(|byte| matches!(byte, b' ' | b'\t'))
 		.count();
 	let after = &rest[horizontal..];
-	if after.is_empty() {
-		return Some(after);
-	}
 	after
 		.strip_prefix("\r\n")
 		.or_else(|| after.strip_prefix('\n'))
+		.unwrap_or(after)
 }
 
 /// UTF-16 code units, pi's length measure.

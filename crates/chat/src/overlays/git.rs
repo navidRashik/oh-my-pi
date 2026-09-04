@@ -2210,7 +2210,10 @@ impl Panel for GitWorkbench {
 	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
 		match note {
 			PanelNote::Outcome(Outcome::Git(outcome)) => self.settle(outcome),
-			PanelNote::Outcome(_) | PanelNote::Dom(_) | PanelNote::Live(_) => PanelEvent::Ignored,
+			PanelNote::Outcome(_)
+			| PanelNote::Dom(_)
+			| PanelNote::Live(..)
+			| PanelNote::SettingResult { .. } => PanelEvent::Ignored,
 		}
 	}
 

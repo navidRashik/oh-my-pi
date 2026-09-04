@@ -10,14 +10,17 @@
 //! - `<notice kind=K>` with text content. `K` ∈ `error | warn | warning | info
 //!   | success` (controller notices), `diagnostics` (late LSP findings, `name`
 //!   = server), `tangent` (background `/tan` dispatch, `id` = job id, `label` =
-//!   work summary), `advisor` (`severity` = `blocker | concern`, `label` =
-//!   summary header, body = paragraphs), `hook` (`name` = hook name, body =
-//!   Markdown, folded to five lines unless expanded), `custom` (`name` = the
-//!   extension's message type, body = Markdown). The kernel journals the last
-//!   two from `EnvEvent::Notice`; `<notice kind=irc data={IrcTraffic}>` is the
-//!   typed incoming/autoreply/relay/work-pool observation projected by every
-//!   actor. `<user file_mention=true data={FileMentions}>` preserves auto-read
-//!   path order, materialization state, model content, and image blob refs.
+//!   work summary), `advisor` (`data={AdvisorMessage}` with ordered `notes[]
+//!   {advisor,severity,note}`). Older journals may retain scalar advisor props,
+//!   `hook`, or `custom` notices.
+//! - `<developer kind=custom|hook name=TYPE display=BOOL presentation=FRAME>`
+//!   keeps extension content model-visible while retaining exact renderer
+//!   identity and optional replacement TML. Actors fall back to the semantic
+//!   Markdown body when replacement parsing fails.
+//! - `<notice kind=irc data={IrcTraffic}>` is the typed
+//!   incoming/autoreply/relay/work-pool observation projected by every actor.
+//!   `<user file_mention=true data={FileMentions}>` preserves auto-read path
+//!   order, materialization state, model content, and image blob refs.
 //! - `<user async_result=true data={"jobs":[...]}>` keeps the model-facing
 //!   notice in its body but projects one compact typed completion row per job;
 //!   `<user launch_completion=true data={"daemons":[...]}>` does the same for
@@ -33,6 +36,10 @@
 //! - `<meta><compaction boundary method tokens-before tokens-after warning
 //!   summary>`; `boundary` names the last entry hidden by the summary, so the
 //!   divider lands after the turn containing that entry.
+//!
+//! The one observer-only exception is [`update::UpdateAvailable`]: the local
+//! interactive host may show a validated official release without journaling
+//! it, so replay, remote spectators, print, RPC, and ACP remain deterministic.
 
 pub mod cache;
 pub mod custom;
@@ -43,9 +50,12 @@ pub(crate) mod irc;
 pub(crate) mod local;
 pub mod misc;
 pub mod retry;
+pub mod session_exit;
 pub(crate) mod skill;
+pub mod update;
 pub mod usage;
 pub mod voice;
+pub(crate) mod workpool;
 
 use omp_core::{Str, Ulid};
 use omp_dom::{Node, PropId, Value};
@@ -117,45 +127,52 @@ pub fn format_number(value: u64) -> String {
 	}
 }
 
-/// pi `formatDuration`: `0ms`, `347ms`, `2.5s`, `1m20s`, `1h5m`, `2d`.
-#[must_use]
-pub fn format_duration(ms: u64) -> String {
+/// Writes pi `formatDuration`: `0ms`, `347ms`, `2.5s`, `1m20s`, `1h5m`, `2d`.
+pub fn write_duration(out: &mut impl std::fmt::Write, ms: u64) -> std::fmt::Result {
 	const SEC: u64 = 1_000;
 	const MIN: u64 = 60 * SEC;
 	const HOUR: u64 = 60 * MIN;
 	const DAY: u64 = 24 * HOUR;
 	#[allow(clippy::cast_precision_loss, reason = "display rounding only")]
 	if ms == 0 {
-		"0ms".to_owned()
+		out.write_str("0ms")
 	} else if ms < SEC {
-		format!("{ms}ms")
+		write!(out, "{ms}ms")
 	} else if ms < MIN {
-		format!("{:.1}s", ms as f64 / SEC as f64)
+		write!(out, "{:.1}s", ms as f64 / SEC as f64)
 	} else if ms < HOUR {
 		let mins = ms / MIN;
 		let secs = (ms % MIN) / SEC;
 		if secs > 0 {
-			format!("{mins}m{secs}s")
+			write!(out, "{mins}m{secs}s")
 		} else {
-			format!("{mins}m")
+			write!(out, "{mins}m")
 		}
 	} else if ms < DAY {
 		let hours = ms / HOUR;
 		let mins = (ms % HOUR) / MIN;
 		if mins > 0 {
-			format!("{hours}h{mins}m")
+			write!(out, "{hours}h{mins}m")
 		} else {
-			format!("{hours}h")
+			write!(out, "{hours}h")
 		}
 	} else {
 		let days = ms / DAY;
 		let hours = (ms % DAY) / HOUR;
 		if hours > 0 {
-			format!("{days}d{hours}h")
+			write!(out, "{days}d{hours}h")
 		} else {
-			format!("{days}d")
+			write!(out, "{days}d")
 		}
 	}
+}
+
+/// Allocating convenience wrapper for [`write_duration`].
+#[must_use]
+pub fn format_duration(ms: u64) -> String {
+	let mut output = String::new();
+	let _ = write_duration(&mut output, ms);
+	output
 }
 
 #[cfg(test)]

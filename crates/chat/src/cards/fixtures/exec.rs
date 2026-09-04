@@ -22,7 +22,7 @@ const AST_GREP_ARGS: &str = r#"{"pat":"useState($A)","path":"packages/tui/src/co
 const AST_GREP_RESULT: &str = r#"{"matches":[{"path":"packages/tui/src/components/SearchBox.tsx","line":18,"text":"  const [query, setQuery] = useState(\"\");","bindings":{"A":"\"\""}},{"path":"packages/tui/src/components/StatusBar.tsx","line":27,"text":"  const [expanded, setExpanded] = useState(false);","bindings":{"A":"false"}}],"match_count":2,"file_count":2,"files_searched":14,"scope_path":"packages/tui/src/components"}"#;
 
 const AST_EDIT_ARGS: &str = r#"{"ops":[{"pat":"countEditFiles($$$ARGS)","out":"countDistinctFiles($$$ARGS)"}],"paths":["packages/coding-agent/src/**/*.ts"]}"#;
-const AST_EDIT_RESULT: &str = r#"{"files":[{"path":"edit/renderer.ts","replacements":2,"before_hash":"38ff7e80e412","after_hash":"4cc43b49bba2","diff":"-468       fileCount = countEditFiles(editArgs.edits);\n+468       fileCount = countDistinctFiles(editArgs.edits);\n-488       const totalFiles = args?.edits ? countEditFiles(args.edits) : 0;\n+488       const totalFiles = args?.edits ? countDistinctFiles(args.edits) : 0;"},{"path":"tools/tool-result.ts","replacements":1,"before_hash":"02b7088f6f8c","after_hash":"886c440e2d72","diff":"-42    return countEditFiles(files);\n+42    return countDistinctFiles(files);"}],"advisories":[],"recovery_root":null,"pending_proposal":"ast-edit-1"}"#;
+const AST_EDIT_RESULT: &str = r#"{"files":[{"path":"edit/renderer.ts","replacements":2,"before_hash":"38ff7e80e412","after_hash":"4cc43b49bba2","diff":"-468       fileCount = countEditFiles(editArgs.edits);\n+468       fileCount = countDistinctFiles(editArgs.edits);\n-488       const totalFiles = args?.edits ? countEditFiles(args.edits) : 0;\n+488       const totalFiles = args?.edits ? countDistinctFiles(args.edits) : 0;"},{"path":"tools/tool-result.ts","replacements":1,"before_hash":"02b7088f6f8c","after_hash":"886c440e2d72","diff":"-42    return countEditFiles(files);\n+42    return countDistinctFiles(files);"}],"advisories":[],"advisories_total":0,"parse_errors":[],"parse_errors_total":0,"files_searched":12,"files_touched":2,"total_replacements":3,"recovery_root":null,"pending_proposal":"ast-edit-1"}"#;
 
 const LSP_ARGS: &str =
 	r#"{"action":"references","file":"src/server/auth.ts","line":42,"symbol":"validateToken"}"#;
@@ -31,9 +31,6 @@ const LSP_RESULT: &str = r#"{"action":"references","references":[{"path":"src/se
 const BROWSER_ARGS: &str = r#"{"action":"run","name":"docs","code":"const obs = await tab.observe();\nconst heading = obs.elements.find(e => e.role === 'heading');\ndisplay({\n    url: obs.url,\n    title: obs.title,\n    headings: obs.elements.filter(e => e.role === 'heading').length\n});\nreturn heading?.name ?? 'no heading found';"}"#;
 const BROWSER_RESULT: &str = r#"{"action":"run","name":"docs","url":"https://bun.sh/docs","browser":"headless","display":[{"url":"https://bun.sh/docs","title":"Bun Documentation","headings":14}],"result":"Get started with Bun"}"#;
 const BROWSER_FAULT: &str = r#"{"code":"browser_automation_failed","message":"TimeoutError: waiting for selector `aria/Sign in` failed: timeout 30000ms exceeded\n    at Tab.waitFor (browser/tab.ts:212:13)\n    at run (eval:3:7)","name":"docs","url":"https://bun.sh/docs","title":"Bun Documentation","browser":"headless"}"#;
-
-const INSPECT_ARGS: &str = r#"{"path":"docs/assets/dashboard-mock.png","question":"What chart types are shown and roughly what layout does the dashboard use?"}"#;
-const INSPECT_RESULT: &str = r#"{"answer":"The dashboard uses a two-column layout on a dark background.\nTop row: four KPI cards (Revenue, Active Users, Churn, MRR) with sparklines.\nLeft column: a stacked area chart of weekly sessions over ~3 months.\nRight column: a horizontal bar chart ranking the top 6 referrers.\nBottom: a paginated table of recent transactions with status pills.","model":"claude-opus-4","image_path":"docs/assets/dashboard-mock.png","mime_type":"image/png"}"#;
 
 pub(super) const FIXTURES: &[CardFixture] = &[
 	CardFixture {
@@ -182,31 +179,6 @@ pub(super) const FIXTURES: &[CardFixture] = &[
 			},
 		],
 	},
-	CardFixture {
-		tool:   "inspect_image",
-		title:  "Inspect Image",
-		states: [
-			FixtureState {
-				args:   r#"{"path":"docs/assets/dashboard-mock.png"}"#,
-				update: None,
-				result: None,
-				fault:  None,
-			},
-			FixtureState { args: INSPECT_ARGS, update: None, result: None, fault: None },
-			FixtureState {
-				args:   INSPECT_ARGS,
-				update: None,
-				result: Some(INSPECT_RESULT),
-				fault:  None,
-			},
-			FixtureState {
-				args:   INSPECT_ARGS,
-				update: None,
-				result: None,
-				fault:  Some(r#""Image not found: docs/assets/dashboard-mock.png""#),
-			},
-		],
-	},
 ];
 
 #[cfg(test)]
@@ -215,9 +187,7 @@ mod tests {
 
 	#[test]
 	fn execution_cards_materialize_every_lifecycle() {
-		for tool in
-			["bash", "eval", "ast_grep", "ast_edit", "lsp", "computer", "browser", "inspect_image"]
-		{
+		for tool in ["bash", "eval", "ast_grep", "ast_edit", "lsp", "computer", "browser"] {
 			let sections = render_sections(Some(tool), &GalleryState::ALL, 100, false)
 				.unwrap_or_else(|error| panic!("{tool}: {error}"));
 			assert_eq!(sections.len(), GalleryState::ALL.len());

@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use omp_core::Str;
-use omp_tools::ask::Answer;
+use omp_tools::ask::Selection;
 use omp_tui::{
 	Frame, Key, Prop, Size, Ui, UiContext, UiEvent,
 	components::{EditInput, EditorPane},
@@ -131,7 +131,7 @@ impl InputDialog {
 		let text = self.current_text();
 		PanelEvent::Ask {
 			id:      self.id.clone(),
-			answers: Some(vec![Answer {
+			answers: Some(vec![Selection {
 				id:           Str::new_static(FIELD),
 				selected:     Vec::new(),
 				custom_input: Some(text),

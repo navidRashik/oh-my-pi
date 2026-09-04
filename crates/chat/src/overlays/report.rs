@@ -146,6 +146,7 @@ pub struct PendingReportPanel<T> {
 	message:   Str,
 	state:     PendingState<T>,
 	render:    fn(&T) -> Str,
+	cancel:    Option<flume::Sender<()>>,
 	next_wake: Option<Duration>,
 	ui:        Ui,
 	ctx:       UiContext,
@@ -164,12 +165,28 @@ impl<T> PendingReportPanel<T> {
 		render: fn(&T) -> Str,
 		ctx: &UiContext,
 	) -> Self {
+		Self::new_cancellable(id, title, message, pending, render, None, ctx)
+	}
+
+	/// Opens a cancellable loader that becomes a scrollable report after
+	/// settlement.
+	#[must_use]
+	pub fn new_cancellable(
+		id: &'static str,
+		title: impl Into<Str>,
+		message: impl Into<Str>,
+		pending: Pending<T>,
+		render: fn(&T) -> Str,
+		cancel: Option<flume::Sender<()>>,
+		ctx: &UiContext,
+	) -> Self {
 		let mut panel = Self {
 			id,
 			title: title.into(),
 			message: message.into(),
 			state: PendingState::Waiting(pending),
 			render,
+			cancel,
 			next_wake: Some(Duration::ZERO),
 			ui: Ui::from_root(dom! { <col/> }, 80, ctx.clone()),
 			ctx: ctx.clone(),
@@ -197,6 +214,7 @@ impl<T> PendingReportPanel<T> {
 	}
 
 	fn settle(&mut self, body: Str) {
+		self.cancel = None;
 		self.state =
 			PendingState::Ready(ReportPanel::new(self.id, self.title.clone(), body, &self.ctx));
 		self.next_wake = None;
@@ -216,7 +234,12 @@ impl<T> Panel for PendingReportPanel<T> {
 		match &mut self.state {
 			PendingState::Ready(report) => report.key(key),
 			PendingState::Waiting(_) => match key {
-				Key::Esc => PanelEvent::Close,
+				Key::Esc => {
+					if let Some(cancel) = self.cancel.take() {
+						let _ = cancel.send(());
+					}
+					PanelEvent::Close
+				},
 				_ => PanelEvent::Consumed,
 			},
 		}
@@ -270,6 +293,7 @@ mod tests {
 	use omp_tui::{Mods, Mouse, MouseButton};
 
 	use super::*;
+	use crate::overlays::services::ServiceResult;
 
 	fn wheel_down(col: u16, row: u16) -> MouseReport {
 		MouseReport {
@@ -334,6 +358,24 @@ mod tests {
 		assert!(text.contains("requests: 7"), "body missing:\n{text}");
 		assert!(text.contains("Esc close"), "hint missing:\n{text}");
 		assert_eq!(panel.key(Key::Esc), PanelEvent::Close);
+	}
+
+	#[test]
+	fn pending_report_escape_cancels_the_backing_operation() {
+		let ctx = UiContext::default();
+		let (_tx, rx) = flume::bounded::<ServiceResult<Str>>(1);
+		let (cancel_tx, cancel_rx) = flume::bounded(1);
+		let mut panel = PendingReportPanel::new_cancellable(
+			"mcp",
+			"Smithery",
+			"Searching...",
+			rx,
+			Str::clone,
+			Some(cancel_tx),
+			&ctx,
+		);
+		assert_eq!(panel.key(Key::Esc), PanelEvent::Close);
+		assert_eq!(cancel_rx.try_recv(), Ok(()));
 	}
 
 	#[test]

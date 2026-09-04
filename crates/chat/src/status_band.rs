@@ -1582,8 +1582,9 @@ struct LayoutCache {
 /// context gauge to the right-docked group (session title, token counts,
 /// throughput, spend). Overflow follows pi's `#buildStatusLine`: the gauge
 /// keeps room for its labels, the session title shrinks first, then right
-/// chips pop from the right, then the path shrinks, then non-path left chips
-/// drop from the right so the working directory survives the longest.
+/// chips pop from the right. Collaboration yields before the protected path;
+/// the path then shrinks before other left chips drop from the configured
+/// right edge.
 pub struct StatusBand {
 	props: Props,
 	slot:  Slot,
@@ -2276,6 +2277,15 @@ impl StatusBand {
 				}
 			}
 		}
+		// Pi's `showHookStatus` is orthogonal to status-line presets: a
+		// producer update remains visible without requiring users to add the
+		// optional `status` segment to a custom layout.
+		if !selected_left.iter().any(|(chip, ..)| *chip == Chip::Hook)
+			&& !selected_right.iter().any(|(chip, ..)| *chip == Chip::Hook)
+			&& let Some(label) = pool.iter().find(|(chip, ..)| *chip == Chip::Hook)
+		{
+			selected_left.push(label.clone());
+		}
 		let embeds_context = self.facts.appearance.context_line == ContextLine::Embedded
 			&& self.facts.context_window.is_some_and(|window| window > 0);
 		let has_context = selected_left
@@ -2397,9 +2407,8 @@ impl StatusBand {
 	}
 
 	/// Fits both groups into `width` around the gauge (pi `#buildStatusLine`):
-	/// clamp the session title, pop right chips, shrink the path, then shed
-	/// left chips. Custom layout drops from the declared right edge while
-	/// preserving path; built-in presets use their semantic priority.
+	/// clamp the session title, pop right chips, yield collaboration, shrink
+	/// the path, then shed left chips from the declared right edge.
 	fn fitted(&self, pc: &PaintCtx<'_>, width: u16) -> Layout {
 		let charset = pc.ctx.charset;
 		let transparent =
@@ -2475,6 +2484,18 @@ impl StatusBand {
 		while overflow(&left, &right) > 0 && !right.is_empty() {
 			right.pop();
 		}
+		// Collaboration is optional presence metadata, while the project path
+		// is the stable location anchor. Keep pi's configured order for every
+		// other chip, but apply those semantic roles before spending any of the
+		// path's elastic width. Custom layouts may repeat either segment.
+		if left.iter().any(|(chip, ..)| *chip == Chip::Path) {
+			while overflow(&left, &right) > 0 {
+				let Some(index) = left.iter().rposition(|(chip, ..)| *chip == Chip::Collab) else {
+					break;
+				};
+				left.remove(index);
+			}
+		}
 		loop {
 			let excess = overflow(&left, &right);
 			if excess == 0 || left.is_empty() {
@@ -2527,26 +2548,10 @@ impl StatusBand {
 				}
 				continue;
 			}
-			let drop = if custom {
-				left
-					.iter()
-					.rposition(|(chip, ..)| *chip != Chip::Path)
-					.unwrap_or(left.len() - 1)
-			} else {
-				[
-					Chip::Pr,
-					Chip::Git,
-					Chip::Hook,
-					Chip::Collab,
-					Chip::Mode,
-					Chip::Model,
-					Chip::Brand,
-					Chip::Path,
-				]
-				.into_iter()
-				.find_map(|candidate| left.iter().position(|(chip, ..)| *chip == candidate))
-				.unwrap_or(left.len() - 1)
-			};
+			let drop = left
+				.iter()
+				.rposition(|(chip, ..)| *chip != Chip::Path)
+				.unwrap_or(left.len() - 1);
 			left.remove(drop);
 		}
 	}
@@ -2904,7 +2909,10 @@ pub(crate) mod tests {
 	}
 
 	fn row(facts: StatusFacts, width: u16) -> String {
-		rows(StatusBand::new(facts), width).remove(0)
+		rows(StatusBand::new(facts), width)
+			.into_iter()
+			.next()
+			.unwrap_or_default()
 	}
 
 	#[test]
@@ -3055,10 +3063,54 @@ pub(crate) mod tests {
 			overflowed.contains("proj"),
 			"collaboration yields before the project path: {overflowed}"
 		);
+
+		let assert_protected_path = |appearance: StatusAppearance| {
+			for width in 1..=160 {
+				let baseline = row(StatusFacts { appearance: appearance.clone(), ..facts() }, width);
+				let collaborative = row(
+					StatusFacts {
+						collab: Some(CollabStatus::host(12)),
+						appearance: appearance.clone(),
+						..facts()
+					},
+					width,
+				);
+				if !collaborative.contains("collab:12") && baseline.contains("📁") {
+					assert!(
+						collaborative.contains("📁"),
+						"collaboration must yield before removing the path at width {width}: \
+						 {collaborative}"
+					);
+				}
+			}
+		};
+		assert_protected_path(StatusAppearance::for_preset(StatusPreset::Default));
+		assert_protected_path(custom_appearance(
+			&[StatusSegment::Model, StatusSegment::Path, StatusSegment::Collab, StatusSegment::Git],
+			&[],
+		));
 	}
 
-	/// Facts with every right-group chip populated.
+	/// Facts with an explicit custom layout exercising every right-group chip.
 	fn spending() -> StatusFacts {
+		let mut appearance = custom_appearance(
+			&[
+				StatusSegment::Pi,
+				StatusSegment::Model,
+				StatusSegment::Path,
+				StatusSegment::Git,
+				StatusSegment::ContextPct,
+			],
+			&[
+				StatusSegment::SessionName,
+				StatusSegment::TokenIn,
+				StatusSegment::TokenOut,
+				StatusSegment::TokenTotal,
+				StatusSegment::TokenRate,
+				StatusSegment::Cost,
+			],
+		);
+		appearance.context_line = ContextLine::Embedded;
 		StatusFacts {
 			session_name: Some(Str::new_static("refactor the auth layer")),
 			tokens_in: 12_000,
@@ -3068,6 +3120,7 @@ pub(crate) mod tests {
 			tokens_per_second: Some(42.4),
 			cost_nano_usd: 120_000_000,
 			premium_requests_millionths: 2_000_000,
+			appearance,
 			..facts()
 		}
 	}
@@ -3266,9 +3319,9 @@ pub(crate) mod tests {
 		assert!(
 			(20..=100).any(|width| {
 				let line = row(configured.clone(), width);
-				line.contains("~/proj") && !line.contains("Sonnet 4.5") && !line.contains("main")
+				line.contains("📁") && !line.contains("Sonnet 4.5") && !line.contains("main")
 			}),
-			"path survives non-path left chips"
+			"the clamped path survives non-path left chips"
 		);
 	}
 
@@ -3545,7 +3598,7 @@ pub(crate) mod tests {
 	}
 
 	#[test]
-	fn git_chip_marks_a_dirty_tree_in_the_warning_color() {
+	fn git_chip_marks_a_dirty_tree_in_the_semantic_dirty_color() {
 		let ui = Ui::from_root(
 			StatusBand::new(StatusFacts {
 				git_status: Some(GitStatus { unstaged: 1, ..GitStatus::default() }),
@@ -3559,7 +3612,7 @@ pub(crate) mod tests {
 		let column = cell_width(" π  > ⬢ Sonnet 4.5 > 📁 ~/proj > ");
 		assert_eq!(
 			ui.frame().cell(column, 0).style().foreground_color(),
-			UiContext::default().theme.warn
+			UiContext::default().theme.status_git_dirty
 		);
 	}
 
@@ -3830,10 +3883,11 @@ pub(crate) mod tests {
 		assert_eq!(color_at(ModeChip::Goal(GoalState::Paused), '⏸'), theme.warn);
 		assert_eq!(color_at(ModeChip::Goal(GoalState::Dropped), '⏹'), theme.muted);
 
-		// The active mode outlives decorative brand/model/git/path chips under
-		// pressure because it changes how the next turn behaves.
+		// Overflow follows the configured segment order: after the path reaches
+		// its floor, the rightmost non-path chip yields first.
 		let row = self::row(StatusFacts { mode: Some(ModeChip::Plan), ..facts() }, 40);
-		assert!(row.contains("Plan"), "{row}");
+		assert!(!row.contains("Plan"), "{row}");
+		assert!(row.contains("📁"), "the path survives the mode chip: {row}");
 	}
 
 	#[test]

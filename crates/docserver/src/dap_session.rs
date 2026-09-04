@@ -14,6 +14,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::future::join_all;
 use omp_core::Str;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -41,6 +42,7 @@ const SWEEP_INTERVALS: u8 = 6;
 
 /// Stable DAP lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, IntoStaticStr, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum DapSessionState {
 	/// Adapter process and initialize request are starting.
@@ -57,6 +59,7 @@ pub enum DapSessionState {
 
 /// Debug action exposed to policy and tool layers.
 #[derive(Clone, Copy, Debug, EnumString, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum DapAction {
 	/// Start a program.
@@ -214,6 +217,8 @@ pub struct DapStopSnapshot {
 	pub granularity: Option<Str>,
 	/// Stable session state after the event.
 	pub state:       DapSessionState,
+	/// Whether execution remained live through the bounded stop wait.
+	pub timed_out:   bool,
 }
 
 /// Session handshake, state, or protocol failure.
@@ -233,6 +238,14 @@ pub enum DapSessionError {
 	/// This action requires a higher-level operation.
 	#[error("debug action {0:?} has no direct protocol command")]
 	UnsupportedAction(DapAction),
+	/// The adapter did not advertise a required capability.
+	#[error("debug action {action:?} requires adapter capability {capability}")]
+	MissingCapability {
+		/// Rejected action.
+		action:     DapAction,
+		/// DAP initialize capability key.
+		capability: &'static str,
+	},
 	/// Adapter process ownership failed.
 	#[error("DAP adapter process failed")]
 	Process(#[from] io::Error),
@@ -273,16 +286,26 @@ impl DapReverseRequestHandler for RejectReverseRequests {
 	}
 }
 
+#[derive(Clone, Debug)]
+struct StoppedState {
+	reason:    Str,
+	thread_id: Option<i64>,
+	frame:     Option<Value>,
+}
+
 /// One live DAP session and its child-session subtree.
 pub struct DapSession {
 	id: Str,
 	adapter: Str,
 	protocol: DapProtocol,
 	process: Option<Arc<AsyncMutex<Child>>>,
+	adapter_process_id: Option<u32>,
+	debuggee_process_id: AtomicU64,
 	terminal_processes: Mutex<Vec<Arc<AsyncMutex<Child>>>>,
 	cleanup_path: Option<PathBuf>,
 	attached: bool,
 	state: Mutex<DapSessionState>,
+	stopped: Mutex<Option<StoppedState>>,
 	capabilities: RwLock<Value>,
 	output: Mutex<VecDeque<u8>>,
 	last_activity_ms: AtomicU64,
@@ -314,7 +337,7 @@ impl DapSession {
 		arguments: Map<String, Value>,
 		handler: Option<Arc<dyn DapReverseRequestHandler>>,
 	) -> Result<Arc<Self>, DapSessionError> {
-		Self::start_owned(id, adapter, protocol, None, None, attach, arguments, handler).await
+		Self::start_owned(id, adapter, protocol, None, None, None, attach, arguments, handler).await
 	}
 
 	/// Starts a session while retaining ownership of its spawned adapter.
@@ -326,11 +349,13 @@ impl DapSession {
 		arguments: Map<String, Value>,
 		handler: Option<Arc<dyn DapReverseRequestHandler>>,
 	) -> Result<Arc<Self>, DapSessionError> {
+		let adapter_process_id = spawned.child.lock().await.id();
 		Self::start_owned(
 			id,
 			adapter,
 			spawned.protocol,
 			Some(spawned.child),
+			adapter_process_id,
 			spawned.cleanup_path,
 			attach,
 			arguments,
@@ -350,6 +375,7 @@ impl DapSession {
 		adapter: impl AsRef<str>,
 		protocol: DapProtocol,
 		process: Option<Arc<AsyncMutex<Child>>>,
+		adapter_process_id: Option<u32>,
 		cleanup_path: Option<PathBuf>,
 		attach: bool,
 		arguments: Map<String, Value>,
@@ -357,6 +383,11 @@ impl DapSession {
 	) -> Result<Arc<Self>, DapSessionError> {
 		let initialized = protocol.subscribe();
 		let mut arguments = arguments;
+		let debuggee_process_id = arguments
+			.get("processId")
+			.or_else(|| arguments.get("pid"))
+			.and_then(Value::as_u64)
+			.and_then(|pid| u32::try_from(pid).ok());
 		let skip_attach_request = attach
 			&& arguments
 				.remove(SKIP_ATTACH_REQUEST)
@@ -367,10 +398,13 @@ impl DapSession {
 			adapter: Str::new(adapter.as_ref()),
 			protocol,
 			process,
+			adapter_process_id,
+			debuggee_process_id: AtomicU64::new(debuggee_process_id.map_or(0, u64::from)),
 			terminal_processes: Mutex::new(Vec::new()),
 			cleanup_path,
 			attached: attach,
 			state: Mutex::new(DapSessionState::Launching),
+			stopped: Mutex::new(None),
 			capabilities: RwLock::new(Value::Null),
 			output: Mutex::new(VecDeque::with_capacity(MAX_OUTPUT_BYTES)),
 			last_activity_ms: AtomicU64::new(now_ms()),
@@ -523,16 +557,54 @@ impl DapSession {
 			DapInbound::Event { event, body } => match event.as_str() {
 				"stopped" => {
 					*session.state.lock() = DapSessionState::Stopped;
+					let thread_id = body.get("threadId").and_then(Value::as_i64);
+					let frame = if let Some(thread_id) = thread_id {
+						session
+							.protocol
+							.request(
+								"stackTrace",
+								json!({"threadId": thread_id, "startFrame": 0, "levels": 1}),
+							)
+							.await
+							.ok()
+							.and_then(|response| {
+								response
+									.get("stackFrames")
+									.and_then(Value::as_array)
+									.and_then(|frames| frames.first())
+									.cloned()
+							})
+					} else {
+						None
+					};
+					*session.stopped.lock() = Some(StoppedState {
+						reason: Str::new(
+							body.get("reason").and_then(Value::as_str).unwrap_or("stopped"),
+						),
+						thread_id,
+						frame,
+					});
 				},
 				"continued" => {
 					*session.state.lock() = DapSessionState::Running;
+					*session.stopped.lock() = None;
 				},
 				"terminated" | "exited" => {
 					*session.state.lock() = DapSessionState::Terminated;
+					*session.stopped.lock() = None;
 				},
 				"output" => {
 					if let Some(output) = body.get("output").and_then(Value::as_str) {
 						session.push_output(output.as_bytes());
+					}
+				},
+				"process" => {
+					if let Some(process_id) = body
+						.get("systemProcessId")
+						.or_else(|| body.get("processId"))
+						.and_then(Value::as_u64)
+					{
+						session.debuggee_process_id.store(process_id, Ordering::Release);
 					}
 				},
 				_ => {},
@@ -588,6 +660,37 @@ impl DapSession {
 		Ok(())
 	}
 
+	/// Returns the most recently active live child, or this root when no child
+	/// has taken over execution.
+	pub fn active_target(self: &Arc<Self>) -> Arc<Self> {
+		let mut selected = Arc::clone(self);
+		let mut pending = self
+			.children
+			.lock()
+			.iter()
+			.filter_map(Weak::upgrade)
+			.collect::<Vec<_>>();
+		while let Some(candidate) = pending.pop() {
+			pending.extend(candidate.children.lock().iter().filter_map(Weak::upgrade));
+			let candidate_state = candidate.state();
+			let selected_state = selected.state();
+			let candidate_rank = (
+				candidate_state == DapSessionState::Stopped,
+				candidate_state == DapSessionState::Running,
+				candidate.last_activity_ms.load(Ordering::Acquire),
+			);
+			let selected_rank = (
+				selected_state == DapSessionState::Stopped,
+				selected_state == DapSessionState::Running,
+				selected.last_activity_ms.load(Ordering::Acquire),
+			);
+			if candidate_state != DapSessionState::Terminated && candidate_rank >= selected_rank {
+				selected = candidate;
+			}
+		}
+		selected
+	}
+
 	/// Returns the stable session identity.
 	pub fn id(&self) -> &str {
 		self.id.as_str()
@@ -603,9 +706,89 @@ impl DapSession {
 		*self.state.lock()
 	}
 
+	/// Returns the owned adapter process id, when the adapter was spawned.
+	pub const fn adapter_process_id(&self) -> Option<u32> {
+		self.adapter_process_id
+	}
+
+	/// Returns the attached or adapter-reported debuggee process id.
+	pub fn debuggee_process_id(&self) -> Option<u32> {
+		u32::try_from(self.debuggee_process_id.load(Ordering::Acquire))
+			.ok()
+			.filter(|pid| *pid != 0)
+	}
+
+	/// Returns one semantic session/process snapshot for diagnostics and tools.
+	pub fn snapshot(&self) -> Value {
+		let stopped = self.stopped.lock().clone();
+		let parent = self
+			.parent
+			.lock()
+			.as_ref()
+			.and_then(Weak::upgrade)
+			.map(|parent| parent.id.clone());
+		let children = self
+			.children
+			.lock()
+			.iter()
+			.filter_map(Weak::upgrade)
+			.map(|child| child.id.clone())
+			.collect::<Vec<_>>();
+		json!({
+			"id": self.id,
+			"adapter": self.adapter,
+			"state": Into::<&'static str>::into(self.state()),
+			"revision": self.revision(),
+			"adapterProcessId": self.adapter_process_id(),
+			"processId": self.debuggee_process_id(),
+			"parentSessionId": parent,
+			"childSessionIds": children,
+			"stop": stopped.map(|stopped| json!({
+				"reason": stopped.reason,
+				"threadId": stopped.thread_id,
+				"frame": stopped.frame,
+			})),
+		})
+	}
+
 	/// Returns the adapter initialize capabilities.
 	pub fn capabilities(&self) -> Value {
 		self.capabilities.read().clone()
+	}
+
+	/// Rejects actions whose optional DAP capability was not advertised.
+	pub fn ensure_action_supported(&self, action: DapAction) -> Result<(), DapSessionError> {
+		let capability = match action {
+			DapAction::SetFunctionBreakpoint | DapAction::RemoveFunctionBreakpoint => {
+				Some("supportsFunctionBreakpoints")
+			},
+			DapAction::SetInstructionBreakpoint | DapAction::RemoveInstructionBreakpoint => {
+				Some("supportsInstructionBreakpoints")
+			},
+			DapAction::DataBreakpointInfo
+			| DapAction::SetDataBreakpoint
+			| DapAction::RemoveDataBreakpoint => Some("supportsDataBreakpoints"),
+			DapAction::Disassemble => Some("supportsDisassembleRequest"),
+			DapAction::ReadMemory => Some("supportsReadMemoryRequest"),
+			DapAction::WriteMemory => Some("supportsWriteMemoryRequest"),
+			DapAction::Modules => Some("supportsModulesRequest"),
+			DapAction::LoadedSources => Some("supportsLoadedSourcesRequest"),
+			_ => None,
+		};
+		let Some(capability) = capability else {
+			return Ok(());
+		};
+		if self
+			.capabilities
+			.read()
+			.get(capability)
+			.and_then(Value::as_bool)
+			.unwrap_or(false)
+		{
+			Ok(())
+		} else {
+			Err(DapSessionError::MissingCapability { action, capability })
+		}
 	}
 
 	/// Returns the current revision fence.
@@ -666,11 +849,15 @@ impl DapSession {
 	pub async fn execute(
 		&self,
 		action: DapAction,
-		arguments: Value,
+		mut arguments: Value,
 	) -> Result<Value, DapSessionError> {
 		let command = action
 			.command()
 			.ok_or(DapSessionError::UnsupportedAction(action))?;
+		self.fill_stopped_defaults(action, &mut arguments);
+		if action == DapAction::StackTrace {
+			self.fill_thread_from_adapter(&mut arguments).await?;
+		}
 		self.touch();
 		Ok(self.protocol.request(command, arguments).await?)
 	}
@@ -686,7 +873,8 @@ impl DapSession {
 	pub async fn control(
 		&self,
 		action: DapAction,
-		arguments: Value,
+		mut arguments: Value,
+		stop_timeout: Duration,
 	) -> Result<DapStopSnapshot, DapSessionError> {
 		let command = action
 			.command()
@@ -701,6 +889,22 @@ impl DapSession {
 		) {
 			return Err(DapSessionError::UnsupportedAction(action));
 		}
+		if action == DapAction::Pause
+			&& self.state() == DapSessionState::Stopped
+			&& let Some(stopped) = self.stopped.lock().clone()
+		{
+			return Ok(DapStopSnapshot {
+				action,
+				reason: stopped.reason,
+				thread_id: stopped.thread_id,
+				frame: stopped.frame,
+				granularity: None,
+				state: DapSessionState::Stopped,
+				timed_out: false,
+			});
+		}
+		self.fill_stopped_defaults(action, &mut arguments);
+		self.fill_thread_from_adapter(&mut arguments).await?;
 		let events = self.protocol.subscribe();
 		let granularity = arguments
 			.get("granularity")
@@ -708,19 +912,34 @@ impl DapSession {
 			.map(Str::new);
 		self.touch();
 		let response = self.protocol.request(command, arguments).await?;
-		let event_name = if action == DapAction::Continue {
-			"continued"
-		} else {
-			"stopped"
+		let awaited = time::timeout(stop_timeout, async {
+			let mut events = events;
+			loop {
+				match events.recv().await {
+					Ok(DapInbound::Event { event, body })
+						if matches!(event.as_str(), "stopped" | "terminated" | "exited") =>
+					{
+						return Ok((event, body));
+					},
+					Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+					Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+						return Err(DapProtocolError::TransportClosed);
+					},
+				}
+			}
+		})
+		.await;
+		let (event_name, body, timed_out) = match awaited {
+			Ok(Ok((event, body))) => (event, body, false),
+			Ok(Err(error)) => return Err(error.into()),
+			Err(_) => (
+				Str::new_static("running"),
+				json!({"reason": "timeout", "threadId": response.get("threadId")}),
+				true,
+			),
 		};
-		let body = DapProtocol::wait_for_event(events, event_name, HANDSHAKE_TIMEOUT).await?;
-		let thread_id = body.get("threadId").and_then(Value::as_i64).or_else(|| {
-			response
-				.get("allThreadsContinued")
-				.and_then(Value::as_bool)
-				.and(Some(0))
-		});
-		let frame = if event_name == "stopped" {
+		let thread_id = body.get("threadId").and_then(Value::as_i64);
+		let frame = if event_name.as_str() == "stopped" {
 			if let Some(thread_id) = thread_id {
 				self
 					.protocol
@@ -736,19 +955,99 @@ impl DapSession {
 		} else {
 			None
 		};
+		if matches!(event_name.as_str(), "terminated" | "exited") {
+			*self.state.lock() = DapSessionState::Terminated;
+			*self.stopped.lock() = None;
+		}
+		let reason = Str::new(
+			body
+				.get("reason")
+				.and_then(Value::as_str)
+				.unwrap_or(event_name.as_str()),
+		);
+		if event_name.as_str() == "stopped" {
+			*self.stopped.lock() =
+				Some(StoppedState { reason: reason.clone(), thread_id, frame: frame.clone() });
+		}
 		Ok(DapStopSnapshot {
 			action,
-			reason: Str::new(
-				body
-					.get("reason")
-					.and_then(Value::as_str)
-					.unwrap_or(event_name),
-			),
+			reason,
 			thread_id,
 			frame,
 			granularity,
 			state: self.state(),
+			timed_out,
 		})
+	}
+
+	async fn fill_thread_from_adapter(
+		&self,
+		arguments: &mut Value,
+	) -> Result<(), DapSessionError> {
+		let Some(arguments) = arguments.as_object_mut() else {
+			return Ok(());
+		};
+		if arguments.contains_key("threadId") {
+			return Ok(());
+		}
+		let thread_id = self
+			.protocol
+			.request("threads", json!({}))
+			.await?
+			.get("threads")
+			.and_then(Value::as_array)
+			.and_then(|threads| threads.first())
+			.and_then(|thread| thread.get("id"))
+			.and_then(Value::as_i64);
+		if let Some(thread_id) = thread_id {
+			arguments.insert("threadId".to_owned(), json!(thread_id));
+		}
+		Ok(())
+	}
+
+	fn fill_stopped_defaults(&self, action: DapAction, arguments: &mut Value) {
+		let Some(arguments) = arguments.as_object_mut() else {
+			return;
+		};
+		let stopped = self.stopped.lock();
+		let Some(stopped) = stopped.as_ref() else {
+			return;
+		};
+		if matches!(
+			action,
+			DapAction::Continue
+				| DapAction::StepOver
+				| DapAction::StepIn
+				| DapAction::StepOut
+				| DapAction::Pause
+				| DapAction::StackTrace
+		) && !arguments.contains_key("threadId")
+			&& let Some(thread_id) = stopped.thread_id
+		{
+			arguments.insert("threadId".to_owned(), json!(thread_id));
+		}
+		if matches!(
+			action,
+			DapAction::Scopes | DapAction::Evaluate | DapAction::DataBreakpointInfo
+		) && !arguments.contains_key("frameId")
+			&& let Some(frame_id) = stopped
+				.frame
+				.as_ref()
+				.and_then(|frame| frame.get("id"))
+				.and_then(Value::as_i64)
+		{
+			arguments.insert("frameId".to_owned(), json!(frame_id));
+		}
+		if action == DapAction::Disassemble
+			&& !arguments.contains_key("memoryReference")
+			&& let Some(reference) = stopped
+				.frame
+				.as_ref()
+				.and_then(|frame| frame.get("instructionPointerReference"))
+				.and_then(Value::as_str)
+		{
+			arguments.insert("memoryReference".to_owned(), json!(reference));
+		}
 	}
 
 	/// Sends an adapter-specific request without rewriting its payload.
@@ -1010,33 +1309,36 @@ impl DapSession {
 			.iter()
 			.filter_map(Weak::upgrade)
 			.collect::<Vec<_>>();
-		for child in children {
-			Box::pin(child.terminate()).await?;
+		let terminations = children
+			.into_iter()
+			.map(|child| async move { Box::pin(child.terminate()).await });
+		for result in join_all(terminations).await {
+			result?;
 		}
 		if self.state() != DapSessionState::Terminated {
-			let _ = self
-				.protocol
-				.request("terminate", json!({"restart": false}))
-				.await;
-			let _ = self
-				.protocol
-				.request("disconnect", json!({"restart": false, "terminateDebuggee": true}))
-				.await;
+			let _ = time::timeout(
+				Duration::from_secs(1),
+				self.protocol.request("terminate", json!({"restart": false})),
+			)
+			.await;
+			let _ = time::timeout(
+				Duration::from_secs(1),
+				self
+					.protocol
+					.request("disconnect", json!({"restart": false, "terminateDebuggee": true})),
+			)
+			.await;
 			*self.state.lock() = DapSessionState::Terminated;
 		}
 		self.protocol.shutdown();
 		if let Some(process) = &self.process {
 			let mut process = process.lock().await;
-			if process.try_wait()?.is_none() {
-				process.kill().await?;
-			}
+			terminate_process_group(&mut process).await?;
 		}
 		let terminal_processes = self.terminal_processes.lock().clone();
 		for process in terminal_processes {
 			let mut process = process.lock().await;
-			if process.try_wait()?.is_none() {
-				process.kill().await?;
-			}
+			terminate_process_group(&mut process).await?;
 		}
 		if let Some(path) = &self.cleanup_path {
 			match tokio::fs::remove_file(path).await {
@@ -1221,6 +1523,28 @@ impl DapSessionRegistry {
 	}
 }
 
+async fn terminate_process_group(child: &mut Child) -> io::Result<()> {
+	if child.try_wait()?.is_some() {
+		return Ok(());
+	}
+	#[cfg(unix)]
+	if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+		// SAFETY: adapter and runInTerminal children call `setsid` before exec,
+		// so the negated child pid addresses only that owned process group.
+		unsafe {
+			libc::kill(-pid, libc::SIGKILL);
+		}
+		match time::timeout(Duration::from_secs(2), child.wait()).await {
+			Ok(result) => {
+				result?;
+				return Ok(());
+			},
+			Err(_) => {},
+		}
+	}
+	child.kill().await
+}
+
 fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -1362,10 +1686,13 @@ mod tests {
 			adapter: sf!("test"),
 			protocol: DapProtocol::from_streams(reader, writer),
 			process: None,
+			adapter_process_id: None,
+			debuggee_process_id: AtomicU64::new(0),
 			terminal_processes: Mutex::new(Vec::new()),
 			cleanup_path: None,
 			attached: false,
 			state: Mutex::new(DapSessionState::Running),
+			stopped: Mutex::new(None),
 			capabilities: RwLock::new(Value::Null),
 			output: Mutex::new(VecDeque::new()),
 			last_activity_ms: AtomicU64::new(0),

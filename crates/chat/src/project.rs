@@ -10,9 +10,12 @@ use smallvec::SmallVec;
 
 use crate::{
 	cards::{CardRegistry, CardStatus, CardView, Component, result_image},
-	notices::{cache, custom, divider, error, file_mentions, irc, local, misc, skill, usage},
+	notices::{
+		cache, custom, divider, error, file_mentions, irc, local, misc, session_exit, skill, update,
+		usage,
+	},
 	reaction, thinking,
-	transcript::{Local, REVEAL_HORIZON, StreamHead},
+	transcript::{Banner, Local, REVEAL_HORIZON, StreamHead, UpdateBanner},
 };
 
 /// Semantic transcript block class.
@@ -119,7 +122,10 @@ pub(crate) fn project(
 ) -> Vec<RenderedBlock> {
 	let mut blocks = Vec::new();
 	if let Some(banner) = options.local.banner() {
-		blocks.push(banner_block(banner.key, banner.text.clone()));
+		blocks.push(banner_block(banner));
+	}
+	if let Some(update) = options.local.update() {
+		blocks.push(update_block(update));
 	}
 	let turns = dom.children(dom.body());
 	let cache_misses = cache::cache_invalidations(dom);
@@ -224,6 +230,25 @@ pub(crate) fn project(
 				Tag::Known(KnownTag::Assistant) => {
 					assistant_blocks(dom, *handle, node, ui, options, &mut blocks, &mut reaction_target);
 				},
+				Tag::Known(KnownTag::Developer) => {
+					if prop_text(node, PropId::Kind).as_deref()
+						== Some(omp_session::late_diagnostics::KIND)
+					{
+						reaction_target = None;
+						let text = node.content.clone().unwrap_or_default();
+						blocks.push(rendered(
+							*handle,
+							BlockKind::Notice,
+							text,
+							Mode::Mutable,
+							true,
+							misc::diagnostics_card(node, options.expanded),
+						));
+					} else if let Some(block) = custom_message_block(*handle, node, ui, options) {
+						reaction_target = None;
+						blocks.push(block);
+					}
+				},
 				Tag::Known(KnownTag::Notice) => {
 					if let Some(traffic) = irc::traffic(node) {
 						reaction_target = None;
@@ -242,30 +267,30 @@ pub(crate) fn project(
 						continue;
 					}
 					let kind = prop_text(node, PropId::Kind).unwrap_or_else(|| Str::new_static("info"));
-					// pi `custom_message` / `hookMessage` entries: framed
-					// Markdown boxes journaled by the kernel (`EnvEvent::Notice`).
-					if let Ok(framed) = kind.as_str().parse::<custom::CustomKind>() {
-						let component = custom::custom_message_card(framed, node, options.expanded);
-						let text = custom::framed_text(node);
-						blocks.push(rendered(
-							*handle,
-							BlockKind::Notice,
-							text,
-							Mode::Mutable,
-							true,
-							component,
-						));
+					// Older journals stored custom messages as notices. They use
+					// the same visibility, replacement, and fallback projection.
+					if custom::message_kind(node).is_some() {
+						if let Some(block) = custom_message_block(*handle, node, ui, options) {
+							blocks.push(block);
+						}
 						continue;
 					}
-					let text = node.content.clone().unwrap_or_default();
+					let text = if kind == "advisor" {
+						misc::advisor_message(node)
+							.map(|message| misc::advisor_message_text(&message))
+							.unwrap_or_default()
+					} else {
+						node.content.clone().unwrap_or_default()
+					};
 					// ERR-06: while the identical error is pinned above the editor the
 					// inline copy is suppressed; ctrl+o draws it in full anyway.
 					if !options.expanded && error::suppressed_inline(dom, *handle) {
 						continue;
 					}
-					let component = misc::custom_notice(kind.as_str(), node).unwrap_or_else(|| {
-						error::notice_card(kind.as_str(), text.clone(), options.expanded)
-					});
+					let component = misc::custom_notice(kind.as_str(), node, options.expanded)
+						.unwrap_or_else(|| {
+							error::notice_card(kind.as_str(), text.clone(), options.expanded)
+						});
 					blocks.push(rendered(
 						*handle,
 						BlockKind::Notice,
@@ -336,7 +361,32 @@ pub(crate) fn project(
 			));
 		}
 	}
+	if let Some((handle, exit)) = omp_session::latest_session_exit(dom)
+		&& let (Some(text), Some(component)) = (session_exit::text(&exit), session_exit::block(&exit))
+	{
+		blocks.push(rendered(handle, BlockKind::Notice, text, Mode::Mutable, true, component));
+	}
 	blocks
+}
+
+fn custom_message_block(
+	handle: Handle,
+	node: &Node,
+	ui: &UiContext,
+	options: &Options<'_>,
+) -> Option<RenderedBlock> {
+	let kind = custom::message_kind(node)?;
+	if !custom::displayed(node) {
+		return None;
+	}
+	Some(rendered(
+		handle,
+		BlockKind::Notice,
+		custom::framed_text(node),
+		Mode::Mutable,
+		true,
+		custom::custom_message_card(kind, node, options.expanded, ui),
+	))
 }
 
 /// One assistant content-array entry retained in provider order.
@@ -635,21 +685,35 @@ fn has_tool_calls(dom: &Dom, assistant: Handle) -> bool {
 		.any(|node| matches!(node.tag, Tag::Custom(_)))
 }
 
-/// Observer-local transcript row after a session reset (pi `present([new
-/// Spacer(1), new Text(success + label, 1, 1)])`).
-fn banner_block(key: u64, text: Str) -> RenderedBlock {
+/// Observer-local session-lifecycle transcript row.
+fn banner_block(banner: &Banner) -> RenderedBlock {
 	let component = dom! {
-		<row gap=1 pad-x=1 fg=accent><icon name="success"/><text>{text.clone()}</text></row>
+		<row gap=1 pad-x=1 fg=accent><icon name="success"/><text>{banner.text.clone()}</text></row>
 	};
 	RenderedBlock {
 		view:      BlockView {
-			key,
+			key: banner.key,
 			kind: BlockKind::Notice,
-			text,
+			text: banner.text.clone(),
 			mode: Mode::Mutable,
 			finalized: true,
 		},
 		component: component.into_component(),
+		stream:    None,
+	}
+}
+
+/// Observer-local typed update-availability card.
+fn update_block(update: &UpdateBanner) -> RenderedBlock {
+	RenderedBlock {
+		view:      BlockView {
+			key: update.key,
+			kind: BlockKind::Notice,
+			text: update.notice.text(),
+			mode: Mode::Mutable,
+			finalized: true,
+		},
+		component: update::card(&update.notice),
 		stream:    None,
 	}
 }
@@ -1181,6 +1245,30 @@ mod tests {
 		Session::create(path, ComponentRegistry::standard()).expect("session")
 	}
 
+	#[test]
+	fn abnormal_exit_projects_after_replay_while_clean_exit_is_silent() {
+		let mut clean = empty_session();
+		clean
+			.record_exit(omp_session::ExitCause::Normal)
+			.expect("clean exit");
+		assert!(block_views(clean.dom(), true).is_empty());
+
+		let mut interrupted = empty_session();
+		let path = interrupted.journal_path().to_path_buf();
+		interrupted
+			.record_exit(omp_session::ExitCause::Signal {
+				signal: omp_session::ExitSignal::new("SIGTERM", Some(15)),
+			})
+			.expect("signal exit");
+		drop(interrupted);
+		let replayed =
+			Session::open(path, ComponentRegistry::standard()).expect("exit journal replays");
+		let views = block_views(replayed.dom(), true);
+		assert_eq!(views.len(), 1);
+		assert_eq!(views[0].kind, BlockKind::Notice);
+		assert!(views[0].text.contains("SIGTERM"));
+	}
+
 	/// A session whose newest assistant is still streaming: reasoning, then
 	/// answer text when `text` is non-empty — none of it finalized.
 	fn streaming(thinking: &str, text: &str) -> Session {
@@ -1406,6 +1494,153 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn late_diagnostics_replay_expand_copy_and_ignore_tool_visibility() {
+		use omp_session::late_diagnostics::{LateDiagnostics, LateDiagnosticsFile};
+
+		let directory = tempfile::tempdir().expect("temp directory");
+		let path = directory.path().join("late-diagnostics.oms");
+		let mut session =
+			Session::create(&path, ComponentRegistry::standard()).expect("session creates");
+		session.begin_turn().expect("turn starts");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		let diagnostics = LateDiagnostics {
+			files: vec![LateDiagnosticsFile {
+				path:     Str::new_static("src/lib.rs"),
+				summary:  Str::new_static("6 error(s)"),
+				errored:  true,
+				messages: (1..=6)
+					.map(|line| Str::new(format!("src/lib.rs:{line}:1 [error] [rustc] failure {line}")))
+					.collect(),
+			}],
+		};
+		let body = diagnostics.body();
+		session
+			.patch(omp_dom::Txn {
+				cause: session.head().expect("journal head"),
+				label: Some(Str::new_static("test.late-diagnostics")),
+				ops:   vec![omp_dom::Op::Ins {
+					parent: turn,
+					after:  None,
+					node:   diagnostics.into_node().expect("diagnostics serialize"),
+				}],
+			})
+			.expect("diagnostics journal");
+
+		let local = Local::default();
+		let hidden = projected(&session, &Options { show_tools: false, ..Options::new(&local) });
+		let collapsed = hidden
+			.into_iter()
+			.find(|block| block.view.text == body)
+			.expect("late diagnostics remain visible without tool activity");
+		let collapsed = render(collapsed.component, 100);
+		assert!(collapsed.contains("src/lib.rs"));
+		assert!(collapsed.contains("… 1 more ⟨Ctrl+O: Expand⟩"));
+		assert!(!collapsed.contains("failure 6"));
+
+		let expanded = projected(&session, &Options {
+			expanded: true,
+			show_tools: false,
+			..Options::new(&local)
+		})
+		.into_iter()
+		.find(|block| block.view.text == body)
+		.expect("expanded diagnostics");
+		assert!(render(expanded.component, 100).contains("failure 6"));
+
+		let copied = crate::overlays::copy::collect_targets(session.dom(), true, false, false);
+		let copied = copied.last().expect("diagnostics copy target");
+		assert_eq!(copied.label, "message");
+		assert_eq!(copied.content, body);
+
+		drop(session);
+		let restored = Session::open(&path, ComponentRegistry::standard()).expect("session replays");
+		assert!(
+			projected(&restored, &Options { show_tools: false, ..Options::new(&local) })
+				.iter()
+				.any(|block| block.view.text == body),
+			"the typed files payload and semantic body survive replay"
+		);
+	}
+
+	#[test]
+	fn custom_renderer_metadata_replays_while_copy_and_visibility_use_the_semantic_body() {
+		use omp_session::custom_message::{CustomMessage, MessageRendererIdentity};
+
+		let directory = tempfile::tempdir().expect("temp directory");
+		let path = directory.path().join("custom-message.oms");
+		let mut session =
+			Session::create(&path, ComponentRegistry::standard()).expect("session creates");
+		session.begin_turn().expect("turn starts");
+		let turn = *session
+			.dom()
+			.children(session.dom().body())
+			.last()
+			.expect("turn");
+		let cause = session.head().expect("journal head");
+		let visible = CustomMessage::new("audit", "semantic **body**").with_rendered(
+			MessageRendererIdentity {
+				extension:   Str::new_static("dev.example"),
+				declaration: Str::new_static("dev.example/audit"),
+				generation:  3,
+			},
+			"<callout kind=success>runtime replacement</callout>",
+		);
+		let hidden = CustomMessage::new("private", "hidden context").with_display(false);
+		session
+			.patch(omp_dom::Txn {
+				cause,
+				label: Some(Str::new_static("test.custom-messages")),
+				ops: vec![
+					omp_dom::Op::Ins { parent: turn, after: None, node: visible.into_node() },
+					omp_dom::Op::Ins { parent: turn, after: None, node: hidden.into_node() },
+				],
+			})
+			.expect("custom messages journal");
+
+		let local = Local::default();
+		let blocks = projected(&session, &Options { show_tools: false, ..Options::new(&local) });
+		let custom = blocks
+			.into_iter()
+			.find(|block| block.view.text == "[audit]\nsemantic **body**")
+			.expect("visible custom message");
+		assert!(render(custom.component, 80).contains("runtime replacement"));
+		let copies = crate::overlays::copy::collect_targets(session.dom(), true, false, false);
+		assert_eq!(
+			copies
+				.iter()
+				.filter(|target| target.content == "semantic **body**")
+				.count(),
+			1
+		);
+		assert!(
+			!copies
+				.iter()
+				.any(|target| target.content == "hidden context")
+		);
+
+		drop(session);
+		let restored = Session::open(&path, ComponentRegistry::standard()).expect("session replays");
+		let replayed = projected(&restored, &Options { show_tools: false, ..Options::new(&local) });
+		assert!(
+			!replayed
+				.iter()
+				.any(|block| block.view.text.contains("hidden context"))
+		);
+		let replayed = replayed
+			.into_iter()
+			.find(|block| block.view.text == "[audit]\nsemantic **body**")
+			.expect("one custom message survives replay");
+		assert!(
+			render(replayed.component, 80).contains("runtime replacement"),
+			"renderer identity and replacement survive replay"
+		);
+	}
+
 	/// Authenticated collaboration prompts are ordinary authored user rows:
 	/// Markdown and attachment order survive replay and copy projection, and
 	/// observer-local tool hiding never suppresses user input.
@@ -1614,11 +1849,11 @@ mod tests {
 	}
 
 	#[test]
-	fn irc_traffic_replays_copies_and_follows_tool_visibility() {
-		use omp_journal::data::{IrcDirection, IrcTraffic};
+	fn workpool_traffic_replays_copies_and_renders_ordered_states() {
+		use omp_journal::data::{IrcDirection, IrcTraffic, WorkpoolMode, WorkpoolObservation};
 
 		let directory = tempfile::tempdir().expect("temp directory");
-		let path = directory.path().join("irc-traffic.oms");
+		let path = directory.path().join("workpool-traffic.oms");
 		let mut session =
 			Session::create(&path, ComponentRegistry::standard()).expect("session creates");
 		session.begin_turn().expect("turn starts");
@@ -1627,53 +1862,118 @@ mod tests {
 			.children(session.dom().body())
 			.last()
 			.expect("turn");
+		let transitions = [
+			(WorkpoolMode::Spawned, "Worker Scout admitted", None),
+			(WorkpoolMode::Dispatched, "[audit#1] inspect parser", Some("spawn")),
+			(WorkpoolMode::Queued, "[audit#2] report risks", Some("dispatch")),
+			(
+				WorkpoolMode::Batch,
+				"[audit#2] report risks\n[audit#3] inspect lexer\n[audit#4] inspect \
+				 recovery\n[audit#5] inspect tests",
+				Some("queued"),
+			),
+		];
+		for (mode, body, reply_to) in transitions {
+			let traffic = IrcTraffic::from(WorkpoolObservation {
+				pool: Str::new_static("audit"),
+				from: Str::new_static("pool:audit"),
+				to: Str::new_static("Scout"),
+				body: Str::new(body),
+				mode,
+				reply_to: reply_to.map(Str::new_static),
+				timestamp_ms: u64::MAX,
+			});
+			omp_agent::append_irc_traffic(&mut session, turn, &traffic)
+				.expect("workpool transition journals");
+		}
 		omp_agent::append_irc_traffic(&mut session, turn, &IrcTraffic {
-			direction:    IrcDirection::Workpool,
-			from:         Some(Str::new_static("scheduler")),
-			to:           Some(Str::new_static("Scout")),
-			body:         Str::new_static("inspect parser\nreport risks"),
-			reply_to:     Some(Str::new_static("01K4A")),
-			pool:         Some(Str::new_static("audit")),
-			mode:         Some(Str::new_static("parallel")),
+			direction:    IrcDirection::Incoming,
+			from:         Some(Str::new_static("Scout")),
+			to:           Some(Str::new_static("Main")),
+			body:         Str::new_static("Batch Scout-b1 failed\nparser fixture missing"),
+			reply_to:     Some(Str::new_static("batch")),
+			pool:         None,
+			mode:         None,
 			timestamp_ms: u64::MAX,
 		})
-		.expect("IRC traffic journals");
+		.expect("worker result journals");
+		let cancelled = IrcTraffic::from(WorkpoolObservation {
+			pool:         Str::new_static("audit"),
+			from:         Str::new_static("pool:audit"),
+			to:           Str::new_static("Main"),
+			body:         Str::new_static("Pool `audit` cancelled"),
+			mode:         WorkpoolMode::Cancelled,
+			reply_to:     Some(Str::new_static("result")),
+			timestamp_ms: u64::MAX,
+		});
+		omp_agent::append_irc_traffic(&mut session, turn, &cancelled)
+			.expect("workpool cancellation journals");
 
 		let local = Local::default();
 		let visible = projected(&session, &Options { show_tools: true, ..Options::new(&local) });
-		let row = visible
+		assert_eq!(visible.len(), transitions.len() + 2);
+		let rendered = visible
 			.into_iter()
-			.find(|block| block.view.text.contains("Pool audit"))
-			.expect("IRC row");
-		assert_eq!(row.view.kind, BlockKind::Notice);
-		let rendered = render(row.component, 120);
-		assert!(rendered.contains("Pool audit ➤ Scout parallel · reply · just now"), "{rendered:?}");
-		assert!(rendered.contains("inspect parser"), "{rendered:?}");
+			.map(|block| {
+				assert_eq!(block.view.kind, BlockKind::Notice);
+				render(block.component, 120)
+			})
+			.collect::<Vec<_>>();
+		assert!(rendered[0].contains("Pool audit ➤ Scout ⟨spawned⟩"), "{:?}", rendered[0]);
+		assert!(rendered[1].contains("audit#1 inspect parser ⟨running⟩"), "{:?}", rendered[1]);
+		assert!(rendered[2].contains("audit#2 report risks ⟨queued⟩"), "{:?}", rendered[2]);
+		assert!(rendered[3].contains("… 1 more items"), "{:?}", rendered[3]);
+		assert!(rendered[4].contains("Batch Scout-b1 ⟨failed⟩ ⟨Scout⟩"), "{:?}", rendered[4]);
+		assert!(rendered[4].contains("Error"), "{:?}", rendered[4]);
+		assert!(rendered[4].contains("parser fixture missing"), "{:?}", rendered[4]);
+		assert!(rendered[5].contains("Pool audit ⟨cancelled⟩"), "{:?}", rendered[5]);
+		let expanded = crate::notices::irc::traffic_card(
+			&IrcTraffic::from(WorkpoolObservation {
+				pool:         Str::new_static("audit"),
+				from:         Str::new_static("pool:audit"),
+				to:           Str::new_static("Scout"),
+				body:         Str::new_static(transitions[3].1),
+				mode:         WorkpoolMode::Batch,
+				reply_to:     Some(Str::new_static("queued")),
+				timestamp_ms: u64::MAX,
+			}),
+			true,
+		);
+		assert!(render(expanded, 120).contains("audit#5 inspect tests"));
 
 		let hidden = projected(&session, &Options { show_tools: false, ..Options::new(&local) });
-		assert!(
-			hidden
-				.iter()
-				.all(|block| !block.view.text.contains("Pool audit")),
-			"IRC traffic follows tool-activity visibility"
-		);
+		assert!(hidden.is_empty(), "workpool traffic follows tool-activity visibility");
 
 		let copied = crate::overlays::copy::collect_targets(session.dom(), true, true, false);
-		assert_eq!(copied.last().expect("IRC copy target").content, "inspect parser\nreport risks");
+		assert_eq!(
+			copied
+				.iter()
+				.map(|target| target.content.as_str())
+				.collect::<Vec<_>>(),
+			[
+				"Worker Scout admitted",
+				"[audit#1] inspect parser",
+				"[audit#2] report risks",
+				transitions[3].1,
+				"Batch Scout-b1 failed\nparser fixture missing",
+				"Pool `audit` cancelled",
+			],
+			"copy keeps producer order and exact bodies"
+		);
 		let hidden_copy = crate::overlays::copy::collect_targets(session.dom(), true, false, false);
-		assert!(hidden_copy.is_empty(), "hidden IRC traffic is not copied");
+		assert!(hidden_copy.is_empty(), "hidden workpool traffic is not copied");
 
+		let live = projected(&session, &Options { show_tools: true, ..Options::new(&local) })
+			.into_iter()
+			.map(|block| block.view)
+			.collect::<Vec<_>>();
 		drop(session);
 		let restored = Session::open(&path, ComponentRegistry::standard()).expect("session replays");
-		let replayed = projected(&restored, &Options { show_tools: true, ..Options::new(&local) });
-		assert_eq!(
-			replayed
-				.iter()
-				.filter(|block| block.view.text.contains("Pool audit"))
-				.count(),
-			1,
-			"one typed IRC card survives replay"
-		);
+		let replayed = projected(&restored, &Options { show_tools: true, ..Options::new(&local) })
+			.into_iter()
+			.map(|block| block.view)
+			.collect::<Vec<_>>();
+		assert_eq!(replayed, live, "replay preserves ordered workpool updates exactly");
 	}
 
 	#[test]
@@ -2185,8 +2485,9 @@ mod tests {
 			"an emoji-only opening run is withheld while it may still become a reaction"
 		);
 		let live = streaming("", "👍 sure");
-		let (_, assistant) = user_and_assistant_text(projected(&live, &options));
-		assert_eq!(assistant.as_deref(), Some("👍 sure"), "proven prose streams through");
+		let (user, assistant) = user_and_assistant_text(projected(&live, &options));
+		assert!(user.contains("👍"), "complete opening emoji becomes the reaction:\n{user}");
+		assert_eq!(assistant.as_deref(), Some("sure"), "remaining prose streams through");
 	}
 
 	/// pi `collapseImageMarkers`: bracketed vision markers (and their paired

@@ -12,7 +12,7 @@ use xutf::IntoAnsiStripped as _;
 
 /// One typed extension or hook status update delivered to the chat actor.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExtensionStatusEvent {
+pub enum ExtensionStatus {
 	/// Insert or replace the value for `key`.
 	Set {
 		/// Stable producer-local identity used only for replacement and ordering.
@@ -30,13 +30,32 @@ pub enum ExtensionStatusEvent {
 	Reset,
 }
 
+impl ExtensionStatus {
+	/// Parses extension-authored TML and builds a keyed status replacement.
+	pub fn from_tml(key: &str, source: &str) -> Result<Self, omp_tui::ParseError> {
+		Ok(Self::Set { key: Str::new(key), text: status_text_from_tml(source)? })
+	}
+
+	/// Builds a keyed status removal.
+	#[must_use]
+	pub fn clear(key: &str) -> Self {
+		Self::Clear { key: Str::new(key) }
+	}
+
+	/// Builds the actor-local reset used when a different session is adopted.
+	#[must_use]
+	pub const fn reset() -> Self {
+		Self::Reset
+	}
+}
+
 /// Lowers one extension-authored TML contribution to safe status text.
 ///
 /// Parsing uses the extension trust boundary, so core-only chrome cannot be
 /// instantiated. Semantic styling is intentionally not encoded into the
 /// returned text: the status segment supplies its semantic accent and the
 /// renderer remains the sole owner of width/overflow policy.
-pub fn status_text_from_tml(source: &str) -> Result<Str, omp_tui::ParseError> {
+fn status_text_from_tml(source: &str) -> Result<Str, omp_tui::ParseError> {
 	// Source byte length is an upper bound for ordinary rendered text width
 	// and avoids imposing a guessed terminal width while extracting content.
 	let width = source.len().clamp(1, usize::from(u16::MAX)) as u16;
@@ -76,9 +95,9 @@ pub struct ExtensionStatuses {
 impl ExtensionStatuses {
 	/// Applies one update and reports whether the retained visible values
 	/// changed. A `Set` whose sanitized value is empty behaves as a clear.
-	pub fn apply(&mut self, event: ExtensionStatusEvent) -> bool {
+	pub fn apply(&mut self, event: ExtensionStatus) -> bool {
 		let changed = match event {
-			ExtensionStatusEvent::Set { key, text } => {
+			ExtensionStatus::Set { key, text } => {
 				let text = sanitize_status(&text);
 				if text.is_empty() {
 					self.by_key.remove(&key).is_some()
@@ -89,8 +108,8 @@ impl ExtensionStatuses {
 					true
 				}
 			},
-			ExtensionStatusEvent::Clear { key } => self.by_key.remove(&key).is_some(),
-			ExtensionStatusEvent::Reset => {
+			ExtensionStatus::Clear { key } => self.by_key.remove(&key).is_some(),
+			ExtensionStatus::Reset => {
 				if self.by_key.is_empty() {
 					false
 				} else {
@@ -150,10 +169,10 @@ fn sanitize_status(value: &str) -> Str {
 mod tests {
 	use omp_core::Str;
 
-	use super::{ExtensionStatusEvent, ExtensionStatuses, status_text_from_tml};
+	use super::{ExtensionStatus, ExtensionStatuses};
 
-	fn set(key: &str, text: &str) -> ExtensionStatusEvent {
-		ExtensionStatusEvent::Set { key: Str::new(key), text: Str::new(text) }
+	fn set(key: &str, text: &str) -> ExtensionStatus {
+		ExtensionStatus::Set { key: Str::new(key), text: Str::new(text) }
 	}
 
 	fn values(statuses: &ExtensionStatuses, configured: bool) -> Vec<&str> {
@@ -166,13 +185,22 @@ mod tests {
 
 	#[test]
 	fn tml_status_uses_extension_parser_and_flattens_semantic_content() {
-		let text =
-			status_text_from_tml("<row><text fg=error>failed</text><text>\\n  safely</text></row>")
-				.expect("valid extension TML");
+		let ExtensionStatus::Set { key, text } = ExtensionStatus::from_tml(
+			"build",
+			"<row><text fg=error>failed</text><text>
+  safely</text></row>",
+		)
+		.expect("valid extension TML") else {
+			panic!("TML status produces a set action");
+		};
+		assert_eq!(key, "build");
 		assert_eq!(text, "failed safely");
 		assert!(
-			status_text_from_tml("<md><button id=unsafe when=active>interactive</button></md>",)
-				.is_err(),
+			ExtensionStatus::from_tml(
+				"unsafe",
+				"<md><button id=unsafe when=active>interactive</button></md>",
+			)
+			.is_err(),
 		);
 	}
 
@@ -209,11 +237,11 @@ mod tests {
 		let mut statuses = ExtensionStatuses::default();
 		statuses.apply(set("alpha", "one"));
 		statuses.apply(set("beta", "two"));
-		assert!(statuses.apply(ExtensionStatusEvent::Clear { key: Str::new("alpha") }));
+		assert!(statuses.apply(ExtensionStatus::clear("alpha")));
 		assert_eq!(values(&statuses, true), ["two"]);
-		assert!(!statuses.apply(ExtensionStatusEvent::Clear { key: Str::new("missing") }));
-		assert!(statuses.apply(ExtensionStatusEvent::Reset));
+		assert!(!statuses.apply(ExtensionStatus::clear("missing")));
+		assert!(statuses.apply(ExtensionStatus::reset()));
 		assert!(statuses.is_empty());
-		assert!(!statuses.apply(ExtensionStatusEvent::Reset));
+		assert!(!statuses.apply(ExtensionStatus::reset()));
 	}
 }

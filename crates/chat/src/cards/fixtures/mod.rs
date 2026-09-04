@@ -14,6 +14,7 @@ mod resolve;
 mod think;
 mod utility;
 mod web_search;
+mod workpool;
 
 /// One tool-card gallery fixture.
 #[derive(Clone, Copy, Debug)]
@@ -55,5 +56,6 @@ pub(crate) fn all() -> Vec<&'static CardFixture> {
 	fixtures.extend(think::FIXTURES);
 	fixtures.extend(utility::FIXTURES);
 	fixtures.extend(web_search::FIXTURES);
+	fixtures.extend(workpool::FIXTURES);
 	fixtures
 }

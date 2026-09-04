@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 
 use omp_core::Str;
 use omp_dom::{Node, PropId};
+use omp_tools::ask::{Answer, OptionItem, Params, Payload, Question};
 use omp_tui::{IntoComponent as _, UiContext, dom};
-use serde_json::{Value, json};
 
-use super::{Card, CardView, Component, typed_fault, typed_input, typed_result};
+use super::{Card, CardStatus, CardView, Component, typed_fault};
 
 /// Renders streamed questions, choices, answers, and cancellation faults.
 pub struct AskCard;
@@ -18,151 +18,68 @@ impl Card for AskCard {
 	}
 
 	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
-		if view.status.as_str() == "error" {
+		if view.status == CardStatus::Failed {
 			let fault = failure(view);
 			return dom! {
 				<col><row gap=1><icon name="warning-status" fg=warn/><text fg=accent>{"Ask"}</text></row><text fg=muted>{fault}</text></col>
 			}.into_component();
 		}
-		let raw = node_text(view.input).unwrap_or_default();
-		let args =
-			typed_input::<omp_tools::ask::Params>(view).unwrap_or_else(|| partial_args(raw.as_str()));
-		let questions = args
-			.get("questions")
-			.and_then(Value::as_array)
-			.cloned()
-			.unwrap_or_default();
-		let answers = result_value(view)
-			.and_then(|value| value.get("answers").and_then(Value::as_array).cloned())
-			.unwrap_or_default();
-		let answered = !answers.is_empty();
-		let selected: BTreeMap<String, Vec<String>> = answers
-			.iter()
-			.filter_map(|answer| {
-				let id = answer.get("id")?.as_str()?.to_owned();
-				let values = answer
-					.get("selected")?
-					.as_array()?
+
+		let payload = view.result::<Payload>();
+		let questions = render_questions(view, payload.as_ref());
+		let answers = payload
+			.as_ref()
+			.map(|payload| {
+				payload
+					.answers
 					.iter()
-					.filter_map(Value::as_str)
-					.map(str::to_owned)
-					.collect();
-				Some((id, values))
+					.map(|answer| (answer.id.as_str(), answer))
+					.collect::<BTreeMap<_, _>>()
 			})
-			.collect();
-		// The user's own words beside the choices (`omp_tools::ask::Answer`):
-		// free text through the Other choice, an attached note, and the
-		// headless-timeout marker (pi `renderAnswerOptionLines` /
-		// `renderCustomInputLines` / `renderNoteLines`).
-		let written: BTreeMap<&str, Written<'_>> = answers
-			.iter()
-			.filter_map(|answer| {
-				let id = answer.get("id")?.as_str()?;
-				Some((id, Written {
-					custom_input: answer
-						.get("customInput")
-						.or_else(|| answer.get("custom_input"))
-						.and_then(Value::as_str),
-					note:         answer.get("note").and_then(Value::as_str),
-					timed_out:    answer
-						.get("timed_out")
-						.or_else(|| answer.get("timedOut"))
-						.and_then(Value::as_bool)
-						.unwrap_or(false),
-				}))
-			})
-			.collect();
-		let count = format!("{} questions", questions.len());
+			.unwrap_or_default();
+		let answered = payload.is_some();
+		let count = if questions.len() == 1 {
+			"1 question".to_owned()
+		} else {
+			format!("{} questions", questions.len())
+		};
 		let mut question_rows = Vec::new();
 		for question in &questions {
-			let id = question
-				.get("id")
-				.and_then(Value::as_str)
-				.unwrap_or_default();
-			let multi = question
-				.get("multi")
-				.and_then(Value::as_bool)
-				.unwrap_or(false);
-			let options = question
-				.get("options")
-				.and_then(Value::as_array)
-				.map(Vec::as_slice)
-				.unwrap_or_default();
+			let answer = answers.get(question.id.as_str()).copied();
 			let divider = if answered {
-				format!("[{id}]")
-			} else if multi {
-				format!("[{id}] · multi · options:{}", options.len())
+				format!("[{}]", question.id)
+			} else if question.multi {
+				format!("[{}] · multi · options:{}", question.id, question.options.len())
 			} else {
-				format!("[{id}] · options:{}", options.len())
+				format!("[{}] · options:{}", question.id, question.options.len())
 			};
 			question_rows
 				.push(dom! { <hr title={divider} title_pad=3 bc=border fg=muted/> }.into_component());
-			let question_text = Str::new(
-				question
-					.get("question")
-					.and_then(Value::as_str)
-					.unwrap_or_default(),
+			question_rows.push(
+				dom! { <text pad-x=1 fg=accent>{question.question.clone()}</text> }.into_component(),
 			);
-			question_rows
-				.push(dom! { <text pad-x=1 fg=accent>{question_text}</text> }.into_component());
-			for option in options {
-				let label = Str::new(
-					option
-						.get("label")
-						.and_then(Value::as_str)
-						.unwrap_or_default(),
-				);
-				let checked = selected
-					.get(id)
-					.is_some_and(|values| values.iter().any(|value| value == label.as_str()));
+			for option in &question.options {
+				let checked = answer.is_some_and(|answer| answer.selected.contains(&option.label));
 				question_rows.push(
 					dom! {
 						<row gap=1 pad-x=1>
-							if multi && checked { <i:checked fg=ok/> }
-							else if multi { <i:unchecked fg=muted/> }
+							if question.multi && checked { <i:checked fg=ok/> }
+							else if question.multi { <i:unchecked fg=muted/> }
 							else if checked { <icon name="radio-selected" fg=ok/> }
 							else { <i:unselected fg=muted/> }
-							<text fg=output>{label}</text>
+							<text fg=output>{option.label.clone()}</text>
 						</row>
 					}
 					.into_component(),
 				);
-				if !answered && let Some(desc) = option.get("description").and_then(Value::as_str) {
-					let desc = Str::new(format!("↳ {desc}"));
-					question_rows.push(dom! { <text pad-x=3 fg=muted>{desc}</text> }.into_component());
+				if !answered && let Some(description) = &option.description {
+					let description = Str::new(format!("↳ {description}"));
+					question_rows
+						.push(dom! { <text pad-x=3 fg=muted>{description}</text> }.into_component());
 				}
 			}
-			if let Some(written) = written.get(id) {
-				if let Some(custom) = written.custom_input {
-					let mut lines = custom.split('\n');
-					let first = Str::new(lines.next().unwrap_or_default());
-					question_rows.push(
-						dom! { <row gap=1 pad-x=1><i:success/><text>{first}</text></row> }
-							.into_component(),
-					);
-					for line in lines {
-						let line = Str::new(line);
-						question_rows.push(dom! { <text pad-x=3>{line}</text> }.into_component());
-					}
-				}
-				if let Some(note) = written.note {
-					let mut lines = note.split('\n');
-					let first = Str::new(lines.next().unwrap_or_default());
-					question_rows.push(
-						dom! { <row gap=1 pad-x=1><text fg=muted>{"Note:"}</text><text>{first}</text></row> }
-							.into_component(),
-					);
-					for line in lines {
-						let line = Str::new(line);
-						question_rows.push(dom! { <text pad-x=7>{line}</text> }.into_component());
-					}
-				}
-				if written.timed_out {
-					question_rows.push(
-						dom! { <text pad-x=1 fg=muted>{"auto-selected after timeout — not a user choice"}</text> }
-							.into_component(),
-					);
-				}
+			if let Some(answer) = answer {
+				append_written_rows(&mut question_rows, answer);
 			}
 		}
 		dom! {
@@ -178,26 +95,99 @@ impl Card for AskCard {
 	}
 }
 
-/// What the user wrote for one answer beyond picking options.
-struct Written<'a> {
-	custom_input: Option<&'a str>,
-	note:         Option<&'a str>,
-	timed_out:    bool,
+#[derive(Clone)]
+struct RenderQuestion {
+	id:       Str,
+	question: Str,
+	options:  Vec<OptionItem>,
+	multi:    bool,
 }
 
-fn partial_args(raw: &str) -> Value {
-	let question = extract_string(raw, "question").unwrap_or_default();
-	let label = extract_string(raw, "label").unwrap_or_default();
-	json!({"questions":[{"id":extract_string(raw, "id").unwrap_or_default(),"question":question,"options":[{"label":label}]}]})
+impl From<&Question> for RenderQuestion {
+	fn from(question: &Question) -> Self {
+		Self {
+			id:       question.id.clone(),
+			question: question.question.clone(),
+			options:  question.options.clone(),
+			multi:    question.multi,
+		}
+	}
 }
-fn extract_string(raw: &str, key: &str) -> Option<String> {
+
+impl From<&Answer> for RenderQuestion {
+	fn from(answer: &Answer) -> Self {
+		Self {
+			id:       answer.id.clone(),
+			question: answer.question.clone(),
+			options:  answer
+				.options
+				.iter()
+				.map(|label| OptionItem {
+					label:       label.clone(),
+					description: None,
+					preview:     None,
+				})
+				.collect(),
+			multi:    answer.multi,
+		}
+	}
+}
+
+fn render_questions(view: &CardView<'_>, payload: Option<&Payload>) -> Vec<RenderQuestion> {
+	if let Some(Params { questions }) = view.input::<Params>() {
+		return questions.iter().map(RenderQuestion::from).collect();
+	}
+	if let Some(payload) = payload {
+		return payload.answers.iter().map(RenderQuestion::from).collect();
+	}
+	let raw = node_text(view.input).unwrap_or_default();
+	vec![RenderQuestion {
+		id:       extract_string(raw.as_str(), "id").unwrap_or_default(),
+		question: extract_string(raw.as_str(), "question").unwrap_or_default(),
+		options:  vec![OptionItem {
+			label:       extract_string(raw.as_str(), "label").unwrap_or_default(),
+			description: None,
+			preview:     None,
+		}],
+		multi:    false,
+	}]
+}
+
+fn append_written_rows(rows: &mut Vec<Component>, answer: &Answer) {
+	if let Some(custom) = &answer.custom_input {
+		let mut lines = custom.as_str().split('\n');
+		let first = Str::new(lines.next().unwrap_or_default());
+		rows
+			.push(dom! { <row gap=1 pad-x=1><i:success/><text>{first}</text></row> }.into_component());
+		for line in lines {
+			rows.push(dom! { <text pad-x=3>{Str::new(line)}</text> }.into_component());
+		}
+	}
+	if let Some(note) = &answer.note {
+		let mut lines = note.as_str().split('\n');
+		let first = Str::new(lines.next().unwrap_or_default());
+		rows.push(
+			dom! { <row gap=1 pad-x=1><text fg=muted>{"Note:"}</text><text>{first}</text></row> }
+				.into_component(),
+		);
+		for line in lines {
+			rows.push(dom! { <text pad-x=7>{Str::new(line)}</text> }.into_component());
+		}
+	}
+	if answer.timed_out {
+		rows.push(
+			dom! { <text pad-x=1 fg=muted>{"auto-selected after timeout — not a user choice"}</text> }
+				.into_component(),
+		);
+	}
+}
+
+fn extract_string(raw: &str, key: &str) -> Option<Str> {
 	let marker = format!("\"{key}\":\"");
 	let rest = raw.split_once(&marker)?.1;
-	Some(rest.split('"').next().unwrap_or(rest).to_owned())
+	Some(Str::new(rest.split('"').next().unwrap_or(rest)))
 }
-fn result_value(view: &CardView<'_>) -> Option<Value> {
-	typed_result::<omp_tools::ask::Payload>(view)
-}
+
 fn failure(view: &CardView<'_>) -> Str {
 	if let Some(fault) = typed_fault::<omp_tools::ask::Fault>(view) {
 		return fault;
@@ -207,6 +197,7 @@ fn failure(view: &CardView<'_>) -> Str {
 		.map(Str::new)
 		.unwrap_or(raw)
 }
+
 fn node_text(node: &Node) -> Option<Str> {
 	node.content.clone().or_else(|| {
 		node

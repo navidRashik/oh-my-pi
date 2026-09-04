@@ -27,8 +27,8 @@ use crate::{
 	actions::{HostAction, post},
 	overlays::{
 		PanelAnchor, PanelCall, PanelCx, PanelEvent, PanelOpener,
-		report::ReportPanel,
-		services::{McpAdd, McpOp, McpScope},
+		report::{PendingReportPanel, ReportPanel},
+		services::{McpAdd, McpOp, McpScope, SmitheryConnect, SmitherySearch},
 		tasks::{PendingPanel, Settle},
 	},
 	project::{BlockKind, block_views},
@@ -57,11 +57,15 @@ const MCP_HELP: &str =
 	 remove <name> [--scope project|user]` — Remove an MCP server\n`/mcp test <name>` — Test \
 	 connection to a server\n`/mcp reauth <name>` — Reauthorize OAuth for a server\n`/mcp unauth \
 	 <name>` — Remove OAuth auth from a server\n`/mcp enable <name>` — Enable an MCP server\n`/mcp \
-	 disable <name>` — Disable an MCP server\n`/mcp reconnect <name>` — Reconnect to a specific \
-	 MCP server\n`/mcp reload` — Force reload MCP runtime tools\n`/mcp resources` — List available \
-	 resources from connected servers\n`/mcp prompts` — List available prompts from connected \
-	 servers\n`/mcp notifications` — Show notification capabilities and subscriptions\n`/mcp help` \
-	 — Show this message";
+	 disable <name>` — Disable an MCP server\n`/mcp smithery-search <keyword> [--scope \
+	 project|user] [--limit <1-100>] [--semantic]` — Search the authenticated Smithery \
+	 registry\n`/mcp smithery-connect <qualified-name> [--name <local-name>] [--scope \
+	 project|user]` — Authorize and mount a Smithery result\n`/mcp smithery-login` — Authorize in \
+	 the browser and save the Smithery API key\n`/mcp smithery-logout` — Remove the saved Smithery \
+	 API key\n`/mcp reconnect <name>` — Reconnect to a specific MCP server\n`/mcp reload` — Force \
+	 reload MCP runtime tools\n`/mcp resources` — List available resources from connected \
+	 servers\n`/mcp prompts` — List available prompts from connected servers\n`/mcp notifications` \
+	 — Show notification capabilities and subscriptions\n`/mcp help` — Show this message";
 
 const fn usage(message: &'static str) -> ConError {
 	ConError::Usage(Str::new_static(message))
@@ -232,10 +236,90 @@ pub fn mcp_command(words: &[&str]) -> Result<McpCommand, ConError> {
 			McpCommand::Run(McpOp::Remove(name, scope(&tail[1..])?))
 		},
 		"add" => McpCommand::Run(McpOp::Add(parse_add(tail)?)),
+		"smithery-search" => McpCommand::Run(McpOp::SmitherySearch(parse_smithery_search(tail)?)),
+		"smithery-login" => McpCommand::Run(McpOp::SmitheryLogin),
+		"smithery-logout" => McpCommand::Run(McpOp::SmitheryLogout),
+		"smithery-connect" => McpCommand::Run(McpOp::SmitheryConnect(parse_smithery_connect(tail)?)),
 		_ => {
 			return Err(ConError::Usage(sf!("Unknown subcommand: {verb}. Type /mcp help for usage.")));
 		},
 	})
+}
+
+fn parse_smithery_search(words: &[&str]) -> Result<SmitherySearch, ConError> {
+	const USAGE: &str = "Keyword required. Usage: /mcp smithery-search <keyword> [--scope \
+	                     project|user] [--limit <1-100>] [--semantic]";
+	let mut keyword = Vec::new();
+	let mut scope = McpScope::Project;
+	let mut limit = 20usize;
+	let mut semantic = false;
+	let mut index = 0;
+	while index < words.len() {
+		match words[index] {
+			"--scope" => {
+				index += 1;
+				scope = words
+					.get(index)
+					.and_then(|value| value.parse().ok())
+					.ok_or_else(|| usage("Invalid --scope value. Use project or user."))?;
+			},
+			"--limit" => {
+				index += 1;
+				let value = words
+					.get(index)
+					.ok_or_else(|| usage("Missing value for --limit."))?;
+				limit = value
+					.parse::<usize>()
+					.ok()
+					.filter(|value| (1..=100).contains(value))
+					.ok_or_else(|| usage("Invalid --limit value. Use an integer between 1 and 100."))?;
+			},
+			"--semantic" => semantic = true,
+			word if word.starts_with("--") => {
+				return Err(ConError::Usage(sf!("Unknown option: {word}")));
+			},
+			word => keyword.push(word),
+		}
+		index += 1;
+	}
+	if keyword.is_empty() {
+		return Err(usage(USAGE));
+	}
+	Ok(SmitherySearch { keyword: Str::new(keyword.join(" ")), scope, limit, semantic })
+}
+
+fn parse_smithery_connect(words: &[&str]) -> Result<SmitheryConnect, ConError> {
+	const USAGE: &str =
+		"Usage: /mcp smithery-connect <qualified-name> [--name <local-name>] [--scope project|user]";
+	let Some(target) = words.first().filter(|word| !word.starts_with("--")) else {
+		return Err(usage(USAGE));
+	};
+	let mut scope = McpScope::Project;
+	let mut name = None;
+	let mut index = 1;
+	while index < words.len() {
+		match words[index] {
+			"--scope" => {
+				index += 1;
+				scope = words
+					.get(index)
+					.and_then(|value| value.parse().ok())
+					.ok_or_else(|| usage("Invalid --scope value. Use project or user."))?;
+			},
+			"--name" => {
+				index += 1;
+				name = Some(Str::new(
+					*words
+						.get(index)
+						.filter(|name| !name.is_empty())
+						.ok_or_else(|| usage(USAGE))?,
+				));
+			},
+			_ => return Err(usage(USAGE)),
+		}
+		index += 1;
+	}
+	Ok(SmitheryConnect { target: Str::new(*target), scope, name })
 }
 
 fn scope(words: &[&str]) -> Result<McpScope, ConError> {
@@ -294,6 +378,10 @@ fn parse_add(words: &[&str]) -> Result<McpAdd, ConError> {
 	Ok(add)
 }
 
+fn report_text(value: &Str) -> Str {
+	value.clone()
+}
+
 /// Loader panel over one MCP operation, titled by its verb.
 fn mcp_panel(op: McpOp) -> PanelOpener {
 	PanelOpener::new(move |cx| {
@@ -311,11 +399,35 @@ fn mcp_panel(op: McpOp) -> PanelOpener {
 			McpOp::Resources => ("MCP resources", sf!("Listing resources…")),
 			McpOp::Prompts => ("MCP prompts", sf!("Listing prompts…")),
 			McpOp::Notifications => ("MCP notifications", sf!("Reading notification state…")),
+			McpOp::SmitherySearch(search) => {
+				("Smithery registry", sf!("Searching Smithery for \"{}\"…", search.keyword))
+			},
+			McpOp::SmitheryLogin => {
+				("Smithery login", sf!("Starting Smithery browser authorization…"))
+			},
+			McpOp::SmitheryLogout => {
+				("Smithery logout", sf!("Removing the saved Smithery credential…"))
+			},
+			McpOp::SmitheryConnect(connect) => {
+				("Smithery connect", sf!("Connecting \"{}\" and refreshing MCP tools…", connect.target))
+			},
 		};
+		let scrollable_report = matches!(&op, McpOp::SmitherySearch(_));
 		let run = cx
 			.services
 			.mcp(op.clone())
 			.map_err(|error| sf!("{error}"))?;
+		if scrollable_report {
+			return Ok(Box::new(PendingReportPanel::new_cancellable(
+				"mcp",
+				title,
+				message,
+				run.done,
+				report_text,
+				run.cancel,
+				cx.ui,
+			)));
+		}
 		Ok(Box::new(PendingPanel::new(
 			"mcp",
 			PanelAnchor::Center,
@@ -377,7 +489,7 @@ omp_con::cmd! {
 	/// Copies the session transcript to the clipboard and writes the LLM request JSON to tmp.
 	dump() = |ctx, _args| call(ctx, PanelCall::new(dump));
 
-	/// Manages MCP servers: `/mcp <add|list|remove|test|reauth|unauth|enable|disable|reconnect|reload|resources|prompts|notifications|help>`.
+	/// Manages MCP servers, including authenticated Smithery search, login, logout, and connect.
 	mcp(?sub: Str, ?args: Str) = |ctx, args| {
 		let words = rest(args, 0).unwrap_or_default();
 		let words = words.split_whitespace().collect::<Vec<_>>();
@@ -385,7 +497,15 @@ omp_con::cmd! {
 			McpCommand::Help => open(ctx, PanelOpener::new(|cx| {
 				Ok(Box::new(ReportPanel::new("mcp", "MCP Server Management", MCP_HELP, cx.ui)))
 			})),
-			McpCommand::Run(op) => open(ctx, mcp_panel(op)),
+			McpCommand::Run(op) => {
+				if matches!(&op, McpOp::SmitheryLogin) {
+					ctx.reply(
+						Severity::Info,
+						"Smithery browser authorization is starting. Press Esc to cancel.",
+					);
+				}
+				open(ctx, mcp_panel(op))
+			},
 		}
 	};
 }
@@ -445,7 +565,46 @@ mod tests {
 				command: Vec::new(),
 			}))
 		);
-		assert!(mcp_command(&["smithery-login"]).is_err());
+		assert_eq!(mcp_command(&["smithery-login"]).unwrap(), McpCommand::Run(McpOp::SmitheryLogin));
+		assert_eq!(
+			mcp_command(&["smithery-logout"]).unwrap(),
+			McpCommand::Run(McpOp::SmitheryLogout)
+		);
+		assert_eq!(
+			mcp_command(&[
+				"smithery-search",
+				"filesystem",
+				"server",
+				"--scope",
+				"user",
+				"--limit",
+				"4",
+				"--semantic"
+			])
+			.unwrap(),
+			McpCommand::Run(McpOp::SmitherySearch(SmitherySearch {
+				keyword:  Str::new_static("filesystem server"),
+				scope:    McpScope::User,
+				limit:    4,
+				semantic: true,
+			}))
+		);
+		assert_eq!(
+			mcp_command(&[
+				"smithery-connect",
+				"smithery-ai/filesystem",
+				"--name",
+				"files",
+				"--scope",
+				"user"
+			])
+			.unwrap(),
+			McpCommand::Run(McpOp::SmitheryConnect(SmitheryConnect {
+				target: Str::new_static("smithery-ai/filesystem"),
+				scope:  McpScope::User,
+				name:   Some(Str::new_static("files")),
+			}))
+		);
 		assert_eq!(
 			mcp_command(&["test"]).unwrap_err().to_string(),
 			"Server name required. Usage: /mcp test <name>"

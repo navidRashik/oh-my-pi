@@ -58,7 +58,7 @@ pub mod tools;
 /// `/move`, `/wt`).
 pub mod workspace;
 
-pub use run::{director_active, director_frame, message_count, todo_markdown};
+pub use run::{VIBE, director_active, director_frame, message_count, todo_markdown};
 
 /// One palette decoration row: the console command name and its icon.
 ///

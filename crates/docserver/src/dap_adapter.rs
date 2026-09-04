@@ -344,7 +344,7 @@ impl DapAdapterRegistry {
 		}
 	}
 
-	/// Selects attach by explicit name, port-capable adapter, or preference.
+	/// Selects attach by explicit name, a port hint (debugpy first), or preference.
 	pub fn select_attach(
 		&self,
 		preferred: Option<&str>,
@@ -356,10 +356,19 @@ impl DapAdapterRegistry {
 				.into_iter()
 				.find(|adapter| adapter.spec.name.as_str() == preferred);
 		}
-		if port.is_some() {
-			adapters.retain(|adapter| matches!(adapter.spec.transport, DapTransport::Tcp { .. }));
-		}
-		adapters.sort_by_key(|adapter| (adapter.spec.preference, adapter.spec.name.clone()));
+		adapters.retain(|adapter| command_available(adapter.spec.command.as_str()));
+		adapters.sort_by_key(|adapter| {
+			let port_rank = if port.is_some() {
+				match adapter.spec.name.as_str() {
+					"debugpy" => 0_u8,
+					"gdb" | "lldb-dap" => 1,
+					_ => 2,
+				}
+			} else {
+				0
+			};
+			(port_rank, adapter.spec.preference, adapter.spec.name.clone())
+		});
 		adapters.into_iter().next()
 	}
 }

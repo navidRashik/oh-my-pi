@@ -6,10 +6,9 @@
 //! by the text typed after the slashes; acceptance inserts the full URL
 //! plus a trailing space (like `@` file references).
 //!
-//! The application supplies candidates through [`UrlCompleter`]; the
-//! provider asks it once per scheme while one token is being typed (the
-//! editor re-queries on every keystroke, and the roster behind a scheme
-//! does not change mid-word).
+//! The application supplies resource-relative candidates through
+//! [`UrlCompleter`]. The provider passes the live query on every request,
+//! matching pi's `InternalUrlRouter.complete(scheme, query)` contract.
 
 use std::sync::Arc;
 
@@ -24,16 +23,18 @@ const MAX_ROWS: usize = 25;
 /// One completable resource under a scheme.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UrlCandidate {
-	/// The full URL inserted on acceptance, e.g. `skill://humanizer`.
+	/// Resource-relative value, e.g. `humanizer` for `skill://humanizer`.
 	pub value:       Str,
+	/// Optional short label; the value is shown when absent.
+	pub label:       Option<Str>,
 	/// Explanatory text shown beside the label.
 	pub description: Option<Str>,
 }
 
-/// Application-supplied candidate source: every resource under `scheme`
-/// (lowercased, without `://`), or `None` when the scheme has no
+/// Application-supplied candidate source: resources matching `query` under
+/// `scheme` (both without `://`), or `None` when the scheme has no
 /// completion-capable resolver.
-pub type UrlCompleter = Arc<dyn Fn(&str) -> Option<Vec<UrlCandidate>> + Send + Sync>;
+pub type UrlCompleter = Arc<dyn Fn(&str, &str) -> Option<Vec<UrlCandidate>> + Send + Sync>;
 
 /// A `scheme://query` token ending at the cursor (pi `InternalUrlContext`).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,60 +148,37 @@ fn scheme_icon(scheme: &str) -> Icon {
 	}
 }
 
-/// The resource part of a full URL: everything after `scheme:` and its
-/// slashes.
-fn resource_of<'a>(value: &'a str, scheme: &str) -> &'a str {
-	value
-		.get(scheme.len()..)
-		.and_then(|rest| rest.strip_prefix(':'))
-		.map_or(value, |rest| rest.trim_start_matches('/'))
-}
-
 /// Internal URL completion over an application-supplied candidate source.
 pub struct InternalUrls {
 	completer: UrlCompleter,
-	/// Candidates fetched for the scheme of the token being typed.
-	cached:    Option<(Str, Option<Vec<UrlCandidate>>)>,
 }
 
 impl InternalUrls {
 	/// Builds the provider over `completer`.
 	#[must_use]
 	pub fn new(completer: UrlCompleter) -> Self {
-		Self { completer, cached: None }
-	}
-
-	fn candidates(&mut self, scheme: &Str) -> Option<&[UrlCandidate]> {
-		if self
-			.cached
-			.as_ref()
-			.is_none_or(|(cached, _)| cached != scheme)
-		{
-			self.cached = Some((scheme.clone(), (self.completer)(scheme)));
-		}
-		self
-			.cached
-			.as_ref()
-			.and_then(|(_, candidates)| candidates.as_deref())
+		Self { completer }
 	}
 }
 
 impl EditorCompletion for InternalUrls {
 	fn suggest(&mut self, text: &str, cursor: usize) -> Option<Suggestions> {
-		let Some(context) = url_context(text, cursor) else {
-			// The token ended: the next one asks for a fresh roster.
-			self.cached = None;
-			return None;
-		};
+		let context = url_context(text, cursor)?;
 		let query = context.query.to_ascii_lowercase();
 		let scheme = context.scheme.clone();
-		let candidates = self.candidates(&scheme)?;
+		let candidates = (self.completer)(&scheme, context.query)?;
 		let mut scored: Vec<(u16, usize, &UrlCandidate)> = candidates
 			.iter()
 			.enumerate()
 			.filter_map(|(index, candidate)| {
-				let target =
-					percent_decode(resource_of(&candidate.value, &scheme)).to_ascii_lowercase();
+				// Scheme ownership is one-way, as in current pi: the resolver
+				// returns a resource-relative value and this provider adds the
+				// scheme exactly once. Reject a producer contract violation
+				// instead of ever offering `agent://agent://…`.
+				if candidate.value.contains("://") {
+					return None;
+				}
+				let target = percent_decode(&candidate.value).to_ascii_lowercase();
 				fuzzy_score(&query, &target).map(|score| (score, index, candidate))
 			})
 			.collect();
@@ -213,8 +191,15 @@ impl EditorCompletion for InternalUrls {
 			.into_iter()
 			.take(MAX_ROWS)
 			.map(|(_, _, candidate)| {
-				let mut row = Suggestion::new(sf!("{} ", candidate.value), candidate.value.clone())
-					.with_icon(icon);
+				let value = sf!("{scheme}://{}", candidate.value);
+				let mut row = Suggestion::new(
+					sf!("{value} "),
+					candidate
+						.label
+						.clone()
+						.unwrap_or_else(|| candidate.value.clone()),
+				)
+				.with_icon(icon);
 				if let Some(description) = &candidate.description {
 					row = row.with_description(description.clone());
 				}
@@ -222,10 +207,6 @@ impl EditorCompletion for InternalUrls {
 			})
 			.collect();
 		Some(Suggestions { range: context.start..cursor, items })
-	}
-
-	fn accepted(&mut self, _replaced: &str, _suggestion: &Suggestion) {
-		self.cached = None;
 	}
 }
 
@@ -238,21 +219,22 @@ mod tests {
 	fn candidate(value: &'static str, description: Option<&'static str>) -> UrlCandidate {
 		UrlCandidate {
 			value:       Str::new_static(value),
+			label:       None,
 			description: description.map(Str::new_static),
 		}
 	}
 
 	fn provider(calls: Arc<AtomicUsize>) -> InternalUrls {
-		InternalUrls::new(Arc::new(move |scheme: &str| {
+		InternalUrls::new(Arc::new(move |scheme: &str, _query: &str| {
 			calls.fetch_add(1, Ordering::Relaxed);
 			match scheme {
 				"skill" => Some(vec![
-					candidate("skill://humanizer", Some("Humanize prose")),
-					candidate("skill://local-plan", None),
-					candidate("skill://pyo3", Some("PyO3 boundary rules")),
+					candidate("humanizer", Some("Humanize prose")),
+					candidate("local-plan", None),
+					candidate("pyo3", Some("PyO3 boundary rules")),
 				]),
-				"local" => Some(vec![candidate("local://omp2-plan.md", None)]),
-				"ssh" => Some(vec![candidate("ssh://alice%40prod", Some("prod"))]),
+				"local" => Some(vec![candidate("omp2-plan.md", None)]),
+				"ssh" => Some(vec![candidate("alice%40prod", Some("prod"))]),
 				_ => None,
 			}
 		}))
@@ -301,21 +283,21 @@ mod tests {
 		let text = "see skill://";
 		let all = urls.suggest(text, text.len()).expect("every skill");
 		assert_eq!(all.range, 4..text.len());
-		assert_eq!(labels(&all), ["skill://humanizer", "skill://local-plan", "skill://pyo3"]);
+		assert_eq!(labels(&all), ["humanizer", "local-plan", "pyo3"]);
 		assert_eq!(all.items[0].value(), "skill://humanizer ");
 		assert_eq!(all.items[0].description(), Some("Humanize prose"));
 		assert_eq!(all.items[0].icon(), Some(Icon::Skill));
 		let text = "see skill://lp";
 		let fuzzy = urls.suggest(text, text.len()).expect("subsequence match");
-		assert_eq!(labels(&fuzzy), ["skill://local-plan"]);
+		assert_eq!(labels(&fuzzy), ["local-plan"]);
 		let text = "see skill://PY";
 		let prefix = urls
 			.suggest(text, text.len())
 			.expect("case-insensitive prefix");
-		assert_eq!(labels(&prefix), ["skill://pyo3"]);
+		assert_eq!(labels(&prefix), ["pyo3"]);
 		assert!(urls.suggest("see skill://zzz", 15).is_none(), "no match closes");
-		// One fetch served the whole token.
-		assert_eq!(calls.load(Ordering::Relaxed), 1);
+		// Current pi passes the live query to the resolver on every request.
+		assert_eq!(calls.load(Ordering::Relaxed), 4);
 	}
 
 	#[test]
@@ -324,23 +306,18 @@ mod tests {
 		let mut urls = provider(Arc::clone(&calls));
 		assert!(urls.suggest("https://exa", 11).is_none());
 		assert!(urls.suggest("https://exam", 12).is_none());
-		assert_eq!(calls.load(Ordering::Relaxed), 1, "an unknown scheme is asked once");
-		// Leaving the token and coming back asks again (the roster may have
-		// changed while the user typed elsewhere).
+		assert_eq!(calls.load(Ordering::Relaxed), 2, "each query reaches the resolver");
 		assert!(urls.suggest("https://exam ", 13).is_none());
 		assert!(urls.suggest("https://exam h", 14).is_none());
-		assert_eq!(calls.load(Ordering::Relaxed), 1, "no URL token, no fetch");
+		assert_eq!(calls.load(Ordering::Relaxed), 2, "no URL token, no fetch");
 		assert!(urls.suggest("https://", 8).is_none());
-		assert_eq!(calls.load(Ordering::Relaxed), 2, "a new token fetches again");
+		assert_eq!(calls.load(Ordering::Relaxed), 3, "a new token fetches again");
 		let rows = urls.suggest("local://", 8).expect("local rows");
-		assert_eq!(labels(&rows), ["local://omp2-plan.md"]);
-		assert_eq!(calls.load(Ordering::Relaxed), 3, "a scheme switch fetches");
-		// Acceptance forgets the roster so the next token sees fresh data.
-		let accepted = rows.items[0].clone();
-		urls.accepted("local://", &accepted);
-		let rows = urls.suggest("local://o", 9).expect("local rows again");
+		assert_eq!(labels(&rows), ["omp2-plan.md"]);
+		assert_eq!(calls.load(Ordering::Relaxed), 4, "a scheme switch fetches");
+		let rows = urls.suggest("local://o", 9).expect("live query");
 		assert_eq!(rows.items.len(), 1);
-		assert_eq!(calls.load(Ordering::Relaxed), 4);
+		assert_eq!(calls.load(Ordering::Relaxed), 5);
 	}
 
 	#[test]
@@ -352,5 +329,18 @@ mod tests {
 			.expect("decoded host matches");
 		assert_eq!(rows.items[0].value(), "ssh://alice%40prod ");
 		assert_eq!(percent_decode("a%zz"), "a%zz");
+	}
+
+	#[test]
+	fn scheme_qualified_values_are_rejected_at_the_source_boundary() {
+		let mut urls = InternalUrls::new(Arc::new(|scheme: &str, query: &str| {
+			assert_eq!(scheme, "agent");
+			assert_eq!(query, "fx2");
+			Some(vec![candidate("agent://Fx2Composer", None)])
+		}));
+		assert!(
+			urls.suggest("agent://fx2", 11).is_none(),
+			"the provider, not the candidate source, owns the scheme prefix"
+		);
 	}
 }

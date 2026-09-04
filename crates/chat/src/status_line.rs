@@ -531,6 +531,7 @@ mod tests {
 				duration_ms:                 Some(4_000),
 				premium_requests_millionths: 330_000,
 				identity:                    None,
+				recoveries:                  Vec::new(),
 			})
 			.expect("receipt");
 
@@ -547,6 +548,7 @@ mod tests {
 				duration_ms:                 Some(2_000),
 				premium_requests_millionths: 1_000_000,
 				identity:                    None,
+				recoveries:                  Vec::new(),
 			})
 			.expect("receipt");
 		session
@@ -623,6 +625,7 @@ mod tests {
 				duration_ms:                 None,
 				premium_requests_millionths: 0,
 				identity:                    None,
+				recoveries:                  Vec::new(),
 			})
 			.expect("receipt");
 		let status = StatusLine::from_dom(session.dom());

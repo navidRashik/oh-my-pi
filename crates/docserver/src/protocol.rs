@@ -31,8 +31,9 @@ use crate::{
 	DestinationOverwritePolicy, DocumentEvent, DocumentEventKind, DocumentHead, DocumentId,
 	DocumentKind, DocumentLocator, DocumentPresence, DocumentSnapshot,
 	Environment as DocserverEnvironment, EnvironmentSession, Error, ExistingDirectoryPolicy,
-	FileKind, FollowSymlinks, LanguageId, LeaseId, LineRange, PathMetadata, PortablePermissions,
-	ReadBody, ReadSelection, Result as CoreResult, Revision, SymlinkTarget, SymlinkTargetForm,
+	FileKind, FollowSymlinks, LanguageId, LaunchAdapterSelection, LeaseId, LineRange, PathMetadata,
+	PortablePermissions, ReadBody, ReadSelection, Result as CoreResult, Revision, SymlinkTarget,
+	SymlinkTargetForm,
 	SymlinkTargetKind, TransactionId,
 	diagnostics::{Range, Severity, normalize, parse_push},
 	environment::{WorkspaceLeaseId, WorkspaceMutationGuard},
@@ -616,9 +617,6 @@ async fn dap_start(
 	event_frame_limit: usize,
 	cancellation: CancellationToken,
 ) -> DispatchResult<proto::DapSessionResponse> {
-	if adapter_name.is_empty() {
-		return Err(Failure::invalid("DAP adapter name must not be empty"));
-	}
 	if configuration_json.len() > MAX_DAP_CONFIGURATION_BYTES {
 		return Err(Failure::resource("DAP configuration exceeds its byte ceiling"));
 	}
@@ -647,20 +645,100 @@ async fn dap_start(
 	if !execute {
 		return Err(Failure::precondition("launch and attach require the DAP execute capability"));
 	}
-	let adapter = connection
-		.environment()
-		.dap_adapters()
-		.select_attach(Some(&adapter_name), None)
-		.ok_or_else(|| Failure::not_found("configured DAP adapter was not found"))?;
 	let supplied: serde_json::Value = serde_json::from_slice(&configuration_json)
 		.map_err(|_| Failure::invalid("DAP configuration must be valid JSON"))?;
-	let supplied = supplied
+	let mut supplied = supplied
 		.as_object()
+		.cloned()
 		.ok_or_else(|| Failure::invalid("DAP configuration must be a JSON object"))?;
-	let arguments = adapter.spec.merged_arguments(attach, supplied);
 	let root = workspace
 		.to_file_path()
 		.map_err(|()| Failure::invalid("DAP workspace is not a local file URI"))?;
+	let port = supplied
+		.get("port")
+		.and_then(serde_json::Value::as_u64)
+		.and_then(|port| u16::try_from(port).ok());
+	let command_cwd = supplied
+		.get("cwd")
+		.and_then(serde_json::Value::as_str)
+		.map(PathBuf::from)
+		.map_or_else(
+			|| root.clone(),
+			|cwd| if cwd.is_absolute() { cwd } else { root.join(cwd) },
+		);
+	let launch_program = (!attach)
+		.then(|| supplied.get("program").and_then(serde_json::Value::as_str))
+		.flatten()
+		.map(PathBuf::from)
+		.map(|program| if program.is_absolute() { program } else { command_cwd.join(program) });
+	if let Some(program) = &launch_program {
+		supplied.insert(
+			"program".to_owned(),
+			serde_json::Value::String(program.to_string_lossy().into_owned()),
+		);
+		supplied.insert(
+			"cwd".to_owned(),
+			serde_json::Value::String(command_cwd.to_string_lossy().into_owned()),
+		);
+	}
+	if !attach && launch_program.is_none() {
+		return Err(Failure::invalid("DAP launch requires program"));
+	}
+	if attach
+		&& adapter_name.is_empty()
+		&& port.is_none()
+		&& supplied.get("pid").and_then(serde_json::Value::as_u64).is_none()
+	{
+		return Err(Failure::invalid("DAP attach requires pid or port when adapter is omitted"));
+	}
+	let adapter = if !adapter_name.is_empty() {
+		connection
+			.environment()
+			.dap_adapters()
+			.select_attach(Some(&adapter_name), port)
+			.ok_or_else(|| Failure::not_found("configured DAP adapter was not found"))?
+	} else if attach {
+		connection
+			.environment()
+			.dap_adapters()
+			.select_attach(None, port)
+			.ok_or_else(|| Failure::not_found("no available DAP adapter accepts this attachment"))?
+	} else {
+		let program = launch_program
+			.as_ref()
+			.expect("launch program presence was validated");
+		match connection
+			.environment()
+			.dap_adapters()
+			.select_launch(program, &root)
+		{
+			LaunchAdapterSelection::Available(adapter) => adapter,
+			LaunchAdapterSelection::Unavailable { .. } => {
+				return Err(Failure::not_found("selected DAP adapter executable is unavailable"));
+			},
+			LaunchAdapterSelection::NoMatch => {
+				return Err(Failure::not_found("no available DAP adapter accepts this program"));
+			},
+		}
+	};
+	if launch_program.as_ref().is_some_and(|program| !program.exists()) {
+		return Err(Failure::not_found("DAP launch program was not found"));
+	}
+	if launch_program.as_ref().is_some_and(|program| program.is_dir())
+		&& !adapter.spec.accepts_directory_program
+	{
+		return Err(Failure::invalid("selected DAP adapter does not accept a directory program"));
+	}
+	let arguments = if attach {
+		adapter.spec.merged_arguments(true, &supplied)
+	} else {
+		adapter.spec.launch_arguments(
+			launch_program
+				.as_deref()
+				.expect("launch program presence was validated"),
+			&supplied,
+		)
+	};
 	let reverse_handler: Arc<dyn DapReverseRequestHandler> =
 		Arc::new(EnvironmentDapReverseHandler {
 			environment: connection.environment().clone(),
@@ -675,29 +753,6 @@ async fn dap_start(
 		biased;
 		() = cancellation.cancelled() => return Err(Failure::cancelled("DAP launch cancelled")),
 		result = async {
-			if attach {
-				if let Some(port) = supplied.get("port").and_then(serde_json::Value::as_u64) {
-					let port = u16::try_from(port)
-						.map_err(|_| Failure::invalid("DAP attach port is out of range"))?;
-					let host = supplied
-						.get("host")
-						.and_then(serde_json::Value::as_str)
-						.unwrap_or("127.0.0.1");
-					let protocol = DapProtocol::connect_tcp_host(host, port)
-						.await
-						.map_err(|_| Failure::internal("DAP remote adapter connection failed"))?;
-					return DapSession::start(
-						registry_id.as_str(),
-						adapter.spec.name.as_str(),
-						protocol,
-						true,
-						arguments,
-						Some(Arc::clone(&reverse_handler)),
-					)
-					.await
-					.map_err(Failure::from_dap);
-				}
-			}
 			let spawned = DapProtocol::spawn_adapter(
 				adapter.spec.command.as_str(),
 				&adapter.spec.args,
@@ -760,6 +815,7 @@ async fn dap_start(
 		.flatten()
 		.collect(),
 		adapter_capabilities_json,
+		adapter: adapter.spec.name.as_str().to_owned(),
 	})
 }
 
@@ -795,10 +851,37 @@ async fn dap_action(
 	if request.max_response_bytes == 0 || request.max_response_bytes > MAX_DAP_RESPONSE_BYTES {
 		return Err(Failure::invalid("DAP response byte ceiling is out of range"));
 	}
+	let timeout = if request.timeout_ms == 0 {
+		Duration::from_secs(30)
+	} else if request.timeout_ms > 300_000 {
+		return Err(Failure::invalid("DAP action timeout is out of range"));
+	} else {
+		Duration::from_millis(u64::from(request.timeout_ms.max(5_000)))
+	};
 	let action = request
 		.command
 		.parse::<DapAction>()
 		.map_err(|_| Failure::invalid("unknown DAP action command"))?;
+	let action_session = if matches!(
+		action,
+		DapAction::SetBreakpoint
+			| DapAction::RemoveBreakpoint
+			| DapAction::SetFunctionBreakpoint
+			| DapAction::RemoveFunctionBreakpoint
+			| DapAction::SetInstructionBreakpoint
+			| DapAction::RemoveInstructionBreakpoint
+			| DapAction::SetDataBreakpoint
+			| DapAction::RemoveDataBreakpoint
+			| DapAction::Terminate
+			| DapAction::Sessions
+	) {
+		Arc::clone(&debug_session)
+	} else {
+		debug_session.active_target()
+	};
+	action_session
+		.ensure_action_supported(action)
+		.map_err(Failure::from_dap)?;
 	let tier = action.approval_tier();
 	if !debug_session.grants(tier) {
 		return Err(Failure::precondition(
@@ -822,11 +905,22 @@ async fn dap_action(
 		serde_json::from_slice(&request.arguments_json)
 			.map_err(|_| Failure::invalid("DAP action arguments must be valid JSON"))?
 	};
-	let mut inbound = debug_session.subscribe();
-	let result = tokio::select! {
-		biased;
-		() = cancellation.cancelled() => return Err(Failure::cancelled("DAP action cancelled")),
-		result = execute_dap_action(connection.environment().dap_sessions(), &debug_session, action, arguments) => result?,
+	let mut inbound = action_session.subscribe();
+	let operation = execute_dap_action(
+		connection.environment().dap_sessions(),
+		&action_session,
+		action,
+		arguments,
+		timeout,
+	);
+	let result = if action == DapAction::Terminate {
+		operation.await?
+	} else {
+		tokio::select! {
+			biased;
+			() = cancellation.cancelled() => return Err(Failure::cancelled("DAP action cancelled")),
+			result = operation => result?,
+		}
 	};
 	let revision = debug_session.advance_revision();
 	let response_ref = proto::DapSessionRef {
@@ -835,16 +929,16 @@ async fn dap_action(
 		revision,
 	};
 	while let Ok(event) = inbound.try_recv() {
-		forward_dap_inbound(events, event_frame_limit, &debug_session, &response_ref, event).await?;
+		forward_dap_inbound(events, event_frame_limit, &action_session, &response_ref, event).await?;
 	}
 	if action == DapAction::Output {
 		send_dap_output(
 			events,
 			event_frame_limit,
-			&debug_session,
+			&action_session,
 			&response_ref,
 			"console",
-			debug_session.output_snapshot(),
+			action_session.output_snapshot(),
 		)
 		.await?;
 	}
@@ -867,6 +961,7 @@ async fn execute_dap_action(
 	session: &Arc<DapSession>,
 	action: DapAction,
 	arguments: serde_json::Value,
+	timeout: Duration,
 ) -> DispatchResult<serde_json::Value> {
 	match action {
 		DapAction::Output => Ok(serde_json::json!({})),
@@ -923,7 +1018,11 @@ async fn execute_dap_action(
 		| DapAction::StepOver
 		| DapAction::StepIn
 		| DapAction::StepOut => session
-			.control(action, arguments)
+			.control(
+				action,
+				arguments,
+				timeout.saturating_sub(Duration::from_millis(50)),
+			)
 			.await
 			.map_err(Failure::from_dap)
 			.and_then(|snapshot| {
@@ -954,14 +1053,7 @@ async fn execute_dap_action(
 				registry
 					.list()
 					.into_iter()
-					.map(|session| {
-						serde_json::json!({
-							"id": session.id(),
-							"adapter": session.adapter(),
-							"state": Into::<&'static str>::into(session.state()),
-							"revision": session.revision(),
-						})
-					})
+					.map(|session| session.snapshot())
 					.collect(),
 			))
 		},
@@ -2950,9 +3042,9 @@ impl Failure {
 			DapSessionError::UnsupportedAction(_) | DapSessionError::InvalidReverseRequest => {
 				Self::invalid(error.to_string())
 			},
-			DapSessionError::InvalidTransition { .. } | DapSessionError::SessionTreeCycle => {
-				Self::precondition(error.to_string())
-			},
+			DapSessionError::InvalidTransition { .. }
+			| DapSessionError::SessionTreeCycle
+			| DapSessionError::MissingCapability { .. } => Self::precondition(error.to_string()),
 			DapSessionError::Protocol(_) | DapSessionError::Process(_) => {
 				Self::internal(error.to_string())
 			},

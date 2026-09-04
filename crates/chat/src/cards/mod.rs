@@ -18,7 +18,6 @@ pub mod glob;
 pub mod goal;
 pub mod grep;
 pub mod hub;
-pub mod inspect_image;
 pub mod lsp;
 pub mod memory;
 pub mod read;
@@ -29,6 +28,7 @@ pub mod think;
 pub mod todo;
 pub mod utility;
 pub mod web_search;
+mod workpool;
 pub mod write;
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -178,9 +178,7 @@ impl CardView<'_> {
 	#[must_use]
 	pub fn input<P: DeserializeOwned>(&self) -> Option<P> {
 		let raw = node_data(self.input).or_else(|| self.args_text())?;
-		let mut value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
-		value.as_object_mut()?.remove("i");
-		serde_json::from_value(value).ok()
+		omp_tool::decode_params(raw).ok()
 	}
 
 	/// Parses the streamed or committed arguments as JSON.
@@ -639,7 +637,6 @@ impl CardRegistry {
 		registry.register(goal::GoalCard);
 		registry.register(grep::GrepCard);
 		registry.register(hub::HubCard);
-		registry.register(inspect_image::InspectImageCard);
 		registry.register(lsp::LspCard);
 		registry.register(memory::RecallCard);
 		registry.register(memory::ReflectCard);

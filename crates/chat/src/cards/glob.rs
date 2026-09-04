@@ -22,7 +22,7 @@ impl Card for GlobCard {
 		let args = typed_input::<omp_tools::glob::Params>(view).unwrap_or(Value::Null);
 		let query = string_at(&args, "path")
 			.or_else(|| partial_string(view.args_text().unwrap_or_default(), "path"))
-			.unwrap_or_default();
+			.unwrap_or("*");
 		match view.status {
 			CardStatus::StreamingArgs | CardStatus::InProgress => {
 				let limit = args
@@ -57,12 +57,31 @@ fn render_done(view: &CardView<'_>, query: &str, expanded: bool) -> Component {
 		.and_then(Value::as_array)
 		.cloned()
 		.unwrap_or_default();
-	let count = result
-		.get("file_count")
-		.or_else(|| result.get("partial_match_count"))
-		.and_then(Value::as_u64)
-		.unwrap_or(files.len() as u64);
+	let count = files.len() as u64;
+	let count_label = if count == 1 { "file" } else { "files" };
 	let scope = glob_scope(query);
+	let timed_out = result
+		.get("timed_out")
+		.and_then(Value::as_bool)
+		.unwrap_or(false);
+	let truncated = timed_out
+		|| result
+			.get("truncated")
+			.and_then(Value::as_bool)
+			.unwrap_or(false);
+	let missing_paths = result
+		.get("missing_paths")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(Value::as_str)
+		.collect::<Vec<_>>();
+	let missing_note = (!missing_paths.is_empty())
+		.then(|| sf!("skipped missing: {}", missing_paths.join(", ")));
+	let limit_note = result
+		.get("result_limit_reached")
+		.and_then(Value::as_u64)
+		.map(|limit| sf!("truncated: limit {limit} results"));
 	let shown = if expanded {
 		files.len()
 	} else {
@@ -73,20 +92,35 @@ fn render_done(view: &CardView<'_>, query: &str, expanded: bool) -> Component {
 	dom! {
 		<col pad-x=1>
 			<row gap=1>
-				<i:search fg=default/><text>{"Glob:"}</text><text fg=output>{query}</text>
-				<text fg=muted>{sf!("{count} files · in {scope}")}</text>
+				if truncated { <i:warning fg=warn/> } else { <i:search fg=default/> }
+				<text>{"Glob:"}</text><text fg=output>{query}</text>
+				<text fg=muted>{sf!("{count} {count_label} · in {scope}")}</text>
+				if truncated { <text fg=warn>{"truncated"}</text> }
 			</row>
-			<col>
-				for (index, file) in files.iter().take(shown).enumerate() {
-					<row gap=1>
-						if index + 1 == shown && hidden == 0 { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
-						<icon name={path_language_icon(file_path(file))} fg=output/><text fg=output href={super::file_link(file_path(file))}>{file_path(file)}</text>
-					</row>
-				}
-				if hidden > 0 {
-					<row gap=1><i:tree-last fg=muted/><text fg=muted>{more}</text></row>
-				}
-			</col>
+			if files.is_empty() {
+				<text fg=muted>{if timed_out { "No matches before timeout (scan incomplete)" } else { "No files found" }}</text>
+			} else {
+				<col>
+					for (index, file) in files.iter().take(shown).enumerate() {
+						<row gap=1>
+							if index + 1 == shown && hidden == 0 { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
+							<icon name={path_language_icon(file_path(file))} fg=output/><text fg=output href={super::file_link(file_path(file))}>{file_path(file)}</text>
+						</row>
+					}
+					if hidden > 0 {
+						<row gap=1><i:tree-last fg=muted/><text fg=muted>{more}</text></row>
+					}
+				</col>
+			}
+			if timed_out {
+				<row gap=1 fg=warn><i:warning/><text>{"timed out; results are incomplete"}</text></row>
+			}
+			if let Some(note) = limit_note {
+				<row gap=1 fg=warn><i:warning/><text>{note}</text></row>
+			}
+			if let Some(note) = missing_note {
+				<row gap=1 fg=warn><i:warning/><text>{note}</text></row>
+			}
 		</col>
 	}
 	.into_component()
@@ -101,12 +135,15 @@ fn render_failed(view: &CardView<'_>) -> Component {
 }
 
 fn glob_scope(pattern: &str) -> &str {
+	if pattern.contains(';') {
+		return ".";
+	}
 	let prefix = pattern
 		.find(['*', '?', '[', '{'])
 		.map_or(pattern, |wildcard| &pattern[..wildcard]);
 	let prefix = prefix.trim_end_matches('/');
 	if prefix.len() == pattern.len() {
-		prefix.rsplit_once('/').map_or(".", |(parent, _)| parent)
+		if prefix.is_empty() { "." } else { prefix }
 	} else if prefix.is_empty() {
 		"."
 	} else {

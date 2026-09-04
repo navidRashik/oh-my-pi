@@ -777,7 +777,7 @@ mod tests {
 		let theme = UiContext::default().theme;
 		let fg = |x: u16, y: u16| ui.frame().cell(x, y).style().foreground_color();
 		assert_eq!(fg(29, 9), theme.ok);
-		assert_eq!(fg(29, 10), theme.border);
+		assert_eq!(fg(29, 10), theme.dim);
 		assert_eq!(fg(29, 11), theme.muted);
 		assert_eq!(fg(29, 12), theme.err);
 	}

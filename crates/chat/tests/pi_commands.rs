@@ -349,7 +349,7 @@ fn model_opens_the_picker_and_model_with_a_selector_sets_ai_model() {
 fn band_row(h: &Harness) -> String {
 	frame_text(h.host.frame())
 		.lines()
-		.find(|row| row.contains("📁 session ▶"))
+		.find(|row| row.contains("📁 session"))
 		.map(|row| row.trim_end().to_owned())
 		.unwrap_or_else(|| panic!("band row in:\n{}", frame_text(h.host.frame())))
 }
@@ -398,7 +398,7 @@ fn band_marks_subscription_billing_from_the_stored_oauth_account() {
 	// shows in the cost chip.
 	h.host.console("ai_model sub/plan").expect("subscribed");
 	let band = band_row(&h);
-	assert!(band.ends_with("(sub)"), "{band}");
+	assert!(band.contains("(sub)"), "{band}");
 	h.host.console("ai_model test/model").expect("back");
 	let band = band_row(&h);
 	assert!(!band.contains("(sub)"), "{band}");
@@ -612,14 +612,27 @@ fn move_validates_the_directory_then_asks_the_controller() {
 		.expect("missing confirmation");
 	assert_eq!(h.host.overlay_id(), Some("move"));
 	h.host.key(Key::Char('y')).expect("confirm create");
-	assert!(matches!(
-		h.commands.try_recv(),
-		Ok(HostCommand::Move { path, create: true }) if path == h.project.join("nowhere")
-	));
+	let create = h
+		.commands
+		.try_iter()
+		.find(|command| matches!(command, HostCommand::Move { .. }))
+		.expect("create move command");
+	assert!(
+		matches!(
+			&create,
+			HostCommand::Move { path, create: true } if path == &h.project.join("nowhere")
+		),
+		"{create:?}",
+	);
 	h.host.console("move elsewhere").expect("move");
+	let existing = h
+		.commands
+		.try_iter()
+		.find(|command| matches!(command, HostCommand::Move { .. }))
+		.expect("existing move command");
 	assert!(matches!(
-		h.commands.try_recv(),
-		Ok(HostCommand::Move { path, create: false }) if path == target
+		existing,
+		HostCommand::Move { path, create: false } if path == target
 	));
 }
 

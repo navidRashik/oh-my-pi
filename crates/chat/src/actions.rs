@@ -18,7 +18,7 @@ use omp_core::Str;
 
 use crate::{
 	commands::CommandAction,
-	extension_status::ExtensionStatusEvent,
+	extension_status::ExtensionStatus,
 	overlays::{PanelCall, PanelOpener},
 };
 
@@ -238,9 +238,15 @@ pub enum HostAction {
 	},
 	/// Ordered streaming speech-recognition state and editor updates.
 	SttEvent(SttUiEvent),
+	/// A validated newer official release for the archived update channel.
+	/// Presentation-only: it never enters the journal or initiates install.
+	UpdateAvailable(crate::notices::update::UpdateAvailable),
 	/// Insert, replace, clear, or reset one observer-local extension/hook
 	/// status contribution.
-	ExtensionStatus(ExtensionStatusEvent),
+	ExtensionStatus(ExtensionStatus),
+	/// Give an extension verbatim ownership of the terminal title until the
+	/// next authoritative session title.
+	ExtensionTitle(Str),
 	/// Register (or replace) an observer-local Esc hook.
 	EscapeHook(EscapeHook),
 	/// Remove an Esc hook by id.

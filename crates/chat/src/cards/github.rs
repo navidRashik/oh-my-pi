@@ -17,7 +17,7 @@ impl Card for GithubCard {
 		"github"
 	}
 
-	fn render(&self, view: &CardView<'_>, _expanded: bool, _ui: &UiContext) -> Component {
+	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::github::Params>(view).unwrap_or(Value::Null);
 		let op = args
 			.get("op")
@@ -32,12 +32,17 @@ impl Card for GithubCard {
 				let output = result_value(view)
 					.and_then(|value| {
 						value
-							.get("result")
-							.and_then(|result| {
-								result
-									.get("output")
-									.and_then(Value::as_str)
-									.or_else(|| result.as_str())
+							.get("output")
+							.and_then(Value::as_str)
+							.or_else(|| {
+								value
+									.get("result")
+									.and_then(|result| {
+										result
+											.get("output")
+											.and_then(Value::as_str)
+											.or_else(|| result.as_str())
+									})
 							})
 							.map(str::to_owned)
 					})
@@ -58,12 +63,21 @@ impl Card for GithubCard {
 					</box>
 				}.into_component()
 			},
-			_ => dom! {
-				<row gap=1><i:pending fg=output/><text fg=accent>{action}</text><text fg=muted>{detail}</text>
-					if let Some(badge) = elapsed_badge(view) { {badge} }
-				</row>
-			}
-			.into_component(),
+			_ => {
+				let progress = typed_result::<omp_tools::github::Update>(view)
+					.and_then(|value| value.get("output").and_then(Value::as_str).map(str::to_owned));
+				dom! {
+					<box border=round bc=border title_pad=3 pad="0 1">
+						<row kind=title gap=1><i:pending fg=output/><text fg=accent>{action}</text><text fg=muted>{detail}</text>
+							if let Some(badge) = elapsed_badge(view) { {badge} }
+						</row>
+						if expanded {
+							if let Some(progress) = progress { <pre fg=output>{progress}</pre> }
+						}
+					</box>
+				}
+				.into_component()
+			},
 		}
 	}
 }

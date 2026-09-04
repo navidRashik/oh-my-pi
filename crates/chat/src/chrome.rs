@@ -183,6 +183,13 @@ impl TerminalTitle {
 		self.state
 	}
 
+	/// Starts a new terminal ownership epoch. Leaving restores the shell's
+	/// title, so re-entry must emit the retained title even when its text did
+	/// not otherwise change.
+	pub fn reset_delivery(&mut self) {
+		self.sent.clear();
+	}
+
 	/// Composes the title at `now` and returns it when it differs from the
 	/// last one handed out; the caller writes it to the terminal. `None`
 	/// means the terminal already shows this title.
@@ -396,6 +403,12 @@ mod tests {
 		title.set_label(Some("refactor auth"), "/work/omp");
 		assert_eq!(title.emit(charset, Duration::ZERO), Some("π > refactor auth"));
 		assert_eq!(title.emit(charset, Duration::ZERO), None, "unchanged titles are not re-sent");
+		title.reset_delivery();
+		assert_eq!(
+			title.emit(charset, Duration::ZERO),
+			Some("π > refactor auth"),
+			"a new terminal epoch restores the title the prior leave popped"
+		);
 		assert_eq!(title.next_wake(charset, Duration::ZERO), None, "idle never animates");
 
 		title.set_state(TitleState::Working);
@@ -424,6 +437,39 @@ mod tests {
 		bare.set_label(None, "/");
 		assert_eq!(bare.emit(charset, Duration::ZERO), Some("π >"), "no label: separator trails");
 		assert_eq!(bare.emit(Charset::Ascii, Duration::ZERO), None);
+	}
+
+	/// pi `setExtensionTerminalTitle`: an extension title is not decorated
+	/// by state, settings, or spinner updates and survives until the next
+	/// authoritative session title.
+	#[test]
+	fn extension_terminal_title_owns_output_until_the_next_session_title() {
+		let charset = Charset::Unicode;
+		let mut title = TerminalTitle::new();
+		title.set_label(Some("session one"), "/work/omp");
+		assert_eq!(title.emit(charset, Duration::ZERO), Some("π > session one"));
+
+		title.set_extension_title("extension owns this");
+		assert_eq!(title.emit(charset, Duration::ZERO), Some("extension owns this"));
+		title.set_state(TitleState::Working);
+		title.set_enabled(false);
+		assert_eq!(
+			title.emit(charset, Duration::from_secs(10)),
+			None,
+			"ordinary run-state and title-setting updates cannot decorate the override"
+		);
+		assert_eq!(
+			title.next_wake(charset, Duration::from_secs(10)),
+			None,
+			"an extension-owned title does not schedule hidden spinner updates"
+		);
+
+		title.set_label(Some("session two"), "/work/other");
+		assert_eq!(
+			title.emit(charset, Duration::from_secs(10)),
+			Some("π: session two"),
+			"an authoritative session switch clears the extension override"
+		);
 	}
 
 	/// pi `sanitizeTerminalTitlePart` / `getFallbackTerminalTitle`: control

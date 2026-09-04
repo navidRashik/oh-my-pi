@@ -15,13 +15,17 @@
 //! `Delete session?` confirmation (`session-selector.ts:942`), and
 //! Ctrl+Backspace deletes without it.
 
+use std::sync::Arc;
+
 use jiff::{Timestamp, fmt::strtime, tz::TimeZone};
-use omp_core::{Str, StrMut, sf};
+use omp_core::{FastHashMap, Str, StrMut, sf};
 use omp_tui::{Frame, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent, dom};
 
 use super::{
 	Outcome, Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent, PanelNote,
-	services::{ForeignSessionRow, ForeignSessionSource, ServiceResult, SessionRow, SessionScope},
+	services::{
+		ForeignSessionRow, ForeignSessionSource, ServiceResult, Services, SessionRow, SessionScope,
+	},
 };
 use crate::host::HostCommand;
 
@@ -39,6 +43,8 @@ const IMPORT_HINT: &str = "[Enter import · Esc cancel]";
 const NO_SESSIONS: &str = "No sessions found";
 /// Border, hint rule, hint, and blank rows around the list.
 const FRAME_ROWS: u16 = 6;
+/// Prompt-history augmentation waits for a typing pause before touching SQLite.
+const HISTORY_MERGE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 /// `YYYY-MM-DD HH:MM` row stamp.
 const STAMP_FORMAT: &str = "%Y-%m-%d %H:%M";
 /// Stamp shown when a timestamp cannot be represented.
@@ -361,10 +367,14 @@ pub struct SessionPicker {
 	mode:      Mode,
 	full_path: bool,
 	sort:      Sort,
-	scope:     SessionScope,
-	requested: Option<SessionScope>,
-	width:     u16,
-	list_rows: u16,
+	scope:           SessionScope,
+	requested:       Option<SessionScope>,
+	history:         Option<Arc<dyn Services>>,
+	history_matches: FastHashMap<Str, usize>,
+	now:             std::time::Duration,
+	history_due:     Option<std::time::Duration>,
+	width:           u16,
+	list_rows:       u16,
 }
 
 impl SessionPicker {
@@ -376,7 +386,9 @@ impl SessionPicker {
 			.services
 			.sessions(SessionScope::Project)
 			.map_err(|error| Str::new(error.to_string()))?;
-		Self::from_rows(rows, TimeZone::system(), cx.viewport, cx.ui)
+		let mut picker = Self::from_rows(rows, TimeZone::system(), cx.viewport, cx.ui)?;
+		picker.history = Some(Arc::clone(cx.services));
+		Ok(picker)
 	}
 
 	/// Opens the picker over `rows`, stamping dates in `zone`.
@@ -402,6 +414,10 @@ impl SessionPicker {
 			sort: Sort::Modified,
 			scope: SessionScope::Project,
 			requested: None,
+			history: None,
+			history_matches: FastHashMap::default(),
+			now: std::time::Duration::ZERO,
+			history_due: None,
 			width: viewport.width,
 			list_rows: Self::list_rows_for(viewport),
 		};
@@ -451,6 +467,19 @@ impl SessionPicker {
 			shown.extend(children.into_iter().map(|row| Shown { row, child: true }));
 		}
 		self.shown = shown;
+	}
+
+	fn reorder_for_query(&mut self) {
+		self.reorder();
+		if !self.history_matches.is_empty() {
+			self.shown.sort_by_key(|shown| {
+				self
+					.history_matches
+					.get(&self.rows[shown.row].id)
+					.copied()
+					.map_or((true, usize::MAX), |rank| (false, rank))
+			});
+		}
 	}
 
 	fn stamp(&self, ms: u64) -> Str {
@@ -535,6 +564,11 @@ impl SessionPicker {
 				if let Some(agent) = &row.agent {
 					label.push(' ');
 					label.push_str(agent.as_str());
+				}
+				// Prompt matches lead the selector's search rank without
+				// exposing private prompt text in the visible session row.
+				if self.history_matches.contains_key(&row.id) {
+					label = StrMut::new(self.query.clone());
 				}
 				Line {
 					value:    row.id.clone(),
@@ -656,7 +690,7 @@ impl SessionPicker {
 	fn delete_now(&mut self, index: usize) -> PanelEvent {
 		let row = self.rows.remove(index);
 		let line = sf!("session_delete {}", row.id);
-		self.reorder();
+		self.reorder_for_query();
 		self.cursor = self
 			.cursor
 			.map(|at| at.min(self.shown.len().saturating_sub(1)))
@@ -716,9 +750,19 @@ impl SessionPicker {
 			},
 			UiEvent::Filtered { query, value, .. } => {
 				self.query = query;
+				self.history_matches.clear();
+				self.history_due = (self.query.trim().chars().count() >= 2)
+					.then_some(self.now.saturating_add(HISTORY_MERGE_DELAY));
+				self.reorder_for_query();
 				match value {
 					Some(value) => self.cursor_to(&value),
 					None => self.cursor = None,
+				}
+				self.rebuild();
+				if self.cursor.is_none()
+					&& let UiEvent::Highlighted { value, .. } = self.ui.handle_key(Key::Home)
+				{
+					self.cursor_to(&value);
 				}
 				PanelEvent::Consumed
 			},
@@ -730,6 +774,34 @@ impl SessionPicker {
 			},
 			_ => PanelEvent::Consumed,
 		}
+	}
+
+	fn apply_history_ranking(&mut self) -> bool {
+		let matches = self
+			.history
+			.as_ref()
+			.and_then(|history| {
+				history
+					.history_matching_session_ids(self.query.as_str(), 500)
+					.ok()
+			})
+			.unwrap_or_default();
+		self.history_matches = matches
+			.into_iter()
+			.enumerate()
+			.map(|(rank, id)| (id, rank))
+			.collect();
+		if self.history_matches.is_empty() {
+			return false;
+		}
+		let selected = self.current().map(|index| self.rows[index].id.clone());
+		self.reorder_for_query();
+		self.cursor = selected
+			.as_ref()
+			.and_then(|id| self.shown.iter().position(|shown| self.rows[shown.row].id == *id))
+			.or_else(|| (!self.shown.is_empty()).then_some(0));
+		self.rebuild();
+		true
 	}
 
 	fn rename_key(&mut self, key: Key) -> PanelEvent {
@@ -802,7 +874,7 @@ impl Panel for SessionPicker {
 			},
 			PanelAction::ToggleSort => {
 				self.sort = self.sort.toggled();
-				self.reorder();
+				self.reorder_for_query();
 				self.rebuild();
 				PanelEvent::Consumed
 			},
@@ -835,6 +907,23 @@ impl Panel for SessionPicker {
 		}
 	}
 
+	fn touch(&mut self, now: std::time::Duration) {
+		self.now = now;
+	}
+
+	fn tick(&mut self, now: std::time::Duration) -> bool {
+		self.now = now;
+		if !self.history_due.is_some_and(|due| due <= now) {
+			return false;
+		}
+		self.history_due = None;
+		self.apply_history_ranking()
+	}
+
+	fn next_wake(&self) -> Option<std::time::Duration> {
+		self.history_due
+	}
+
 	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
 		let PanelNote::Outcome(Outcome::SessionIndex(outcome)) = note else {
 			return PanelEvent::Ignored;
@@ -853,7 +942,7 @@ impl Panel for SessionPicker {
 		let selected = self.current().map(|index| self.rows[index].id.clone());
 		self.scope = outcome.scope;
 		self.rows = rows;
-		self.reorder();
+		self.reorder_for_query();
 		self.cursor = selected
 			.as_ref()
 			.and_then(|id| {
@@ -884,16 +973,9 @@ impl Panel for SessionPicker {
 	fn paste(&mut self, text: &str) -> PanelEvent {
 		match self.mode {
 			Mode::Confirm { .. } => PanelEvent::Consumed,
-			Mode::List => match self.ui.handle_paste(text) {
-				UiEvent::Filtered { query, value, .. } => {
-					self.query = query;
-					match value {
-						Some(value) => self.cursor_to(&value),
-						None => self.cursor = None,
-					}
-					PanelEvent::Consumed
-				},
-				_ => PanelEvent::Consumed,
+			Mode::List => {
+				let event = self.ui.handle_paste(text);
+				self.list_event(event)
 			},
 			Mode::Rename { index, .. } => {
 				if let UiEvent::Changed { value, .. } = self.ui.handle_paste(text) {
@@ -951,6 +1033,41 @@ mod tests {
 
 	fn text(picker: &mut SessionPicker) -> String {
 		omp_tui::frame_text(picker.frame(VIEWPORT))
+	}
+
+	struct HistoryMatches;
+
+	impl Services for HistoryMatches {
+		fn history_matching_session_ids(
+			&self,
+			query: &str,
+			_limit: usize,
+		) -> ServiceResult<Vec<Str>> {
+			Ok((query == "needle")
+				.then(|| vec![Str::new_static("target")])
+				.unwrap_or_default())
+		}
+	}
+
+	#[test]
+	fn prompt_matches_participate_in_session_search_without_disclosure() {
+		let mut picker = picker(vec![
+			row("noise", Some("Ordinary"), MODIFIED, CREATED),
+			row("target", Some("Private match"), MODIFIED - 1, CREATED),
+		]);
+		picker.history = Some(Arc::new(HistoryMatches));
+		picker.touch(std::time::Duration::ZERO);
+		assert_eq!(picker.paste("needle"), PanelEvent::Consumed);
+		assert_eq!(picker.next_wake(), Some(HISTORY_MERGE_DELAY));
+		assert!(picker.tick(HISTORY_MERGE_DELAY));
+		let shown = text(&mut picker);
+		assert!(shown.contains("Private match"), "{shown}");
+		assert!(!shown.contains("Ordinary"), "{shown}");
+		assert!(!shown.contains("secret prompt body"), "{shown}");
+		assert_eq!(
+			picker.key(Key::Enter),
+			PanelEvent::Finish(Str::new("resume \"/tmp/sessions/target.jsonl\""))
+		);
 	}
 
 	#[test]

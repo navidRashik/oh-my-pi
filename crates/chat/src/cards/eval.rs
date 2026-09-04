@@ -3,7 +3,10 @@
 //! pi `eval-render.ts`: a framed code cell titled `<lang icon> <status>
 //! <title> · (<duration>ms)`, the cell's stdout under an `Output` rule, and —
 //! after a blank row — every `display()` value as a JSON tree
-//! (`json-tree.ts` `renderJsonTreeLines`). A Python exception is not a tool
+//! (`json-tree.ts` `renderJsonTreeLines`). Helper status events retain their
+//! live action rows, while workpool status and snapshot values retain typed
+//! aggregate/worker/item presentation instead of degrading into an
+//! indistinguishable JSON tree. A Python exception is not a tool
 //! fault: the cell settles `Ok(Payload)` with `CellOutcome::Error` and the
 //! traceback in `CellStatus::exception`, and paints as failed.
 
@@ -11,7 +14,9 @@ use omp_tools::eval::{CellOutcome, CellStatus, DisplayOutput, Params, Payload};
 use omp_tui::{IntoComponent as _, UiContext, components::hr::truncate_to_width, dom};
 use serde_json::Value;
 
-use super::{Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input};
+use super::{
+	Card, CardStatus, CardView, Component, elapsed_badge, typed_fault, typed_input, workpool,
+};
 
 /// Persistent Python-kernel cell card.
 pub struct EvalCard;
@@ -77,6 +82,14 @@ impl Card for EvalCard {
 			output.push_str(&fault);
 		}
 		let duration = status.map(|status| format!("({}ms)", status.duration_ms));
+		let workpool_cards = payload
+			.as_ref()
+			.map(|payload| workpool::render(&payload.display_outputs, expanded))
+			.unwrap_or_default();
+		let status_cards = payload
+			.as_ref()
+			.map(|payload| status_components(&payload.display_outputs, expanded))
+			.unwrap_or_default();
 		let tree = payload
 			.as_ref()
 			.filter(|_| !failed)
@@ -102,6 +115,14 @@ impl Card for EvalCard {
 						<pre fg={if failed { "err" } else { "output" }}>{output}</pre>
 					}
 				</box>
+				if !status_cards.is_empty() {
+					<spacer h=1/>
+					<col gap=1>{status_cards}</col>
+				}
+				if !workpool_cards.is_empty() {
+					<spacer h=1/>
+					<col gap=1>{workpool_cards}</col>
+				}
 				if !tree.is_empty() {
 					<spacer h=1/>
 					<col>
@@ -124,7 +145,7 @@ fn output_preview(output: &str, expanded: bool) -> String {
 		return output.to_owned();
 	}
 	let lines = output.lines().collect::<Vec<_>>();
-	let skipped = lines.len().saturating_sub(20);
+	let skipped = lines.len().saturating_sub(10);
 	let tail = lines
 		.into_iter()
 		.skip(skipped)
@@ -134,6 +155,124 @@ fn output_preview(output: &str, expanded: bool) -> String {
 		tail
 	} else {
 		format!("… ({skipped} earlier lines)\n{tail}")
+	}
+}
+
+fn status_components(outputs: &[DisplayOutput], expanded: bool) -> Vec<Component> {
+	let events = outputs
+		.iter()
+		.filter_map(|output| match output {
+			DisplayOutput::Status { event }
+				if event.get("op").and_then(Value::as_str) != Some("workpool") =>
+			{
+				Some(event)
+			},
+			_ => None,
+		})
+		.collect::<Vec<_>>();
+	let shown = if expanded {
+		events.len().min(200)
+	} else {
+		events.len().min(3)
+	};
+	let hidden = events.len().saturating_sub(shown);
+	let mut rows = Vec::with_capacity(shown + usize::from(hidden > 0) + 1);
+	rows.push(dom! { <text fg=muted>{"Status"}</text> }.into_component());
+	if hidden > 0 {
+		rows.push(
+			dom! {
+				<row gap=1>
+					<i:tree-branch fg=muted/>
+					<text fg=muted>{format!("… {hidden} earlier")}</text>
+				</row>
+			}
+			.into_component(),
+		);
+	}
+	for (index, event) in events.iter().skip(hidden).enumerate() {
+		let last = index + 1 == shown;
+		let summary = status_summary(event);
+		rows.push(
+			dom! {
+				<row gap=1>
+					if last { <i:tree-last fg=muted/> } else { <i:tree-branch fg=muted/> }
+					<text fg={if event.get("error").is_some() { "warn" } else { "muted" }}>{summary}</text>
+				</row>
+			}
+			.into_component(),
+		);
+	}
+	rows
+}
+
+fn status_summary(event: &Value) -> String {
+	let op = event.get("op").and_then(Value::as_str).unwrap_or("status");
+	if let Some(error) = event.get("error").and_then(Value::as_str) {
+		return format!("{op}: {error}");
+	}
+	if op == "agent" {
+		let id = event.get("id").and_then(Value::as_str).unwrap_or("agent");
+		let status = event.get("status").and_then(Value::as_str).unwrap_or("running");
+		let detail = event
+			.get("currentTool")
+			.or_else(|| event.get("lastIntent"))
+			.or_else(|| event.get("taskPreview"))
+			.and_then(Value::as_str);
+		return detail.map_or_else(
+			|| format!("{id} · {status}"),
+			|detail| format!("{id} · {status} · {detail}"),
+		);
+	}
+	let detail = match op {
+		"read" => status_path_count(event, "from", "chars"),
+		"write" => status_path_count(event, "to", "chars"),
+		"env" => event
+			.get("key")
+			.and_then(Value::as_str)
+			.map(|key| {
+				let value = event
+					.get("value")
+					.map(display_scalar)
+					.unwrap_or_default();
+				format!("{key}={value}")
+			}),
+		"completion" => event
+			.get("model")
+			.and_then(Value::as_str)
+			.map(str::to_owned),
+		"log" => event.get("message").and_then(Value::as_str).map(str::to_owned),
+		"phase" => event.get("title").and_then(Value::as_str).map(str::to_owned),
+		"tool_define" => event
+			.get("name")
+			.and_then(Value::as_str)
+			.map(str::to_owned),
+		"output" => event
+			.get("id")
+			.and_then(Value::as_str)
+			.map(str::to_owned),
+		_ => event
+			.get("path")
+			.or_else(|| event.get("count"))
+			.map(display_scalar),
+	};
+	detail.map_or_else(|| op.to_owned(), |detail| format!("{op} · {detail}"))
+}
+
+fn status_path_count(event: &Value, preposition: &str, count_key: &str) -> Option<String> {
+	let path = event.get("path").and_then(Value::as_str);
+	let count = event.get(count_key).and_then(Value::as_u64);
+	match (count, path) {
+		(Some(count), Some(path)) => Some(format!("{count} chars {preposition} {path}")),
+		(Some(count), None) => Some(format!("{count} chars")),
+		(None, Some(path)) => Some(path.to_owned()),
+		(None, None) => None,
+	}
+}
+
+fn display_scalar(value: &Value) -> String {
+	match value {
+		Value::String(value) => value.clone(),
+		_ => value.to_string(),
 	}
 }
 
@@ -159,7 +298,7 @@ fn display_tree(outputs: &[DisplayOutput], expanded: bool, ui: &UiContext) -> Ve
 	let values = outputs
 		.iter()
 		.filter_map(|output| match output {
-			DisplayOutput::Json { data } => Some(data),
+			DisplayOutput::Json { data } if !workpool::is_snapshot(data) => Some(data),
 			_ => None,
 		})
 		.collect::<Vec<_>>();
@@ -401,4 +540,45 @@ fn partial_string(raw: &str, key: &str) -> Option<String> {
 		}
 	}
 	Some(raw[quote..].replace("\\n", "\n").replace("\\\"", "\""))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn helper_status_summaries_keep_agent_and_resource_details() {
+		assert_eq!(
+			status_summary(&serde_json::json!({
+				"op": "agent",
+				"id": "Scout",
+				"status": "running",
+				"currentTool": "read"
+			})),
+			"Scout · running · read"
+		);
+		assert_eq!(
+			status_summary(&serde_json::json!({
+				"op": "read",
+				"chars": 12,
+				"path": "agent://child"
+			})),
+			"read · 12 chars from agent://child"
+		);
+		assert_eq!(
+			status_summary(&serde_json::json!({
+				"op": "output",
+				"error": "job is unavailable"
+			})),
+			"output: job is unavailable"
+		);
+	}
+
+	#[test]
+	fn collapsed_output_uses_the_pi_ten_line_tail() {
+		let output = (1..=12).map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+		let preview = output_preview(&output, false);
+		assert!(preview.starts_with("… (2 earlier lines)\n3\n"));
+		assert!(preview.ends_with("\n12"));
+	}
 }

@@ -7,12 +7,13 @@ use std::fmt::Write as _;
 use omp_core::{Str, StrMut, sf};
 use omp_dom::{Node, PropId, Value};
 use omp_journal::data::{
-	AsyncJobStatus, AsyncResult, LaunchCompletion, LaunchDaemonCompletion, LaunchDaemonStatus,
+	AdvisorMessage, AdvisorNote, AdvisorSeverity, AsyncJobStatus, AsyncResult, LaunchCompletion,
+	LaunchDaemonCompletion, LaunchDaemonStatus,
 };
 use omp_tui::{IntoComponent as _, dom};
 
 use super::{format_duration, prop_text};
-use crate::cards::Component;
+use crate::cards::{Component, file_link, path_language_icon};
 
 /// Reads an async-result payload from its journal-derived user node.
 #[must_use]
@@ -155,11 +156,11 @@ pub(crate) fn launch_completion_block(completion: &LaunchCompletion) -> Componen
 /// Dispatches a `<notice kind=K>` custom kind to its renderer; `None` for
 /// the controller kinds (`error | warn | info | success`) and anything else.
 #[must_use]
-pub fn custom_notice(kind: &str, node: &Node) -> Option<Component> {
+pub fn custom_notice(kind: &str, node: &Node, expanded: bool) -> Option<Component> {
 	match kind {
-		"diagnostics" => Some(diagnostics_card(node)),
+		"diagnostics" => Some(diagnostics_card(node, expanded)),
 		"tangent" => Some(tangent_pill(node)),
-		"advisor" => Some(advisor_card(node)),
+		"advisor" => Some(advisor_card(node, expanded)),
 		_ => None,
 	}
 }
@@ -167,23 +168,25 @@ pub fn custom_notice(kind: &str, node: &Node) -> Option<Component> {
 /// One parsed `path:line:col [severity] [source] message (code)` line
 /// (pi `parseDiagnosticMessage`, `tools/render-utils.ts:346-359`).
 struct Diagnostic<'a> {
-	location: String,
+	path:     &'a str,
+	line:     &'a str,
+	col:      &'a str,
 	severity: &'a str,
 	message:  &'a str,
 	code:     Option<&'a str>,
 }
 
 impl<'a> Diagnostic<'a> {
-	fn parse(line: &'a str) -> Option<Self> {
-		let (path, rest) = line.split_once(':')?;
-		let (line_no, rest) = rest.split_once(':')?;
-		let (col, rest) = rest.split_once(' ')?;
-		if path.is_empty() || !is_digits(line_no) || !is_digits(col) {
+	fn parse(text: &'a str) -> Option<Self> {
+		let (location, rest) = text.split_once(" [")?;
+		let mut location = location.rsplitn(3, ':');
+		let col = location.next()?;
+		let line = location.next()?;
+		let path = location.next()?;
+		if path.is_empty() || !is_digits(line) || !is_digits(col) {
 			return None;
 		}
-		let rest = rest.trim_start();
-		let severity = rest.strip_prefix('[')?;
-		let (severity, rest) = severity.split_once(']')?;
+		let (severity, rest) = rest.split_once(']')?;
 		if !matches!(severity, "error" | "warning" | "info" | "hint") {
 			return None;
 		}
@@ -201,7 +204,7 @@ impl<'a> Diagnostic<'a> {
 			Some((code, body)) => (Some(code), body),
 			None => (None, message),
 		};
-		Some(Self { location: format!("{path}:{line_no}:{col}"), severity, message, code })
+		Some(Self { path, line, col, severity, message, code })
 	}
 
 	fn icon(&self) -> &'static str {
@@ -216,7 +219,7 @@ impl<'a> Diagnostic<'a> {
 		match self.severity {
 			"error" => "error",
 			"warning" => "warning",
-			_ => "muted",
+			_ => "output",
 		}
 	}
 }
@@ -225,79 +228,158 @@ fn is_digits(text: &str) -> bool {
 	!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-/// Late LSP diagnostics that arrived after an edit tool returned
-/// (pi `late-diagnostics-message.ts` over `formatDiagnostics`,
-/// `tools/render-utils.ts:361-487`): a `Late diagnostics` header naming the
-/// server, then one tree row per line with a severity glyph, `path:line:col`,
-/// and the message tinted by severity.
-#[must_use]
-pub fn diagnostics_card(node: &Node) -> Component {
-	let server = prop_text(node, PropId::Name);
-	let lines: Vec<&str> = node
+fn legacy_diagnostics(node: &Node) -> omp_session::late_diagnostics::LateDiagnostics {
+	let mut files = Vec::<omp_session::late_diagnostics::LateDiagnosticsFile>::new();
+	for line in node
 		.content
 		.as_deref()
-		.map(|content| {
-			content
-				.lines()
-				.map(str::trim_end)
-				.filter(|line| !line.trim().is_empty())
-				.collect()
-		})
-		.unwrap_or_default();
-	let count = lines.len();
-	let errored = lines.iter().any(|line| line.contains("[error]"));
-	let rows: Vec<Component> = lines
 		.into_iter()
-		.enumerate()
-		.map(|(index, line)| {
-			let last = index + 1 == count;
-			match Diagnostic::parse(line) {
-				Some(diagnostic) => {
-					let icon = diagnostic.icon();
-					let color = diagnostic.color();
-					let message = diagnostic.message.replace('\t', "    ");
-					let location = diagnostic.location;
-					let code = diagnostic.code.map(|code| sf!("({code})"));
-					dom! {
-						<row gap=1>
-							<icon name={if last { "tree-last" } else { "tree-branch" }} fg=muted dim/>
-							<icon name={icon} fg={color}/>
-							<text fg=muted dim>{location}</text>
-							<text fg={color}>{message}</text>
-							if let Some(code) = code { <text fg=muted dim>{code}</text> }
-						</row>
-					}
-					.into_component()
-				},
-				None => {
-					let color = if line.contains("[error]") {
-						"error"
-					} else if line.contains("[warning]") {
-						"warning"
-					} else {
-						"muted"
-					};
-					let text = line.replace('\t', "    ");
-					dom! {
-						<row gap=1>
-							<icon name={if last { "tree-last" } else { "tree-branch" }} fg=muted dim/>
-							<text fg={color} grow>{text}</text>
-						</row>
-					}
-					.into_component()
-				},
+		.flat_map(str::lines)
+		.map(str::trim_end)
+		.filter(|line| !line.trim().is_empty())
+	{
+		let path = Diagnostic::parse(line).map_or("", |diagnostic| diagnostic.path);
+		let index = files
+			.iter()
+			.position(|file| file.path == path)
+			.unwrap_or_else(|| {
+				files.push(omp_session::late_diagnostics::LateDiagnosticsFile {
+					path:     Str::new(path),
+					summary:  Str::new_static(""),
+					errored:  false,
+					messages: Vec::new(),
+				});
+				files.len() - 1
+			});
+		files[index].errored |= line.contains("[error]");
+		files[index].messages.push(Str::new(line));
+	}
+	omp_session::late_diagnostics::LateDiagnostics { files }
+}
+
+/// Late LSP diagnostics that arrived after an edit tool returned. The typed
+/// `files[]` payload is the durable grouping contract; both this card and edit
+/// surfaces project the same file/diagnostic tree semantics.
+#[must_use]
+pub fn diagnostics_card(node: &Node, expanded: bool) -> Component {
+	let diagnostics = omp_session::late_diagnostics::LateDiagnostics::from_node(node)
+		.unwrap_or_else(|| legacy_diagnostics(node));
+	let total = diagnostics
+		.files
+		.iter()
+		.map(|file| file.messages.len())
+		.sum::<usize>();
+	if total == 0 {
+		return dom! { <col/> }.into_component();
+	}
+	let limit = if expanded { total } else { total.min(5) };
+	let errored = diagnostics.files.iter().any(|file| file.errored);
+	let mut summary = StrMut::new("");
+	for file in &diagnostics.files {
+		if file.summary.is_empty() {
+			continue;
+		}
+		if !summary.is_empty() {
+			summary.push_str(", ");
+		}
+		summary.push_str(&file.summary);
+	}
+
+	let mut shown = 0usize;
+	let mut file_blocks = Vec::new();
+	for file in diagnostics
+		.files
+		.iter()
+		.filter(|file| !file.messages.is_empty())
+	{
+		if shown == limit {
+			break;
+		}
+		let take = (limit - shown).min(file.messages.len());
+		let is_last_file = shown + take == total;
+		let source_path = file.path.as_str();
+		let path = file
+			.messages
+			.iter()
+			.find_map(|message| Diagnostic::parse(message).map(|diagnostic| diagnostic.path))
+			.unwrap_or(source_path);
+		let href = file_link(source_path);
+		let diagnostics = file
+			.messages
+			.iter()
+			.take(take)
+			.enumerate()
+			.map(|(index, message)| {
+				let last = index + 1 == take;
+				match Diagnostic::parse(message) {
+					Some(diagnostic) => {
+						let icon = diagnostic.icon();
+						let color = diagnostic.color();
+						let location = sf!(":{}:{}", diagnostic.line, diagnostic.col);
+						let message = diagnostic.message.replace('\t', "    ");
+						let code = diagnostic.code.map(|code| sf!("({code})"));
+						dom! {
+							<row gap=1>
+								if is_last_file { <text>{"  "}</text> } else { <icon name="tree-vertical" fg=muted dim/> }
+								<icon name={if last { "tree-last" } else { "tree-branch" }} fg=muted dim/>
+								<icon name={icon} fg={color}/>
+								<text fg=muted dim href={href.clone()}>{location}</text>
+								<text fg={color}>{message}</text>
+								if let Some(code) = code { <text fg=muted dim>{code}</text> }
+							</row>
+						}
+						.into_component()
+					},
+					None => {
+						let color = if message.contains("[error]") {
+							"error"
+						} else if message.contains("[warning]") {
+							"warning"
+						} else {
+							"muted"
+						};
+						dom! {
+							<row gap=1>
+								if is_last_file { <text>{"  "}</text> } else { <icon name="tree-vertical" fg=muted dim/> }
+								<icon name={if last { "tree-last" } else { "tree-branch" }} fg=muted dim/>
+								<text fg={color} grow>{message.replace('\t', "    ")}</text>
+							</row>
+						}
+						.into_component()
+					},
+				}
+			})
+			.collect::<Vec<_>>();
+		file_blocks.push(
+			dom! {
+				<col>
+					<row gap=1>
+						<icon name={if is_last_file { "tree-last" } else { "tree-branch" }} fg=muted dim/>
+						<icon name={path_language_icon(path)} fg=muted/>
+						<text fg=accent href={href}>{path}</text>
+					</row>
+					{diagnostics}
+				</col>
 			}
-		})
-		.collect();
+			.into_component(),
+		);
+		shown += take;
+	}
+	let remaining = total.saturating_sub(shown);
 	dom! {
 		<col pad-x=1>
 			<row gap=1>
-				<icon name="lsp" fg=accent/>
 				if errored { <icon name="error" fg=error/> } else { <icon name="warning-status" fg=warning/> }
 				<text bold>{"Late diagnostics"}</text>
-				if let Some(server) = server { <text fg=muted dim>{sf!("({server})")}</text> }
+				if !summary.is_empty() { <text fg=muted dim>{sf!("({summary})")}</text> }
 			</row>
-			<col pad-x=1>{rows}</col>
+			<col pad-x=1>{file_blocks}</col>
+			if remaining > 0 {
+				<row pad-x=1 gap=1>
+					<icon name="tree-last" fg=muted dim/>
+					<text fg=muted>{sf!("… {remaining} more ⟨Ctrl+O: Expand⟩")}</text>
+				</row>
+			}
 		</col>
 	}
 	.into_component()
@@ -347,54 +429,158 @@ pub fn tangent_pill(node: &Node) -> Component {
 	.into_component()
 }
 
-/// pi `severityColor` (`advisor-message.ts:32-41`).
-fn severity_color(severity: Option<&str>) -> &'static str {
+/// Number of notes shown before the shared transcript expansion is engaged.
+const COLLAPSED_ADVISOR_NOTES: usize = 3;
+
+/// Reads the typed advisor payload from its journal-derived notice.
+///
+/// The legacy scalar shape remains readable so existing `.oms` sessions keep
+/// their visible and copyable note after this clean producer cutover.
+#[must_use]
+pub(crate) fn advisor_message(node: &Node) -> Option<AdvisorMessage> {
+	if let Some(Value::Json(data)) = node.prop(&PropId::Data.into())
+		&& let Ok(message) = serde_json::from_str::<AdvisorMessage>(data.get())
+		&& !message.notes.is_empty()
+	{
+		return Some(message);
+	}
+	let content = node.content.as_deref().unwrap_or_default().trim();
+	let summary = prop_text(node, PropId::Label);
+	if content.is_empty() && summary.is_none() {
+		return None;
+	}
+	let mut note = StrMut::new("");
+	if let Some(summary) = summary {
+		note.push_str(summary.trim().as_str());
+	}
+	if !content.is_empty() {
+		if !note.is_empty() {
+			note.push('\n');
+		}
+		note.push_str(content);
+	}
+	let severity = prop_text(node, PropId::Severity)
+		.and_then(|severity| severity.parse().ok())
+		.unwrap_or_default();
+	Some(AdvisorMessage {
+		notes: vec![AdvisorNote {
+			advisor: Str::new_static("default"),
+			severity,
+			note: note.freeze(),
+		}],
+	})
+}
+
+/// Complete clipboard/search projection of an advisor card.
+#[must_use]
+pub(crate) fn advisor_message_text(message: &AdvisorMessage) -> Str {
+	let mut text = StrMut::new("");
+	for (index, entry) in message.notes.iter().enumerate() {
+		if index > 0 {
+			text.push('\n');
+		}
+		let _ = write!(text, "[{}]", entry.severity);
+		if entry.advisor != "default" {
+			let _ = write!(text, " [{}]", entry.advisor.replace('\t', "    "));
+		}
+		if !entry.note.is_empty() {
+			text.push(' ');
+			text.push_str(entry.note.as_str());
+		}
+	}
+	text.freeze()
+}
+
+fn severity_color(severity: AdvisorSeverity) -> &'static str {
 	match severity {
-		Some("blocker") => "error",
-		Some("concern") => "warning",
-		_ => "muted",
+		AdvisorSeverity::Blocker => "error",
+		AdvisorSeverity::Concern => "warning",
+		AdvisorSeverity::Nit => "muted",
 	}
 }
 
-/// Advisor note injected into the primary session (pi `advisor-message.ts`):
-/// a bold `Advisor` header tag with the severity badge, then a heavy rail
-/// tinted per severity beside the bold summary and the note's paragraphs.
+/// Batched advisor notes injected into the primary session (pi
+/// `advisor-message.ts`): a counted header, one attributed severity rail per
+/// note, three-note collapsed preview, and every paragraph when expanded.
 #[must_use]
-pub fn advisor_card(node: &Node) -> Component {
-	let severity = prop_text(node, PropId::Severity);
-	let color = severity_color(severity.as_deref());
-	let summary = prop_text(node, PropId::Label);
-	let paragraphs: Vec<Str> = node
-		.content
-		.as_deref()
-		.map(|content| {
-			content
-				.split('\n')
+pub fn advisor_card(node: &Node, expanded: bool) -> Component {
+	let message = advisor_message(node).unwrap_or(AdvisorMessage { notes: Vec::new() });
+	let blockers = message
+		.notes
+		.iter()
+		.filter(|entry| entry.severity == AdvisorSeverity::Blocker)
+		.count();
+	let note_count = message.notes.len();
+	let count_label = sf!("{note_count} {}", if note_count == 1 { "note" } else { "notes" });
+	let blocker_label = (blockers > 0)
+		.then(|| sf!("{blockers} {}", if blockers == 1 { "blocker" } else { "blockers" }));
+	let shown = if expanded {
+		message.notes.as_slice()
+	} else {
+		&message.notes[..message.notes.len().min(COLLAPSED_ADVISOR_NOTES)]
+	};
+	let rows = shown
+		.iter()
+		.map(|entry| {
+			let color = severity_color(entry.severity);
+			let severity: &'static str = entry.severity.into();
+			let advisor =
+				(entry.advisor != "default").then(|| sf!("[{}]", entry.advisor.replace('\t', "    ")));
+			let mut paragraphs = entry
+				.note
+				.lines()
+				.map(str::trim_end)
 				.filter(|paragraph| !paragraph.trim().is_empty())
-				.map(|paragraph| Str::new(paragraph.replace('\t', "    ")))
-				.collect()
+				.map(|paragraph| Str::new(paragraph.replace('\t', "    ")));
+			let first = paragraphs.next();
+			let rest = paragraphs.collect::<Vec<_>>();
+			dom! {
+				<row gap=1 pad-x=1>
+					<hr vertical border=heavy fg={color}/>
+					<col grow>
+						<row gap=1>
+							<row>
+								<icon name="bracket-left" fg={color}/>
+								<text fg={color}>{severity}</text>
+								<icon name="bracket-right" fg={color}/>
+							</row>
+							if let Some(advisor) = advisor { <text fg=muted dim>{advisor}</text> }
+							if let Some(first) = first {
+								<text wrap=word grow>{first}</text>
+							}
+						</row>
+						for paragraph in rest {
+							<text wrap=word>{paragraph}</text>
+						}
+					</col>
+				</row>
+			}
+			.into_component()
 		})
-		.unwrap_or_default();
+		.collect::<Vec<Component>>();
+	let hidden = message.notes.len().saturating_sub(shown.len());
+	let hidden_label =
+		(hidden > 0).then(|| sf!("… +{hidden} more {}", if hidden == 1 { "note" } else { "notes" }));
 	dom! {
 		<col pad-x=1>
 			<row gap=1>
 				<icon name="advisor" fg=accent/>
 				<text bold fg=accent>{"Advisor"}</text>
-				if let Some(severity) = severity {
-					<row>
-						<icon name="bracket-left" fg={color}/>
-						<text fg={color}>{severity}</text>
-						<icon name="bracket-right" fg={color}/>
-					</row>
-				}
+				<row gap=0 fg=muted dim>
+					<text>{count_label}</text>
+					if let Some(blocker_label) = blocker_label {
+						<icon name="dot"/>
+						<text fg=error>{blocker_label}</text>
+					}
+				</row>
 			</row>
-			<row gap=1 pad-x=1>
-				<hr vertical border=heavy fg={color}/>
-				<col grow>
-					if let Some(summary) = summary { <text bold>{summary}</text> }
-					for paragraph in paragraphs { <text>{paragraph}</text> }
-				</col>
-			</row>
+			{rows}
+			if let Some(hidden_label) = hidden_label {
+				<row gap=1 pad-x=1>
+					<hr vertical border=heavy fg=muted/>
+					<text fg=muted dim>{hidden_label}</text>
+				</row>
+			}
 		</col>
 	}
 	.into_component()
@@ -497,7 +683,7 @@ pub fn synthetic_row(text: &str, expanded: bool) -> Component {
 #[cfg(test)]
 mod tests {
 	use omp_dom::{KnownTag, PropKey, Tag, Value};
-	use omp_tui::{CellContent, Color, Ui, UiContext, frame_text};
+	use omp_tui::{CellContent, Color, Ui, UiContext, frame_text, with_link_url};
 	use smallvec::smallvec;
 
 	use super::*;
@@ -513,6 +699,20 @@ mod tests {
 			props:   all,
 			kids:    Vec::new(),
 			content: content.map(Str::new),
+		}
+	}
+
+	fn advisor_notice(notes: Vec<AdvisorNote>) -> Node {
+		let message = AdvisorMessage { notes };
+		let data = serde_json::value::to_raw_value(&message).expect("advisor message serializes");
+		Node {
+			tag:     Tag::Known(KnownTag::Notice),
+			props:   smallvec![
+				(PropId::Kind.into(), Value::Str(Str::new_static("advisor"))),
+				(PropId::Data.into(), Value::Json(data)),
+			],
+			kids:    Vec::new(),
+			content: Some(Str::new_static("fallback advisor text")),
 		}
 	}
 
@@ -597,8 +797,8 @@ mod tests {
 
 		let bare = notice("tangent", &[(PropId::Id, "job-8")], None);
 		assert_eq!(render(tangent_pill(&bare), 80), " ⤴ Tangent dispatched [task] job-8");
-		assert!(custom_notice("tangent", &bare).is_some());
-		assert!(custom_notice("error", &bare).is_none());
+		assert!(custom_notice("tangent", &bare, false).is_some());
+		assert!(custom_notice("error", &bare, false).is_none());
 	}
 
 	fn rail_color(component: Component) -> omp_tui::Color {
@@ -617,36 +817,75 @@ mod tests {
 	}
 
 	#[test]
-	fn advisor_rail_color_follows_severity() {
+	fn advisor_batch_counts_attributes_collapses_and_wraps() {
 		let theme = UiContext::default().theme;
-		let body = "The retry loop re-reads the config every time.\n\nCache it outside the loop.";
-		let blocker = notice(
-			"advisor",
-			&[(PropId::Severity, "blocker"), (PropId::Label, "Config reread per retry")],
-			Some(body),
-		);
-		assert_eq!(rail_color(advisor_card(&blocker)), theme.err);
-		let concern = notice("advisor", &[(PropId::Severity, "concern")], Some(body));
-		assert_eq!(rail_color(advisor_card(&concern)), theme.warn);
-		let plain = notice("advisor", &[], Some(body));
-		assert_eq!(rail_color(advisor_card(&plain)), theme.muted);
+		let node = advisor_notice(vec![
+			AdvisorNote {
+				advisor:  Str::new_static("security"),
+				severity: AdvisorSeverity::Blocker,
+				note:     Str::new_static(
+					"The retry loop re-reads the config every time.\nCache it outside the loop.",
+				),
+			},
+			AdvisorNote {
+				advisor:  Str::new_static("performance"),
+				severity: AdvisorSeverity::Concern,
+				note:     Str::new_static("Avoid rebuilding the complete transcript for each delta."),
+			},
+			AdvisorNote {
+				advisor:  Str::new_static("default"),
+				severity: AdvisorSeverity::Nit,
+				note:     Str::new_static("Keep the helper private."),
+			},
+			AdvisorNote {
+				advisor:  Str::new_static("security"),
+				severity: AdvisorSeverity::Blocker,
+				note:     Str::new_static("Do not log the credential."),
+			},
+			AdvisorNote {
+				advisor:  Str::new_static("docs"),
+				severity: AdvisorSeverity::Nit,
+				note:     Str::new_static("Name the public contract."),
+			},
+		]);
+		assert_eq!(advisor_message(&node).expect("typed message").notes.len(), 5);
+		assert_eq!(rail_color(advisor_card(&node, false)), theme.err);
 
-		let text = render(advisor_card(&blocker), 60);
-		let lines: Vec<&str> = text.lines().collect();
-		assert!(lines[0].contains("Advisor ⟦blocker⟧"), "{text:?}");
-		assert!(lines[1].contains("┃ Config reread per retry"), "{text:?}");
-		assert!(text.contains("┃ Cache it outside the loop."), "{text:?}");
-		assert_eq!(
-			lines.iter().filter(|line| line.contains('┃')).count(),
-			3,
-			"the rail spans header and both paragraphs: {text:?}"
+		let collapsed = render(advisor_card(&node, false), 80);
+		assert!(collapsed.contains("Advisor 5 notes · 2 blockers"), "{collapsed:?}");
+		assert!(collapsed.contains("⟦blocker⟧ [security]"), "{collapsed:?}");
+		assert!(collapsed.contains("⟦concern⟧ [performance]"), "{collapsed:?}");
+		assert!(collapsed.contains("⟦nit⟧ Keep the helper private."), "{collapsed:?}");
+		assert!(collapsed.contains("… +2 more notes"), "{collapsed:?}");
+		assert!(!collapsed.contains("Do not log the credential."), "{collapsed:?}");
+
+		let expanded = render(advisor_card(&node, true), 42);
+		assert!(expanded.contains("Do not log") && expanded.contains("credential."), "{expanded:?}");
+		assert!(
+			expanded.contains("Name the public") && expanded.contains("contract."),
+			"{expanded:?}"
 		);
-		let narrow = render(advisor_card(&blocker), 30);
-		assert_eq!(
-			narrow.lines().filter(|line| line.contains('┃')).count(),
-			5,
-			"the rail follows wrapped paragraph rows: {narrow:?}"
+		assert!(!expanded.contains("more notes"), "{expanded:?}");
+		assert!(
+			expanded.contains("complete")
+				&& expanded.contains("transcript")
+				&& expanded.contains("delta"),
+			"long paragraph wraps without disappearing: {expanded:?}"
 		);
+		assert_eq!(
+			advisor_message_text(&advisor_message(&node).expect("typed message")).as_str(),
+			"[blocker] [security] The retry loop re-reads the config every time.\nCache it outside \
+			 the loop.\n[concern] [performance] Avoid rebuilding the complete transcript for each \
+			 delta.\n[nit] Keep the helper private.\n[blocker] [security] Do not log the \
+			 credential.\n[nit] [docs] Name the public contract."
+		);
+
+		let legacy = notice(
+			"advisor",
+			&[(PropId::Severity, "concern"), (PropId::Label, "Tests are missing")],
+			Some("The parser change has no coverage."),
+		);
+		assert!(render(advisor_card(&legacy, false), 60).contains("Tests are missing"));
 	}
 
 	#[test]
@@ -697,20 +936,90 @@ mod tests {
 	}
 
 	#[test]
-	fn diagnostics_rows_carry_severity_and_location() {
-		let node = notice(
-			"diagnostics",
-			&[(PropId::Name, "rust-analyzer")],
-			Some(
-				"src/lib.rs:12:5 [error] [rustc] mismatched types (E0308)\nsrc/lib.rs:40:1 [warning] \
-				 unused import\nserver restarted",
-			),
+	fn diagnostics_group_by_file_cap_then_expand() {
+		use omp_session::late_diagnostics::{LateDiagnostics, LateDiagnosticsFile};
+
+		let payload = LateDiagnostics {
+			files: vec![
+				LateDiagnosticsFile {
+					path:     Str::new_static("/abs/src/lib.rs"),
+					summary:  Str::new_static("2 error(s), 2 warning(s)"),
+					errored:  true,
+					messages: vec![
+						Str::new_static("src/lib.rs:12:5 [error] [rustc] mismatched types (E0308)"),
+						Str::new_static("src/lib.rs:40:1 [warning] [rustc] unused import"),
+						Str::new_static("src/lib.rs:41:1 [error] [rustc] missing field (E0063)"),
+						Str::new_static("src/lib.rs:50:2 [warning] [rustc] unused variable"),
+					],
+				},
+				LateDiagnosticsFile {
+					path:     Str::new_static("/abs/src/main.rs"),
+					summary:  Str::new_static("2 warning(s)"),
+					errored:  false,
+					messages: vec![
+						Str::new_static("src/main.rs:3:1 [warning] [rustc] unused import"),
+						Str::new_static("src/main.rs:9:4 [warning] [rustc] unused result"),
+					],
+				},
+			],
+		};
+		let data = serde_json::value::to_raw_value(&payload).expect("diagnostics serialize");
+		let node = Node {
+			tag:     Tag::Known(KnownTag::Developer),
+			props:   smallvec![
+				(PropId::Kind.into(), Value::Str(Str::new_static("diagnostics"))),
+				(PropId::Data.into(), Value::Json(data)),
+			],
+			kids:    Vec::new(),
+			content: Some(payload.body()),
+		};
+
+		let ui = Ui::from_root(diagnostics_card(&node, false), 100, UiContext::default());
+		let frame = ui.frame();
+		let collapsed = frame_text(frame);
+		let size = frame.size();
+		let href = (0..size.height).find_map(|row| {
+			(0..size.width).find_map(|col| {
+				frame
+					.cell(col, row)
+					.style()
+					.spec()
+					.link
+					.and_then(|link| with_link_url(link, str::to_owned))
+			})
+		});
+		assert!(
+			href
+				.as_deref()
+				.is_some_and(|href| href.ends_with("/src/lib.rs")),
+			"file rows and locations expose the source path as a terminal link: {href:?}"
 		);
-		let text = render(diagnostics_card(&node), 80);
-		let lines: Vec<&str> = text.lines().collect();
-		assert_eq!(lines[0], " 💡 ✘ Late diagnostics (rust-analyzer)");
-		assert_eq!(lines[1], "  ├─ ✘ src/lib.rs:12:5 mismatched types (E0308)");
-		assert_eq!(lines[2], "  ├─ ⚠ src/lib.rs:40:1 unused import");
-		assert_eq!(lines[3], "  └─ server restarted");
+		assert!(collapsed.contains("Late diagnostics (2 error(s), 2 warning(s), 2 warning(s))"));
+		assert!(collapsed.contains("src/lib.rs"));
+		assert!(collapsed.contains("src/main.rs"));
+		assert!(collapsed.contains(":12:5 mismatched types (E0308)"));
+		assert!(collapsed.contains("… 1 more ⟨Ctrl+O: Expand⟩"));
+		assert!(!collapsed.contains("unused result"));
+
+		let expanded = render(diagnostics_card(&node, true), 100);
+		assert!(expanded.contains("unused result"));
+		assert!(!expanded.contains("Ctrl+O: Expand"));
+
+		let empty = Node {
+			tag:     Tag::Known(KnownTag::Developer),
+			props:   smallvec![
+				(PropId::Kind.into(), Value::Str(Str::new_static("diagnostics"))),
+				(
+					PropId::Data.into(),
+					Value::Json(
+						serde_json::value::to_raw_value(&LateDiagnostics::default())
+							.expect("empty diagnostics serialize"),
+					),
+				),
+			],
+			kids:    Vec::new(),
+			content: None,
+		};
+		assert_eq!(render(diagnostics_card(&empty, false), 100), "");
 	}
 }

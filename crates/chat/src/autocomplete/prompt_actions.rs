@@ -106,14 +106,42 @@ fn prefix_start(text: &str, cursor: usize) -> Option<usize> {
 /// Prompt-action completion. Acceptance is reported through the shared
 /// [`PromptActions::take`] slot, polled by the composer after every key.
 pub struct PromptActions {
-	pending: Rc<Cell<Option<PromptAction>>>,
+	pending:  Rc<Cell<Option<PromptAction>>>,
+	/// Submitted slash commands whose argument text keeps `#word` literal.
+	commands: Box<[Str]>,
 }
 
 impl PromptActions {
 	/// Creates a provider and its acceptance slot.
 	#[must_use]
 	pub fn new() -> Self {
-		Self { pending: Rc::new(Cell::new(None)) }
+		Self { pending: Rc::new(Cell::new(None)), commands: Box::default() }
+	}
+
+	/// Records the submitted slash-command roster. Current pi suppresses
+	/// prompt actions inside a recognized command's arguments while still
+	/// allowing numeric GitHub refs and internal URLs there.
+	pub fn suppress_in_command_args<'a>(&mut self, commands: impl IntoIterator<Item = &'a str>) {
+		self.commands = commands.into_iter().map(Str::new).collect();
+	}
+
+	fn inside_command_args(&self, text: &str, cursor: usize) -> bool {
+		let before = &text[..cursor];
+		let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+		if !before[..line_start].trim().is_empty() {
+			return false;
+		}
+		let Some(body) = before[line_start..]
+			.trim_start_matches([' ', '\t'])
+			.strip_prefix('/')
+		else {
+			return false;
+		};
+		let Some(delimiter) = body.find(char::is_whitespace) else {
+			return false;
+		};
+		let name = &body[..delimiter];
+		self.commands.iter().any(|command| command.as_str() == name)
 	}
 
 	/// Shared acceptance slot; clone it into the composer.
@@ -131,6 +159,9 @@ impl Default for PromptActions {
 
 impl EditorCompletion for PromptActions {
 	fn suggest(&mut self, text: &str, cursor: usize) -> Option<Suggestions> {
+		if self.inside_command_args(text, cursor) {
+			return None;
+		}
 		let start = prefix_start(text, cursor)?;
 		let query = text[start + 1..cursor].to_ascii_lowercase();
 		let mut ranked: SmallVec<(u16, usize), 8> = DEFINITIONS
@@ -225,6 +256,19 @@ mod tests {
 		));
 		assert!(actions.suggest("#copy done", 10).is_none());
 		assert!(actions.suggest("#zzzz", 5).is_none());
+	}
+
+	#[test]
+	fn recognized_slash_arguments_keep_hash_actions_literal() {
+		let mut actions = PromptActions::new();
+		actions.suppress_in_command_args(["mcp", "help"]);
+		assert!(actions.suggest("/mcp test #copy", 15).is_none());
+		assert!(actions.suggest("/unknown #copy", 14).is_some());
+		assert!(
+			actions
+				.suggest("prose /mcp #copy", "prose /mcp #copy".len())
+				.is_some()
+		);
 	}
 
 	#[test]

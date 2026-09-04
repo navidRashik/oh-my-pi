@@ -27,15 +27,24 @@ impl Card for ReadCard {
 		let target = string_at(&args, "path")
 			.or_else(|| partial_string(view.args_text().unwrap_or_default(), "path"))
 			.unwrap_or_default();
+		let question = string_at(&args, "question")
+			.or_else(|| partial_string(view.args_text().unwrap_or_default(), "question"))
+			.filter(|question| !question.trim().is_empty());
+		let title = if question.is_some() { "Inspect" } else { "Read" };
 		match view.status {
 			CardStatus::StreamingArgs | CardStatus::InProgress => dom! {
-				<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{"Read"}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {target}")}</text>
-					if let Some(badge) = elapsed_badge(view) { {badge} }
-				</row>
+				<col>
+					<row gap=0><i:pending fg=output/><text>{" "}</text><text fg=accent>{title}</text><text>{":"}</text><text fg=output wrap=pre>{format!(" {target}")}</text>
+						if let Some(badge) = elapsed_badge(view) { {badge} }
+					</row>
+					if let Some(question) = question {
+						<row gap=1 pad-x=2><text fg=muted>{"Question:"}</text><text fg=accent wrap=word>{question}</text></row>
+					}
+				</col>
 			}
 			.into_component(),
-			CardStatus::Done => render_done(view, target, expanded, ui),
-			CardStatus::Failed => render_failed(view, target, ui),
+			CardStatus::Done => render_done(view, target, question, expanded, ui),
+			CardStatus::Failed => render_failed(view, target, question, ui),
 		}
 	}
 }
@@ -103,7 +112,13 @@ fn display_content(text: &str) -> DisplayContent {
 	}
 }
 
-fn render_done(view: &CardView<'_>, target: &str, expanded: bool, ui: &UiContext) -> Component {
+fn render_done(
+	view: &CardView<'_>,
+	target: &str,
+	question: Option<&str>,
+	expanded: bool,
+	ui: &UiContext,
+) -> Component {
 	let result = typed_result::<omp_tools::read::Payload>(view).unwrap_or(Value::Null);
 	let content = result
 		.get("parts")
@@ -130,9 +145,13 @@ fn render_done(view: &CardView<'_>, target: &str, expanded: bool, ui: &UiContext
 	let more = sf!("… {hidden} more line{} ⟨Ctrl+O: Expand⟩", if hidden == 1 { "" } else { "s" });
 	let src = content.and_then(|content| content.resolved);
 	let images = result_images(&result, target, ui);
+	let title = if question.is_some() { "Inspect" } else { "Read" };
 	dom! {
 		<box border=round bc=muted bg=panel bleed title_pad=3>
-			<row kind=title gap=1><i:card-bullet fg=ok/><text>{format!("Read {target}")}</text></row>
+			<row kind=title gap=1><i:card-bullet fg=ok/><text>{format!("{title} {target}")}</text></row>
+			if let Some(question) = question {
+				<row gap=1 pad-x=1><text fg=muted>{"Question:"}</text><text fg=accent wrap=word>{question}</text></row>
+			}
 			if let Some(preview) = preview { <pre wrap=word path={target}>{preview}</pre> }
 			if hidden > 0 { <text fg=muted pad-x=1>{more}</text> }
 			for image in images { {image} }
@@ -145,13 +164,22 @@ fn render_done(view: &CardView<'_>, target: &str, expanded: bool, ui: &UiContext
 	.into_component()
 }
 
-fn render_failed(view: &CardView<'_>, target: &str, _ui: &UiContext) -> Component {
+fn render_failed(
+	view: &CardView<'_>,
+	target: &str,
+	question: Option<&str>,
+	_ui: &UiContext,
+) -> Component {
 	let fault = typed_fault::<omp_tools::read::Fault>(view)
 		.or_else(|| diag_text(view.diag))
 		.unwrap_or_else(|| Str::new_static("read failed"));
+	let title = if question.is_some() { "Inspect" } else { "Read" };
 	dom! {
 		<box border=round bc=err bg=error_surface bleed title_pad=3>
-			<row kind=title gap=1><i:error fg=err/><text fg=accent>{format!("Read {target}")}</text></row>
+			<row kind=title gap=1><i:error fg=err/><text fg=accent>{format!("{title} {target}")}</text></row>
+			if let Some(question) = question {
+				<row gap=1 pad-x=1><text fg=muted>{"Question:"}</text><text fg=accent wrap=word>{question}</text></row>
+			}
 			<text fg=err wrap=word pad-x=1>{fault}</text>
 		</box>
 	}
@@ -356,7 +384,11 @@ mod tests {
 	}
 
 	fn render(ui: &UiContext) -> (Vec<String>, bool) {
-		let input = text_node(KnownTag::Input, Str::new(r#"{"path":"docs/logo.png"}"#));
+		render_call(ui, r#"{"path":"docs/logo.png"}"#)
+	}
+
+	fn render_call(ui: &UiContext, args: &str) -> (Vec<String>, bool) {
+		let input = text_node(KnownTag::Input, Str::new(args));
 		let payload = sf!(
 			r#"{{"parts":[{{"kind":"text","text":"Image file docs/logo.png"}},{{"kind":"blob","blob":{{"hash":"{HASH}","media_type":"image/png","byte_len":12}},"alt":"logo"}}]}}"#
 		);
@@ -414,5 +446,20 @@ mod tests {
 			"cells tier shows pi's placeholder: {rows:?}"
 		);
 		let _ = fs::remove_file(path);
+	}
+
+	#[test]
+	fn image_question_uses_the_read_card_with_inspection_semantics() {
+		let (rows, _) = render_call(
+			&UiContext::default(),
+			r#"{"path":"docs/logo.png","question":"Which provider logo is shown?"}"#,
+		);
+		assert!(rows.iter().any(|row| row.contains("Inspect docs/logo.png")), "{rows:?}");
+		assert!(
+			rows
+				.iter()
+				.any(|row| row.contains("Question: Which provider logo is shown?")),
+			"{rows:?}"
+		);
 	}
 }

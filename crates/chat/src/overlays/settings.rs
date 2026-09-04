@@ -14,11 +14,13 @@ use omp_con::{
 use omp_core::{Str, StrMut, sf};
 use omp_tui::{
 	Component, Frame, IntoComponent as _, Key, MouseReport, Prop, Size, Ui, UiContext, UiEvent,
-	cell_width, components::Tabs, dom,
+	cell_width,
+	components::{Input, Tabs},
+	dom,
 };
 
 use super::{
-	Panel, PanelAnchor, PanelCx, PanelEvent,
+	Panel, PanelAnchor, PanelCx, PanelEvent, PanelNote,
 	services::{SettingsChoice, SettingsInventory},
 };
 
@@ -449,11 +451,36 @@ enum Item {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Editor {
-	Text(String),
-	Submenu { cursor: usize },
-	Multi { cursor: usize, selected: Vec<Str>, ordered: bool },
-	ProviderList { cursor: usize },
-	ProviderValue { provider: Str, buffer: String },
+	Text {
+		buffer: String,
+		error:  Option<Str>,
+	},
+	Submenu {
+		cursor: usize,
+	},
+	Multi {
+		cursor:   usize,
+		selected: Vec<Str>,
+		ordered:  bool,
+		pressed:  Option<Str>,
+		drop:     Option<Str>,
+	},
+	ProviderList {
+		cursor: usize,
+	},
+	ProviderValue {
+		provider: Str,
+		buffer:   String,
+		error:    Option<Str>,
+	},
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingSetting {
+	convar:          Str,
+	index:           usize,
+	previous:        RowValue,
+	rejected_editor: Option<Editor>,
 }
 
 /// Retained curated settings selector.
@@ -470,6 +497,7 @@ pub struct SettingsPanel {
 	section_focus:      bool,
 	section_cursor:     usize,
 	editor:             Option<Editor>,
+	pending:            Option<PendingSetting>,
 	providers:          Vec<Str>,
 	has_image_protocol: bool,
 	ui:                 Ui,
@@ -583,6 +611,7 @@ impl SettingsPanel {
 			section_focus: false,
 			section_cursor: 0,
 			editor: None,
+			pending: None,
 			providers: inventory.providers,
 			has_image_protocol: !matches!(ctx.graphics, omp_tui::Graphics::Cells),
 			ui: Ui::from_root(dom! { <col/> }, 80, ctx.clone()),
@@ -913,7 +942,7 @@ impl SettingsPanel {
 				PanelEvent::Consumed
 			},
 			RowWidget::Text { .. } => {
-				self.editor = Some(Editor::Text(self.rows[index].editable()));
+				self.editor = Some(Editor::Text { buffer: self.rows[index].editable(), error: None });
 				self.rebuild();
 				PanelEvent::Consumed
 			},
@@ -930,7 +959,13 @@ impl SettingsPanel {
 						.collect(),
 					_ => Vec::new(),
 				};
-				self.editor = Some(Editor::Multi { cursor: 0, selected, ordered: *ordered });
+				self.editor = Some(Editor::Multi {
+					cursor: 0,
+					selected,
+					ordered: *ordered,
+					pressed: None,
+					drop: None,
+				});
 				self.rebuild();
 				PanelEvent::Consumed
 			},
@@ -1021,36 +1056,97 @@ impl SettingsPanel {
 		}
 	}
 
-	fn commit(&mut self, index: usize, value: RowValue) -> PanelEvent {
+	fn show_editor_error(&mut self, error: Str) -> PanelEvent {
+		let inline = match self.editor.as_mut() {
+			Some(Editor::Text { error: shown, .. })
+			| Some(Editor::ProviderValue { error: shown, .. }) => {
+				*shown = Some(error.clone());
+				true
+			},
+			_ => false,
+		};
+		if inline {
+			let _ = self.ui.set_text("settings-editor-error", error);
+			PanelEvent::Consumed
+		} else {
+			PanelEvent::Notice(error)
+		}
+	}
+
+	fn stage_commit(&mut self, index: usize, value: RowValue, close_editor: bool) -> PanelEvent {
+		if self.pending.is_some() {
+			return PanelEvent::Consumed;
+		}
 		if self.rows[index].value == value {
-			self.editor = None;
-			self.rebuild();
+			if close_editor {
+				self.editor = None;
+				self.rebuild();
+			}
 			return PanelEvent::Consumed;
 		}
 		let command = match Self::command_value(&self.rows[index], &value) {
 			Ok(command) => command,
-			Err(error) => return PanelEvent::Notice(error),
+			Err(error) => return self.show_editor_error(error),
 		};
-		self.rows[index].value = value;
-		self.editor = None;
-		self.reflow_items();
-		self.rebuild();
 		let convar = self.rows[index].convar.clone();
+		self.pending = Some(PendingSetting {
+			convar: convar.clone(),
+			index,
+			previous: self.rows[index].value.clone(),
+			rejected_editor: self.editor.clone(),
+		});
+		self.rows[index].value = value;
+		if close_editor {
+			self.editor = None;
+			self.reflow_items();
+		}
+		self.rebuild();
 		PanelEvent::RunSetting { convar: convar.clone(), line: sf!("{convar} {command}; writecfg") }
 	}
 
+	fn commit(&mut self, index: usize, value: RowValue) -> PanelEvent {
+		self.stage_commit(index, value, true)
+	}
+
 	fn commit_live(&mut self, index: usize, value: RowValue) -> PanelEvent {
-		if self.rows[index].value == value {
-			return PanelEvent::Consumed;
+		self.stage_commit(index, value, false)
+	}
+
+	fn settle_setting(&mut self, convar: &str, error: Option<&str>) -> PanelEvent {
+		if self
+			.pending
+			.as_ref()
+			.is_none_or(|pending| pending.convar != convar)
+		{
+			return PanelEvent::Ignored;
 		}
-		let command = match Self::command_value(&self.rows[index], &value) {
-			Ok(command) => command,
-			Err(error) => return PanelEvent::Notice(error),
+		let pending = self.pending.take().expect("matching pending setting");
+		let Some(message) = error else {
+			return PanelEvent::Consumed;
 		};
-		self.rows[index].value = value;
-		self.rebuild();
-		let convar = self.rows[index].convar.clone();
-		PanelEvent::RunSetting { convar: convar.clone(), line: sf!("{convar} {command}; writecfg") }
+		self.rows[pending.index].value = pending.previous.clone();
+		self.editor = pending.rejected_editor;
+		if let (Some(Editor::Multi { selected, .. }), RowValue::Multi(previous)) =
+			(self.editor.as_mut(), pending.previous)
+		{
+			*selected = previous;
+		}
+		self.reflow_items();
+		if let Some(selected) = self
+			.items
+			.iter()
+			.position(|item| matches!(item, Item::Row(index) if *index == pending.index))
+		{
+			self.selected = selected;
+			self.clamp_scroll();
+		}
+		if self.editor.is_some() {
+			self.rebuild();
+			self.show_editor_error(Str::new(message))
+		} else {
+			self.rebuild();
+			PanelEvent::Notice(Str::new(message))
+		}
 	}
 
 	fn previewable(row: &SettingRow) -> bool {
@@ -1082,49 +1178,207 @@ impl SettingsPanel {
 		}
 	}
 
+	fn apply_editor_event(&mut self, event: UiEvent) -> PanelEvent {
+		let UiEvent::Changed { id, value } = event else {
+			return PanelEvent::Consumed;
+		};
+		if id != "settings-editor-input" {
+			return PanelEvent::Consumed;
+		}
+		match self.editor.as_mut() {
+			Some(Editor::Text { buffer, error })
+			| Some(Editor::ProviderValue { buffer, error, .. }) => {
+				buffer.clear();
+				buffer.push_str(&value);
+				*error = None;
+				let _ = self.ui.set_text("settings-editor-error", "");
+			},
+			_ => {},
+		}
+		PanelEvent::Consumed
+	}
+
+	fn route_editor_input(&mut self, key: Key) -> PanelEvent {
+		let event = self.ui.handle_key(key);
+		self.apply_editor_event(event)
+	}
+
+	fn ordered_multi_choice_at(&mut self, col: u16, row: u16) -> Option<usize> {
+		if let Some(index) = self
+			.ui
+			.id_at(col, row)
+			.as_deref()
+			.and_then(|id| id.strip_prefix("setting-choice-"))
+			.and_then(|index| index.parse::<usize>().ok())
+		{
+			return Some(index);
+		}
+		let cursor = match self.editor.as_ref()? {
+			Editor::Multi { cursor, ordered: true, .. } => *cursor,
+			_ => return None,
+		};
+		let Item::Row(row_index) = *self.items.get(self.selected)? else {
+			return None;
+		};
+		let RowWidget::MultiSelect { options, ordered: true } = &self.rows[row_index].widget else {
+			return None;
+		};
+		let start = cursor
+			.saturating_sub(11)
+			.min(options.len().saturating_sub(12));
+		(start..options.len().min(start + 12)).find(|index| {
+			let id = sf!("setting-choice-{index}");
+			self.ui.rect(&id).is_some_and(|rect| {
+				col >= rect.x
+					&& col < rect.x.saturating_add(rect.width)
+					&& row >= rect.y
+					&& row < rect.y.saturating_add(rect.height)
+			})
+		})
+	}
+
+	fn ordered_multi_pointer(
+		&mut self,
+		option_index: Option<usize>,
+		report: MouseReport,
+	) -> Option<PanelEvent> {
+		let Item::Row(row_index) = *self.items.get(self.selected)? else {
+			return None;
+		};
+		let RowWidget::MultiSelect { options, ordered: true } = &self.rows[row_index].widget else {
+			return None;
+		};
+		let option = option_index.and_then(|index| {
+			options
+				.get(index)
+				.map(|option| (index, option.value.clone()))
+		});
+		let Some(Editor::Multi { cursor, selected, pressed, drop, .. }) = self.editor.as_mut() else {
+			return None;
+		};
+		match (report.kind, report.button, report.pressed) {
+			(omp_tui::Mouse::Click, omp_tui::MouseButton::Left, true) => {
+				let Some((index, value)) = option else {
+					return Some(PanelEvent::Consumed);
+				};
+				*cursor = index;
+				*pressed = Some(value.clone());
+				*drop = Some(value);
+				let id = sf!("setting-choice-{index}");
+				let _ = self.ui.focus_id(&id);
+				Some(PanelEvent::Consumed)
+			},
+			(omp_tui::Mouse::Drag, omp_tui::MouseButton::Left, true) => {
+				let Some((_, target)) = option else {
+					return Some(PanelEvent::Consumed);
+				};
+				if pressed.as_ref().is_some_and(|pressed| {
+					pressed != &target && selected.contains(pressed) && selected.contains(&target)
+				}) {
+					*drop = Some(target);
+				}
+				Some(PanelEvent::Consumed)
+			},
+			(omp_tui::Mouse::Release, omp_tui::MouseButton::Left, false) => {
+				let Some(pressed) = pressed.take() else {
+					return Some(PanelEvent::Consumed);
+				};
+				let drop = drop.take();
+				if let Some(drop) = drop.filter(|drop| drop != &pressed) {
+					let mut next = selected
+						.iter()
+						.filter(|value| value.as_str() != pressed.as_str())
+						.cloned()
+						.collect::<Vec<_>>();
+					if let Some(target) = next.iter().position(|value| *value == drop) {
+						next.insert(target, pressed);
+						*selected = next;
+					}
+				} else if let Some(at) = selected.iter().position(|value| *value == pressed) {
+					selected.remove(at);
+				} else {
+					selected.push(pressed);
+				}
+				let value = RowValue::Multi(selected.clone());
+				Some(self.commit_live(row_index, value))
+			},
+			_ => Some(PanelEvent::Consumed),
+		}
+	}
+
+	fn text_editor_key(&mut self, index: usize, key: Key) -> PanelEvent {
+		match key {
+			Key::Esc => {
+				self.editor = None;
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Enter => {
+				let value = match self.editor.as_ref() {
+					Some(Editor::Text { buffer, .. }) => RowValue::Text(Str::new(buffer.trim())),
+					_ => return PanelEvent::Consumed,
+				};
+				self.commit(index, value)
+			},
+			_ => self.route_editor_input(key),
+		}
+	}
+
+	fn provider_editor_key(&mut self, index: usize, key: Key) -> PanelEvent {
+		match key {
+			Key::Esc => {
+				self.editor = Some(Editor::ProviderList { cursor: 0 });
+				self.rebuild();
+				PanelEvent::Consumed
+			},
+			Key::Enter => {
+				let (provider, buffer) = match self.editor.as_ref() {
+					Some(Editor::ProviderValue { provider, buffer, .. }) => {
+						(provider.clone(), buffer.clone())
+					},
+					_ => return PanelEvent::Consumed,
+				};
+				let trimmed = buffer.trim();
+				let parsed = if trimmed.is_empty() {
+					None
+				} else {
+					match trimmed.parse::<f64>() {
+						Ok(limit) if limit.is_finite() && limit > 0.0 => {
+							Some((limit.floor() as i64).max(1))
+						},
+						_ => {
+							return self
+								.show_editor_error(Str::new_static("Limit must be a positive number."));
+						},
+					}
+				};
+				let mut limits = match &self.rows[index].value {
+					RowValue::ProviderLimits(limits) => limits.clone(),
+					_ => Vec::new(),
+				};
+				limits.retain(|(name, _)| *name != provider);
+				if let Some(limit) = parsed {
+					limits.push((provider, limit));
+					limits.sort_by(|left, right| left.0.cmp(&right.0));
+				}
+				self.editor = Some(Editor::ProviderList { cursor: 0 });
+				self.commit_live(index, RowValue::ProviderLimits(limits))
+			},
+			_ => self.route_editor_input(key),
+		}
+	}
+
 	fn editor_key(&mut self, key: Key) -> PanelEvent {
 		let Some(Item::Row(index)) = self.items.get(self.selected).cloned() else {
 			return PanelEvent::Consumed;
 		};
+		if matches!(self.editor.as_ref(), Some(Editor::Text { .. })) {
+			return self.text_editor_key(index, key);
+		}
+		if matches!(self.editor.as_ref(), Some(Editor::ProviderValue { .. })) {
+			return self.provider_editor_key(index, key);
+		}
 		match self.editor.as_mut() {
-			Some(Editor::Text(buffer)) => match key {
-				Key::Esc => {
-					self.editor = None;
-					self.rebuild();
-					PanelEvent::Consumed
-				},
-				Key::Enter => {
-					let value = RowValue::Text(Str::new(std::mem::take(buffer).trim()));
-					self.commit(index, value)
-				},
-				Key::Backspace => {
-					buffer.pop();
-					self.rebuild();
-					PanelEvent::Consumed
-				},
-				Key::Space => {
-					buffer.push(' ');
-					self.rebuild();
-					PanelEvent::Consumed
-				},
-				Key::Ctrl('u') => {
-					buffer.clear();
-					self.rebuild();
-					PanelEvent::Consumed
-				},
-				Key::Ctrl('w') => {
-					buffer.truncate(buffer.trim_end().len());
-					buffer.truncate(buffer.rfind(' ').map_or(0, |at| at + 1));
-					self.rebuild();
-					PanelEvent::Consumed
-				},
-				Key::Char(character) if !character.is_control() => {
-					buffer.push(character);
-					self.rebuild();
-					PanelEvent::Consumed
-				},
-				_ => PanelEvent::Consumed,
-			},
 			Some(Editor::Submenu { cursor }) => {
 				let (RowWidget::Submenu(options) | RowWidget::RuntimeSubmenu(_, options)) =
 					&self.rows[index].widget
@@ -1163,7 +1417,7 @@ impl SettingsPanel {
 					_ => PanelEvent::Consumed,
 				}
 			},
-			Some(Editor::Multi { cursor, selected, ordered }) => {
+			Some(Editor::Multi { cursor, selected, ordered, .. }) => {
 				let RowWidget::MultiSelect { options, .. } = &self.rows[index].widget else {
 					return PanelEvent::Consumed;
 				};
@@ -1251,65 +1505,14 @@ impl SettingsPanel {
 							.find(|(name, _)| *name == provider)
 							.map(|(_, limit)| limit.to_string())
 							.unwrap_or_default();
-						self.editor = Some(Editor::ProviderValue { provider, buffer });
+						self.editor = Some(Editor::ProviderValue { provider, buffer, error: None });
 						self.rebuild();
 						PanelEvent::Consumed
 					},
 					_ => PanelEvent::Consumed,
 				}
 			},
-			Some(Editor::ProviderValue { provider, buffer }) => match key {
-				Key::Esc => {
-					self.editor = Some(Editor::ProviderList { cursor: 0 });
-					self.rebuild();
-					PanelEvent::Consumed
-				},
-				Key::Enter => {
-					let trimmed = buffer.trim();
-					let parsed = if trimmed.is_empty() {
-						None
-					} else {
-						match trimmed.parse::<f64>() {
-							Ok(limit) if limit.is_finite() && limit > 0.0 => {
-								Some((limit.floor() as i64).max(1))
-							},
-							_ => {
-								return PanelEvent::Notice(Str::new_static(
-									"Limit must be a positive number.",
-								));
-							},
-						}
-					};
-					let provider = provider.clone();
-					let mut limits = match &self.rows[index].value {
-						RowValue::ProviderLimits(limits) => limits.clone(),
-						_ => Vec::new(),
-					};
-					limits.retain(|(name, _)| *name != provider);
-					if let Some(limit) = parsed {
-						limits.push((provider, limit));
-						limits.sort_by(|left, right| left.0.cmp(&right.0));
-					}
-					self.editor = Some(Editor::ProviderList { cursor: 0 });
-					self.commit_live(index, RowValue::ProviderLimits(limits))
-				},
-				Key::Backspace => {
-					buffer.pop();
-					self.rebuild();
-					PanelEvent::Consumed
-				},
-				Key::Ctrl('u') => {
-					buffer.clear();
-					self.rebuild();
-					PanelEvent::Consumed
-				},
-				Key::Char(character) if character.is_ascii_digit() || character == '.' => {
-					buffer.push(character);
-					self.rebuild();
-					PanelEvent::Consumed
-				},
-				_ => PanelEvent::Consumed,
-			},
+			Some(Editor::Text { .. } | Editor::ProviderValue { .. }) => PanelEvent::Consumed,
 			None => PanelEvent::Consumed,
 		}
 	}
@@ -1317,6 +1520,10 @@ impl SettingsPanel {
 	fn insert_query(&mut self, text: &str) {
 		if self.query.is_empty() {
 			self.pre_search_tab = self.tab;
+		}
+		self.query_cursor = self.query_cursor.min(self.query.len());
+		while !self.query.is_char_boundary(self.query_cursor) {
+			self.query_cursor = self.query_cursor.saturating_sub(1);
 		}
 		self.query.insert_str(self.query_cursor, text);
 		self.query_cursor += text.len();
@@ -1384,7 +1591,7 @@ impl SettingsPanel {
 		let mut ordered = if self.query.is_empty() {
 			SETTING_TABS
 				.iter()
-				.map(|tab| (tab.tab, tab.label.to_owned()))
+				.map(|tab| (tab.tab, tab.label.to_owned(), false))
 				.collect::<Vec<_>>()
 		} else {
 			let mut matched = SETTING_TABS
@@ -1404,27 +1611,27 @@ impl SettingsPanel {
 				.collect::<Vec<_>>();
 			let mut ordered = matched
 				.into_iter()
-				.map(|(_, _, tab, label)| (tab, label))
+				.map(|(_, _, tab, label)| (tab, label, false))
 				.collect::<Vec<_>>();
 			ordered.extend(
 				SETTING_TABS
 					.iter()
 					.filter(|tab| !matched_tabs.contains(&tab.tab))
-					.map(|tab| (tab.tab, tab.label.to_owned())),
+					.map(|tab| (tab.tab, tab.label.to_owned(), true)),
 			);
 			ordered
 		};
 		let selected = ordered
 			.iter()
-			.position(|(tab, _)| *tab == self.tab())
+			.position(|(tab, ..)| *tab == self.tab())
 			.unwrap_or(0) as u16;
 		let mut tabs = Tabs::new().with_str(Prop::Id, "settings-tabs");
-		for (tab, label) in ordered.drain(..) {
+		for (tab, label, muted) in ordered.drain(..) {
 			let icon = SETTING_TABS
 				.iter()
 				.find(|spec| spec.tab == tab)
 				.map_or("tab.appearance", |spec| spec.icon);
-			tabs = tabs.pane_icon(icon, label, dom! { <col/> });
+			tabs = tabs.pane_icon_muted(icon, label, muted, dom! { <col/> });
 		}
 		(tabs, selected)
 	}
@@ -1462,6 +1669,10 @@ impl SettingsPanel {
 				.take(self.list_rows.saturating_sub(shown)),
 		);
 		let searching = !self.query.is_empty();
+		self.query_cursor = self.query_cursor.min(self.query.len());
+		while !self.query.is_char_boundary(self.query_cursor) {
+			self.query_cursor = self.query_cursor.saturating_sub(1);
+		}
 		let query_before = Str::new(&self.query[..self.query_cursor]);
 		let query_after = Str::new(&self.query[self.query_cursor..]);
 		let description = self
@@ -1564,15 +1775,17 @@ impl SettingsPanel {
 			.as_ref()
 			.expect("checked")
 		{
-			Editor::Text(buffer) => {
-				let text = if matches!(row.widget, RowWidget::Text { secret: true }) {
-					"•".repeat(buffer.chars().count())
-				} else {
-					buffer.clone()
-				};
+			Editor::Text { buffer, error } => {
+				let mut input = Input::new()
+					.with_str(Prop::Id, "settings-editor-input")
+					.with_str(Prop::Value, buffer);
+				if matches!(row.widget, RowWidget::Text { secret: true }) {
+					input = input.with(Prop::Mask, true);
+				}
 				(
 					vec![
-						dom! { <row><text fg=accent>{text}</text><text fg=accent>{"_"}</text></row> }
+						Box::new(input) as Box<dyn Component>,
+						dom! { <text id="settings-editor-error" fg=error truncate>{error.clone().unwrap_or_default()}</text> }
 							.into_component(),
 					],
 					TEXT_FOOTER,
@@ -1607,7 +1820,7 @@ impl SettingsPanel {
 					})
 					.collect(), CHOICE_FOOTER)
 			},
-			Editor::Multi { cursor, selected, ordered } => {
+			Editor::Multi { cursor, selected, ordered, .. } => {
 				let RowWidget::MultiSelect { options, .. } = &row.widget else {
 					return;
 				};
@@ -1690,15 +1903,19 @@ impl SettingsPanel {
 					PROVIDER_FOOTER,
 				)
 			},
-			Editor::ProviderValue { provider, buffer } => {
+			Editor::ProviderValue { provider, buffer, error } => {
 				title = sf!("Max In-Flight Requests: {provider}");
 				description = Str::new_static(
 					"Enter a positive number. Decimals round down. Clear the field to make this \
 					 provider unlimited.",
 				);
+				let input = Input::new()
+					.with_str(Prop::Id, "settings-editor-input")
+					.with_str(Prop::Value, buffer);
 				(
 					vec![
-						dom! { <row><text fg=accent>{buffer.clone()}</text><text fg=accent>{"_"}</text></row> }
+						Box::new(input) as Box<dyn Component>,
+						dom! { <text id="settings-editor-error" fg=error truncate>{error.clone().unwrap_or_default()}</text> }
 							.into_component(),
 					],
 					TEXT_FOOTER,
@@ -1721,6 +1938,17 @@ impl SettingsPanel {
 			self.width,
 			self.ctx.clone(),
 		);
+		match self.editor.as_ref() {
+			Some(Editor::Text { .. } | Editor::ProviderValue { .. }) => {
+				let _ = self.ui.focus_id("settings-editor-input");
+			},
+			Some(Editor::Multi { cursor, ordered: true, .. }) => {
+				let id = sf!("setting-choice-{cursor}");
+				let _ = self.ui.focus_id(&id);
+			},
+			Some(Editor::Submenu { .. } | Editor::Multi { .. } | Editor::ProviderList { .. })
+			| None => {},
+		}
 	}
 
 	fn list_row(
@@ -1942,14 +2170,14 @@ impl Panel for SettingsPanel {
 
 	fn paste(&mut self, text: &str) -> PanelEvent {
 		let clean = text.replace(['\n', '\r', '\t'], " ");
-		if let Some(Editor::Text(buffer) | Editor::ProviderValue { buffer, .. }) =
-			self.editor.as_mut()
-		{
-			buffer.push_str(&clean);
-		} else if self.editor.is_none() {
-			self.insert_query(clean.trim());
+		if matches!(self.editor.as_ref(), Some(Editor::Text { .. } | Editor::ProviderValue { .. })) {
+			let event = self.ui.handle_paste(&clean);
+			return self.apply_editor_event(event);
 		}
-		self.rebuild();
+		if self.editor.is_none() {
+			self.insert_query(clean.trim());
+			self.rebuild();
+		}
 		PanelEvent::Consumed
 	}
 
@@ -1974,10 +2202,25 @@ impl Panel for SettingsPanel {
 			}
 			return PanelEvent::Consumed;
 		}
+		let ordered_choice = self.ordered_multi_choice_at(report.col, report.row);
+		let pointed = self.ui.id_at(report.col, report.row).map(String::from);
 		let event = self
 			.ui
 			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 		let focused = self.ui.focused_id().map(String::from);
+		let choice_target = if matches!(report.kind, omp_tui::Mouse::Drag | omp_tui::Mouse::Release) {
+			pointed.as_deref()
+		} else {
+			focused.as_deref()
+		};
+		let choice_index = ordered_choice.or_else(|| {
+			choice_target
+				.and_then(|id| id.strip_prefix("setting-choice-"))
+				.and_then(|index| index.parse::<usize>().ok())
+		});
+		if let Some(event) = self.ordered_multi_pointer(choice_index, report) {
+			return event;
+		}
 		if let Some(index) = focused
 			.as_deref()
 			.and_then(|id| id.strip_prefix("setting-choice-"))
@@ -1987,7 +2230,7 @@ impl Panel for SettingsPanel {
 				Some(Editor::Submenu { cursor })
 				| Some(Editor::Multi { cursor, .. })
 				| Some(Editor::ProviderList { cursor }) => *cursor = index,
-				Some(Editor::Text(_) | Editor::ProviderValue { .. }) | None => {},
+				Some(Editor::Text { .. } | Editor::ProviderValue { .. }) | None => {},
 			}
 			if report.kind == omp_tui::Mouse::Click {
 				return self.editor_key(Key::Enter);
@@ -2033,11 +2276,23 @@ impl Panel for SettingsPanel {
 		}
 	}
 
+	fn notify(&mut self, note: PanelNote<'_>) -> PanelEvent {
+		match note {
+			PanelNote::SettingResult { convar, error } => self.settle_setting(convar, error),
+			_ => PanelEvent::Ignored,
+		}
+	}
+
 	fn frame(&mut self, viewport: Size) -> &Frame {
 		if viewport.width != self.width || viewport.height != self.height {
 			self.width = viewport.width;
 			self.height = viewport.height;
-			self.rebuild();
+			if matches!(self.editor.as_ref(), Some(Editor::Text { .. } | Editor::ProviderValue { .. }))
+			{
+				self.ui.resize(self.width);
+			} else {
+				self.rebuild();
+			}
 		}
 		self.ui.frame()
 	}
@@ -2046,7 +2301,7 @@ impl Panel for SettingsPanel {
 #[cfg(test)]
 mod tests {
 	use omp_con::{DynamicUiSpec, DynamicUiWidget, DynamicVarSpec, SettingTab, TypeSpec, VarFlags};
-	use omp_tui::frame_text;
+	use omp_tui::{Mods, Mouse, MouseButton, frame_text};
 
 	use super::*;
 
@@ -2121,6 +2376,16 @@ mod tests {
 
 	fn text(panel: &mut SettingsPanel) -> String {
 		frame_text(panel.frame(Size { width: 140, height: 32 }))
+	}
+
+	fn accept_setting(panel: &mut SettingsPanel, event: &PanelEvent) {
+		let PanelEvent::RunSetting { convar, .. } = event else {
+			return;
+		};
+		assert_eq!(
+			panel.notify(PanelNote::SettingResult { convar, error: None }),
+			PanelEvent::Consumed
+		);
 	}
 
 	#[test]
@@ -2217,14 +2482,18 @@ mod tests {
 			RowValue::Scalar(Str::new_static("one")),
 		));
 		let mut panel = SettingsPanel::from_rows(rows, &UiContext::default());
-		assert!(matches!(panel.key(Key::Enter), PanelEvent::RunSetting { .. }));
+		let event = panel.key(Key::Enter);
+		assert!(matches!(event, PanelEvent::RunSetting { .. }));
+		accept_setting(&mut panel, &event);
 		panel.key(Key::Right);
 		assert_eq!(panel.selected().map(|row| row.label.as_str()), Some("Thinking Level"));
 		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
 		panel.key(Key::Down);
+		let event = panel.key(Key::Enter);
 		assert!(
-			matches!(&panel.key(Key::Enter), PanelEvent::RunSetting { line, .. } if line.contains(" high; writecfg"))
+			matches!(&event, PanelEvent::RunSetting { line, .. } if line.contains(" high; writecfg"))
 		);
+		accept_setting(&mut panel, &event);
 		panel.key(Key::Right);
 		assert_eq!(panel.selected().map(|row| row.label.as_str()), Some("Profile Name"));
 		panel.key(Key::Enter);
@@ -2232,9 +2501,11 @@ mod tests {
 		panel.key(Key::Char('B'));
 		panel.key(Key::Space);
 		panel.key(Key::Char('C'));
+		let event = panel.key(Key::Enter);
 		assert!(
-			matches!(&panel.key(Key::Enter), PanelEvent::RunSetting { line, .. } if line.contains(" \"B C\"; writecfg"))
+			matches!(&event, PanelEvent::RunSetting { line, .. } if line.contains(" \"B C\"; writecfg"))
 		);
+		accept_setting(&mut panel, &event);
 		while panel.tab() != SettingTab::Providers {
 			panel.key(Key::Right);
 		}
@@ -2317,6 +2588,217 @@ mod tests {
 		);
 		setting.codec = UiValueCodec::IsolationEnabled;
 		assert_eq!(SettingsPanel::command_value(&setting, &RowValue::Boolean(true)).unwrap(), "auto");
+	}
+
+	#[test]
+	fn unicode_search_and_stale_cursor_are_char_boundary_safe() {
+		let mut unicode = row(
+			"Café Theme",
+			SettingTab::Appearance,
+			"Display",
+			RowWidget::Boolean,
+			RowValue::Boolean(false),
+		);
+		unicode.description = Str::new_static("日本語の説明");
+		let mut panel = SettingsPanel::from_rows(vec![unicode], &UiContext::default());
+		for character in "日本".chars() {
+			panel.key(Key::Char(character));
+		}
+		assert_eq!(panel.selected().map(|row| row.label.as_str()), Some("Café Theme"));
+
+		panel.query = "界".to_owned();
+		panel.query_cursor = 1;
+		panel.insert_query("é");
+		assert_eq!(panel.query, "é界");
+		assert!(panel.query.is_char_boundary(panel.query_cursor));
+	}
+
+	#[test]
+	fn zero_match_search_tabs_paint_with_the_dim_token() {
+		let mut panel = SettingsPanel::from_rows(fixture(), &UiContext::default());
+		for character in "thinking".chars() {
+			panel.key(Key::Char(character));
+		}
+		let frame = panel.frame(Size { width: 140, height: 32 });
+		let lines = frame_text(frame);
+		let (row, line) = lines
+			.lines()
+			.enumerate()
+			.find(|(_, line)| line.contains("Appearance") && line.contains("Model"))
+			.expect("wide tab strip");
+		let appearance = line.find("Appearance").expect("appearance tab");
+		let column = cell_width(&line[..appearance]);
+		assert_eq!(
+			frame
+				.cell(column, u16::try_from(row).expect("row fits"))
+				.style()
+				.foreground_color(),
+			UiContext::default().theme.dim
+		);
+	}
+
+	#[test]
+	fn text_editor_uses_input_cursor_word_undo_and_kill_ring() {
+		let setting = row(
+			"Profile Name",
+			SettingTab::Appearance,
+			"Display",
+			RowWidget::Text { secret: false },
+			RowValue::Text(Str::new_static("Ada Lovelace")),
+		);
+		let mut panel = SettingsPanel::from_rows(vec![setting], &UiContext::default());
+		panel.key(Key::Enter);
+		panel.key(Key::WordLeft);
+		panel.key(Key::Ctrl('k'));
+		assert!(matches!(
+			&panel.editor,
+			Some(Editor::Text { buffer, .. }) if buffer == "Ada "
+		));
+		panel.key(Key::Ctrl('y'));
+		assert!(matches!(
+			&panel.editor,
+			Some(Editor::Text { buffer, .. }) if buffer == "Ada Lovelace"
+		));
+		panel.key(Key::Ctrl('_'));
+		assert!(matches!(
+			&panel.editor,
+			Some(Editor::Text { buffer, .. }) if buffer == "Ada "
+		));
+		panel.key(Key::Char('界'));
+		panel.key(Key::Left);
+		panel.key(Key::Char('é'));
+		assert!(matches!(
+			&panel.editor,
+			Some(Editor::Text { buffer, .. }) if buffer == "Ada é界"
+		));
+	}
+
+	#[test]
+	fn typed_setting_rejection_stays_inline_with_the_edited_text() {
+		let mut setting = row(
+			"Retry Count",
+			SettingTab::Appearance,
+			"Display",
+			RowWidget::Text { secret: false },
+			RowValue::Text(Str::new_static("1")),
+		);
+		setting.value_kind = ValueKind::Int;
+		let mut panel = SettingsPanel::from_rows(vec![setting], &UiContext::default());
+		panel.key(Key::Enter);
+		panel.key(Key::Ctrl('u'));
+		panel.paste("not-a-number");
+		let event = panel.key(Key::Enter);
+		let PanelEvent::RunSetting { convar, .. } = &event else {
+			panic!("text submission must reach typed con validation");
+		};
+		assert_eq!(
+			panel.notify(PanelNote::SettingResult { convar, error: Some("expected an integer") }),
+			PanelEvent::Consumed
+		);
+		assert!(matches!(
+			&panel.editor,
+			Some(Editor::Text { buffer, error: Some(error) })
+				if buffer == "not-a-number" && error == "expected an integer"
+		));
+		assert!(text(&mut panel).contains("expected an integer"));
+	}
+
+	#[test]
+	fn provider_limit_validation_is_inline_and_retains_input() {
+		let setting = row(
+			"Provider Limits",
+			SettingTab::Appearance,
+			"Display",
+			RowWidget::ProviderLimits,
+			RowValue::ProviderLimits(Vec::new()),
+		);
+		let inventory = SettingsInventory {
+			providers: vec![Str::new_static("openai")],
+			..SettingsInventory::default()
+		};
+		let mut panel =
+			SettingsPanel::from_rows_with_inventory(vec![setting], inventory, &UiContext::default());
+		panel.key(Key::Enter);
+		panel.key(Key::Enter);
+		panel.paste("many");
+		assert_eq!(panel.key(Key::Enter), PanelEvent::Consumed);
+		assert!(matches!(
+			&panel.editor,
+			Some(Editor::ProviderValue { buffer, error: Some(error), .. })
+				if buffer == "many" && error == "Limit must be a positive number."
+		));
+		assert!(text(&mut panel).contains("Limit must be a positive number."));
+	}
+
+	#[test]
+	fn ordered_multiselect_drag_reorders_and_release_without_drag_toggles() {
+		let mut setting = row(
+			"Search Engines",
+			SettingTab::Appearance,
+			"Display",
+			RowWidget::MultiSelect {
+				options: vec![choice("a", "Alpha"), choice("b", "Beta")],
+				ordered: true,
+			},
+			RowValue::Multi(vec![Str::new_static("a"), Str::new_static("b")]),
+		);
+		setting.value_kind = ValueKind::List;
+		let mut panel = SettingsPanel::from_rows(vec![setting], &UiContext::default());
+		panel.key(Key::Enter);
+		let _ = panel.frame(Size { width: 100, height: 24 });
+		let alpha = panel.ui.rect("setting-choice-0").expect("alpha row");
+		let beta = panel.ui.rect("setting-choice-1").expect("beta row");
+		let report = |kind, rect: omp_tui::Rect, pressed| MouseReport {
+			kind,
+			col: rect.x,
+			row: rect.y,
+			button: MouseButton::Left,
+			mods: Mods::default(),
+			pressed,
+		};
+		let list_selection = panel.selected;
+		let list_scroll = panel.scroll;
+		assert_eq!(panel.mouse(report(Mouse::Click, beta, true)), PanelEvent::Consumed);
+		assert!(panel.pending.is_none(), "pointer press must not write the convar");
+		assert_eq!(panel.ui.focused_id().as_deref(), Some("setting-choice-1"));
+		assert_eq!(panel.mouse(report(Mouse::Drag, alpha, true)), PanelEvent::Consumed);
+		assert!(panel.pending.is_none(), "pointer move must not write the convar");
+		assert!(matches!(
+			&panel.editor,
+			Some(Editor::Multi { cursor: 1, selected, .. })
+				if selected.iter().map(Str::as_str).eq(["a", "b"])
+		));
+		let event = panel.mouse(report(Mouse::Release, alpha, false));
+		assert!(matches!(
+			&event,
+			PanelEvent::RunSetting { convar, line }
+				if convar.as_str() == "internal_search_engines"
+					&& line.as_str() == "internal_search_engines [b a]; writecfg"
+		));
+		assert_eq!(panel.selected, list_selection);
+		assert_eq!(panel.scroll, list_scroll);
+		assert_eq!(panel.ui.focused_id().as_deref(), Some("setting-choice-1"));
+		assert!(matches!(
+			&panel.editor,
+			Some(Editor::Multi { cursor: 1, selected, .. })
+				if selected.iter().map(Str::as_str).eq(["b", "a"])
+		));
+		accept_setting(&mut panel, &event);
+
+		let _ = panel.frame(Size { width: 100, height: 24 });
+		let beta = panel.ui.rect("setting-choice-1").expect("beta row");
+		assert_eq!(panel.mouse(report(Mouse::Click, beta, true)), PanelEvent::Consumed);
+		assert!(panel.pending.is_none(), "pointer press must not write the convar");
+		let event = panel.mouse(report(Mouse::Release, beta, false));
+		assert!(matches!(
+			&event,
+			PanelEvent::RunSetting { convar, line }
+				if convar.as_str() == "internal_search_engines"
+					&& line.as_str() == "internal_search_engines [a]; writecfg"
+		));
+		assert_eq!(panel.selected, list_selection);
+		assert_eq!(panel.scroll, list_scroll);
+		assert_eq!(panel.ui.focused_id().as_deref(), Some("setting-choice-1"));
 	}
 
 	#[test]

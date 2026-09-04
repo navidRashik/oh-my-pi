@@ -514,15 +514,35 @@ fn fixture_payload(
 				.and_then(serde_json::Value::as_array)
 				.into_iter()
 				.flatten()
-				.map(|answer| serde_json::json!({
-					"id": answer.get("id").or_else(|| answer.get("question")).cloned().unwrap_or_default(),
-					"selected": answer.get("selected").or_else(|| answer.get("options")).cloned().unwrap_or_else(|| serde_json::json!([])),
-					"customInput": answer.get("customInput").cloned(),
-					"note": answer.get("note").cloned(),
-					"timed_out": false,
-				}))
+				.map(|answer| {
+					let id = answer
+						.get("id")
+						.or_else(|| answer.get("question"))
+						.cloned()
+						.unwrap_or_default();
+					let question = args
+						.get("questions")
+						.and_then(serde_json::Value::as_array)
+						.and_then(|questions| {
+							questions.iter().find(|question| question.get("id") == Some(&id))
+						});
+					serde_json::json!({
+						"id": id,
+						"question": question.and_then(|question| question.get("question")).cloned().unwrap_or_default(),
+						"options": question
+							.and_then(|question| question.get("options"))
+							.and_then(serde_json::Value::as_array)
+							.map(|options| options.iter().filter_map(|option| option.get("label")).cloned().collect::<Vec<_>>())
+							.unwrap_or_default(),
+						"multi": question.and_then(|question| question.get("multi")).and_then(serde_json::Value::as_bool).unwrap_or(false),
+						"selected": answer.get("selected").or_else(|| answer.get("options")).cloned().unwrap_or_else(|| serde_json::json!([])),
+						"customInput": answer.get("customInput").cloned(),
+						"note": answer.get("note").cloned(),
+						"timed_out": answer.get("timed_out").or_else(|| answer.get("timedOut")).and_then(serde_json::Value::as_bool).unwrap_or(false),
+					})
+				})
 				.collect::<Vec<_>>();
-			serde_json::json!({ "answers": answers, "headless": false })
+			serde_json::json!({ "answers": answers })
 		},
 		"bash" => {
 			let projection = value
@@ -1030,6 +1050,7 @@ fn card_tool(tool: &str) -> &str {
 		"read_group" => "read",
 		"edit_delete" | "edit_move" => "edit",
 		"report_tool_issue" => "report_issue",
+		"eval_workpool" => "eval",
 		"hub_inbox" | "hub_jobs" | "hub_list" | "hub_logs" | "hub_send" | "hub_start"
 		| "hub_wait" => "hub",
 		"custom" => "Custom Tool",
@@ -1061,6 +1082,7 @@ mod tests {
 			"edit_delete",
 			"edit_move",
 			"eval",
+			"eval_workpool",
 			"github",
 			"glob",
 			"goal",
@@ -1074,7 +1096,6 @@ mod tests {
 			"hub_start",
 			"hub_wait",
 			"image_gen",
-			"inspect_image",
 			"learn",
 			"lsp",
 			"manage_skill",
@@ -1113,11 +1134,11 @@ mod tests {
 	}
 
 	#[test]
-	fn all_51_fixtures_use_projected_production_settlement() {
+	fn all_52_fixtures_use_projected_production_settlement() {
 		let sections = render_sections(None, &GalleryState::ALL, 100, false)
 			.expect("every fixture should fold through settle_projected/fail_projected");
-		assert_eq!(fixture_names().len(), 51);
-		assert_eq!(sections.len(), 51 * GalleryState::ALL.len());
+		assert_eq!(fixture_names().len(), 52);
+		assert_eq!(sections.len(), 52 * GalleryState::ALL.len());
 		assert!(
 			sections
 				.iter()

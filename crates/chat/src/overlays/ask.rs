@@ -1,4 +1,4 @@
-//! `ask@1` dialog: pi `modes/components/ask-dialog.ts` as an observer-local
+//! `ask@2` dialog: pi `modes/components/ask-dialog.ts` as an observer-local
 //! [`Panel`] (ADR 0005).
 //!
 //! The dialog is projected from the tool's own `<ask status=running>`
@@ -17,10 +17,11 @@
 use std::time::Duration;
 
 use omp_core::{Str, StrMut, sf};
-use omp_tools::ask::{Answer, OTHER_OPTION, Question};
+use omp_dom::{KnownTag, PropKey, Tag, Value};
+use omp_tools::ask::{OTHER_OPTION, Question, Selection};
 use omp_tui::{Frame, Key, Size, Ui, UiContext, UiEvent, cell_width, dom};
 
-use super::{Panel, PanelAction, PanelAnchor, PanelEvent};
+use super::{Panel, PanelAction, PanelAnchor, PanelCx, PanelEvent};
 
 omp_con::var! {
 	/// Auto-select the recommended `ask` option after this many seconds; 0
@@ -35,6 +36,50 @@ omp_con::var! {
 
 /// Stable overlay identity.
 pub const ID: &str = "ask";
+
+/// Resolves the ask inactivity timeout from the actor's live facts.
+#[must_use]
+pub fn timeout(cx: &PanelCx<'_>) -> Option<Duration> {
+	if director_engaged(cx, "plan") {
+		return None;
+	}
+	u64::try_from(CL_ASK_TIMEOUT.get(cx.con))
+		.ok()
+		.filter(|seconds| *seconds > 0)
+		.map(Duration::from_secs)
+}
+
+fn director_engaged(cx: &PanelCx<'_>, family: &str) -> bool {
+	let Some(root) = cx
+		.dom
+		.children(cx.dom.meta())
+		.iter()
+		.copied()
+		.find(|handle| {
+			cx.dom
+				.get(*handle)
+				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Directors))
+		})
+	else {
+		return false;
+	};
+	let family_key = PropKey::Custom(Str::new_static("family"));
+	let status = PropKey::Custom(Str::new_static("status"));
+	let mut pending = cx.dom.children(root).to_vec();
+	while let Some(handle) = pending.pop() {
+		let Some(node) = cx.dom.get(handle) else {
+			continue;
+		};
+		if node.tag == Tag::Known(KnownTag::Director)
+			&& node.prop(&family_key).and_then(Value::as_str) == Some(family)
+			&& node.prop(&status).and_then(Value::as_str) == Some("active")
+		{
+			return true;
+		}
+		pending.extend(node.kids.iter().copied());
+	}
+	false
+}
 /// pi `DIALOG_HEIGHT_RATIO`: the dialog may occupy this much of the
 /// terminal.
 const HEIGHT_RATIO: (u16, u16) = (7, 10);
@@ -559,7 +604,7 @@ impl AskDialog {
 			.questions
 			.iter()
 			.zip(&self.states)
-			.map(|(question, state)| Answer {
+			.map(|(question, state)| Selection {
 				id:           question.id.clone(),
 				selected:     question
 					.options
@@ -922,6 +967,66 @@ mod tests {
 			VIEWPORT,
 			&UiContext::default(),
 		)
+	}
+
+	#[test]
+	fn timeout_selects_recommended_and_falls_back_to_first_option() {
+		let mut recommended = question("Choose");
+		recommended.options.push(OptionItem {
+			label:       Str::new_static("Second"),
+			description: None,
+			preview:     None,
+		});
+		recommended.recommended = Some(1);
+		let mut fallback = recommended.clone();
+		fallback.id = Str::new_static("fallback");
+		fallback.recommended = None;
+		let mut dialog = AskDialog::open(
+			Str::new_static("call"),
+			vec![recommended, fallback],
+			Some(Duration::from_secs(5)),
+			Duration::ZERO,
+			VIEWPORT,
+			&UiContext::default(),
+		);
+		let PanelEvent::Ask { answers: Some(selections), .. } = dialog.timed_out() else {
+			panic!("timeout submits selections");
+		};
+		assert_eq!(selections[0].selected, [Str::new_static("Second")]);
+		assert_eq!(selections[1].selected, [Str::new_static("Default")]);
+		assert!(selections.iter().all(|selection| selection.timed_out));
+	}
+
+	#[test]
+	fn multi_empty_and_single_freeform_are_valid_answers() {
+		let mut multi = question("Pick any");
+		multi.multi = true;
+		let mut multi_dialog = AskDialog::open(
+			Str::new_static("multi"),
+			vec![multi],
+			None,
+			Duration::ZERO,
+			VIEWPORT,
+			&UiContext::default(),
+		);
+		let PanelEvent::Ask { answers: Some(selections), .. } = multi_dialog.finish(false) else {
+			panic!("empty multi submits");
+		};
+		assert!(selections[0].selected.is_empty());
+		assert!(selections[0].custom_input.is_none());
+
+		let mut dialog = dialog("Name another", None);
+		let PanelEvent::Ask { answers: Some(selections), .. } =
+			dialog.committed(Str::new_static("Custom choice"))
+		else {
+			panic!("single freeform submits");
+		};
+		assert_eq!(selections[0].custom_input.as_deref(), Some("Custom choice"));
+		assert!(selections[0].selected.is_empty());
+		assert_eq!(dialog.cancel(), PanelEvent::Ask {
+			id:      Str::new_static("call"),
+			answers: None,
+		});
 	}
 
 	#[test]

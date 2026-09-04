@@ -15,6 +15,8 @@ use flume::{Receiver, Sender};
 use omp_core::Str;
 use thiserror::Error;
 
+use crate::history::HistoryEntry;
+
 /// Why a service request could not be served.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ServiceError {
@@ -774,6 +776,42 @@ pub enum McpOp {
 	Prompts,
 	/// `notifications`: notification capabilities and subscriptions.
 	Notifications,
+	/// `smithery-search`: authenticated registry search.
+	SmitherySearch(SmitherySearch),
+	/// `smithery-login`: browser/device authorization and private key
+	/// persistence.
+	SmitheryLogin,
+	/// `smithery-logout`: delete the persisted Smithery key.
+	SmitheryLogout,
+	/// `smithery-connect`: resolve, authorize, persist, and mount one registry
+	/// result.
+	SmitheryConnect(SmitheryConnect),
+}
+
+/// Authenticated Smithery registry query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SmitherySearch {
+	/// Search terms.
+	pub keyword:  Str,
+	/// Config scope used by a subsequent connect command.
+	pub scope:    McpScope,
+	/// Bounded result count.
+	pub limit:    usize,
+	/// Preserve Smithery semantic ranking instead of identity filtering.
+	pub semantic: bool,
+}
+
+/// Smithery registry result to connect and persist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SmitheryConnect {
+	/// Qualified registry identity (`namespace/server`, with optional leading
+	/// `@`).
+	pub target: Str,
+	/// Config scope receiving the MCP declaration.
+	pub scope:  McpScope,
+	/// Optional local config name; otherwise the qualified identity is
+	/// normalized.
+	pub name:   Option<Str>,
 }
 
 /// Which MCP config file a mutation targets.
@@ -832,8 +870,10 @@ pub enum SessionScope {
 /// One scored internal-URL completion row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UrlCompletion {
-	/// Full URL to insert.
+	/// Resource-relative value, e.g. `humanizer` for `skill://humanizer`.
 	pub value:       Str,
+	/// Optional short label; the value is shown when absent.
+	pub label:       Option<Str>,
 	/// Short description shown beside the value.
 	pub description: Str,
 	/// Provider score; higher ranks first.
@@ -1177,6 +1217,31 @@ pub trait Services: Send + Sync {
 		Err(ServiceError::Unavailable("live session id"))
 	}
 
+	/// Durable prompts newest first, across projects and sessions.
+	fn history_recent(&self, _limit: usize) -> ServiceResult<Vec<HistoryEntry>> {
+		Err(ServiceError::Unavailable("prompt history"))
+	}
+
+	/// Durable prompts matching every query token, ranked by recency.
+	fn history_search(&self, _query: &str, _limit: usize) -> ServiceResult<Vec<HistoryEntry>> {
+		Err(ServiceError::Unavailable("prompt history"))
+	}
+
+	/// Session IDs whose latest prompt provenance matches `query`, newest first.
+	fn history_matching_session_ids(
+		&self,
+		_query: &str,
+		_limit: usize,
+	) -> ServiceResult<Vec<Str>> {
+		Err(ServiceError::Unavailable("prompt history"))
+	}
+
+	/// Records an accepted composer submission with controller-owned project
+	/// and live-session provenance.
+	fn history_add(&self, _prompt: &str) -> ServiceResult<()> {
+		Err(ServiceError::Unavailable("prompt history"))
+	}
+
 	/// Current collaboration role, links, and presence.
 	fn collaboration(&self) -> ServiceResult<CollabState> {
 		Err(ServiceError::Unavailable("collaboration"))
@@ -1201,9 +1266,10 @@ pub trait Services: Send + Sync {
 
 	/// Internal-URL completions for the composer (pi
 	/// `internal-url-autocomplete.ts`): `input` is the whole token being
-	/// typed (`skill://pro`); every row's `value` is the full URL to insert.
-	/// Served by the Environment's resource catalog (`skill://`, `rule://`,
-	/// `local://`, `omp://`, `memory://`, `agent://`, `artifact://`, …).
+	/// typed (`skill://pro`); every row's `value` is resource-relative
+	/// (`provider`, not `skill://provider`). Served by the Environment's
+	/// resource catalog (`skill://`, `rule://`, `local://`, `omp://`,
+	/// `memory://`, `agent://`, `artifact://`, …).
 	fn url_completions(
 		&self,
 		_input: &str,

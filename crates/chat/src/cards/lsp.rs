@@ -1,4 +1,4 @@
-//! Typed card for `lsp@1`.
+//! Typed card for `lsp@3`.
 
 use omp_tui::{IntoComponent as _, UiContext, dom};
 use serde_json::Value;
@@ -19,10 +19,19 @@ impl Card for LspCard {
 
 	fn render(&self, view: &CardView<'_>, expanded: bool, _ui: &UiContext) -> Component {
 		let args = typed_input::<omp_tools::lsp::Params>(view);
-		let action = args
+		let result = typed_result::<omp_tools::lsp::Payload>(view);
+		// A settled typed payload is authoritative. Arguments remain the
+		// action source only while the call is still in progress.
+		let action = result
 			.as_ref()
 			.and_then(|value| value.get("action"))
 			.and_then(Value::as_str)
+			.or_else(|| {
+				args
+					.as_ref()
+					.and_then(|value| value.get("action"))
+					.and_then(Value::as_str)
+			})
 			.unwrap_or_default()
 			.to_owned();
 		let path = args
@@ -41,19 +50,21 @@ impl Card for LspCard {
 			.and_then(Value::as_str)
 			.unwrap_or_default()
 			.to_owned();
-		let result = typed_result::<omp_tools::lsp::Payload>(view);
-		let files = result
-			.as_ref()
-			.and_then(|value| value.get("data"))
-			.and_then(|value| value.get("references"))
-			.and_then(Value::as_array)
-			.cloned()
-			.unwrap_or_default();
-		let count: usize = files
-			.iter()
-			.filter_map(|file| file.get("locations").and_then(Value::as_array))
-			.map(Vec::len)
-			.sum();
+		let files = if action == "references" {
+			result
+				.as_ref()
+				.and_then(|value| value.get("data"))
+				.map(|data| {
+					data
+						.get("references")
+						.and_then(|references| serde_json::from_value(references.clone()).ok())
+						.unwrap_or_else(|| omp_tools::lsp::navigation::group_locations(data))
+				})
+				.unwrap_or_default()
+		} else {
+			Vec::new()
+		};
+		let count: usize = files.iter().map(|file| file.locations.len()).sum();
 		// Hover text, symbol tables, diagnostics, and "OK" all ride the
 		// bounded `output` projection (pi `renderGeneric` over the result
 		// text); a zero-reference search never leaves the Response empty.
@@ -173,51 +184,30 @@ impl Card for LspCard {
 	}
 }
 
-fn file_path(file: &Value) -> String {
-	file
-		.get("path")
-		.and_then(Value::as_str)
-		.unwrap_or_default()
-		.to_owned()
+fn file_path(file: &omp_tools::lsp::navigation::LocationGroup) -> String {
+	file.path.to_string()
 }
 
-fn locations(file: &Value) -> &[Value] {
-	file
-		.get("locations")
-		.and_then(Value::as_array)
-		.map(Vec::as_slice)
-		.unwrap_or_default()
+fn locations(
+	file: &omp_tools::lsp::navigation::LocationGroup,
+) -> &[omp_tools::lsp::navigation::LocationPoint] {
+	&file.locations
 }
 
-fn reference_label(file: &Value) -> String {
+fn reference_label(file: &omp_tools::lsp::navigation::LocationGroup) -> String {
 	let count = locations(file).len();
 	format!("{count} reference{}", if count == 1 { "" } else { "s" })
 }
 
-fn location_label(location: &Value) -> String {
-	let line = location
-		.get("line")
-		.and_then(Value::as_u64)
-		.unwrap_or_default();
-	location
-		.get("col")
-		.and_then(Value::as_u64)
-		.map_or_else(|| line.to_string(), |column| format!("{line}, col {column}"))
+fn location_label(location: &omp_tools::lsp::navigation::LocationPoint) -> String {
+	format!("{}, col {}", location.line, location.col)
 }
 
-fn location_href(file: &Value, location: &Value) -> String {
-	let mut href = format!(
-		"{}:{}",
-		file_path(file),
-		location
-			.get("line")
-			.and_then(Value::as_u64)
-			.unwrap_or_default()
-	);
-	if let Some(column) = location.get("col").and_then(Value::as_u64) {
-		href.push_str(&format!(":{column}"));
-	}
-	href
+fn location_href(
+	file: &omp_tools::lsp::navigation::LocationGroup,
+	location: &omp_tools::lsp::navigation::LocationPoint,
+) -> String {
+	format!("{}:{}:{}", file_path(file), location.line, location.col)
 }
 
 fn diag_text(view: &CardView<'_>) -> Option<String> {

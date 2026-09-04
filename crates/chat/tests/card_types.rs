@@ -102,7 +102,7 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 
 	renders_typed::<tools::ask::Params, tools::ask::Payload, tools::ask::Fault>(
 		"ask",
-		json!({"answers": [], "headless": false}),
+		json!({"answers": []}),
 	);
 	renders_typed::<
 		tools::edit::apply_patch::FreeformEditParams,
@@ -111,11 +111,20 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 	>("apply_patch", json!({"sections": []}));
 	renders_typed::<tools::ast_edit::Params, tools::ast_edit::Payload, tools::ast_edit::Fault>(
 		"ast_edit",
-		json!({"files": [], "advisories": [], "recovery_root": null, "pending_proposal": null}),
+		json!({
+			"files": [], "advisories": [], "advisories_total": 0, "parse_errors": [],
+			"parse_errors_total": 0, "files_searched": 0, "files_touched": 0,
+			"total_replacements": 0, "recovery_root": null, "pending_proposal": null
+		}),
 	);
 	renders_typed::<tools::ast_grep::Params, tools::ast_grep::Payload, tools::ast_grep::Fault>(
 		"ast_grep",
-		json!({"matches": [], "advisories": [], "total": 0, "next_cursor": null}),
+		json!({
+			"matches": [], "advisories": [], "advisories_total": 0, "parse_errors": [],
+			"parse_errors_total": 0, "total": 0, "files_with_matches": 0,
+			"files_searched": 0, "skip": 0, "limit": 100, "limit_reached": false,
+			"next_skip": null
+		}),
 	);
 	renders_typed::<tools::shell::Params, tools::shell::Payload, tools::shell::Fault>(
 		"bash",
@@ -152,7 +161,8 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 	);
 	renders_typed::<tools::github::Params, tools::github::Payload, tools::github::Fault>(
 		"github",
-		json!({"op": "repo_view", "result": {}, "rate_limit_remaining": null, "rate_limit_reset": null}),
+		json!({"op": "repo_view", "result": {}, "output": "", "artifact": null, "useless": false,
+			"rate_limit_remaining": null, "rate_limit_reset": null}),
 	);
 	renders_typed::<tools::glob::Params, tools::glob::Payload, tools::glob::Fault>(
 		"glob",
@@ -218,14 +228,22 @@ fn every_native_registered_card_accepts_its_tool_contract() {
 		tools::checkpoint::CheckpointParams,
 		tools::checkpoint::CheckpointPayload,
 		tools::checkpoint::Fault,
-	>("checkpoint", json!({"token":"checkpoint-1","goal":"explore parser","started_at":1}));
+	>(
+		"checkpoint",
+		json!({"token":"checkpoint-1","goal":"explore parser","started_at":1,"workspace":{
+			"snapshot_id":"snapshot-1","root_uri":"file:///workspace","generation":1,
+			"tree_hash":"tree","files":2,"bytes":12
+		}}),
+	);
 	renders_typed::<
 		tools::checkpoint::RewindParams,
 		tools::checkpoint::RewindPayload,
 		tools::checkpoint::Fault,
 	>(
 		"rewind",
-		json!({"token":"checkpoint-1","report":"parser is sound","receipt":"r1","scheduled":true}),
+		json!({"token":"checkpoint-1","report":"parser is sound","receipt":"r1","scheduled":true,
+			"workspace":{"snapshot_id":"snapshot-1","undo_snapshot_id":"undo-1","written":1,
+				"deleted":1,"unchanged":0,"from_generation":1,"to_generation":2}}),
 	);
 	renders_typed::<tools::yield_tool::Params, tools::yield_tool::Payload, tools::yield_tool::Fault>(
 		"yield",
@@ -267,8 +285,12 @@ fn typed_outcomes_are_not_shadowed_by_projection_json() {
 
 	let ask = renders_typed::<tools::ask::Params, tools::ask::Payload, tools::ask::Fault>(
 		"ask",
-		json!({"answers":[{"id":"db","selected":["Postgres"],"timed_out":false}],"headless":false}),
+		json!({"answers":[{
+			"id":"db","question":"Which database?","options":["Postgres","SQLite"],
+			"multi":false,"selected":["Postgres"],"timed_out":false
+		}]}),
 	);
+	assert!(ask.contains("Postgres"), "{ask}");
 	assert!(!ask.contains("operation failed"), "{ask}");
 
 	let hub = renders_typed::<tools::hub::Params, tools::hub::Response, tools::hub::Fault>(
@@ -293,8 +315,8 @@ fn typed_outcomes_are_not_shadowed_by_projection_json() {
 
 	let debug = renders_typed::<tools::debug::Params, tools::debug::Payload, tools::debug::Fault>(
 		"debug",
-		json!({"action":"stack_trace","session":null,"revision":null,"output":"",
-			"data":{"session":{"path":"src/main.rs","line":7,"col":2},"frames":[{"name":"main","path":"src/main.rs","line":7,"col":2}]}}),
+		json!({"action":"stack_trace","session":"dbg-1","revision":2,"output":"",
+			"data":{"session":{"id":"dbg-1","adapter":"lldb-dap","status":"stopped","frame":{"name":"main","source":{"path":"src/main.rs"},"line":7,"column":2}},"stackFrames":[{"name":"main","source":{"path":"src/main.rs"},"line":7,"column":2}]}}),
 	);
 	assert!(debug.contains("main"), "{debug}");
 
@@ -315,8 +337,8 @@ fn typed_outcomes_are_not_shadowed_by_projection_json() {
 
 	let github = renders_typed::<tools::github::Params, tools::github::Payload, tools::github::Fault>(
 		"github",
-		json!({"op":"search_prs","result":{"output":"#42 production result"},
-			"rate_limit_remaining":null,"rate_limit_reset":null}),
+		json!({"op":"search_prs","result":{},"output":"#42 production result","artifact":null,
+			"useless":false,"rate_limit_remaining":null,"rate_limit_reset":null}),
 	);
 	assert!(github.contains("#42 production result"), "{github}");
 }

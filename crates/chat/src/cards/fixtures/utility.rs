@@ -21,7 +21,7 @@ pub(super) const FIXTURES: &[CardFixture] = &[
 		states: states(
 			r#"{"goal":"Investigate the parser without changing"#,
 			r#"{"goal":"Investigate the parser without changing the public API"}"#,
-			r#"{"token":"checkpoint-01","goal":"Investigate the parser without changing the public API","started_at":1788400000000}"#,
+			r#"{"token":"checkpoint-01","goal":"Investigate the parser without changing the public API","started_at":1788400000000,"workspace":{"snapshot_id":"snapshot-01","root_uri":"file:///workspace","generation":1,"tree_hash":"tree-01","files":42,"bytes":8192}}"#,
 			r#"{"code":"already_active","message":"A checkpoint is already active for this session."}"#,
 		),
 	},
@@ -31,7 +31,7 @@ pub(super) const FIXTURES: &[CardFixture] = &[
 		states: states(
 			r#"{"report":"The parser already handles escaped"#,
 			r#"{"report":"The parser already handles escaped delimiters; no source change is needed."}"#,
-			r#"{"token":"checkpoint-01","report":"The parser already handles escaped delimiters; no source change is needed.","receipt":"rewind-01","scheduled":true}"#,
+			r#"{"token":"checkpoint-01","report":"The parser already handles escaped delimiters; no source change is needed.","receipt":"rewind-01","workspace":{"snapshot_id":"snapshot-01","undo_snapshot_id":"undo-01","written":2,"deleted":1,"unchanged":39,"from_generation":1,"to_generation":2},"scheduled":true}"#,
 			r#"{"code":"no_active","message":"No active checkpoint exists for this session."}"#,
 		),
 	},

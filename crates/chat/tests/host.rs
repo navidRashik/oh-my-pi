@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use omp_agent::{ApprovalBook, ApprovalScope, ApprovalSpec};
+use omp_agent::{ApprovalBook, ApprovalScope, ApprovalSpec, Up};
 use omp_chat::{
-	BlockKind, CtrlCAction, HostAction, HostCommand, HostOptions, NativeEffect, NativeHost,
-	block_views, ctrl_c_action,
+	BlockKind, CtrlCAction, Host, HostAction, HostCommand, HostMailbox, HostOptions, NativeEffect,
+	NativeHost, block_views, ctrl_c_action,
 	overlays::{
 		Outcome, Overlays,
 		services::{CollabOp, CollabOutcome, CollabParticipant, CollabRole, CollabState},
@@ -14,7 +14,7 @@ use omp_chat::{
 };
 use omp_dom::{Dom, Event, KnownTag, PropId, Tag};
 use omp_session::{ComponentRegistry, Session};
-use omp_tui::{Key, Size, UiContext, slots::ResizePolicy};
+use omp_tui::{Key, Mods, Mouse, MouseButton, MouseReport, Size, UiContext, slots::ResizePolicy};
 use tempfile::tempdir;
 
 fn fixture() -> (Session, omp_journal::EntryId) {
@@ -337,6 +337,10 @@ fn ctrl_c_behavior_is_independent_of_turn_activity_from_the_tree() {
 }
 
 fn empty_host(resuming: bool, quiet: bool) -> NativeHost {
+	empty_host_with_ctx(resuming, quiet).0
+}
+
+fn empty_host_with_ctx(resuming: bool, quiet: bool) -> (NativeHost, Arc<omp_con::Ctx>) {
 	let directory = tempdir().expect("temp directory");
 	let mut session =
 		Session::create(directory.path().join("empty.oms"), ComponentRegistry::standard())
@@ -349,14 +353,14 @@ fn empty_host(resuming: bool, quiet: bool) -> NativeHost {
 	if quiet {
 		con.run("cl_startup_quiet 1").expect("quiet");
 	}
-	NativeHost::new(
+	let host = NativeHost::new(
 		HostOptions {
 			snapshot,
 			dom_events,
 			kernel_events,
 			commands,
 			up,
-			con,
+			con: Arc::clone(&con),
 			models: Vec::new(),
 			cycle: Vec::new(),
 			resize_policy: ResizePolicy::Rebuild,
@@ -370,7 +374,62 @@ fn empty_host(resuming: bool, quiet: bool) -> NativeHost {
 			initial_panel: None,
 		},
 		Size::new(80, 24),
-	)
+	);
+	(host, con)
+}
+
+#[test]
+fn native_host_polls_background_update_actions_into_a_local_card() {
+	let (mut host, con) = empty_host_with_ctx(false, false);
+	con.user::<HostMailbox>()
+		.expect("host mailbox")
+		.post(HostAction::UpdateAvailable(
+			omp_chat::notices::update::UpdateAvailable::new("99.0.0", "stable")
+				.expect("valid update"),
+		));
+	assert_eq!(host.poll().expect("poll update"), NativeEffect::Consumed);
+	assert!(host.blocks().iter().any(|block| {
+		block.kind == BlockKind::Notice
+			&& block.text.as_str()
+				== "Update Available\nNew version 99.0.0 is available on the stable channel. Run: omp update"
+	}));
+}
+
+#[test]
+fn dropping_terminal_host_requests_controller_teardown_exactly_once() {
+	let directory = tempdir().expect("temp directory");
+	let mut session =
+		Session::create(directory.path().join("drop.oms"), ComponentRegistry::standard())
+			.expect("empty session");
+	let (snapshot, dom_events) = session.subscribe();
+	let (_, kernel_events) = flume::unbounded();
+	let (commands, command_rx) = flume::unbounded();
+	let (up, up_rx) = flume::unbounded();
+	let host = Host::new(HostOptions {
+		snapshot,
+		dom_events,
+		kernel_events,
+		commands,
+		up,
+		con: Arc::new(omp_con::Ctx::new()),
+		models: Vec::new(),
+		cycle: Vec::new(),
+		resize_policy: ResizePolicy::Rebuild,
+		model: omp_chat::ModelBadge::from_identifier("test/model"),
+		project: std::path::PathBuf::new(),
+		welcome: omp_chat::welcome::WelcomeFacts::default(),
+		ui: UiContext::default(),
+		services: Arc::new(omp_chat::overlays::NoServices),
+		speech: None,
+		resuming: false,
+		initial_panel: None,
+	});
+	drop(host);
+
+	assert!(matches!(up_rx.recv().expect("cancel"), Up::Cancel));
+	assert!(matches!(command_rx.recv().expect("quit"), HostCommand::Quit));
+	assert!(up_rx.try_recv().is_err(), "teardown sends one cancellation");
+	assert!(command_rx.try_recv().is_err(), "teardown sends one quit");
 }
 
 #[test]
@@ -528,14 +587,14 @@ fn internal_url_tokens_complete_local_artifacts_and_live_agents() {
 	type_text(&mut host, "see local://pl");
 	host.key(Key::Tab).expect("accept");
 	assert_eq!(host.composer_text(), "see local://omp2-plan.md ");
-	host.act(omp_chat::HostAction::Clear).expect("clear draft");
+	host.key(Key::Ctrl('u')).expect("clear draft");
 	assert_eq!(host.composer_text(), "");
 
 	// No agents yet: `agent://` declines rather than offering stale rows.
 	type_text(&mut host, "agent://");
 	host.key(Key::Tab).expect("tab with nothing to accept");
 	assert_eq!(host.composer_text(), "agent://");
-	host.act(omp_chat::HostAction::Clear).expect("clear draft");
+	host.key(Key::Ctrl('u')).expect("clear draft");
 
 	let cause = session.head().expect("head");
 	let txn = jobs::insert(session.dom(), cause, JobSpec {
@@ -549,14 +608,45 @@ fn internal_url_tokens_complete_local_artifacts_and_live_agents() {
 	session.patch(txn).expect("spawn agent");
 	host.poll().expect("apply spawn");
 	type_text(&mut host, "agent://fx2");
+	let completion_frame = omp_tui::frame_text(host.frame());
+	assert!(
+		completion_frame.contains("Fx2Composer"),
+		"agent completion missing:\n{completion_frame}"
+	);
 	host.key(Key::Tab).expect("accept");
 	assert_eq!(host.composer_text(), "agent://Fx2Composer ");
 
 	// An unknown scheme never opens a dropdown, so Tab has nothing to take.
-	host.act(omp_chat::HostAction::Clear).expect("clear draft");
+	host.key(Key::Ctrl('u')).expect("clear draft");
 	type_text(&mut host, "https://exa");
 	host.key(Key::Tab).expect("tab");
 	assert_eq!(host.composer_text(), "https://exa");
+}
+
+#[test]
+fn composer_completion_popup_accepts_mouse_hits_and_requests_tracking() {
+	let (mut host, _session, _dir) = host_with_services(Arc::new(LocalArtifacts));
+	type_text(&mut host, "/sett");
+	assert!(host.mouse_tracking(), "an open completion popup enables pointer reports");
+	let row = omp_tui::frame_text(host.frame())
+		.lines()
+		.enumerate()
+		.filter_map(|(row, line)| line.contains("settings").then_some(row))
+		.last()
+		.expect("settings completion row");
+	let effect = host
+		.mouse(MouseReport {
+			kind:    Mouse::Click,
+			col:     1,
+			row:     u16::try_from(row).expect("frame row"),
+			button:  MouseButton::Left,
+			mods:    Mods::default(),
+			pressed: true,
+		})
+		.expect("click completion");
+	assert_eq!(effect, NativeEffect::Consumed);
+	assert_eq!(host.composer_text(), "/settings ");
+	assert!(!host.mouse_tracking(), "acceptance closes the popup");
 }
 
 /// pi `applySpellingSettings`: the `cl_spelling_*` convars reach the live
@@ -656,13 +746,86 @@ fn shift_tab_cycles_ai_thinking_through_the_model_efforts_then_off() {
 }
 
 #[test]
-fn ctrl_r_recalls_a_prior_prompt_into_the_composer() {
-	let (mut host, _commands) = bound_host(vec![row("test/model", &[])]);
+fn ctrl_r_recalls_copies_and_submits_a_prior_prompt() {
+	let (mut host, commands) = bound_host(vec![row("test/model", &[])]);
 	host.key(Key::Ctrl('r')).expect("ctrl+r");
 	assert!(host.overlay_open(), "history picker opens over the fixture's prompt");
+	host.key(Key::Ctrl('c')).expect("copy");
+	assert!(host.overlay_open(), "copy keeps history open");
+	assert_eq!(host.take_clipboard().as_deref(), Some("hello"));
+	host.key(Key::FollowUp).expect("submit from history");
+	assert!(!host.overlay_open());
+	assert!(matches!(
+		commands.recv().expect("history submission"),
+		HostCommand::Submit(text) if text == "hello"
+	));
+
+	let (mut host, _commands) = bound_host(vec![row("test/model", &[])]);
+	host.key(Key::Ctrl('r')).expect("ctrl+r");
 	host.key(Key::Enter).expect("enter");
 	assert!(!host.overlay_open());
+	assert_eq!(host.composer_text(), "hello");
 	assert_eq!(host.key(Key::Char('!')).expect("type"), NativeEffect::Consumed);
+}
+
+#[test]
+fn durable_history_seeds_up_down_and_records_accepted_submissions() {
+	struct HistoryFeed {
+		added: parking_lot::Mutex<Vec<omp_core::Str>>,
+	}
+
+	impl omp_chat::overlays::Services for HistoryFeed {
+		fn history_recent(
+			&self,
+			_limit: usize,
+		) -> omp_chat::overlays::services::ServiceResult<Vec<omp_chat::history::HistoryEntry>> {
+			Ok(vec![omp_chat::history::HistoryEntry {
+				id: 1,
+				prompt: omp_core::Str::new_static("persisted prompt"),
+				created_at: 1,
+				cwd: Some(std::path::PathBuf::from("/project")),
+				session_id: Some(omp_core::Str::new_static("old-session")),
+			}])
+		}
+
+		fn history_add(&self, prompt: &str) -> omp_chat::overlays::services::ServiceResult<()> {
+			self.added.lock().push(omp_core::Str::new(prompt));
+			Ok(())
+		}
+	}
+
+	let (mut session, _) = fixture();
+	let (snapshot, dom_events) = session.subscribe();
+	let (_, kernel_events) = flume::unbounded();
+	let (commands, _) = flume::unbounded();
+	let (up, _) = flume::unbounded();
+	let services = Arc::new(HistoryFeed { added: parking_lot::Mutex::new(Vec::new()) });
+	let mut host = NativeHost::new(
+		HostOptions {
+			model: omp_chat::ModelBadge::from_identifier("test/model"),
+			snapshot,
+			dom_events,
+			kernel_events,
+			commands,
+			up,
+			con: Arc::new(omp_con::Ctx::new()),
+			models: Vec::new(),
+			cycle: Vec::new(),
+			resize_policy: ResizePolicy::Rebuild,
+			project: std::path::PathBuf::from("/project"),
+			welcome: omp_chat::welcome::WelcomeFacts::default(),
+			ui: UiContext::default(),
+			services: services.clone(),
+			speech: None,
+			resuming: false,
+			initial_panel: None,
+		},
+		Size::new(80, 24),
+	);
+	host.key(Key::Up).expect("recall durable prompt");
+	assert_eq!(host.composer_text(), "persisted prompt");
+	host.key(Key::Enter).expect("submit recalled prompt");
+	assert_eq!(services.added.lock().as_slice(), ["persisted prompt"]);
 }
 
 #[test]
@@ -1049,11 +1212,12 @@ fn ask_call_waiting_on_the_user_earns_one_toast() {
 		.assistant_start("test/model", "test", "test/model")
 		.expect("assistant start");
 	let args = serde_json::value::to_raw_value(&serde_json::json!({
+		"i":"Asking which region","notrunc":false,
 		"questions":[{"id":"region","question":"Which region?","options":[{"label":"us"},{"label":"eu"}]}]
 	}))
 	.expect("args");
 	session
-		.call("ask", 1, "ask-1", None, Some(args), None)
+		.call("ask", 2, "ask-1", None, Some(args), None)
 		.expect("ask call");
 	session.assistant_end("tool_calls").expect("assistant end");
 	host.poll().expect("apply dom events");
@@ -1074,6 +1238,7 @@ fn ask_host() -> (NativeHost, flume::Receiver<HostCommand>, Session) {
 		.assistant_start("test/model", "test", "test/model")
 		.expect("assistant start");
 	let args = serde_json::value::to_raw_value(&serde_json::json!({
+		"i":"Asking deployment preferences",
 		"questions":[
 			{"id":"region","question":"Which region?","options":[{"label":"us"},{"label":"eu","description":"Frankfurt"}],"recommended":1},
 			{"id":"tier","header":"Tier","question":"Which tiers?","multi":true,"options":[{"label":"free"},{"label":"pro"}]}
@@ -1081,7 +1246,7 @@ fn ask_host() -> (NativeHost, flume::Receiver<HostCommand>, Session) {
 	}))
 	.expect("args");
 	session
-		.call("ask", 1, "ask-7", None, Some(args), None)
+		.call("ask", 2, "ask-7", None, Some(args), None)
 		.expect("ask call");
 	session.assistant_end("tool_calls").expect("assistant end");
 	host.poll().expect("apply dom events");
@@ -1394,13 +1559,58 @@ fn live_reconnect_and_errors_do_not_close_the_host_before_closed() {
 	commands.try_iter().for_each(drop);
 
 	host
+		.act(omp_chat::HostAction::LiveEvent(omp_chat::overlays::live::LiveUiEvent::Path(
+			omp_chat::overlays::live::LivePathFacts {
+				available:   true,
+				interface:   Some("en0".into()),
+				class:       Some(omp_chat::overlays::live::LivePathClass::Wifi),
+				constrained: Some(true),
+				metered:     None,
+				expensive:   Some(true),
+			},
+		)))
+		.expect("redacted path event");
+	let live = text_of(&host.picker_frame().expect("live overlay frame"));
+	assert!(live.contains("Network · Wi-Fi (en0) · constrained · expensive"), "{live}");
+	assert!(!live.contains("192.0.2."), "path presentation cannot expose addresses: {live}");
+
+	host
+		.act(omp_chat::HostAction::LiveEvent(omp_chat::overlays::live::LiveUiEvent::IcePath(Some(
+			omp_chat::overlays::live::LiveIcePathFacts {
+				local:  omp_chat::overlays::live::LiveIceCandidateClass::Relay,
+				remote: omp_chat::overlays::live::LiveIceCandidateClass::Host,
+				kind:   omp_chat::overlays::live::LiveIcePathKind::Relay,
+			},
+		))))
+		.expect("redacted ICE path event");
+	let live = text_of(&host.picker_frame().expect("live overlay frame"));
+	assert!(live.contains("ICE · relay · local relay · remote host"), "{live}");
+	for sensitive in ["192.0.2.", ":3478", "turn.example", "secret", "ssid"] {
+		assert!(
+			!live.to_ascii_lowercase().contains(sensitive),
+			"ICE path leaked {sensitive}: {live}"
+		);
+	}
+
+	let delay = std::time::Duration::from_secs(5);
+	host
 		.act(omp_chat::HostAction::LiveEvent(omp_chat::overlays::live::LiveUiEvent::Reconnect {
 			attempt: 2,
 			maximum: 4,
+			delay,
+			deadline: std::time::Instant::now() + delay,
 		}))
 		.expect("reconnect event");
-	assert!(text_of(host.frame()).contains("Reconnecting · attempt 2 of 4"));
+	let live = text_of(&host.picker_frame().expect("live overlay frame"));
+	assert!(live.contains("Reconnecting · attempt 2 of 4 · retrying in"), "{live}");
 	assert!(commands.try_recv().is_err(), "reconnect does not stop the live controller");
+
+	host
+		.act(omp_chat::HostAction::LiveEvent(omp_chat::overlays::live::LiveUiEvent::IcePath(None)))
+		.expect("ICE path reset");
+	let live = text_of(&host.picker_frame().expect("live overlay frame"));
+	assert!(!live.contains("ICE ·"), "reconnect must not retain a stale ICE path: {live}");
+	assert!(live.contains("Reconnecting · attempt 2 of 4 · retrying in"), "{live}");
 
 	for recoverable in [true, false] {
 		host
@@ -1409,7 +1619,9 @@ fn live_reconnect_and_errors_do_not_close_the_host_before_closed() {
 				recoverable,
 			}))
 			.expect("error event");
-		assert!(text_of(host.frame()).contains("network changed"));
+		let live = text_of(&host.picker_frame().expect("live overlay frame"));
+		assert!(live.contains("network changed"));
+		assert!(!live.contains("retrying in"), "terminal state clears the countdown: {live}");
 		assert!(commands.try_recv().is_err(), "an error remains panel state until Closed");
 	}
 
@@ -1552,7 +1764,10 @@ fn pasted_image_chip_submits_attachments_and_the_bubble_shows_the_chip() {
 		.filter(|block| block.kind == BlockKind::User)
 		.last()
 		.expect("user block");
-	assert_eq!(user.text, "[Image #1, 4x3] what is this?", "the block carries the wire text");
+	assert_eq!(
+		user.text, "[Image #1, 200x200] what is this?",
+		"normalizing bytes never rewrites the source dimensions in the submitted marker"
+	);
 	// The painted bubble collapses the marker back into the composer's chip
 	// (pi `collapseImageMarkers` in `user-message.ts`).
 	let frame = text_of(host.frame());
@@ -1564,4 +1779,28 @@ fn pasted_image_chip_submits_attachments_and_the_bubble_shows_the_chip() {
 		!frame.contains(&format!("{paperclip} #1")),
 		"a referenced image is not repeated:\n{frame}"
 	);
+}
+
+#[test]
+fn session_reset_preserves_the_draft_and_staged_image_chip() {
+	let (mut host, commands, mut session) = bound_host_with_session(vec![row("test/model", &[])]);
+	let png = real_png(32, 24);
+	let dir = tempdir().expect("image directory");
+	let path = dir.path().join("draft.png");
+	std::fs::write(&path, png).expect("write png");
+	host.paste(path.to_str().expect("utf-8 path"));
+	type_text(&mut host, "keep this draft");
+	let before = host.composer_text();
+	let image = omp_tui::Charset::default().icon(omp_tui::Icon::Image);
+	assert!(text_of(host.frame()).contains(&format!("{image} #1")));
+
+	let head = session.head().expect("session head");
+	session.rewind(head).expect("reset session projection");
+	assert_eq!(host.poll().expect("apply reset"), NativeEffect::Consumed);
+	assert_eq!(host.composer_text(), before, "session navigation never owns the observer draft");
+	assert!(
+		text_of(host.frame()).contains(&format!("{image} #1")),
+		"the staged chip survives the reset"
+	);
+	assert!(commands.try_recv().is_err(), "resetting never submits the draft");
 }

@@ -8,6 +8,7 @@ use omp_journal::data::{IrcDirection, IrcTraffic};
 use omp_tui::{IntoComponent as _, components::hr::truncate_to_width, dom};
 use smallvec::SmallVec;
 
+use super::workpool;
 use crate::cards::Component;
 
 const COLLAPSED_LINES: usize = 3;
@@ -51,6 +52,12 @@ pub(crate) fn traffic_text(traffic: &IrcTraffic) -> Str {
 /// expanded body.
 #[must_use]
 pub(crate) fn traffic_card(traffic: &IrcTraffic, expanded: bool) -> Component {
+	if let Some(observation) = workpool::observation(traffic) {
+		return workpool::transition_card(&observation, expanded, age(traffic.timestamp_ms));
+	}
+	if let Some(result) = workpool::batch_result(traffic) {
+		return workpool::result_card(traffic, &result, expanded, age(traffic.timestamp_ms));
+	}
 	let from = trimmed_or(traffic.from.as_ref(), "?");
 	let to = trimmed_or(traffic.to.as_ref(), "?");
 	let pool = trimmed_or(traffic.pool.as_ref(), "?");

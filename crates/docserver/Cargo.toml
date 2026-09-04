@@ -13,6 +13,7 @@ async-trait.workspace = true
 bytes.workspace = true
 cap-std.workspace = true
 flume.workspace = true
+futures.workspace = true
 omp-walker.workspace = true
 notify.workspace = true
 omp-ast.workspace = true

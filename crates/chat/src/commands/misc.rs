@@ -745,11 +745,14 @@ mod tests {
 	#[test]
 	fn collaboration_commands_route_to_the_controller() {
 		let (_, event) = run_call("join wss://relay.example/room");
-		assert!(matches!(
-			event,
-			PanelEvent::Command(HostCommand::Collab(CollabOp::Join { link, name: None }))
-				if link == "wss://relay.example/room"
-		));
+		assert!(
+			matches!(
+				event,
+				PanelEvent::Command(HostCommand::Collab(CollabOp::Join { ref link, name: None }))
+					if link == "wss://relay.example/room"
+			),
+			"{event:?}",
+		);
 		let (_, event) = run_call("collab view wss://relay.example");
 		assert!(matches!(
 			event,

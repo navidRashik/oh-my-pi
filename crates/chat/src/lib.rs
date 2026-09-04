@@ -23,6 +23,8 @@ pub mod editor;
 pub mod extension_status;
 /// Journal-derived tool-card gallery.
 pub mod gallery;
+/// Durable, searchable prompt history.
+pub mod history;
 /// Live git branch/dirty facts for the status band.
 pub mod gitwatch;
 /// Interactive terminal actor.
@@ -58,7 +60,7 @@ pub mod welcome;
 
 pub use actions::{HostAction, HostMailbox, SttFailureKind, SttUiEvent};
 pub use chrome::ModelBadge;
-pub use extension_status::{ExtensionStatusEvent, ExtensionStatuses, status_text_from_tml};
+pub use extension_status::{ExtensionStatus, ExtensionStatuses};
 pub use host::{
 	CtrlCAction, Host, HostCommand, HostError, HostOptions, InitialPanel, LocalFacts, NativeEffect,
 	NativeHost, UpEvent, ctrl_c_action, render_surface,

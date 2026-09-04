@@ -57,7 +57,8 @@ impl Card for DebugCard {
 		// variable reads carry neither a session snapshot nor frames.
 		let has_session = session.is_object();
 		let frames = data
-			.get("frames")
+			.get("stackFrames")
+			.or_else(|| data.get("frames"))
 			.and_then(Value::as_array)
 			.cloned()
 			.unwrap_or_default();
@@ -87,15 +88,23 @@ impl Card for DebugCard {
 		}
 		.min(output_lines.len());
 		let output_hidden = output_lines.len() - output_shown;
+		let frame = session.get("frame").unwrap_or(&Value::Null);
+		let source = frame.get("source").unwrap_or(&Value::Null);
 		let location = format!(
 			"{}:{}:{}",
-			str_field(session, "path"),
-			session
+			source
+				.get("path")
+				.and_then(Value::as_str)
+				.or_else(|| session.get("path").and_then(Value::as_str))
+				.unwrap_or_default(),
+			frame
 				.get("line")
+				.or_else(|| session.get("line"))
 				.and_then(Value::as_u64)
 				.unwrap_or_default(),
-			session
-				.get("col")
+			frame
+				.get("column")
+				.or_else(|| session.get("col"))
 				.and_then(Value::as_u64)
 				.unwrap_or_default(),
 		);
@@ -110,9 +119,10 @@ impl Card for DebugCard {
 						<text>{format!("Status: {}", str_field(session, "status"))}</text>
 						<text>{format!("CWD: {}", str_field(session, "cwd"))}</text>
 						<text>{format!("Program: {}", str_field(session, "program"))}</text>
-						<text>{format!("Stop reason: {}", str_field(session, "reason"))}</text>
-						<text>{format!("Frame: {}", str_field(session, "frame"))}</text>
-						<text>{format!("Instruction pointer: {}", str_field(session, "instruction_pointer"))}</text>
+						<text>{format!("PID: {}", session.get("pid").and_then(Value::as_u64).map_or_else(|| "-".to_owned(), |pid| pid.to_string()))}</text>
+						<text>{format!("Stop reason: {}", str_field(data, "reason"))}</text>
+						<text>{format!("Frame: {}", str_field(frame, "name"))}</text>
+						<text>{format!("Instruction pointer: {}", str_field(frame, "instructionPointerReference"))}</text>
 						<text>{format!("Location: {location}")}</text>
 					}
 					<hr title="Output" title_pad=3 bc=muted/>
@@ -124,7 +134,7 @@ impl Card for DebugCard {
 					} else {
 						<text>{"Stack trace:"}</text>
 						for frame in frames.iter().take(shown) {
-							<text>{format!("- #{} {} @ {}:{}:{}", frame.get("id").and_then(Value::as_u64).unwrap_or_default(), str_field(frame, "name"), str_field(frame, "path"), frame.get("line").and_then(Value::as_u64).unwrap_or_default(), frame.get("col").and_then(Value::as_u64).unwrap_or_default())}</text>
+							<text>{format!("- #{} {} @ {}:{}:{}", frame.get("id").and_then(Value::as_u64).unwrap_or_default(), str_field(frame, "name"), frame.get("source").map_or_else(|| str_field(frame, "path"), |source| str_field(source, "path")), frame.get("line").and_then(Value::as_u64).unwrap_or_default(), frame.get("column").or_else(|| frame.get("col")).and_then(Value::as_u64).unwrap_or_default())}</text>
 						}
 						if shown < frames.len() { <text fg=muted>{format!("… {} more lines ⟨Ctrl+O: Expand⟩", frames.len() - shown)}</text> }
 					}

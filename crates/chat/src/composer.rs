@@ -5,7 +5,7 @@ use std::{cell::Cell, fmt::Write as _, path::Path, rc::Rc, time::Duration};
 
 use omp_core::Str;
 use omp_tui::{
-	Command, EditorOptions, Frame, Key, SpellingFeatures, Ui, UiContext, UiEvent,
+	Command, EditorOptions, Frame, Key, MouseReport, SpellingFeatures, Ui, UiContext, UiEvent,
 	components::{
 		AttachmentContent, ComposerStyle, EditorPane, InlineAccent, PrefixAccent, marker_sized_paste,
 	},
@@ -260,18 +260,20 @@ pub fn should_skip_history(text: &str) -> bool {
 	let Some(body) = text.strip_prefix('/') else {
 		return false;
 	};
-	let separator = body.find(|character: char| character.is_whitespace() || character == ':');
+	let separator = body
+		.char_indices()
+		.find(|(_, character)| character.is_whitespace() || *character == ':');
 	let (name, args) = match separator {
-		Some(at) => (&body[..at], Some(body[at + 1..].trim())),
+		Some((at, character)) => (&body[..at], Some(body[at + character.len_utf8()..].trim())),
 		None => (body, None),
 	};
 	match name {
 		"login" | "join" => args.is_some(),
 		"mcp" => args.is_some_and(|args| {
 			args.starts_with("add")
-				&& args
-					.split_once("--token")
-					.is_some_and(|(_, rest)| rest.starts_with(char::is_whitespace))
+				&& args.split_once("--token").is_some_and(|(_, rest)| {
+					rest.starts_with(char::is_whitespace) || rest.starts_with('=')
+				})
 		}),
 		_ => false,
 	}
@@ -1110,6 +1112,24 @@ impl Composer {
 		}
 	}
 
+	/// Routes a pointer report in composer-frame coordinates. Completion
+	/// rows accept on click, hover without moving keyboard selection, and
+	/// wheel without wrapping; prompt actions run through the same slot as
+	/// keyboard acceptance.
+	pub fn mouse(&mut self, report: MouseReport) -> ComposerAction {
+		let event = self
+			.ui
+			.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
+		if let Some(action) = self.pending.take() {
+			return self.apply_prompt_action(action);
+		}
+		match event {
+			UiEvent::Submit => self.preview_submission(),
+			UiEvent::Copied(text) => ComposerAction::Copy(text),
+			_ => ComposerAction::Changed,
+		}
+	}
+
 	/// Classifies the current draft without mutating it.
 	///
 	/// Collapsed text attachments are expanded, surviving media markers are
@@ -1255,6 +1275,15 @@ impl Composer {
 		self.ui.resize(width);
 	}
 
+	/// Restores keyboard focus after the terminal or native surface is
+	/// reconstructed. The retained editor buffer is not rebuilt, so its
+	/// caret, selection, undo history, and attachment atoms survive.
+	pub fn restore_focus(&mut self) {
+		if self.ui.focused_id().as_deref() != Some(COMPOSER_ID) {
+			let _ = self.ui.focus_id(COMPOSER_ID);
+		}
+	}
+
 	/// Replaces the presentation context (theme, charset, terminal caps).
 	pub fn set_context(&mut self, ctx: UiContext) {
 		self.ui.set_context(ctx);
@@ -1306,7 +1335,7 @@ mod tests {
 	}
 
 	fn no_urls() -> UrlCompleter {
-		std::sync::Arc::new(|_scheme: &str| None)
+		std::sync::Arc::new(|_scheme: &str, _query: &str| None)
 	}
 
 	fn composer() -> Composer {
@@ -1449,8 +1478,10 @@ mod tests {
 	fn secret_bearing_commands_are_kept_out_of_history() {
 		assert!(should_skip_history("/login https://x?code=abc&state=1"));
 		assert!(should_skip_history("/login:?code=abc"));
+		assert!(should_skip_history("/login\u{a0}secret"));
 		assert!(should_skip_history("/join room-link"));
 		assert!(should_skip_history("/mcp add --token abc srv"));
+		assert!(should_skip_history("/mcp add srv --token=abc"));
 		assert!(!should_skip_history("/login"));
 		assert!(!should_skip_history("/mcp add srv"));
 		assert!(!should_skip_history("/mcp list --tokens"));
@@ -1475,6 +1506,39 @@ mod tests {
 		assert_eq!(composer.text(), "newest");
 		assert_eq!(composer.key(Key::Up), ComposerAction::Changed);
 		assert_eq!(composer.text(), "older");
+	}
+
+	/// A recalled multiline prompt remains focused and keeps its caret visible
+	/// while terminal resize recomputes the editor's row budget.
+	#[test]
+	fn recalled_history_reflows_without_losing_navigation_or_caret() {
+		let mut composer = composer();
+		let recalled = (1..=20)
+			.map(|line| format!("history line {line}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		composer.seed_history([Str::new(recalled.clone())]);
+		assert_eq!(composer.key(Key::Up), ComposerAction::Changed);
+		assert_eq!(composer.text(), recalled);
+
+		for (width, height) in [(32, 8), (80, 30), (24, 10)] {
+			composer.resize(width, height);
+			composer.restore_focus();
+			let (x, y) = composer
+				.frame()
+				.cursor()
+				.expect("recalled history keeps the caret");
+			assert!(x < composer.frame().size().width);
+			assert!(y < composer.frame().size().height);
+			assert_eq!(composer.ui.focused_id().as_deref(), Some(COMPOSER_ID));
+		}
+
+		assert_eq!(
+			composer.apply_prompt_action(PromptAction::MessageEnd),
+			ComposerAction::Changed
+		);
+		assert_eq!(composer.key(Key::Down), ComposerAction::Changed);
+		assert_eq!(composer.text(), "", "history navigation survives every reflow");
 	}
 
 	/// The `cl_spelling_*` convars reach the live editor.
@@ -1662,10 +1726,22 @@ mod tests {
 	#[test]
 	fn editor_height_budget_follows_pi_and_caps_growth() {
 		assert_eq!(editor_max_rows(40), 18);
+		assert_eq!(editor_max_rows(30), 18);
 		assert_eq!(editor_max_rows(24), 12);
+		assert_eq!(editor_max_rows(18), 6);
 		assert_eq!(editor_max_rows(10), 6);
+		assert_eq!(editor_max_rows(8), 4);
 		assert_eq!(editor_max_rows(6), 3);
+		assert_eq!(editor_max_rows(5), 3);
+		assert_eq!(editor_max_rows(1), 3);
 		assert_eq!(editor_max_rows(0), 12, "unknown size falls back to 24 rows");
+
+		for rows in 7..=18 {
+			assert!(
+				rows - editor_max_rows(rows) >= 4,
+				"{rows} terminal rows do not preserve four chrome rows"
+			);
+		}
 
 		let mut composer = composer();
 		let base = composer.height();
@@ -1682,6 +1758,35 @@ mod tests {
 		);
 		composer.resize(60, 40);
 		assert!(composer.height() > base + 6, "a roomy terminal lets the draft grow again");
+	}
+
+	/// Terminal leave/re-enter and resize retain the live editor object rather
+	/// than rebuilding it: focus, selection, and collapsed atoms all survive.
+	#[test]
+	fn lifecycle_reentry_preserves_focus_selection_and_atoms() {
+		let mut composer = composer();
+		composer.paste_chip("line one\nline two", None);
+		for character in " tail".chars() {
+			composer.key(Key::Char(character));
+		}
+		composer.key(Key::SelectLeft);
+		composer.key(Key::SelectLeft);
+		let displayed = composer.text_displayed();
+		let expanded = composer.text();
+
+		composer.resize(47, 8);
+		composer.restore_focus();
+
+		assert_eq!(composer.ui.focused_id().as_deref(), Some(COMPOSER_ID));
+		assert_eq!(composer.text_displayed(), displayed);
+		assert_eq!(composer.text(), expanded, "the collapsed atom keeps its submitted expansion");
+		composer.key(Key::Char('X'));
+		assert_eq!(composer.text_displayed(), displayed.replace("il", "X"));
+		assert_eq!(
+			composer.text().matches("line one\nline two").count(),
+			1,
+			"editing the retained selection must not flatten or duplicate the atom"
+		);
 	}
 
 	/// pi `handleExternalEditor`: the draft handed to `$EDITOR` expands every
