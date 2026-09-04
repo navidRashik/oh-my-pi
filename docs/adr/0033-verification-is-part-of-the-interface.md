@@ -53,7 +53,14 @@ through that protocol.
 
 ## Status in omp
 
-**Partial.** Primary implementation: `crates/tui/src/debug.rs`. The real-PTY debug protocol and terminal chat smoke are implemented. Gap: an equivalent native-GUI protocol is not proved.
+**Implemented.** Primary terminal implementation: `crates/tui/src/debug.rs`. The real-PTY
+protocol and terminal chat smoke are implemented. `crates/app/src/gui.rs` serves the same named
+debug wire against the production `NativeHost` off-screen, including key/chord, mouse, paste,
+resize, text, tree, values, slots, frame PNG, and clean quit. Its native lifecycle extensions
+inject IME preedit/commit, file/media drops, focus, and light/dark appearance through the same
+`omp_gui::Scene` methods as winit. Focused adapter proofs exercise those live scene/paint paths,
+and `crates/chat/tests/host.rs` proves terminal and native actors produce the exact same typed
+block projection for one detached session snapshot.
 
 ## References
 

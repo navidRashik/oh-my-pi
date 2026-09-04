@@ -59,7 +59,11 @@ renders a gradient. No theme object anywhere.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/chat/src/project.rs`. Chat and cards emit semantic presentation values into one ambient renderer context.
+**Implemented.** Primary implementation: `crates/chat/src/project.rs`. Chat and cards emit semantic
+presentation values into one ambient renderer context. `crates/gui/src/host.rs` maps the native
+window's initial and changed light/dark appearance into that same `UiContext`; `NativeHost`
+reprojects the retained actor and composer from the ambient palette rather than threading a native
+theme through components.
 
 ## References
 

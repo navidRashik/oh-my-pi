@@ -92,7 +92,10 @@ versioned element and settle through the journal-first session API. Authorizatio
 `tool.call`, or `kernel=ready` after streaming), execution start (`kernel=started`), and the terminal
 result are separate ordered journal entries;
 the start marker replays as `execution-started=true`, so skipped sibling placeholders never claim
-effects while a forcibly terminated started call records uncertainty.
+effects while a forcibly terminated started call records uncertainty. Lifecycle-hook approval
+requirements and native tool-admission requirements are merged before filing, producing one durable
+prompt per invocation; timeout or cancellation settles the call as never-started and replay
+reconstructs the same decided or withdrawn ticket and skipped terminal.
 
 ## References
 

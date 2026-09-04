@@ -93,7 +93,12 @@ live tool/resource/prompt diffs into the same `dyn` catalog, recover failed star
 servers through bounded shared reconnects, persist and invalidate config-keyed tool definitions,
 buffer startup notifications, and expose setting-gated URI-debounced resource updates. MCP text
 results retain their Markdown presentation semantic while the shell writes identical source bytes
-for composition. Gap: Eval binding and terminal graphics passthrough remain unproved.
+for composition. The `browser@3` code surface in `crates/tools/src/browser.rs`,
+`crates/envd/src/browser_daemon.rs`, and `crates/webview/src/{automation.rs,remote/chromium.rs}`
+implements session-owned named tabs, owned launch and non-owning CDP/relay attachment, a lifted
+JavaScript helper vocabulary, bounded waits/navigation/actions/extraction, CAS-backed screenshots
+and downloads, run-scoped request interception cleanup, and forcibly closable run surfaces.
+Gap: Eval binding and terminal graphics passthrough remain unproved.
 
 ## References
 

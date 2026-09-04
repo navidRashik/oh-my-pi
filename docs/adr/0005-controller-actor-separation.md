@@ -56,7 +56,21 @@ Controller and actor are completely separate.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/chat/src/host.rs`. The chat actor consumes `Session::subscribe()` and returns commands without holding controller authority. `crates/app/src/chat_control.rs` transports pause/resume commands while the controller and kernel derive the gate exclusively from the session DOM. The stdio actor in `crates/app/src/rpc_mode.rs` projects the same snapshot/patch stream into pi-compatible message, tool, turn, and subagent events; private DOM snapshots and patches never cross the public RPC boundary.
+**Implemented.** Primary implementation: `crates/chat/src/host.rs`. The terminal and native chat
+actors consume `Session::subscribe()` and return commands without holding controller authority;
+`crates/gui` owns only winit/GPU lifecycle and input delivery. `crates/app/src/gui.rs` proves its
+native `NativeHost` is built from the detached snapshot/event contract, while
+`crates/chat/tests/host.rs` proves terminal and native boot projections are identical and each
+actor emits exactly one controller teardown on drop. `crates/app/src/chat_control.rs` transports
+pause/resume commands while the controller and kernel derive the gate exclusively from the session
+DOM. The stdio actor in `crates/app/src/rpc_mode.rs` projects the same snapshot/patch stream into
+pi-compatible message, tool, turn, and subagent events; private DOM snapshots and patches never
+cross the public RPC boundary. Collaboration uses the same contract:
+`crates/driver/src/collab/observer.rs` publishes a detached child snapshot plus
+a bounded event stream, `crates/app/src/chat_services/agents.rs` hands that
+projection to the unchanged transcript viewer, and host select/editor requests
+race local and remote actors by correlated ids without granting either actor a
+mutable session handle.
 
 ## References
 

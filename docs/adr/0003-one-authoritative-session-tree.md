@@ -108,7 +108,7 @@ Rules:
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/session/src/fold.rs`. Live writes and replay use the same journal-to-DOM fold; replay and Appendix A laws passed P2. `crates/journal/src/gc.rs` derives attachment, assistant-media, compaction, and tool-artifact blob roots from every committed branch before the project/session CAS can evict bytes; abandoned roots are released only when journal GC first prunes that history.
+**Implemented.** Primary implementation: `crates/session/src/fold.rs`. Live writes and replay use the same journal-to-DOM fold; replay and Appendix A laws passed P2. `crates/journal/src/gc.rs` derives attachment, assistant-media, compaction, tool-artifact, child-job, checkpoint, and imported-session blob roots across every journal in a project/session namespace. Collection holds an exclusive namespace lease from the authoritative inventory through the CAS sweep, refuses live writers, retains complete branch history unless that same run first prunes it, and fails closed on malformed data, cancellation, or traversal bounds. `crates/journal/src/blob.rs` gives dry-run and apply identical age/candidate selection, serializes collection with atomic placement, and reports eligible separately from reclaimed bytes.
 
 Work-pool presentation is likewise replay-derived: `omp_journal::data::WorkpoolObservation`
 converts the producer-authenticated transition into the same typed IRC notice folded by

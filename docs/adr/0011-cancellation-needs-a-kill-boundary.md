@@ -68,13 +68,22 @@ The pause hold in `crates/agent/src/loop.rs` continues servicing interrupt, sess
 rewind lifecycle, and job settlement instead of becoming an uncancellable wait. Workpool-forwarded
 eval handlers execute back inside the retained killable eval process; the child's tool cancellation
 token interrupts that IPC request, and reset epochs plus namespace generations fence stale handlers.
+Workpool cancellation closes every worker input, raises each worker's shared `JobBoard` kill token,
+waits a bounded grace for ordinary settlement, and journals its terminal snapshot before aggregate
+delivery. On process restart, a live subagent without an execution unit is orphan-settled instead of
+leaving `wait` and explicit revival fenced behind a phantom `running` state.
 MCP transport execution in `crates/envd/src/mcp/{stdio,http,legacy_sse,timeout}.rs` applies the same
 contract: request and connection deadlines cover framing and body reads, transport shutdown cancels
 in-flight HTTP/SSE work, and stdio drop/close terminates and reaps the process tree with bounded
-TERM-to-KILL escalation. Tool-scoped aborts cancel only matching call scopes: calls that never
-crossed the journaled execution-start boundary settle as skipped placeholders, started calls that
-ignore the grace settle effects-unknown, and unrelated siblings continue. Inference-time scoped
-aborts label each retained call separately and commit placeholders in provider call order.
+TERM-to-KILL escalation. Hook dispatches own cancellation guards and bounded reply deadlines;
+dropping a gate removes its pending reply slot, while a cancelled durable approval is withdrawn and
+the never-started call settles skipped. Tool-scoped aborts cancel only matching call scopes: calls
+that never crossed the journaled execution-start boundary settle as skipped placeholders, started
+calls that ignore the grace settle effects-unknown, and unrelated siblings continue. Inference-time scoped
+aborts label each retained call separately and commit placeholders in provider call order. Daemon
+startup failure and readiness timeout use the same bounded TERM→KILL process-group boundary in
+`crates/envd/src/lib.rs`; hub and public `omp ps` stop/kill commands wait for the exact generation's
+terminal state instead of reporting success while descendants remain live.
 Proof: `crates/agent/tests/dispatch.rs::interrupt_kills_a_running_shell_tool_and_settles_aborted`,
 `crates/agent/tests/dispatch.rs::tool_scoped_abort_forces_only_the_selected_sibling_and_replays`,
 `crates/agent/tests/turn.rs::scoped_stream_abort_labels_siblings_in_call_order_and_replays`,

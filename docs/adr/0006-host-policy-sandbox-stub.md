@@ -59,7 +59,17 @@ The trust boundary is fixed as follows.
 
 ## Status in omp
 
-**Partial.** Primary implementation: `crates/envd/src/server.rs`. Host policy and bounded environment transport are implemented. Gap: remote/container/VM targets still use the full envd binary rather than a separately minimized stub.
+**Partial.** Primary implementation: `crates/envd/src/server.rs`. Host policy and bounded environment
+transport are implemented. The live `web_search@2` path is session-local policy: `omp-driver`
+binds the one production inference facade into `omp-envd`'s search bridge, while provider HTTP
+execution remains in the bounded host transport. Lifecycle-hook approval descriptions are generation-fenced in
+`crates/envd/src/tools.rs`, then merged with native admission into one Core-owned durable ticket by
+`crates/agent/src/{hooks,approvals,dispatch}.rs`; extension hosts never own or await the human
+decision. Project daemon lifecycle stays behind the same typed boundary:
+`crates/envd/src/{server,exec,process_store}.rs` owns readiness, durable generation fencing,
+persistent-process idle leases, no-replace owner listeners, crash recovery, and bounded process-tree
+cleanup, while `crates/app/src/{cli,ps_cmd}.rs` only dispatches and presents public operations. Gap:
+remote/container/VM targets still use the full envd binary rather than a separately minimized stub.
 
 ## References
 

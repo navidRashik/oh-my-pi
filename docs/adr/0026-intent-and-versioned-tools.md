@@ -46,7 +46,7 @@ input, output, diagnostics, or usage is avoidable technical debt.
 
 ## Status in omp
 
-**Implemented.** Primary implementation: `crates/tool/src/lib.rs`. Every native schema receives `i`; durable calls record `ToolIdentity { name, rev }`.
+**Implemented.** Primary implementation: `crates/tool/src/lib.rs`. Every native schema receives `i`; durable calls record `ToolIdentity { name, rev }`. The production checkpoint family is a clean revisioned cutover: `checkpoint@3` owns named create/list and `rewind@4` owns explicit token-or-label selection; the former create-only and report-only argument shapes are rejected rather than accepted through aliases. `crates/tools/src/web_search.rs` records the expanded provider/query/deadline contract as `web_search@2` and carries an explicit, redacting `@1` journal lift.
 
 ## References
 

@@ -52,15 +52,30 @@ features independently or lack them.
 
 **Implemented.** Primary implementation: `crates/agent/src/jobs.rs`. The kernel job board and session `<meta><jobs>` component own detached tools and subagents. A durable call-entry link lets `JobBoard` adopt a terminal tool artifact after restart when `tool.result@1` committed but `jobs.settle` did not; otherwise the missing execution unit is orphan-settled, and the atomic async-result marker prevents duplicate delivery. Remote detached outcomes use the same path: `crates/driver/src/headless/kernel.rs` resumes verified CAS replication after a stream reconnect, while `crates/envd/src/blobs.rs` persists session/invocation-scoped delivery leases across host restarts, acknowledges each lease once, and releases content only after journal-derived roots disappear. `crates/agent/src/dispatch.rs` holds new tool, subagent, and job admission at the journal-derived global pause gate while existing units may settle.
 
+Named daemons use that same surface: `crates/driver/src/subagent/hub.rs` maps
+start/list/describe/logs/wait/send/restart/stop onto generation-fenced `omp-env` process requests,
+projects each daemon as a normal `JobBoard` entry, bounds followed logs and wait buffers, and does not
+acknowledge stop before `omp-envd` reports terminal process-tree settlement.
+
 `crates/driver/src/subagent/workpool.rs` implements the work-pool observation producer without
 adding a second settlement path: real worker transitions are topology-authenticated, display-only
 events. `crates/driver/src/subagent/{workpool_scheduler.rs,workpool_runtime.rs}` owns persistent
 worker selection, queueing, batches, dead-worker requeue, fresh-worker policy, and cancellation.
-Its aggregate is a normal `JobBoard` entry whose result keeps the atomic delivered marker;
-worker-job results remain internal while authenticated per-batch replies use the ordinary session
-mailbox. Each worker turn installs a child-local, batch-specific `yield@2` roster: one strict
+The actor prioritizes settlement over a bounded command inbox, auto-settles when its accepted queue
+drains, waits for every worker's ordinary `JobBoard` settlement, and applies asynchronous mailbox
+backpressure without duplicating the observation or model input. Production composition binds its
+`ParentSessionHost` through `ProjectEnvironment::bind_eval_sdk_parent`; every job insertion and
+snapshot patch crosses a typed `Up::SessionMutation` request so only the kernel actor touches the
+authoritative `Session`. Its aggregate is a normal
+`JobBoard` entry whose result keeps the atomic delivered marker; each transition also patches a
+typed `workpool_state` snapshot, so replay can adopt a drained aggregate when a restart lands between
+worker completion and `jobs.settle`. Worker-job results remain internal while authenticated
+per-batch replies use the ordinary session mailbox. Each worker turn installs a child-local,
+batch-specific `yield@2` roster: one strict
 numbered key per stable item id, one incremental result per item, duplicate/unknown rejection, and
-journal-replayed assembly in authored item order before aggregate settlement. Eval-defined `@tool`
+journal-replayed assembly in authored item order before aggregate settlement. A durable forced-yield
+Director stays engaged through partial item submissions and uses the same bounded soft-to-native
+retry ladder as ordinary schema-bound subagents. Eval-defined `@tool`
 registrations are sealed at that authenticated bridge boundary and installed into each worker's
 child-local registry; calls still flow through the ordinary tool dispatch, result, CAS spill, and
 cancellation path rather than a workpool-specific executor.
