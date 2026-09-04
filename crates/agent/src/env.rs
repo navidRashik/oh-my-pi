@@ -100,13 +100,17 @@ pub enum EnvEvent {
 	/// A workspace generation was captured before speculative exploration.
 	CheckpointOpened {
 		/// Opaque token scoped to the bound session controller.
-		token:      Str,
+		token:        Str,
+		/// Human-readable unique branch label.
+		label:        Str,
 		/// Human-readable exploration goal.
-		goal:       Str,
+		goal:         Str,
+		/// Immediate checkpoint ancestor on the selected branch.
+		parent_token: Option<Str>,
 		/// Checkpoint creation time in epoch milliseconds.
-		started_at: u64,
+		started_at:   u64,
 		/// Typed environment-owned workspace generation.
-		workspace:  WorkspaceSnapshot,
+		workspace:    WorkspaceSnapshot,
 	},
 	/// Workspace restoration completed and the matching journal branch may be
 	/// selected.

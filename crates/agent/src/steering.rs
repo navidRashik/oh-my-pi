@@ -74,6 +74,36 @@ impl ToolScopedAbortReason {
 	}
 }
 
+/// One one-shot mutation executed only by the actor that currently owns the
+/// authoritative [`Session`].
+#[derive(Clone)]
+pub struct SessionMutation {
+	apply: std::sync::Arc<
+		parking_lot::Mutex<Option<Box<dyn FnOnce(&mut Session) + Send + 'static>>>,
+	>,
+}
+
+impl SessionMutation {
+	/// Seals a mutation for delivery through the kernel mailbox.
+	pub fn new(apply: impl FnOnce(&mut Session) + Send + 'static) -> Self {
+		Self { apply: std::sync::Arc::new(parking_lot::Mutex::new(Some(Box::new(apply)))) }
+	}
+
+	/// Applies the mutation at most once.
+	pub fn apply(&self, session: &mut Session) {
+		let apply = self.apply.lock().take();
+		if let Some(apply) = apply {
+			apply(session);
+		}
+	}
+}
+
+impl std::fmt::Debug for SessionMutation {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.debug_struct("SessionMutation").finish_non_exhaustive()
+	}
+}
+
 /// Control sent to a running kernel turn.
 #[derive(Clone, Debug)]
 pub enum Up {
@@ -134,6 +164,8 @@ pub enum Up {
 	Interrupt,
 	/// Cancels the whole session and every execution scope.
 	Cancel,
+	/// Runs a one-shot authoritative session mutation on the kernel actor.
+	SessionMutation(SessionMutation),
 	/// Delivers an environment observation or host-authority request.
 	Env(crate::EnvEvent),
 	/// Commits an automatic peer response observation before its producer

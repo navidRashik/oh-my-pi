@@ -90,6 +90,35 @@ fn successful_any_call_stays_satisfied_until_the_next_candidate_yield() {
 }
 
 #[test]
+fn terminal_yield_force_survives_partial_items_and_closes_on_batch_completion() {
+	let mut world = Harness::new();
+	world.engage(
+		ForceTool::new("yield", ForceUntil::TerminalYield, Some(Str::new_static("finish batch")), 3)
+			.deferred(),
+	);
+	assert!(matches!(
+		world.turn(
+			"",
+			&[Call::new("yield", serde_json::json!({"key": 1}))
+				.with_outcome(serde_json::json!({"value":{"complete":false,"failed":false}}))],
+			0,
+		),
+		LoopDecision::Continue { .. }
+	));
+	assert!(world.active().iter().any(|&id| id == "force_tool"));
+	assert!(matches!(
+		world.turn(
+			"",
+			&[Call::new("yield", serde_json::json!({"key": 2}))
+				.with_outcome(serde_json::json!({"value":{"complete":true,"failed":false}}))],
+			0,
+		),
+		LoopDecision::Yield
+	));
+	assert!(world.active().is_empty());
+}
+
+#[test]
 fn test_force_tool_is_evaluated_from_engagement_state() {
 	let mut world = Harness::new();
 	world.engage(ForceTool::new("grep", ForceUntil::AnyToolCall, None, 1));

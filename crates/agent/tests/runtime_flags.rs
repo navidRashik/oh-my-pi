@@ -190,6 +190,45 @@ async fn inline_sloppy_edit_recovery_is_gated_and_rejects_malformed_or_non_slopp
 }
 
 #[tokio::test]
+async fn goal_tool_roster_follows_the_durable_engagement_state() {
+	for (paused, expected) in [(false, true), (true, false)] {
+		let temp = tempfile::tempdir().expect("tempdir");
+		let directors = DirectorRegistry::standard();
+		let mut session = fresh_session(&temp.path().join("goal-roster.oms"));
+		let mut stack = DirectorStack::from_dom(session.dom(), &directors);
+		stack
+			.engage(&mut session, Box::new(Goal::new("finish", None)))
+			.expect("goal engages");
+		if paused {
+			stack.pause(&mut session, "goal").expect("goal pauses");
+		}
+		let (inference, requests) = ScriptedInference::new([text_script("candidate")]);
+		let mut kernel = Kernel::new(
+			inference,
+			registry([spec("goal", 1, "goal")]),
+			DispatchPolicy::new(BlobStore::open(temp.path().join("blobs")).expect("blobs")),
+			StaticPrompt(Str::new_static("system")),
+		)
+		.with_director_registry(directors)
+		.with_runtime_flags(flags(false, true));
+		kernel
+			.run_turn(
+				&mut session,
+				TurnInput { text: sf!("run"), attachments: Vec::new() },
+				RunControl::default(),
+			)
+			.await
+			.expect("turn");
+		let requests = requests.lock();
+		assert_eq!(
+			requests[0].tools.iter().any(|tool| tool.name == "goal"),
+			expected,
+			"pause and replay must re-derive hidden Goal tool visibility"
+		);
+	}
+}
+
+#[tokio::test]
 async fn disabled_goal_is_removed_before_inference_while_enabled_goal_remains() {
 	for (enabled, expected) in [(false, 0), (true, 1)] {
 		let temp = tempfile::tempdir().expect("tempdir");

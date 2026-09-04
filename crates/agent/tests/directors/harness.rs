@@ -9,13 +9,19 @@ use serde_json::value::RawValue;
 use tempfile::TempDir;
 
 pub struct Call<'a> {
-	pub tool: &'a str,
-	pub args: serde_json::Value,
+	pub tool:    &'a str,
+	pub args:    serde_json::Value,
+	pub outcome: serde_json::Value,
 }
 
 impl<'a> Call<'a> {
 	pub fn new(tool: &'a str, args: serde_json::Value) -> Self {
-		Self { tool, args }
+		Self { tool, args, outcome: serde_json::json!({}) }
+	}
+
+	pub fn with_outcome(mut self, outcome: serde_json::Value) -> Self {
+		self.outcome = outcome;
+		self
 	}
 }
 
@@ -81,7 +87,7 @@ impl Harness {
 				.session
 				.call(call.tool, 1, format!("call-{}", self.next_call), None, Some(args), None)
 				.expect("tool call");
-			let outcome = RawValue::from_string("{}".to_owned()).expect("raw result");
+			let outcome = RawValue::from_string(call.outcome.to_string()).expect("raw result");
 			self.session.settle(id, outcome).expect("tool result");
 		}
 		self
@@ -125,7 +131,7 @@ impl Harness {
 				.session
 				.call(call.tool, 1, format!("call-{}", self.next_call), None, Some(args), None)
 				.expect("tool call");
-			let outcome = RawValue::from_string("{}".to_owned()).expect("raw result");
+			let outcome = RawValue::from_string(call.outcome.to_string()).expect("raw result");
 			self.session.settle(id, outcome).expect("tool result");
 		}
 		self

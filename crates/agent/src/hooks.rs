@@ -1,9 +1,12 @@
 #![allow(missing_docs, reason = "strum IntoStaticStr emits undocumented inherent methods")]
 //! Subscription masks and the per-invocation hook decision procedure.
 
-use std::sync::{
-	Arc,
-	atomic::{AtomicU64, Ordering},
+use std::{
+	sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -417,8 +420,16 @@ pub enum GateDecision {
 	Defer,
 	/// A domain-family payload encoded in the existing wire `domain` field.
 	Domain(Bytes),
-	/// A legal APPROVAL requirement.
+	/// One legal APPROVAL requirement.
 	RequireApproval(ApprovalSpec),
+	/// Legal APPROVAL requirements and the composed transform from a delegated
+	/// host.
+	RequireApprovals {
+		/// Every merged requirement.
+		specs: Vec<ApprovalSpec>,
+		/// Effective payload after the host's ordered TRANSFORM phase.
+		patch: Option<HookPatch>,
+	},
 }
 
 impl GateDecision {
@@ -428,7 +439,9 @@ impl GateDecision {
 			Self::Deny(_) | Self::DenyPolicy(_) => HookDecision::Deny,
 			Self::Modify(_) => HookDecision::Modify,
 			Self::Defer => HookDecision::Defer,
-			Self::RequireApproval(_) => HookDecision::RequireApproval,
+			Self::RequireApproval(_) | Self::RequireApprovals { .. } => {
+				HookDecision::RequireApproval
+			},
 			Self::Domain(_) => return None,
 		})
 	}
@@ -497,6 +510,18 @@ pub enum GateOutcome {
 		/// Ordered transform overwrite audit trail.
 		trail: Vec<TransformTrail>,
 	},
+}
+
+/// Typed result of a gateable lifecycle seam before its caller performs the
+/// admitted operation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LifecycleAdmission {
+	/// Effective payload after the one ordered transform pass.
+	pub payload:   JsonValue,
+	/// Every APPROVAL requirement, in deterministic dispatch order.
+	pub approvals: Vec<ApprovalSpec>,
+	/// Ordered transform evidence retained for the caller's durable record.
+	pub trail:     Vec<TransformTrail>,
 }
 
 /// Domain gate result retaining each valid responder's authenticated
@@ -570,17 +595,19 @@ impl LifecycleHooks {
 		&self.gate
 	}
 
-	/// Runs a revision-1 JSON lifecycle gate.
-	///
-	/// This seam does not own approval tickets, so an approval response is a
-	/// typed error rather than an implicit allow.
-	pub async fn gate(
+	/// Evaluates a revision-1 JSON lifecycle gate without silently authorizing
+	/// an unresolved approval requirement.
+	pub async fn evaluate(
 		&self,
 		event: HookEventId,
 		payload: JsonValue,
-	) -> Result<JsonValue, LifecycleHookError> {
+	) -> Result<LifecycleAdmission, LifecycleHookError> {
 		if !self.gate.subscribed(event) {
-			return Ok(payload);
+			return Ok(LifecycleAdmission {
+				payload,
+				approvals: Vec::new(),
+				trail: Vec::new(),
+			});
 		}
 		let encoded = serde_json::to_vec(&payload)
 			.map_err(|source| LifecycleHookError::MalformedPayload { event, source })?;
@@ -589,12 +616,34 @@ impl LifecycleHooks {
 			.gate(event, GateEvent::new(Str::default(), Bytes::from(encoded)))
 			.await
 		{
-			GateOutcome::Allow { event: effective, .. } => {
-				serde_json::from_slice(&effective.effective_args)
-					.map_err(|source| LifecycleHookError::MalformedTransform { event, source })
+			GateOutcome::Allow { event: effective, trail } => {
+				let payload = serde_json::from_slice(&effective.effective_args)
+					.map_err(|source| LifecycleHookError::MalformedTransform { event, source })?;
+				Ok(LifecycleAdmission { payload, approvals: Vec::new(), trail })
 			},
 			GateOutcome::Deny { reason, .. } => Err(LifecycleHookError::Denied { event, reason }),
-			GateOutcome::Approval { .. } => Err(LifecycleHookError::ApprovalUnsupported { event }),
+			GateOutcome::Approval { event: effective, specs, trail } => {
+				let payload = serde_json::from_slice(&effective.effective_args)
+					.map_err(|source| LifecycleHookError::MalformedTransform { event, source })?;
+				Ok(LifecycleAdmission { payload, approvals: specs, trail })
+			},
+		}
+	}
+
+	/// Runs a lifecycle gate whose caller has no durable approval owner.
+	///
+	/// Callers which can file a prompt use [`Self::evaluate`] and must settle
+	/// every returned requirement before performing the operation.
+	pub async fn gate(
+		&self,
+		event: HookEventId,
+		payload: JsonValue,
+	) -> Result<JsonValue, LifecycleHookError> {
+		let admission = self.evaluate(event, payload).await?;
+		if admission.approvals.is_empty() {
+			Ok(admission.payload)
+		} else {
+			Err(LifecycleHookError::ApprovalUnsupported { event })
 		}
 	}
 
@@ -641,36 +690,47 @@ struct Pending {
 	response: flume::Sender<Vec<(u32, GateDecision)>>,
 }
 
+struct PendingGuard<'a> {
+	gate: &'a HookGate,
+	id:   u64,
+}
+
+impl Drop for PendingGuard<'_> {
+	fn drop(&mut self) {
+		self.gate.pending.lock().remove(self.id);
+	}
+}
+
 /// Core-owned subscription bitmap, dispatch queue, and pending reply table.
 ///
 /// Unsubscribed emission performs only one relaxed load, one bit-and, and a
 /// branch; it does not construct a payload or frame.
 pub struct HookGate {
 	mask:             [AtomicU64; MASK_WORDS],
+	fail_closed:      [AtomicU64; MASK_WORDS],
 	dispatch:         flume::Sender<HookDispatch>,
 	pending:          Mutex<omp_core::SparseMap<u64, Pending>>,
 	next_id:          AtomicU64,
 	subscriptions:    Mutex<Vec<Subscription>>,
 	dropped_notifies: AtomicU64,
-	delegated:        bool,
+	delegated:         bool,
+	timeout_override:  Option<Duration>,
+	tool_call_timeout: Duration,
 }
 
 impl HookGate {
 	/// Creates a gate and the bounded lossy observer-dispatch receiver.
 	pub fn channel() -> (Self, Receiver<HookDispatch>) {
-		let (dispatch, receive) = flume::bounded(OBSERVE_HANDLER_CAP);
-		(
-			Self {
-				mask: [const { AtomicU64::new(0) }; MASK_WORDS],
-				dispatch,
-				pending: Mutex::new(omp_core::SparseMap::new()),
-				next_id: AtomicU64::new(1),
-				subscriptions: Mutex::new(Vec::new()),
-				dropped_notifies: AtomicU64::new(0),
-				delegated: false,
-			},
-			receive,
-		)
+		Self::channel_inner(false, None, Duration::from_secs(30))
+	}
+
+	/// Creates a gate with a narrower decision deadline.
+	///
+	/// Production uses the catalog deadlines; this constructor supports
+	/// focused hosts and deterministic timeout tests without changing event
+	/// policy.
+	pub fn channel_with_timeout(timeout: Duration) -> (Self, Receiver<HookDispatch>) {
+		Self::channel_inner(false, Some(timeout), Duration::from_secs(30))
 	}
 
 	/// Creates a gate whose subscribed decisions are composed by the receiver.
@@ -679,25 +739,78 @@ impl HookGate {
 	/// event. The receiver owns phase ordering, failure policy, and callback
 	/// composition and answers with one final decision.
 	pub fn delegated_channel() -> (Self, Receiver<HookDispatch>) {
+		Self::channel_inner(true, None, Duration::from_secs(30))
+	}
+
+	/// Creates a delegated gate with a host-composition deadline for tool-call
+	/// admission. The host applies the configured per-handler deadline; this
+	/// outer bound prevents an unavailable composer from waiting forever.
+	pub fn delegated_channel_with_tool_call_timeout(
+		timeout: Duration,
+	) -> (Self, Receiver<HookDispatch>) {
+		Self::channel_inner(true, None, timeout)
+	}
+
+	fn channel_inner(
+		delegated: bool,
+		timeout_override: Option<Duration>,
+		tool_call_timeout: Duration,
+	) -> (Self, Receiver<HookDispatch>) {
 		let (dispatch, receive) = flume::bounded(OBSERVE_HANDLER_CAP);
 		(
 			Self {
 				mask: [const { AtomicU64::new(0) }; MASK_WORDS],
+				fail_closed: [const { AtomicU64::new(0) }; MASK_WORDS],
 				dispatch,
 				pending: Mutex::new(omp_core::SparseMap::new()),
 				next_id: AtomicU64::new(1),
 				subscriptions: Mutex::new(Vec::new()),
 				dropped_notifies: AtomicU64::new(0),
-				delegated: true,
+				delegated,
+				timeout_override,
+				tool_call_timeout,
 			},
 			receive,
 		)
 	}
 
-	/// Publishes the complete event subscription bitmap for a delegated gate.
-	pub fn replace_union_mask(&self, mask: u128) {
+	fn decision_timeout(&self, event: HookEventId) -> Duration {
+		self.timeout_override.unwrap_or_else(|| match event {
+			HookEventId::HookEventToolCall => self.tool_call_timeout,
+			HookEventId::HookEventToolResult | HookEventId::HookEventSubagentSpawn => {
+				Duration::from_secs(30)
+			},
+			HookEventId::HookEventSessionShutdown => Duration::from_secs(2),
+			_ => Duration::from_secs(5),
+		})
+	}
+
+	fn delegated_failure(
+		&self,
+		event_id: HookEventId,
+		event: GateEvent,
+		reason: &'static str,
+	) -> GateOutcome {
+		let (word, bit) = event_position(event_id);
+		if self.fail_closed[word].load(Ordering::Relaxed) & bit != 0 {
+			GateOutcome::Deny {
+				event,
+				reason: Str::new_static(reason),
+				policy: None,
+				trail: Vec::new(),
+			}
+		} else {
+			GateOutcome::Allow { event, trail: Vec::new() }
+		}
+	}
+
+	/// Publishes the complete subscription and fail-closed bitmaps for a
+	/// delegated gate.
+	pub fn replace_masks(&self, mask: u128, fail_closed: u128) {
 		self.mask[0].store(mask as u64, Ordering::Release);
 		self.mask[1].store((mask >> 64) as u64, Ordering::Release);
+		self.fail_closed[0].store(fail_closed as u64, Ordering::Release);
+		self.fail_closed[1].store((fail_closed >> 64) as u64, Ordering::Release);
 	}
 
 	/// Replaces one host's subscriptions and publishes their event bits.
@@ -834,6 +947,21 @@ impl HookGate {
 						});
 					},
 					GateDecision::RequireApproval(spec) => approvals.push(spec),
+					GateDecision::RequireApprovals { specs, patch } => {
+						if let Some(patch) = patch {
+							let previous_target = event.effective_target.clone();
+							let previous_args = event.effective_args.clone();
+							let _ = event.apply(&patch);
+							trail.push(TransformTrail {
+								subscription_id: subscription.id,
+								previous_target,
+								previous_args,
+								effective_target: event.effective_target.clone(),
+								effective_args: event.effective_args.clone(),
+							});
+						}
+						approvals.extend(specs);
+					},
 					GateDecision::Allow | GateDecision::Defer | GateDecision::Domain(_) => {},
 				}
 			}
@@ -852,6 +980,7 @@ impl HookGate {
 			.pending
 			.lock()
 			.insert(dispatch_id, Pending { response: reply });
+		let _pending = PendingGuard { gate: self, id: dispatch_id };
 		let mut payload = BytesMut::new();
 		event.encode_into(&mut payload);
 		let dispatch = HookDispatch {
@@ -863,29 +992,24 @@ impl HookGate {
 			payload: payload.freeze(),
 		};
 		if self.dispatch.send_async(dispatch).await.is_err() {
-			self.pending.lock().remove(dispatch_id);
-			return GateOutcome::Deny {
-				event,
-				reason: sf!("required hook host unavailable"),
-				policy: None,
-				trail: Vec::new(),
-			};
+			return self.delegated_failure(event_id, event, "required hook host unavailable");
 		}
-		let Ok(decisions) = receive.recv_async().await else {
-			return GateOutcome::Deny {
-				event,
-				reason: sf!("required hook host failed"),
-				policy: None,
-				trail: Vec::new(),
+		let decisions =
+			match tokio::time::timeout(self.decision_timeout(event_id), receive.recv_async()).await {
+				Ok(Ok(decisions)) => decisions,
+				Ok(Err(_)) => {
+					return self.delegated_failure(event_id, event, "required hook host failed");
+				},
+				Err(_) => {
+					return self.delegated_failure(event_id, event, "required hook host timed out");
+				},
 			};
-		};
 		let Some((subscription_id, decision)) = decisions.into_iter().next() else {
-			return GateOutcome::Deny {
+			return self.delegated_failure(
+				event_id,
 				event,
-				reason: sf!("required hook host returned no decision"),
-				policy: None,
-				trail: Vec::new(),
-			};
+				"required hook host returned no decision",
+			);
 		};
 		match decision {
 			GateDecision::Allow | GateDecision::Defer => {
@@ -903,16 +1027,37 @@ impl HookGate {
 			GateDecision::RequireApproval(spec) => {
 				GateOutcome::Approval { event, specs: vec![spec], trail: Vec::new() }
 			},
+			GateDecision::RequireApprovals { specs, patch } => {
+				let mut trail = Vec::new();
+				if let Some(patch) = patch {
+					let previous_target = event.effective_target.clone();
+					let previous_args = event.effective_args.clone();
+					if event.apply(&patch).is_err() {
+						return self.delegated_failure(
+							event_id,
+							event,
+							"illegal composed hook modification",
+						);
+					}
+					trail.push(TransformTrail {
+						subscription_id,
+						previous_target,
+						previous_args,
+						effective_target: event.effective_target.clone(),
+						effective_args: event.effective_args.clone(),
+					});
+				}
+				GateOutcome::Approval { event, specs, trail }
+			},
 			GateDecision::Modify(patch) => {
 				let previous_target = event.effective_target.clone();
 				let previous_args = event.effective_args.clone();
 				if event.apply(&patch).is_err() {
-					return GateOutcome::Deny {
+					return self.delegated_failure(
+						event_id,
 						event,
-						reason: sf!("illegal composed hook modification"),
-						policy: None,
-						trail: Vec::new(),
-					};
+						"illegal composed hook modification",
+					);
 				}
 				let trail = vec![TransformTrail {
 					subscription_id,
@@ -923,11 +1068,8 @@ impl HookGate {
 				}];
 				GateOutcome::Allow { event, trail }
 			},
-			GateDecision::Domain(_) => GateOutcome::Deny {
-				event,
-				reason: sf!("illegal composed hook decision"),
-				policy: None,
-				trail: Vec::new(),
+			GateDecision::Domain(_) => {
+				self.delegated_failure(event_id, event, "illegal composed hook decision")
 			},
 		}
 	}
@@ -959,6 +1101,7 @@ impl HookGate {
 					.pending
 					.lock()
 					.insert(dispatch_id, Pending { response: reply });
+				let _pending = PendingGuard { gate: self, id: dispatch_id };
 				let dispatch = HookDispatch {
 					dispatch_id,
 					event: E::ID,
@@ -968,10 +1111,11 @@ impl HookGate {
 					payload: payload.clone(),
 				};
 				if self.dispatch.send_async(dispatch).await.is_err() {
-					self.pending.lock().remove(dispatch_id);
 					continue;
 				}
-				let Ok(decisions) = receive.recv_async().await else {
+				let Ok(Ok(decisions)) =
+					tokio::time::timeout(self.decision_timeout(E::ID), receive.recv_async()).await
+				else {
 					continue;
 				};
 				for (reported_id, decision) in decisions {
@@ -1012,6 +1156,7 @@ impl HookGate {
 			let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 			let (reply, receive) = flume::bounded(1);
 			self.pending.lock().insert(id, Pending { response: reply });
+			let _pending = PendingGuard { gate: self, id };
 			let mut payload = BytesMut::new();
 			event.encode_into(&mut payload);
 			let dispatch = HookDispatch {
@@ -1023,15 +1168,14 @@ impl HookGate {
 				payload: payload.freeze(),
 			};
 			if self.dispatch.send_async(dispatch).await.is_err() {
-				self.pending.lock().remove(id);
 				if subscription.on_failure == OnFailure::Deny {
 					replies
 						.push((subscription, GateDecision::Deny(sf!("required hook host unavailable"))));
 				}
 				continue;
 			}
-			match receive.recv_async().await {
-				Ok(decisions) => {
+			match tokio::time::timeout(self.decision_timeout(event_id), receive.recv_async()).await {
+				Ok(Ok(decisions)) => {
 					for (reported, decision) in decisions {
 						if reported == subscription.id {
 							replies.push((subscription.clone(), decision));
@@ -1043,10 +1187,13 @@ impl HookGate {
 						}
 					}
 				},
-				Err(_) if subscription.on_failure == OnFailure::Deny => {
+				Ok(Err(_)) if subscription.on_failure == OnFailure::Deny => {
 					replies.push((subscription, GateDecision::Deny(sf!("required hook host failed"))));
 				},
-				Err(_) => {},
+				Err(_) if subscription.on_failure == OnFailure::Deny => {
+					replies.push((subscription, GateDecision::Deny(sf!("required hook host timed out"))));
+				},
+				Ok(Err(_)) | Err(_) => {},
 			}
 		}
 		replies
@@ -1081,7 +1228,7 @@ pub(crate) const fn event_position(event: HookEventId) -> (usize, u64) {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
+	use std::{sync::Arc, time::Duration};
 
 	use bytes::Bytes;
 	use omp_core::sf;
@@ -1092,6 +1239,20 @@ mod tests {
 		HookGate, HookPatch, HookPhase, LifecycleHookError, LifecycleHooks, OnFailure,
 		ProviderFailover, SourceRef, Subscription, When,
 	};
+
+	#[test]
+	fn delegated_tool_call_timeout_does_not_change_other_hook_deadlines() {
+		let configured = Duration::from_millis(125);
+		let (gate, _receiver) = HookGate::delegated_channel_with_tool_call_timeout(configured);
+		assert_eq!(
+			gate.decision_timeout(HookEventId::HookEventToolCall),
+			configured
+		);
+		assert_eq!(
+			gate.decision_timeout(HookEventId::HookEventToolResult),
+			Duration::from_secs(30)
+		);
+	}
 
 	#[tokio::test]
 	async fn lifecycle_hooks_bypass_unsubscribed_payload_without_dispatch() {

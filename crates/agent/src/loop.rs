@@ -578,6 +578,12 @@ impl<C> Kernel<C> {
 		&self.client
 	}
 
+	/// Mutably borrows the composed inference owner for host-binding retention
+	/// before the kernel starts a turn.
+	pub const fn inference_mut(&mut self) -> &mut C {
+		&mut self.client
+	}
+
 	/// Rebinds private debug capture to one durable session identity.
 	pub fn set_debug_session(&mut self, session: Option<Str>)
 	where
@@ -2098,11 +2104,28 @@ impl<C: Inference> Kernel<C> {
 		};
 		let caps = route.lowering_caps();
 		let registry = self.dispatcher.registry();
+		let goal_visible = self.runtime_flags.goal_enabled
+			&& crate::find_director(session.dom(), "goal").is_some_and(|(_, node)| {
+				crate::director_status(node) == Some("active")
+					&& !crate::state_bool(node, "done").unwrap_or(false)
+					&& !crate::state_bool(node, "dropped").unwrap_or(false)
+			});
 		let mut tools = registry.advertise(caps)?;
+		tools.retain(|tool| tool.definition.name.as_str() != "goal" || goal_visible);
 		// `sv_tools` is the effective roster: the user's allowlist or a mode
 		// Director's bind (plan/vibe restrict what the model may call).
 		if let Some(roster) = crate::tool_allowlist(self.con.as_deref()) {
 			tools.retain(|tool| roster.iter().any(|name| *name == tool.definition.name));
+		}
+		// Goal engagement mounts its hidden lifecycle tool in addition to the
+		// user's ordinary roster; pause, completion, drop, rewind, and resume
+		// all re-derive this decision from the selected branch.
+		if goal_visible
+			&& !tools
+				.iter()
+				.any(|tool| tool.definition.name.as_str() == "goal")
+		{
+			tools.extend(registry.advertise_selected(caps, &[Str::new_static("goal")])?);
 		}
 		// pi `externalThinking`: provider reasoning is off and the hidden
 		// `think` slot is advertised so the model reasons through a tool.
@@ -2280,6 +2303,7 @@ impl<C: Inference> Kernel<C> {
 							Str::new(id.to_string()),
 							None,
 						)?;
+						record_provider_tool_index(session, entry, index)?;
 						self.apply_live_components(session)?;
 						let call_id = Str::new(id.to_string());
 						let cancellation = tool_cancellation(
@@ -2377,6 +2401,7 @@ impl<C: Inference> Kernel<C> {
 								call_id.clone(),
 								intent,
 							)?;
+							record_provider_tool_index(session, entry, index)?;
 							self.apply_live_components(session)?;
 							let cancellation = tool_cancellation(
 								self.dispatcher.registry(),
@@ -2399,7 +2424,7 @@ impl<C: Inference> Kernel<C> {
 						let turn_id = current_turn(session)
 							.map(|handle| Str::new(handle.to_string()))
 							.unwrap_or_else(|_| Str::new_static("turn"));
-						let (identity, args) = match Self::gate_tool_call(
+						let (identity, args, approvals) = match Self::gate_tool_call(
 							self.lifecycle_hooks.clone(),
 							Arc::clone(self.dispatcher.registry()),
 							&session_id,
@@ -2410,7 +2435,9 @@ impl<C: Inference> Kernel<C> {
 						)
 						.await
 						{
-							ToolGate::Allow { identity, args } => (identity, args),
+							ToolGate::Allow { identity, args, approvals } => {
+								(identity, args, approvals)
+							},
 							ToolGate::Deny(reason) => {
 								session.call_ready(entry, denied_args.clone())?;
 								prepared.commit(denied_args);
@@ -2438,6 +2465,7 @@ impl<C: Inference> Kernel<C> {
 							)?;
 							prepared.arg_delta(args.get());
 						}
+						prepared.require_approvals(approvals);
 						prepared.commit(args);
 						self.events.publish(KernelEvent::ToolReady {
 							call_id: call_id.clone(),
@@ -2746,7 +2774,11 @@ impl<C: Inference> Kernel<C> {
 		args: Box<RawValue>,
 	) -> ToolGate {
 		let Some(hooks) = hooks else {
-			return ToolGate::Allow { identity: identity.clone(), args };
+			return ToolGate::Allow {
+				identity: identity.clone(),
+				args,
+				approvals: Vec::new(),
+			};
 		};
 		let Ok(args_value) = serde_json::from_str::<serde_json::Value>(args.get()) else {
 			return ToolGate::Deny(Str::new_static("tool-call arguments are not valid JSON"));
@@ -2776,14 +2808,15 @@ impl<C: Inference> Kernel<C> {
 			"deadline": serde_json::Value::Null,
 			"bash": serde_json::Value::Null,
 		});
-		let transformed = match hooks.gate(HookEventId::HookEventToolCall, payload).await {
-			Ok(value) => value,
+		let admission = match hooks.evaluate(HookEventId::HookEventToolCall, payload).await {
+			Ok(admission) => admission,
 			Err(crate::LifecycleHookError::Denied { reason, .. }) => return ToolGate::Deny(reason),
 			Err(error) => {
 				tracing::warn!(?error, "tool-call lifecycle hook failed");
 				return ToolGate::Deny(Str::new_static("tool-call lifecycle hook failed"));
 			},
 		};
+		let transformed = admission.payload;
 		let Some(name) = transformed
 			.get("target")
 			.and_then(|target| target.get("name"))
@@ -2798,7 +2831,7 @@ impl<C: Inference> Kernel<C> {
 			return ToolGate::Deny(Str::new_static("tool-call hook removed canonical arguments"));
 		};
 		match serde_json::value::to_raw_value(args) {
-			Ok(args) => ToolGate::Allow { identity, args },
+			Ok(args) => ToolGate::Allow { identity, args, approvals: admission.approvals },
 			Err(error) => {
 				tracing::warn!(?error, "tool-call hook returned malformed arguments");
 				ToolGate::Deny(Str::new_static("tool-call hook returned malformed arguments"))
@@ -3535,7 +3568,11 @@ fn session_usage_json(session: &Session, turn: Handle) -> serde_json::Value {
 }
 
 enum ToolGate {
-	Allow { identity: ToolIdentity, args: Box<RawValue> },
+	Allow {
+		identity:  ToolIdentity,
+		args:      Box<RawValue>,
+		approvals: Vec<crate::ApprovalSpec>,
+	},
 	Deny(Str),
 }
 
@@ -3687,6 +3724,25 @@ fn recover_inline_sloppy_edits(
 		ops,
 	})?;
 	Ok(Some((visible, payloads.join("\n"), regions)))
+}
+
+/// Persists the provider content-array position without widening `tool.call@1`.
+fn record_provider_tool_index(
+	session: &mut Session,
+	call: EntryId,
+	index: u32,
+) -> Result<(), SessionError> {
+	let handle = session.call_handle(call)?;
+	session.patch(Txn {
+		cause: call,
+		label: Some(Str::new_static("tool.provider-order")),
+		ops:   vec![Op::Set {
+			h:     handle,
+			prop:  PropKey::Custom(Str::new_static(omp_session::PROVIDER_BLOCK_INDEX_PROP)),
+			value: Value::Int(i64::from(index)),
+		}],
+	})?;
+	Ok(())
 }
 
 fn close_streams(

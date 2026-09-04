@@ -6,8 +6,10 @@ use async_stream::stream;
 use bytes::Bytes;
 use futures::Stream;
 use omp_agent::{
-	DispatchPolicy, GateDecision, HookGate, HookPatch, HookPhase, Kernel, OnFailure, RunControl,
-	SourceRef, StaticPrompt, TurnInput, When,
+	ApprovalBook, ApprovalDecision, ApprovalScope, ApprovalSource, ApprovalSpec, DispatchPolicy,
+	GateDecision, GateError, GateEvent, GateOutcome, HookDecision, HookGate, HookPatch, HookPhase,
+	Kernel, KernelEvent, LifecycleHooks, OnFailure, RunControl, SourceRef, StaticPrompt, TicketState,
+	ToolAdmission, ToolAdmissionVerdict, TurnInput, TurnStop, Up, When,
 };
 use omp_core::sf;
 use omp_journal::{blob::BlobStore, kind};
@@ -86,6 +88,40 @@ fn capture_registry(seen: Arc<Mutex<Option<Value>>>) -> Arc<Registry> {
 	Arc::new(registry)
 }
 
+fn approval_spec(title: &'static str, body: &'static str) -> ApprovalSpec {
+	ApprovalSpec {
+		title: sf!(title),
+		body: sf!(body),
+		subject: sf!("capture"),
+		kind: sf!("exec"),
+		scopes: vec![sf!("once")],
+		default: Some(false),
+		route: sf!("user"),
+		approver: None,
+		timeout_ms: 1_000,
+		unreachable: sf!("fail_closed"),
+		require_human: true,
+		pattern: None,
+		evidence: vec![sf!("host_generation=7"), sf!("session_generation=3")],
+	}
+}
+
+struct PromptAdmission;
+
+impl ToolAdmission for PromptAdmission {
+	fn admit(
+		&self,
+		_name: &str,
+		_effects: &Effects,
+		_args: &serde_json::value::RawValue,
+	) -> ToolAdmissionVerdict {
+		ToolAdmissionVerdict::Prompt(approval_spec(
+			"Native capability approval",
+			"native admission policy",
+		))
+	}
+}
+
 fn subscription(id: u32, event: HookEventId, phase: HookPhase) -> omp_agent::hooks::Subscription {
 	omp_agent::hooks::Subscription {
 		host: sf!("test"),
@@ -101,6 +137,120 @@ fn subscription(id: u32, event: HookEventId, phase: HookPhase) -> omp_agent::hoo
 		on_failure: OnFailure::Deny,
 		when: When::default(),
 	}
+}
+
+#[test]
+fn every_phase_has_a_closed_typed_decision_vocabulary() {
+	let expected = [
+		(HookPhase::Precheck, [false, true, false, true, false]),
+		(HookPhase::Transform, [false, false, true, true, false]),
+		(HookPhase::Review, [true, true, false, true, false]),
+		(HookPhase::Approval, [true, true, false, true, true]),
+		(HookPhase::Observe, [false, false, false, true, false]),
+	];
+	for (phase, legal) in expected {
+		for (decision, expected) in HookDecision::ALL.into_iter().zip(legal) {
+			assert_eq!(decision.is_legal_in(phase), expected, "{phase:?} {decision:?}");
+		}
+	}
+}
+
+#[tokio::test]
+async fn timeout_obeys_each_subscription_failure_policy() {
+	for (policy, denied) in [(OnFailure::Defer, false), (OnFailure::Deny, true)] {
+		let (gate, _receiver) = HookGate::channel_with_timeout(Duration::from_millis(1));
+		let mut row = subscription(17, HookEventId::HookEventToolCall, HookPhase::Review);
+		row.on_failure = policy;
+		gate.subscribe("test", [row]).expect("subscription");
+		let outcome = gate
+			.gate(
+				HookEventId::HookEventToolCall,
+				GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")),
+			)
+			.await;
+		assert_eq!(matches!(outcome, GateOutcome::Deny { .. }), denied);
+	}
+}
+
+#[tokio::test]
+async fn delegated_host_loss_uses_the_published_failure_class() {
+	for (event, denied) in [
+		(HookEventId::HookEventSessionStart, false),
+		(HookEventId::HookEventToolCall, true),
+	] {
+		let (gate, receiver) = HookGate::delegated_channel();
+		let bit = 1_u128 << (event as u32);
+		gate.replace_masks(bit, denied.then_some(bit).unwrap_or(0));
+		drop(receiver);
+		let outcome = gate
+			.gate(event, GateEvent::new(sf!("target"), Bytes::from_static(b"{}")))
+			.await;
+		assert_eq!(matches!(outcome, GateOutcome::Deny { .. }), denied);
+	}
+}
+
+#[tokio::test]
+async fn cancelling_a_gate_removes_its_pending_reply_slot() {
+	let (gate, receiver) = HookGate::channel();
+	let mut row = subscription(18, HookEventId::HookEventToolCall, HookPhase::Review);
+	row.on_failure = OnFailure::Deny;
+	gate.subscribe("test", [row]).expect("subscription");
+	let gate = Arc::new(gate);
+	let worker = {
+		let gate = Arc::clone(&gate);
+		tokio::spawn(async move {
+			gate
+				.gate(
+					HookEventId::HookEventToolCall,
+					GateEvent::new(sf!("bash"), Bytes::from_static(b"{}")),
+				)
+				.await
+		})
+	};
+	let dispatch = receiver.recv_async().await.expect("dispatch");
+	worker.abort();
+	let _ = worker.await;
+	assert_eq!(
+		gate.answer(dispatch.dispatch_id, vec![(18, GateDecision::Allow)]),
+		Err(GateError::UnknownDispatch),
+	);
+}
+
+#[tokio::test]
+async fn approval_phase_collects_every_requirement_in_dispatch_order() {
+	let (gate, receiver) = HookGate::channel();
+	gate
+		.subscribe("test", [
+			subscription(1, HookEventId::HookEventToolCall, HookPhase::Approval),
+			subscription(2, HookEventId::HookEventToolCall, HookPhase::Approval),
+		])
+		.expect("subscriptions");
+	let gate = Arc::new(gate);
+	let hooks = LifecycleHooks::new(Arc::clone(&gate));
+	let work = hooks.evaluate(
+		HookEventId::HookEventToolCall,
+		serde_json::json!({"target": {"name": "bash"}, "args": {}}),
+	);
+	let driver = async {
+		for (id, subject) in [(1, "first"), (2, "second")] {
+			let dispatch = receiver.recv_async().await.expect("approval phase");
+			let mut spec = approval_spec("Approve", "Approval required");
+			spec.subject = subject.into();
+			gate
+				.answer(dispatch.dispatch_id, vec![(id, GateDecision::RequireApproval(spec))])
+				.expect("approval requirement");
+		}
+	};
+	let (outcome, ()) = tokio::join!(work, driver);
+	let outcome = outcome.expect("typed lifecycle admission");
+	assert_eq!(
+		outcome
+			.approvals
+			.iter()
+			.map(|spec| spec.subject.as_str())
+			.collect::<Vec<_>>(),
+		["first", "second"],
+	);
 }
 
 #[tokio::test]
@@ -209,6 +359,247 @@ async fn lifecycle_tool_call_transform_reaches_executor_and_observations_are_com
 	}
 	drop(kernel);
 	responder.abort();
+}
+
+#[tokio::test]
+async fn lifecycle_and_native_approval_share_one_durable_ticket_and_replay() {
+	let (gate, receiver) = HookGate::channel();
+	let gate = Arc::new(gate);
+	gate
+		.subscribe("test", [subscription(
+			1,
+			HookEventId::HookEventToolCall,
+			HookPhase::Approval,
+		)])
+		.expect("approval subscription");
+	let responder = {
+		let gate = Arc::clone(&gate);
+		tokio::spawn(async move {
+			let dispatch = receiver.recv_async().await.expect("tool-call approval phase");
+			gate
+				.answer(dispatch.dispatch_id, vec![(
+					1,
+					GateDecision::RequireApproval(approval_spec(
+						"Extension approval",
+						"extension policy",
+					)),
+				)])
+				.expect("approval requirement");
+		})
+	};
+	let seen = Arc::new(Mutex::new(None));
+	let temp = tempfile::tempdir().expect("tempdir");
+	let (inference, _) = ScriptedInference::new([
+		tool_script("capture-approval", "capture", serde_json::json!({"value": 1})),
+		text_script("done"),
+	]);
+	let mut kernel = Kernel::new(
+		inference,
+		capture_registry(Arc::clone(&seen)),
+		DispatchPolicy::new(BlobStore::open(temp.path().join("blobs")).expect("blobs")),
+		StaticPrompt(sf!("system")),
+	)
+	.with_hook_gate(gate)
+	.with_tool_admission(Arc::new(PromptAdmission));
+	let events = kernel.subscribe();
+	let mailbox = kernel.mailbox();
+	let path = temp.path().join("approval.oms");
+	let mut session = fresh_session(&path);
+	let host = tokio::spawn(async move {
+		while let Ok(event) = events.recv_async().await {
+			if let KernelEvent::ApprovalRequested(ticket) = event {
+				assert_eq!(ticket.reasons.len(), 2, "one ticket merges both authorities");
+				assert_eq!(ticket.reasons[0].title, "Extension approval");
+				assert_eq!(ticket.reasons[1].title, "Native capability approval");
+				assert_eq!(
+					ticket.reasons[0].evidence,
+					[sf!("host_generation=7"), sf!("session_generation=3")],
+				);
+				mailbox
+					.send(Up::Approve {
+						id: ticket.ticket_id,
+						decision: ApprovalDecision {
+							approved: true,
+							scope: ApprovalScope::Once,
+							source: ApprovalSource::User,
+							decided_by: Some(sf!("tester")),
+							reason: None,
+							audited: true,
+						},
+					})
+					.expect("approve merged ticket");
+				break;
+			}
+		}
+	});
+	kernel
+		.run_turn(
+			&mut session,
+			TurnInput { text: sf!("capture"), attachments: Vec::new() },
+			RunControl::default(),
+		)
+		.await
+		.expect("turn");
+	host.await.expect("approval host");
+	responder.await.expect("hook responder");
+	assert_eq!(*seen.lock(), Some(serde_json::json!({"value": 1})));
+	let live = session.dom().snapshot();
+	drop(session);
+	let replayed =
+		omp_session::Session::open(&path, omp_session::ComponentRegistry::default()).expect("replay");
+	assert_eq!(replayed.dom().snapshot(), live);
+}
+
+#[tokio::test]
+async fn lifecycle_approval_timeout_denies_before_execution_and_replays() {
+	let (gate, receiver) = HookGate::channel();
+	let gate = Arc::new(gate);
+	gate
+		.subscribe("test", [subscription(
+			1,
+			HookEventId::HookEventToolCall,
+			HookPhase::Approval,
+		)])
+		.expect("approval subscription");
+	let responder = {
+		let gate = Arc::clone(&gate);
+		tokio::spawn(async move {
+			let dispatch = receiver.recv_async().await.expect("tool-call approval phase");
+			let mut spec = approval_spec("Extension approval", "extension policy");
+			spec.timeout_ms = 1;
+			gate
+				.answer(
+					dispatch.dispatch_id,
+					vec![(1, GateDecision::RequireApproval(spec))],
+				)
+				.expect("approval requirement");
+		})
+	};
+	let seen = Arc::new(Mutex::new(None));
+	let temp = tempfile::tempdir().expect("tempdir");
+	let (inference, _) = ScriptedInference::new([
+		tool_script("capture-timeout", "capture", serde_json::json!({"value": 1})),
+		text_script("done"),
+	]);
+	let mut kernel = Kernel::new(
+		inference,
+		capture_registry(Arc::clone(&seen)),
+		DispatchPolicy::new(BlobStore::open(temp.path().join("blobs")).expect("blobs")),
+		StaticPrompt(sf!("system")),
+	)
+	.with_hook_gate(gate);
+	let events = kernel.subscribe();
+	let path = temp.path().join("approval-timeout.oms");
+	let mut session = fresh_session(&path);
+	let ticket_id = Arc::new(Mutex::new(None));
+	let capture_id = Arc::clone(&ticket_id);
+	let host = tokio::spawn(async move {
+		while let Ok(event) = events.recv_async().await {
+			if let KernelEvent::ApprovalRequested(ticket) = event {
+				*capture_id.lock() = Some(ticket.ticket_id);
+				break;
+			}
+		}
+	});
+	kernel
+		.run_turn(
+			&mut session,
+			TurnInput { text: sf!("capture"), attachments: Vec::new() },
+			RunControl::default(),
+		)
+		.await
+		.expect("turn");
+	host.await.expect("approval host");
+	responder.await.expect("hook responder");
+	assert!(seen.lock().is_none(), "timed-out approval never executes");
+	let ticket_id = ticket_id.lock().clone().expect("ticket id");
+	let ticket = ApprovalBook::new()
+		.ticket(&session, ticket_id.as_str())
+		.expect("durable ticket");
+	assert_eq!(ticket.state, TicketState::Decided);
+	assert_eq!(
+		ticket.decision.as_ref().map(|decision| decision.source),
+		Some(ApprovalSource::Timeout),
+	);
+	let live = session.dom().snapshot();
+	drop(session);
+	let replayed =
+		omp_session::Session::open(&path, omp_session::ComponentRegistry::default()).expect("replay");
+	assert_eq!(replayed.dom().snapshot(), live);
+}
+
+#[tokio::test]
+async fn cancellation_withdraws_lifecycle_approval_and_never_starts_the_tool() {
+	let (gate, receiver) = HookGate::channel();
+	let gate = Arc::new(gate);
+	gate
+		.subscribe("test", [subscription(
+			1,
+			HookEventId::HookEventToolCall,
+			HookPhase::Approval,
+		)])
+		.expect("approval subscription");
+	let responder = {
+		let gate = Arc::clone(&gate);
+		tokio::spawn(async move {
+			let dispatch = receiver.recv_async().await.expect("tool-call approval phase");
+			let mut spec = approval_spec("Extension approval", "extension policy");
+			spec.timeout_ms = 0;
+			gate
+				.answer(
+					dispatch.dispatch_id,
+					vec![(1, GateDecision::RequireApproval(spec))],
+				)
+				.expect("approval requirement");
+		})
+	};
+	let seen = Arc::new(Mutex::new(None));
+	let temp = tempfile::tempdir().expect("tempdir");
+	let (inference, _) =
+		ScriptedInference::new([tool_script(
+			"capture-cancel",
+			"capture",
+			serde_json::json!({"value": 1}),
+		)]);
+	let mut kernel = Kernel::new(
+		inference,
+		capture_registry(Arc::clone(&seen)),
+		DispatchPolicy::new(BlobStore::open(temp.path().join("blobs")).expect("blobs")),
+		StaticPrompt(sf!("system")),
+	)
+	.with_hook_gate(gate);
+	let events = kernel.subscribe();
+	let cancellation = tokio_util::sync::CancellationToken::new();
+	let cancel = cancellation.clone();
+	let ticket_id = Arc::new(Mutex::new(None));
+	let capture_id = Arc::clone(&ticket_id);
+	let host = tokio::spawn(async move {
+		while let Ok(event) = events.recv_async().await {
+			if let KernelEvent::ApprovalRequested(ticket) = event {
+				*capture_id.lock() = Some(ticket.ticket_id);
+				cancel.cancel();
+				break;
+			}
+		}
+	});
+	let mut session = fresh_session(&temp.path().join("approval-cancel.oms"));
+	let outcome = kernel
+		.run_turn(
+			&mut session,
+			TurnInput { text: sf!("capture"), attachments: Vec::new() },
+			RunControl::new(cancellation, None),
+		)
+		.await
+		.expect("cancelled turn settles");
+	host.await.expect("approval host");
+	responder.await.expect("hook responder");
+	assert_eq!(outcome.stop, TurnStop::Cancelled);
+	assert!(seen.lock().is_none(), "cancelled approval never executes");
+	let ticket_id = ticket_id.lock().clone().expect("ticket id");
+	let ticket = ApprovalBook::new()
+		.ticket(&session, ticket_id.as_str())
+		.expect("withdrawn ticket remains durable");
+	assert_eq!(ticket.state, TicketState::Withdrawn);
 }
 
 #[tokio::test]

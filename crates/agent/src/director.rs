@@ -232,6 +232,9 @@ pub enum ForceUntil {
 	AnyToolCall,
 	/// Only a call to this exact tool satisfies the request.
 	ToolCalled(Str),
+	/// A successful `yield` whose durable payload closes an incremental batch
+	/// (`complete` or `failed`) satisfies the request.
+	TerminalYield,
 }
 
 /// One durable Director property replacement.

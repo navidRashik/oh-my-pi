@@ -433,6 +433,10 @@ impl CallControl {
 				self.turn.cancel_turn();
 				Ok(Received::Cancelled)
 			},
+			Up::SessionMutation(request) => {
+				request.apply(session);
+				Ok(Received::None)
+			},
 			Up::Env(event) => {
 				Ok(journal_env_event(session, event)?.map_or(Received::None, Received::Rewound))
 			},
@@ -503,8 +507,15 @@ pub(crate) fn journal_env_event(
 			)?;
 			Ok(None)
 		},
-		crate::EnvEvent::CheckpointOpened { token, goal, started_at, workspace } => {
-			checkpoint_open(session, token, goal, started_at, workspace)?;
+		crate::EnvEvent::CheckpointOpened {
+			token,
+			label,
+			goal,
+			parent_token,
+			started_at,
+			workspace,
+		} => {
+			checkpoint_open(session, token, label, goal, parent_token, started_at, workspace)?;
 			Ok(None)
 		},
 		crate::EnvEvent::CheckpointRewind { token, report, receipt, workspace, rewound_at } => {
@@ -543,52 +554,77 @@ pub(crate) fn journal_env_event(
 fn checkpoint_open(
 	session: &mut Session,
 	token: Str,
+	label: Str,
 	goal: Str,
+	parent_token: Option<Str>,
 	started_at: u64,
 	workspace: omp_proto::env::v1::WorkspaceSnapshot,
 ) -> Result<(), SessionError> {
 	let cause = session.head().ok_or(SessionError::NoActiveTurn)?;
+	let mut node =
+		NodeSpec::new(omp_dom::Tag::Custom(Str::new_static("rewind-checkpoint")))
+			.with_prop(PropKey::Custom(Str::new_static("token")), Value::Str(token))
+			.with_prop(PropId::Label, Value::Str(label))
+			.with_prop(
+				PropKey::Custom(Str::new_static("target")),
+				Value::Str(Str::new(cause.to_string())),
+			)
+			.with_prop(PropKey::Custom(Str::new_static("goal")), Value::Str(goal))
+			.with_prop(
+				PropKey::Custom(Str::new_static("started-at")),
+				Value::Int(i64::try_from(started_at).unwrap_or(i64::MAX)),
+			)
+			.with_prop(
+				PropKey::Custom(Str::new_static("workspace-snapshot")),
+				Value::Str(Str::new(workspace.snapshot_id)),
+			)
+			.with_prop(
+				PropKey::Custom(Str::new_static("workspace-root")),
+				Value::Str(Str::new(workspace.root_uri)),
+			)
+			.with_prop(
+				PropKey::Custom(Str::new_static("workspace-generation")),
+				Value::Int(i64::try_from(workspace.generation).unwrap_or(i64::MAX)),
+			)
+			.with_prop(
+				PropKey::Custom(Str::new_static("workspace-tree")),
+				Value::Str(Str::new(workspace.tree_hash)),
+			)
+			.with_prop(
+				PropKey::Custom(Str::new_static("workspace-files")),
+				Value::Int(i64::try_from(workspace.files).unwrap_or(i64::MAX)),
+			)
+			.with_prop(
+				PropKey::Custom(Str::new_static("workspace-bytes")),
+				Value::Int(i64::try_from(workspace.bytes).unwrap_or(i64::MAX)),
+			)
+			.with_prop(
+				PropKey::Custom(Str::new_static("workspace-created-at")),
+				Value::Int(i64::try_from(workspace.created_ms).unwrap_or(i64::MAX)),
+			)
+			.with_prop(
+				PropKey::Custom(Str::new_static("workspace-partial")),
+				Value::Bool(workspace.partial),
+			);
+	if let Some(parent_token) = parent_token {
+		node = node.with_prop(
+			PropKey::Custom(Str::new_static("parent-token")),
+			Value::Str(parent_token),
+		);
+	}
+	if let Some(workspace_parent) = workspace.parent_snapshot_id {
+		node = node.with_prop(
+			PropKey::Custom(Str::new_static("workspace-parent")),
+			Value::Str(Str::new(workspace_parent)),
+		);
+	}
 	session.patch(Txn {
 		cause,
 		label: Some(Str::new_static("checkpoint.open")),
 		ops: vec![Op::Ins {
 			parent: session.dom().meta(),
 			after:  session.dom().children(session.dom().meta()).last().copied(),
-			node:   NodeSpec::new(omp_dom::Tag::Custom(Str::new_static("rewind-checkpoint")))
-				.with_prop(PropKey::Custom(Str::new_static("token")), Value::Str(token))
-				.with_prop(
-					PropKey::Custom(Str::new_static("target")),
-					Value::Str(Str::new(cause.to_string())),
-				)
-				.with_prop(PropKey::Custom(Str::new_static("goal")), Value::Str(goal))
-				.with_prop(
-					PropKey::Custom(Str::new_static("started-at")),
-					Value::Int(i64::try_from(started_at).unwrap_or(i64::MAX)),
-				)
-				.with_prop(
-					PropKey::Custom(Str::new_static("workspace-snapshot")),
-					Value::Str(Str::new(workspace.snapshot_id)),
-				)
-				.with_prop(
-					PropKey::Custom(Str::new_static("workspace-root")),
-					Value::Str(Str::new(workspace.root_uri)),
-				)
-				.with_prop(
-					PropKey::Custom(Str::new_static("workspace-generation")),
-					Value::Int(i64::try_from(workspace.generation).unwrap_or(i64::MAX)),
-				)
-				.with_prop(
-					PropKey::Custom(Str::new_static("workspace-tree")),
-					Value::Str(Str::new(workspace.tree_hash)),
-				)
-				.with_prop(
-					PropKey::Custom(Str::new_static("workspace-files")),
-					Value::Int(i64::try_from(workspace.files).unwrap_or(i64::MAX)),
-				)
-				.with_prop(
-					PropKey::Custom(Str::new_static("workspace-bytes")),
-					Value::Int(i64::try_from(workspace.bytes).unwrap_or(i64::MAX)),
-				),
+			node,
 		}],
 	})?;
 	Ok(())
@@ -628,9 +664,10 @@ fn checkpoint_rewind(
 			Value::Int(value) => u64::try_from(*value).ok()?,
 			_ => return None,
 		};
-		Some((target, started_at))
+		let label = node.prop(&PropKey::from(PropId::Label)).and_then(Value::as_str).map(Str::new)?;
+		Some((target, started_at, label))
 	});
-	let Some((target, started_at)) = checkpoint else {
+	let Some((target, started_at, label)) = checkpoint else {
 		return Ok(None);
 	};
 	let work = session.rewind(target)?;
@@ -646,7 +683,8 @@ fn checkpoint_rewind(
 		report
 	);
 	let status = sf!(
-		"Workspace restored to checkpoint: {} written, {} deleted, {} unchanged.",
+		"Workspace restored to checkpoint {}: {} written, {} deleted, {} unchanged.",
+		label,
 		workspace.written,
 		workspace.deleted,
 		workspace.unchanged
@@ -662,6 +700,10 @@ fn checkpoint_rewind(
 					.with_prop(
 						PropKey::Custom(Str::new_static("checkpoint-token")),
 						Value::Str(Str::new(token)),
+					)
+					.with_prop(
+						PropKey::Custom(Str::new_static("checkpoint-label")),
+						Value::Str(label),
 					)
 					.with_prop(
 						PropKey::Custom(Str::new_static("workspace-snapshot")),
@@ -733,6 +775,9 @@ pub enum SessionToolError {
 	/// Journaling a job or steering side effect failed.
 	#[error(transparent)]
 	Session(#[from] SessionError),
+	/// A session-owned Director transition failed.
+	#[error(transparent)]
+	Director(#[from] crate::DirectorError),
 }
 
 /// A host-authority tool whose operation requires the session DOM.
@@ -744,6 +789,25 @@ pub trait SessionTool: Send + Sync {
 	fn spec(&self) -> &ToolSpec;
 	/// Executes one committed call against the authoritative session.
 	fn call<'a>(&'a self, cx: SessionToolCx<'a>, args: Box<RawValue>) -> SessionToolFuture<'a>;
+
+	/// Projects the terminal truth into model-visible parts.
+	///
+	/// Structured session tools default to their typed JSON. Tools whose
+	/// contract promises a human-oriented projection (for example `todo`)
+	/// override this without changing the journaled outcome.
+	fn project(
+		&self,
+		outcome: &CallOutcome<Box<RawValue>, Box<RawValue>>,
+	) -> Result<Vec<Part>, SessionToolError> {
+		Ok(match outcome {
+			CallOutcome::Ok(payload) | CallOutcome::Faulted(payload) => {
+				vec![Part::Json {
+					json: bytes::Bytes::copy_from_slice(payload.get().as_bytes()),
+				}]
+			},
+			CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => Vec::new(),
+		})
+	}
 }
 
 /// Live ordered output of one dispatched call (ADR 0008 tool output
@@ -1111,9 +1175,13 @@ pub struct PreparedCall {
 	closed:       bool,
 	report:       Option<DispatchReport>,
 	/// Approval prompt this call waits on while `AwaitingApproval`.
-	ticket:       Option<Str>,
+	ticket:           Option<Str>,
+	/// Hook requirements merged with native admission before filing.
+	approval_specs:   Vec<crate::ApprovalSpec>,
+	/// Deadline and default decision for the open durable ticket.
+	approval_timeout: Option<(Instant, crate::ApprovalDecision)>,
 	/// Call-specific stop label supplied by a scoped abort.
-	abort_reason: Option<Str>,
+	abort_reason:     Option<Str>,
 }
 
 impl PreparedCall {
@@ -1155,6 +1223,11 @@ impl PreparedCall {
 			// call); commitment reports that as the terminal.
 			let _ = feed.arg_text(Str::new(fragment));
 		}
+	}
+
+	/// Records approval requirements returned by the lifecycle gate.
+	pub fn require_approvals(&mut self, specs: Vec<crate::ApprovalSpec>) {
+		self.approval_specs.extend(specs);
 	}
 
 	/// Records the canonical committed arguments. Execution starts when the
@@ -1326,6 +1399,8 @@ impl Dispatcher {
 				closed: true,
 				report: None,
 				ticket: None,
+				approval_specs: Vec::new(),
+				approval_timeout: None,
 				abort_reason: None,
 			});
 		}
@@ -1373,6 +1448,8 @@ impl Dispatcher {
 			closed: false,
 			report: None,
 			ticket: None,
+			approval_specs: Vec::new(),
+			approval_timeout: None,
 			abort_reason: None,
 		})
 	}
@@ -1429,6 +1506,7 @@ impl Dispatcher {
 			}
 		}
 		let policy = self.committer.policy.clone();
+		let mut run_expired = false;
 		loop {
 			self.admit(session, &mut calls, control).await?;
 			if calls.iter().all(|call| call.phase == Phase::Settled) {
@@ -1479,19 +1557,22 @@ impl Dispatcher {
 				.filter(|call| call.phase == Phase::Interrupting)
 				.filter_map(|call| call.grace_until)
 				.min();
-			let wake = match (deadline, grace) {
-				(Some(a), Some(b)) => Some(a.min(b)),
-				(a, b) => a.or(b),
-			};
+			let approval = calls
+				.iter()
+				.filter(|call| call.phase == Phase::AwaitingApproval)
+				.filter_map(|call| call.approval_timeout.as_ref().map(|(deadline, _)| *deadline))
+				.min();
+			let wake = [deadline, grace, approval].into_iter().flatten().min();
 			let signal = tokio::select! {
 				biased;
-				() = control_expired(control) => Signal::RunExpired,
+				() = control_expired(control), if !run_expired => Signal::RunExpired,
 				message = control_recv(control) => Signal::Mailbox(message),
 				() = sleep_until(wake) => Signal::Wake,
 				signal = Signals { calls: &mut calls } => signal,
 			};
 			match signal {
 				Signal::RunExpired => {
+					run_expired = true;
 					if let Some(control) = control {
 						control.cancel_turn();
 					}
@@ -1524,6 +1605,8 @@ impl Dispatcher {
 								call.phase == Phase::AwaitingApproval
 									&& call.ticket.as_deref() == Some(ticket.ticket_id.as_str())
 							}) {
+								call.interrupted = None;
+								call.approval_timeout = None;
 								if approved {
 									// Re-admitted by the next `admit` pass; the ticket stays
 									// recorded so policy is not consulted twice.
@@ -1551,6 +1634,8 @@ impl Dispatcher {
 						if let Some(ticket) = call.ticket.take() {
 							let _ = crate::ApprovalBook::new().withdraw(session, ticket.as_str());
 						}
+						call.interrupted = None;
+						call.approval_timeout = None;
 						let mut output = std::mem::take(call.output(&self.committer.policy));
 						let reason = call.abort_reason.take().unwrap_or_else(|| {
 							Str::new_static("tool execution cancelled while awaiting approval")
@@ -1568,6 +1653,25 @@ impl Dispatcher {
 				Signal::Interrupt(index) => {
 					let call = &mut calls[index];
 					call.interrupted = None;
+					if call.phase == Phase::AwaitingApproval {
+						if let Some(ticket) = call.ticket.take() {
+							let _ = crate::ApprovalBook::new().withdraw(session, ticket.as_str());
+						}
+						call.approval_timeout = None;
+						let mut output = std::mem::take(call.output(&policy));
+						let reason = call.abort_reason.take().unwrap_or_else(|| {
+							Str::new_static("tool execution cancelled while awaiting approval")
+						});
+						let report = self.committer.commit_abort(
+							session,
+							call,
+							Abort::Skipped { reason },
+							&mut output,
+						)?;
+						call.phase = Phase::Settled;
+						call.report = Some(report);
+						continue;
+					}
 					call.phase = Phase::Interrupting;
 					call.grace_until = Some(Instant::now() + policy.interrupt_grace);
 					if let Unit::Native { feed } = &call.unit {
@@ -1583,6 +1687,58 @@ impl Dispatcher {
 					let now = Instant::now();
 					for index in 0..calls.len() {
 						let call = &mut calls[index];
+						if call.phase == Phase::AwaitingApproval
+							&& call
+								.approval_timeout
+								.as_ref()
+								.is_some_and(|(deadline, _)| *deadline <= now)
+						{
+							let (_, decision) = call
+								.approval_timeout
+								.take()
+								.expect("filtered on approval timeout");
+							let ticket = match (control, call.ticket.as_deref()) {
+								(Some(control), Some(ticket_id)) => control
+									.approvals
+									.decide(session, ticket_id, decision)
+									.map_err(|source| DispatchError::Approval { source })?,
+								_ => {
+									let mut output = std::mem::take(call.output(&policy));
+									let report = self.committer.commit_abort(
+										session,
+										call,
+										Abort::Skipped {
+											reason: Str::new_static(
+												"approval deadline elapsed without a host route",
+											),
+										},
+										&mut output,
+									)?;
+									call.phase = Phase::Settled;
+									call.report = Some(report);
+									continue;
+								},
+							};
+							call.interrupted = None;
+							if ticket
+								.decision
+								.as_ref()
+								.is_some_and(|decision| decision.approved)
+							{
+								call.phase = Phase::Pending;
+							} else {
+								let mut output = std::mem::take(call.output(&policy));
+								let report = self.committer.commit_abort(
+									session,
+									call,
+									Abort::Skipped { reason: denial_reason(&ticket) },
+									&mut output,
+								)?;
+								call.phase = Phase::Settled;
+								call.report = Some(report);
+							}
+							continue;
+						}
 						if call.phase == Phase::Interrupting
 							&& call.grace_until.is_some_and(|until| until <= now)
 						{
@@ -1688,77 +1844,99 @@ impl Dispatcher {
 				continue;
 			}
 			let args = call.args.clone().expect("drive requires committed calls");
-			// Host approval policy for native calls (worker/remote calls are
-			// admitted by their environment; session tools are host code).
-			if matches!(call.unit, Unit::Native { .. })
-				&& call.ticket.is_none()
-				&& let Some(admission) = &self.admission
-			{
-				let effects = self
-					.committer
-					.registry
-					.effects(call.identity.name.as_str())
-					.cloned()
-					.unwrap_or_else(|_| Effects::empty());
-				match admission.admit(call.identity.name.as_str(), &effects, &args) {
-					ToolAdmissionVerdict::Allow => {},
-					ToolAdmissionVerdict::Deny(reason) => {
-						let mut output = std::mem::take(call.output(&self.committer.policy));
-						let report = self.committer.commit_abort(
-							session,
-							call,
-							Abort::Skipped { reason },
-							&mut output,
-						)?;
-						call.phase = Phase::Settled;
-						call.report = Some(report);
-						continue;
-					},
-					ToolAdmissionVerdict::Prompt(spec) => {
-						let Some(control) = control else {
+			// Hook and native tool-admission requirements are collected before
+			// filing, so one invocation can open only one durable prompt.
+			if call.ticket.is_none() {
+				let mut specs = std::mem::take(&mut call.approval_specs);
+				// Worker/remote calls are admitted by their environment;
+				// session tools are trusted host code.
+				if matches!(call.unit, Unit::Native { .. })
+					&& let Some(admission) = &self.admission
+				{
+					let effects = self
+						.committer
+						.registry
+						.effects(call.identity.name.as_str())
+						.cloned()
+						.unwrap_or_else(|_| Effects::empty());
+					match admission.admit(call.identity.name.as_str(), &effects, &args) {
+						ToolAdmissionVerdict::Allow => {},
+						ToolAdmissionVerdict::Deny(reason) => {
 							let mut output = std::mem::take(call.output(&self.committer.policy));
 							let report = self.committer.commit_abort(
 								session,
 								call,
-								Abort::Skipped {
-									reason: Str::new_static(
-										"tool requires approval but no host can answer the prompt",
-									),
-								},
+								Abort::Skipped { reason },
 								&mut output,
 							)?;
 							call.phase = Phase::Settled;
 							call.report = Some(report);
 							continue;
-						};
-						let ticket = control
+						},
+						ToolAdmissionVerdict::Prompt(spec) => specs.push(spec),
+					}
+				}
+				if !specs.is_empty() {
+					let ticket = if let Some(control) = control {
+						control
 							.approvals
-							.file_spec(session, call.call_id.clone(), spec)
+							.file_specs(session, call.call_id.clone(), specs)
+							.map_err(|source| DispatchError::Approval { source })?
+					} else {
+						let book = crate::ApprovalBook::new();
+						let ticket = book
+							.open_for(
+								session,
+								Some(call.call_id.clone()),
+								specs,
+								crate::approvals::epoch_millis(),
+							)
 							.map_err(|source| DispatchError::Approval { source })?;
-						if ticket.state == crate::TicketState::Decided {
-							// A session-wide grant in the tree decided it at once.
-							if !ticket
-								.decision
-								.as_ref()
-								.is_some_and(|decision| decision.approved)
-							{
-								let mut output = std::mem::take(call.output(&self.committer.policy));
-								let report = self.committer.commit_abort(
-									session,
-									call,
-									Abort::Skipped { reason: denial_reason(&ticket) },
-									&mut output,
-								)?;
-								call.phase = Phase::Settled;
-								call.report = Some(report);
-								continue;
-							}
-						} else {
-							call.ticket = Some(ticket.ticket_id);
-							call.phase = Phase::AwaitingApproval;
+						let decision = crate::approvals::unreachable_decision(
+							&ticket,
+							"approval host unavailable",
+						);
+						book
+							.decide(session, ticket.ticket_id.as_str(), decision)
+							.map_err(|source| DispatchError::Approval { source })?
+					};
+					if ticket.state == crate::TicketState::Decided {
+						// A session-wide grant in the tree decided every
+						// requirement at once.
+						if !ticket
+							.decision
+							.as_ref()
+							.is_some_and(|decision| decision.approved)
+						{
+							let mut output = std::mem::take(call.output(&self.committer.policy));
+							let report = self.committer.commit_abort(
+								session,
+								call,
+								Abort::Skipped { reason: denial_reason(&ticket) },
+								&mut output,
+							)?;
+							call.phase = Phase::Settled;
+							call.report = Some(report);
 							continue;
 						}
-					},
+					} else {
+						call.approval_timeout = ticket
+							.reasons
+							.iter()
+							.map(|reason| reason.timeout_ms)
+							.filter(|timeout| *timeout != 0)
+							.min()
+							.map(|timeout| {
+								(
+									Instant::now() + Duration::from_millis(timeout),
+									crate::approvals::timeout_decision(&ticket),
+								)
+							});
+						call.ticket = Some(ticket.ticket_id);
+						call.interrupted = Some(Box::pin(call.interrupt.clone().cancelled_owned()));
+						call.phase = Phase::AwaitingApproval;
+						continue;
+					}
 				}
 			}
 			// Journal the execution boundary before releasing committed
@@ -1880,12 +2058,7 @@ impl Dispatcher {
 			outcome,
 			CallOutcome::Faulted(_) | CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. }
 		);
-		let parts = match &outcome {
-			CallOutcome::Ok(payload) | CallOutcome::Faulted(payload) => {
-				vec![Part::Json { json: bytes::Bytes::copy_from_slice(payload.get().as_bytes()) }]
-			},
-			CallOutcome::ArgsRejected(_) | CallOutcome::Aborted { .. } => Vec::new(),
-		};
+		let parts = tool.project(&outcome)?;
 		let outcome = serde_json::value::to_raw_value(&outcome)?;
 		let staged = self.committer.stage_external(
 			session,
@@ -2040,7 +2213,7 @@ impl Future for Signals<'_> {
 
 	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		for (index, call) in self.calls.iter_mut().enumerate() {
-			if call.phase == Phase::Running
+			if matches!(call.phase, Phase::Running | Phase::AwaitingApproval)
 				&& let Some(interrupted) = call.interrupted.as_mut()
 				&& interrupted.as_mut().poll(cx).is_ready()
 			{
@@ -2106,9 +2279,11 @@ impl crate::jobs::DetachedCall {
 			started:      None,
 			grace_until:  None,
 			closed:       false,
-			report:       None,
-			ticket:       None,
-			abort_reason: None,
+			report:           None,
+			ticket:           None,
+			approval_specs:   Vec::new(),
+			approval_timeout: None,
+			abort_reason:     None,
 		};
 		while let Ok(event) = self.events.try_recv() {
 			// A detached settlement lands from the job board's synchronous
@@ -3197,10 +3372,12 @@ mod checkpoint_tests {
 		session.begin_turn().expect("turn");
 		session.user("before", Vec::new()).expect("before");
 		journal_env_event(&mut session, crate::EnvEvent::CheckpointOpened {
-			token:      sf!("checkpoint-1"),
-			goal:       sf!("inspect"),
-			started_at: 42,
-			workspace:  snapshot("snapshot-1"),
+			token:        sf!("checkpoint-1"),
+			label:        sf!("parser-baseline"),
+			goal:         sf!("inspect"),
+			parent_token: None,
+			started_at:   42,
+			workspace:    snapshot("snapshot-1"),
 		})
 		.expect("checkpoint");
 		let checkpoint = session
@@ -3217,6 +3394,51 @@ mod checkpoint_tests {
 				.and_then(Value::as_str),
 			Some("snapshot-1")
 		);
+		journal_env_event(&mut session, crate::EnvEvent::CheckpointOpened {
+			token:        sf!("checkpoint-2"),
+			label:        sf!("parser-nested"),
+			goal:         sf!("inspect nested branch"),
+			parent_token: Some(sf!("checkpoint-1")),
+			started_at:   43,
+			workspace:    snapshot("snapshot-2"),
+		})
+		.expect("nested checkpoint");
+		let nested = session
+			.dom()
+			.select("rewind-checkpoint[label=parser-nested]")
+			.expect("selector")
+			.next()
+			.and_then(|handle| session.dom().get(handle))
+			.expect("nested checkpoint element");
+		assert_eq!(
+			nested
+				.prop(&PropKey::Custom(sf!("parent-token")))
+				.and_then(Value::as_str),
+			Some("checkpoint-1")
+		);
+		let jobs = session
+			.dom()
+			.handles()
+			.find(|handle| {
+				session
+					.dom()
+					.get(*handle)
+					.is_some_and(|node| node.tag == Tag::Known(KnownTag::Jobs))
+			})
+			.expect("canonical jobs component");
+		session
+			.patch(omp_dom::Txn {
+				cause: session.head().expect("head"),
+				label: Some(sf!("test.job")),
+				ops:   vec![omp_dom::Op::Ins {
+					parent: jobs,
+					after:  session.dom().children(jobs).last().copied(),
+					node:   omp_dom::NodeSpec::new(KnownTag::Job)
+						.with_prop(omp_dom::PropId::Id, Value::Str(sf!("job-after-checkpoint")))
+						.with_prop(omp_dom::PropId::Status, Value::Str(sf!("running"))),
+				}],
+			})
+			.expect("running job");
 
 		session.user("after", Vec::new()).expect("after");
 		let work = journal_env_event(&mut session, crate::EnvEvent::CheckpointRewind {
@@ -3228,7 +3450,7 @@ mod checkpoint_tests {
 		})
 		.expect("schedule")
 		.expect("rewind work");
-		assert!(work.terminate.is_empty());
+		assert_eq!(work.terminate.len(), 1);
 		let texts = session
 			.dom()
 			.select("body turn user")
@@ -3252,7 +3474,7 @@ mod checkpoint_tests {
 			.filter_map(|handle| session.dom().get(handle)?.content.as_deref())
 			.next()
 			.expect("restoration status");
-		assert!(status.contains("1 written, 1 deleted, 0 unchanged"));
+		assert!(status.contains("parser-baseline: 1 written, 1 deleted, 0 unchanged"));
 
 		let live = session.dom().snapshot();
 		drop(session);
@@ -3269,10 +3491,12 @@ mod checkpoint_tests {
 		session.begin_turn().expect("turn");
 		session.user("before", Vec::new()).expect("before");
 		journal_env_event(&mut session, crate::EnvEvent::CheckpointOpened {
-			token:      sf!("checkpoint-1"),
-			goal:       sf!("inspect"),
-			started_at: 42,
-			workspace:  snapshot("snapshot-1"),
+			token:        sf!("checkpoint-1"),
+			label:        sf!("parser-baseline"),
+			goal:         sf!("inspect"),
+			parent_token: None,
+			started_at:   42,
+			workspace:    snapshot("snapshot-1"),
 		})
 		.expect("checkpoint");
 		session.user("after", Vec::new()).expect("after");

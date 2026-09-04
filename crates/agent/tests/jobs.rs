@@ -7,6 +7,7 @@ use std::sync::{
 
 use omp_agent::{JobBoard, JobSettlement};
 use omp_core::Str;
+use omp_dom::{Op, PropKey, Txn, Value};
 use omp_session::{
 	ComponentRegistry, Session,
 	components::jobs::{self, JobSpec},
@@ -101,6 +102,126 @@ async fn jobs_tool_job_without_an_execution_unit_settles_failed_at_poll() {
 	assert_eq!(settled.status.as_str(), "failed");
 	assert_eq!(settled.error.as_deref(), Some(omp_agent::ORPHANED_TOOL_JOB));
 	assert!(!board.has_finished_units(), "the orphan is journaled exactly once");
+}
+
+/// A parent-process restart cannot retain the child execution unit. The stale
+/// live node settles before explicit revival so neither `wait` nor revive is
+/// permanently fenced by a phantom `running` status.
+#[tokio::test]
+async fn jobs_restart_settles_orphaned_subagent_and_replay_stays_revivable() {
+	let temp = tempdir().expect("temporary session directory");
+	let path = temp.path().join("subagent-restart.oms");
+	let mut session = Session::create(&path, ComponentRegistry::standard()).expect("create session");
+	let head = session.head().expect("genesis head");
+	let txn = jobs::insert(session.dom(), head, JobSpec {
+		id:      Str::new_static("child-restart"),
+		kind:    Str::new_static("subagent"),
+		owner:   Str::new_static("Main"),
+		started: Str::new_static("1"),
+		agent:   Some(Str::new_static("task")),
+	})
+	.expect("jobs root");
+	session.patch(txn).expect("insert subagent");
+	drop(session);
+
+	let mut session = Session::open(&path, ComponentRegistry::standard()).expect("restart session");
+	let board = JobBoard::new();
+	board.rebuild(&session);
+	assert!(board.has_finished_units(), "the missing child wakes settlement");
+	let settled = board
+		.wait(&mut session, Some(&[Str::new_static("child-restart")]))
+		.await
+		.expect("orphan settlement")
+		.expect("subagent remains addressable");
+	assert_eq!(settled.status.as_str(), "failed");
+	assert_eq!(settled.error.as_deref(), Some(omp_agent::ORPHANED_SUBAGENT_JOB));
+	drop(session);
+
+	let replayed = Session::open(&path, ComponentRegistry::standard()).expect("replay settlement");
+	let record = omp_agent::jobs::undelivered(replayed.dom())
+		.into_iter()
+		.find(|record| record.id == "child-restart")
+		.expect("settled child remains deliverable");
+	assert_eq!(record.status.as_str(), "failed");
+	assert_eq!(record.error.as_deref(), Some(omp_agent::ORPHANED_SUBAGENT_JOB));
+}
+
+/// Explicit revival clears stale terminal presentation and re-arms exactly one
+/// delivery for the new execution generation.
+#[tokio::test]
+async fn jobs_revive_rearms_settlement_delivery() {
+	let temp = tempdir().expect("temporary session directory");
+	let mut session = Session::create(
+		temp.path().join("revive-delivery.oms"),
+		ComponentRegistry::standard(),
+	)
+	.expect("create session");
+	let head = session.head().expect("genesis head");
+	session
+		.patch(
+			jobs::insert(session.dom(), head, JobSpec {
+				id: Str::new_static("child-revive"),
+				kind: Str::new_static("subagent"),
+				owner: Str::new_static("Main"),
+				started: Str::new_static("1"),
+				agent: Some(Str::new_static("task")),
+			})
+			.expect("jobs root"),
+		)
+		.expect("insert child");
+	let handle = session
+		.dom()
+		.select("jobs subagent[id=child-revive]")
+		.expect("selector")
+		.into_iter()
+		.next()
+		.expect("child handle");
+	let delivered = session.head().expect("insert head");
+	session
+		.patch(Txn {
+			cause: delivered,
+			label: Some(Str::new_static("test.delivered")),
+			ops: vec![Op::Set {
+				h: handle,
+				prop: PropKey::Custom(Str::new_static(omp_agent::jobs::DELIVERED)),
+				value: Value::Bool(true),
+			}],
+		})
+		.expect("old delivery marker");
+	let restart = session.head().expect("delivered head");
+	session
+		.patch(jobs::restart(restart, handle, Str::new_static("2")))
+		.expect("restart generation");
+	let board = JobBoard::new();
+	assert!(board.attach_task(
+		session.dom(),
+		handle,
+		tokio_util::sync::CancellationToken::new(),
+		tokio::spawn(async {
+			JobSettlement {
+				status: Str::new_static("completed"),
+				output: Some(
+					serde_json::value::to_raw_value(&serde_json::json!({"text":"revived"}))
+						.expect("output"),
+				),
+				error: None,
+				completion: None,
+			}
+		}),
+	));
+	let settled = board
+		.wait(&mut session, Some(&[Str::new_static("child-revive")]))
+		.await
+		.expect("wait")
+		.expect("revived result");
+	assert_eq!(settled.status, "completed");
+	let pending = omp_agent::jobs::undelivered(session.dom());
+	assert_eq!(pending.len(), 1);
+	assert_eq!(pending[0].id, "child-revive");
+	assert_eq!(
+		pending[0].output.as_deref().map(serde_json::value::RawValue::get),
+		Some(r#"{"text":"revived"}"#)
+	);
 }
 
 /// Progress after detachment is not a terminal outcome. Restart reconciliation

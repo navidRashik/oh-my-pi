@@ -26,16 +26,15 @@ fn test_goal_continues_until_complete_and_accounts_tokens() {
 }
 
 #[test]
-fn test_goal_exits_when_token_budget_is_exhausted() {
+fn test_goal_holds_budget_limited_without_claiming_completion() {
 	let mut world = Harness::new();
 	world.engage(Goal::new("bounded work", Some(5)));
 	world.turn("", &[Call::new("todo", serde_json::json!({"op": "add"}))], 9);
-	assert!(!world.active().iter().any(|&id| id == "goal"));
+	assert!(world.active().iter().any(|&id| id == "goal"));
+	assert_eq!(world.state_int("goal", "tokens_used"), Some(9));
 	assert!(
-		world
-			.developer_texts()
-			.iter()
-			.any(|text| text.contains("budget exhausted"))
+		continuation_prompt(world.session.dom()).is_none(),
+		"budget-limited goals must not arm another idle continuation"
 	);
 }
 
@@ -54,6 +53,12 @@ fn continuation_prompt_requires_an_active_goal_and_escapes_the_objective() {
 	let prompt = continuation_prompt(world.session.dom()).expect("active goal continues");
 	assert!(prompt.contains("<objective>\nship &lt;safe&gt; &amp; sound\n</objective>"));
 	assert!(prompt.contains("- Token budget: 20"));
+	world.set_state("goal", "continuation_armed", omp_agent::BindValue::Bool(false));
+	assert!(
+		continuation_prompt(world.session.dom()).is_none(),
+		"a prose-only continuation hold is durable in the Director node"
+	);
+	world.set_state("goal", "continuation_armed", omp_agent::BindValue::Bool(true));
 	world
 		.stack
 		.pause(&mut world.session, "goal")

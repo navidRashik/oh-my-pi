@@ -448,7 +448,7 @@ fn find_ticket(
 		.ok_or_else(|| ApprovalError::UnknownTicket { id: Str::new(ticket_id) })
 }
 
-fn epoch_millis() -> u64 {
+pub(crate) fn epoch_millis() -> u64 {
 	std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
 		.map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
@@ -663,9 +663,20 @@ impl ApprovalDesk {
 		call_id: Str,
 		spec: ApprovalSpec,
 	) -> Result<ApprovalTicket, ApprovalError> {
+		self.file_specs(session, call_id, vec![spec])
+	}
+
+	/// Journals every hook and tool-admission requirement for one call as one
+	/// durable prompt.
+	pub fn file_specs(
+		&self,
+		session: &mut Session,
+		call_id: Str,
+		specs: Vec<ApprovalSpec>,
+	) -> Result<ApprovalTicket, ApprovalError> {
 		let ticket = self
 			.book
-			.open_for(session, Some(call_id), vec![spec], epoch_millis())?;
+			.open_for(session, Some(call_id), specs, epoch_millis())?;
 		if let Some(grant) = session_grant(session, &ticket) {
 			return self.book.decide(session, ticket.ticket_id.as_str(), grant);
 		}
@@ -935,7 +946,7 @@ impl ApprovalRoute {
 	}
 }
 
-fn timeout_decision(ticket: &ApprovalTicket) -> ApprovalDecision {
+pub(crate) fn timeout_decision(ticket: &ApprovalTicket) -> ApprovalDecision {
 	let mut defaults = ticket.reasons.iter().map(|reason| reason.default);
 	let first = defaults.next().flatten();
 	let approved = first.is_some() && defaults.all(|value| value == first) && first == Some(true);
@@ -949,7 +960,10 @@ fn timeout_decision(ticket: &ApprovalTicket) -> ApprovalDecision {
 	}
 }
 
-fn unreachable_decision(ticket: &ApprovalTicket, reason: &'static str) -> ApprovalDecision {
+pub(crate) fn unreachable_decision(
+	ticket: &ApprovalTicket,
+	reason: &'static str,
+) -> ApprovalDecision {
 	let approved = !ticket.reasons.is_empty()
 		&& ticket
 			.reasons

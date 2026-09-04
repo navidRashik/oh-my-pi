@@ -132,23 +132,36 @@ struct RuntimeJob {
 	/// A terminal call outcome recovered before its job settlement patch
 	/// landed.
 	recovered: Option<RecoveredSettlement>,
-	/// A running detached tool call whose execution unit no longer exists
-	/// (re-derived by a forward rewind or a process restart): nothing can
-	/// ever settle it, so [`JobBoard::poll`] journals it `failed`.
+	/// A running tool or subagent whose execution unit no longer exists
+	/// (re-derived by a forward rewind or process restart): nothing can ever
+	/// settle it, so [`JobBoard::poll`] journals it `failed`.
 	orphaned:  bool,
 }
 
 #[derive(Clone)]
 struct RecoveredSettlement {
 	is_error: bool,
+	status:   Option<Str>,
 	artifact: Option<BlobRef>,
+	output:   Option<Box<RawValue>>,
 	error:    Option<Str>,
 }
+
+/// Custom job property carrying the journal-first workpool snapshot used for
+/// restart adoption.
+pub const WORKPOOL_STATE: &str = "workpool_state";
 
 /// Stable diagnostic journaled on a detached tool call that lost its
 /// execution unit.
 pub const ORPHANED_TOOL_JOB: &str =
 	"detached tool execution was lost across a rewind or restart and cannot settle";
+/// Stable diagnostic journaled on a subagent whose execution unit disappeared.
+///
+/// Settling the stale `running` node is what makes the durable child eligible
+/// for the ordinary explicit revive path; leaving it live would make both
+/// `wait` and revive hang forever.
+pub const ORPHANED_SUBAGENT_JOB: &str =
+	"subagent execution was lost across a rewind or restart and can be revived";
 
 /// A disposable runtime index over the authoritative jobs subtree.
 ///
@@ -347,15 +360,13 @@ impl JobBoard {
 			.collect();
 		for record in records {
 			let mut job = by_id.remove(&record.id).unwrap_or_else(|| {
-				let recovered = recovered_tool_settlement(session.dom(), &record);
+				let recovered = recovered_settlement(session.dom(), &record);
 				RuntimeJob {
-					// A detached tool whose terminal call result already
-					// reached the journal is adopted into its job node. Only
-					// a genuinely running call without an execution unit is
-					// orphaned.
-					orphaned: record.kind == JobKind::Tool
-						&& is_live_status(record.status.as_str())
-						&& recovered.is_none(),
+					// Terminal detached-tool artifacts and drained workpool
+					// snapshots are adopted into their job nodes. A genuinely
+					// running tool or child without an execution unit is
+					// orphaned so wait/revive cannot hang.
+					orphaned: restart_orphan(&record, recovered.as_ref()),
 					recovered,
 					record: record.clone(),
 					cancel: CancellationToken::new(),
@@ -370,8 +381,8 @@ impl JobBoard {
 				job.recovered = None;
 				job.orphaned = false;
 			} else if !retained_live_owner && job.task.is_none() && job._detached.is_none() {
-				job.recovered = recovered_tool_settlement(session.dom(), &record);
-				job.orphaned = record.kind == JobKind::Tool && job.recovered.is_none();
+				job.recovered = recovered_settlement(session.dom(), &record);
+				job.orphaned = restart_orphan(&record, job.recovered.as_ref());
 			}
 			jobs.insert(record.handle, job);
 		}
@@ -405,14 +416,18 @@ impl JobBoard {
 			jobs
 				.iter()
 				.filter(|(_, job)| job.orphaned)
-				.map(|(handle, _)| *handle)
+				.map(|(handle, job)| (*handle, job.record.kind))
 				.collect::<Vec<_>>()
 		};
-		for handle in orphaned {
+		for (handle, kind) in orphaned {
+			let error = match kind {
+				JobKind::Subagent => ORPHANED_SUBAGENT_JOB,
+				JobKind::Tool | JobKind::Process => ORPHANED_TOOL_JOB,
+			};
 			self.commit(session, handle, JobSettlement {
 				status:     Str::new_static("failed"),
 				output:     None,
-				error:      Some(Str::new_static(ORPHANED_TOOL_JOB)),
+				error:      Some(Str::new_static(error)),
 				completion: None,
 			})?;
 			if let Some(job) = self.jobs.lock().get_mut(&handle) {
@@ -428,10 +443,12 @@ impl JobBoard {
 					match detached.poll(session) {
 						Ok(Some(report)) => {
 							job._detached = None;
-							let settlement = recovered_tool_settlement(session.dom(), &job.record)
+							let settlement = recovered_settlement(session.dom(), &job.record)
 								.unwrap_or(RecoveredSettlement {
 									is_error: report.is_error,
+									status:   None,
 									artifact: report.spilled,
+									output:   None,
 									error:    None,
 								});
 							job.recovered = Some(settlement.clone());
@@ -443,7 +460,9 @@ impl JobBoard {
 							job._detached = None;
 							let settlement = RecoveredSettlement {
 								is_error: true,
+								status:   None,
 								artifact: None,
+								output:   None,
 								error:    Some(Str::new_static("detached tool settlement failed")),
 							};
 							job.recovered = Some(settlement.clone());
@@ -481,6 +500,23 @@ impl JobBoard {
 		}
 		self.rebuild(session);
 		Ok(self.list())
+	}
+
+	/// Whether the named execution unit has finished but has not yet been
+	/// committed to its DOM node.
+	#[must_use]
+	pub fn has_finished(&self, id: &str) -> bool {
+		self.jobs.lock().values().any(|job| {
+			job.record.id == id
+				&& (job.orphaned
+					|| job.recovered.is_some()
+					|| job.task.as_ref().is_some_and(JoinHandle::is_finished)
+					|| job._detached.as_ref().is_some_and(|detached| {
+						detached.closed
+							|| !detached.events.is_empty()
+							|| detached.task.as_ref().is_some_and(JoinHandle::is_finished)
+					}))
+		})
 	}
 
 	/// Whether any owned execution unit has finished but not yet been
@@ -526,23 +562,28 @@ impl JobBoard {
 		session: &Session,
 		settlement: RecoveredSettlement,
 	) -> Result<JobSettlement, omp_session::SessionError> {
-		let output = settlement
-			.artifact
-			.map(|artifact| self.pin_artifact(session, artifact))
-			.transpose()?
-			.map(|artifact| {
-				serde_json::value::to_raw_value(&SpilledOutput {
-					artifact: Str::new(format!("artifact://sha256/{}", artifact.to_hex())),
-					byte_len: artifact.size,
-					text:     None,
+		let output = match settlement.output {
+			Some(output) => Some(output),
+			None => settlement
+				.artifact
+				.map(|artifact| self.pin_artifact(session, artifact))
+				.transpose()?
+				.map(|artifact| {
+					serde_json::value::to_raw_value(&SpilledOutput {
+						artifact: Str::new(format!("artifact://sha256/{}", artifact.to_hex())),
+						byte_len: artifact.size,
+						text:     None,
+					})
 				})
-			})
-			.transpose()?;
+				.transpose()?,
+		};
 		Ok(JobSettlement {
-			status: Str::new_static(if settlement.is_error {
-				"failed"
-			} else {
-				"completed"
+			status: settlement.status.unwrap_or_else(|| {
+				Str::new_static(if settlement.is_error {
+					"failed"
+				} else {
+					"completed"
+				})
 			}),
 			output,
 			error: settlement.error,
@@ -750,6 +791,56 @@ async fn terminate_runtime(mut job: RuntimeJob) -> JobSettlement {
 	}
 }
 
+fn recovered_settlement(dom: &Dom, record: &JobRecord) -> Option<RecoveredSettlement> {
+	recovered_workpool_settlement(dom, record).or_else(|| recovered_tool_settlement(dom, record))
+}
+
+fn recovered_workpool_settlement(dom: &Dom, record: &JobRecord) -> Option<RecoveredSettlement> {
+	if record.kind != JobKind::Tool || !is_live_status(record.status.as_str()) {
+		return None;
+	}
+	let node = dom.get(record.handle)?;
+	let Value::Json(raw) = node.prop(&PropKey::Custom(Str::new_static(WORKPOOL_STATE)))? else {
+		return None;
+	};
+	let state = serde_json::from_str::<serde_json::Value>(raw.get()).ok()?;
+	if state.get("closed").and_then(serde_json::Value::as_bool) != Some(true) {
+		return None;
+	}
+	let summary = state.get("summary").and_then(serde_json::Value::as_str)?;
+	let status = state
+		.get("terminal_status")
+		.and_then(serde_json::Value::as_str)
+		.filter(|status| matches!(*status, "completed" | "cancelled" | "failed"))
+		.map(Str::new)
+		.unwrap_or_else(|| Str::new_static("completed"));
+	let is_error = status != "completed";
+	let error = match status.as_str() {
+		"cancelled" => Some(Str::new_static("workpool was cancelled")),
+		"failed" => Some(Str::new_static("workpool failed before settlement delivery")),
+		_ => None,
+	};
+	let output = serde_json::value::to_raw_value(&serde_json::json!({ "text": summary })).ok()?;
+	Some(RecoveredSettlement {
+		is_error,
+		status: Some(status),
+		artifact: None,
+		output: Some(output),
+		error,
+	})
+}
+
+fn restart_orphan(record: &JobRecord, recovered: Option<&RecoveredSettlement>) -> bool {
+	is_live_status(record.status.as_str())
+		&& match record.kind {
+			JobKind::Tool => recovered.is_none(),
+			JobKind::Subagent => true,
+			// The environment host owns durable process generations and may
+			// reconnect them independently of this disposable board.
+			JobKind::Process => false,
+		}
+}
+
 fn recovered_tool_settlement(dom: &Dom, record: &JobRecord) -> Option<RecoveredSettlement> {
 	if record.kind != JobKind::Tool || !is_live_status(record.status.as_str()) {
 		return None;
@@ -781,7 +872,7 @@ fn recovered_tool_settlement(dom: &Dom, record: &JobRecord) -> Option<RecoveredS
 			.map(Str::new)
 			.unwrap_or_else(|| Str::new_static("detached tool failed"))
 	});
-	Some(RecoveredSettlement { is_error, artifact, error })
+	Some(RecoveredSettlement { is_error, status: None, artifact, output: None, error })
 }
 
 fn find_call(dom: &Dom, parent: Handle, call: EntryId) -> Option<Handle> {
@@ -957,10 +1048,10 @@ pub fn undelivered(dom: &Dom) -> Vec<JobRecord> {
 		.into_iter()
 		.filter(|record| {
 			!is_live_status(record.status.as_str())
-				&& dom
+				&& !dom
 					.get(record.handle)
 					.and_then(|node| node.prop(&PropKey::Custom(Str::new_static(DELIVERED))))
-					.is_none()
+					.is_some_and(|value| matches!(value, Value::Bool(true)))
 		})
 		.collect::<Vec<_>>();
 	out.sort_by(|left, right| {

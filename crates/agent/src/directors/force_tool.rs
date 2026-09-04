@@ -1,7 +1,7 @@
 //! Forced-tool Director and its bounded escalation ladder.
 
 use omp_core::Str;
-use omp_dom::{Dom, Node};
+use omp_dom::{Dom, KnownTag, Node, PropId, PropKey, Tag, Value};
 use omp_inference::{ChatRequest, ForcedCall, Setting, ToolChoice};
 
 use crate::director::{
@@ -57,6 +57,7 @@ impl ForceTool {
 		let name = state_str(node, "tool").unwrap_or_else(|| Str::new_static("required"));
 		let until = match state_str(node, "until").as_deref() {
 			Some("*") | None => ForceUntil::AnyToolCall,
+			Some("terminal-yield") => ForceUntil::TerminalYield,
 			Some(tool) => ForceUntil::ToolCalled(Str::new(tool)),
 		};
 		let reminder = state_str(node, "reminder").filter(|value| !value.is_empty());
@@ -75,8 +76,44 @@ impl ForceTool {
 		match &self.until {
 			ForceUntil::AnyToolCall => turn.had_tool_calls,
 			ForceUntil::ToolCalled(tool) => turn_called(dom, turn.turn, tool),
+			ForceUntil::TerminalYield => turn_has_terminal_yield(dom, turn.turn),
 		}
 	}
+}
+
+fn turn_has_terminal_yield(dom: &Dom, turn: omp_dom::Handle) -> bool {
+	dom.children(turn).iter().copied().any(|handle| {
+		let Some(call) = dom.get(handle) else {
+			return false;
+		};
+		if !matches!(&call.tag, Tag::Custom(name) if name == "yield")
+			|| call
+				.prop(&PropKey::from(PropId::Status))
+				.and_then(Value::as_str)
+				!= Some("ok")
+		{
+			return false;
+		}
+		dom.children(handle).iter().copied().any(|child| {
+			let Some(result) = dom.get(child) else {
+				return false;
+			};
+			if result.tag != Tag::Known(KnownTag::Result) {
+				return false;
+			}
+			let Some(Value::Json(raw)) = result.prop(&PropKey::from(PropId::Outcome)) else {
+				return false;
+			};
+			let Ok(outcome) = serde_json::from_str::<serde_json::Value>(raw.get()) else {
+				return false;
+			};
+			let Some(payload) = outcome.get("value") else {
+				return false;
+			};
+			payload.get("complete").and_then(serde_json::Value::as_bool) == Some(true)
+				|| payload.get("failed").and_then(serde_json::Value::as_bool) == Some(true)
+		})
+	})
 }
 
 impl Director for ForceTool {
@@ -96,6 +133,7 @@ impl Director for ForceTool {
 				BindValue::Str(match &self.until {
 					ForceUntil::AnyToolCall => Str::new_static("*"),
 					ForceUntil::ToolCalled(tool) => tool.clone(),
+					ForceUntil::TerminalYield => Str::new_static("terminal-yield"),
 				}),
 			),
 			(Str::new_static("reminder"), BindValue::Str(self.reminder.clone().unwrap_or_default())),
