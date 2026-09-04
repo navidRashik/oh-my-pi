@@ -362,6 +362,32 @@ describe("github copilot model limits mapping", () => {
 		// not the OpenAI global reference (1050k).
 		expect(model?.contextWindow).toBe(272_000);
 	});
+	it("does not inherit a cross-provider wire id from the global reference index (#10796)", async () => {
+		// The bundled reference index is keyed by bare model id across every
+		// provider, so a Copilot-served id can collide with a model owned only by
+		// another provider (here `cursor`, api `cursor-agent`). `cursor-*` ids are
+		// cursor-exclusive, so the global index resolves them to the cursor spec
+		// and its cursor-only `requestModelId`/`effortRouting`. Before the fix the
+		// discovery mapper spread that spec wholesale and the model emitted the
+		// cursor wire id as `body.model` -> HTTP 400 model_not_supported. The
+		// crossing must keep provider-independent metadata but drop wire routing.
+		const collision = getBundledModels("cursor").find(
+			candidate => candidate.requestModelId && candidate.id.startsWith("cursor-"),
+		);
+		expect(collision).toBeDefined();
+		const servedId = collision!.id;
+		expect(collision!.provider).toBe("cursor");
+
+		const { models } = await discoverCopilotModels({ data: [{ id: servedId, name: servedId }] });
+		const model = models.find(candidate => candidate.id === servedId);
+		expect(model).toBeDefined();
+		expect(model?.provider).toBe("github-copilot");
+		expect(model?.requestModelId).toBeUndefined();
+		expect(model?.thinking?.effortRouting).toBeUndefined();
+		// Provider-independent metadata still crosses (this is why the global
+		// index exists): the cursor context window is inherited.
+		expect(model?.contextWindow).toBe(collision!.contextWindow);
+	});
 	it("routes mai-code models to the openai-responses endpoint (#5612)", async () => {
 		// Copilot's /chat/completions rejects mai-* models with
 		// `unsupported_api_for_model` (400); they are served only via /responses.
