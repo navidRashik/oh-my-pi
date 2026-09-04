@@ -261,6 +261,23 @@ describe("status line path segment", () => {
 			removeSyncWithRetries(parentDir);
 		}
 	});
+	it("does not repeat canonical filesystem reads for an unchanged project directory", () => {
+		const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-status-line-cache-"));
+		try {
+			setProjectDir(scratchDir);
+			const realpath = vi.spyOn(fs, "realpathSync");
+
+			renderSegment("path", createPathContext());
+			const coldReads = realpath.mock.calls.length;
+			expect(coldReads).toBeGreaterThan(0);
+
+			renderSegment("path", createPathContext());
+			expect(realpath).toHaveBeenCalledTimes(coldReads);
+		} finally {
+			setProjectDir(originalProjectDir);
+			removeSyncWithRetries(scratchDir);
+		}
+	});
 });
 
 describe("status line path segment in a linked worktree", () => {

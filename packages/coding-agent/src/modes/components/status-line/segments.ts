@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { SPINNER_ADVANCE_MS, TERMINAL } from "@oh-my-pi/pi-tui";
 import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { type Theme, type ThemeColor, theme } from "../../../modes/theme/theme";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../../tools/render-utils";
 import { fileHyperlink } from "../../../tui/hyperlink";
@@ -127,13 +128,28 @@ const SCRATCH_ROOTS: readonly string[] = (() => {
 	return [...roots];
 })();
 
-function classifyProjectDir(pwd: string): { scratch: boolean; relative: string | null } {
+interface ProjectDirClassification {
+	readonly scratch: boolean;
+	readonly relative: string | null;
+	readonly stripped: string;
+}
+
+const PROJECT_DIR_CLASSIFICATIONS = new LRUCache<string, ProjectDirClassification>({ max: 32 });
+
+function classifyProjectDir(pwd: string): ProjectDirClassification {
+	const cached = PROJECT_DIR_CLASSIFICATIONS.get(pwd);
+	if (cached) return cached;
+
+	let classification: ProjectDirClassification | undefined;
 	for (const root of SCRATCH_ROOTS) {
 		if (pathIsWithin(root, pwd)) {
-			return { scratch: true, relative: relativePathWithinRoot(root, pwd) };
+			classification = { scratch: true, relative: relativePathWithinRoot(root, pwd), stripped: pwd };
+			break;
 		}
 	}
-	return { scratch: false, relative: null };
+	classification ??= { scratch: false, relative: null, stripped: stripDisplayRoot(pwd) };
+	PROJECT_DIR_CLASSIFICATIONS.set(pwd, classification);
+	return classification;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -408,15 +424,12 @@ const pathSegment: StatusLineSegment = {
 		}
 
 		const projectDir = ctx.activeRepo?.cwd ?? getProjectDir();
-		const { scratch, relative } = classifyProjectDir(projectDir);
+		let scratch = false;
 		let pwd = projectDir;
-
 		if (stripPrefix) {
-			if (scratch) {
-				if (relative) pwd = relative;
-			} else {
-				pwd = stripDisplayRoot(pwd);
-			}
+			const classification = classifyProjectDir(projectDir);
+			scratch = classification.scratch;
+			pwd = classification.scratch ? (classification.relative ?? projectDir) : classification.stripped;
 		}
 		const repoSuffix = ctx.activeRepo ? ` ↳ ${ctx.activeRepo.relativeRepoRoot}` : "";
 		if (opts.abbreviate !== false) {
