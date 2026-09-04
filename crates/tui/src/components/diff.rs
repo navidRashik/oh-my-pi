@@ -1105,7 +1105,8 @@ mod tests {
 	}
 
 	/// The `edit` and `apply_patch` gallery fixtures must paint exactly as
-	/// pi's `renderDiff` does in `.gallery-ref/tools/{edit,apply_patch}.txt`.
+	/// pi's `renderDiff` does in
+	/// `scripts/qa/fixtures/gallery/tools/{edit,apply_patch}.txt`.
 	#[test]
 	fn gallery_edit_fixtures_match_pi_rows() {
 		let edit = "@@ -88,5 +88,6 @@\n \tconst offset = args.offset ?? 1;\n-\tconst limit = \

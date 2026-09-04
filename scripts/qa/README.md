@@ -5,6 +5,49 @@ harness, no unit-test mocks. A scripted mock model server stands in for the
 LLM; everything else (catalog, inference spine, agent loop, envd, tools,
 journal, sessions) is production code. Pure-stdlib Python.
 
+## Spine smoke gates
+
+These five executable smoke drivers exercise the production binary rather
+than a library-only substitute:
+
+| Driver | Gate proved |
+|---|---|
+| `scripts/qa/smoke-print.sh` | P0/P1: vendor credentials and the Anthropic, OpenAI, and OpenRouter routes each complete one real `pong` turn. |
+| `scripts/qa/smoke-spine.sh` | P3: the journal-first kernel performs a provider turn, journals causal `.oms` entries, resumes it, and renders the replayed session. |
+| `scripts/qa/smoke-tools.sh` | P6: the production kernel dispatches the built-in tool matrix and journals settled outcomes. |
+| `scripts/qa/smoke-pty.ts` | P5/P7: terminal chat paints welcome/composer, streams a provider turn and tool card, survives resize, and exits with terminal state restored. |
+| `scripts/qa/run.py` | Deterministic joined-system regression smoke over the real binary with the scripted model, including extension and transport cases. |
+
+Prerequisites: build `target/debug/omp` (or let the TypeScript PTY driver
+build it), run `just setup-python` once, and create
+`/tmp/omp-smoke/note.txt` containing `hello from fixture`. The real-provider
+driver needs vendor-standard `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and
+`OPENROUTER_API_KEY`; the deterministic suite does not. The PTY driver needs
+Bun and the repository's `.omp/tools` dependencies. Run the shell scripts
+from the repository root.
+
+## Gallery references
+
+`fixtures/gallery/` holds pi reference captures: collapsed, expanded, and
+styled tool cards plus terminal-surface captures. `crates/chat/tests/chrome.rs`
+also reads the chrome goldens here. Keep these fixtures; they are comparison
+inputs, not disposable build output.
+
+Compare against the current `target/debug/omp` binary:
+
+```sh
+OMP_GALLERY_BIN=target/debug/omp uv run --no-project python scripts/qa/gallery-diff.py
+OMP_GALLERY_BIN=target/debug/omp uv run --no-project python scripts/qa/gallery-diff.py --expanded
+```
+
+Pass tool names to narrow the comparison and `--diff` to show differences.
+After an intentional reference change, regenerate selected tool captures from
+`/work/pi` (override with `PI_ROOT`) and review the results:
+
+```sh
+uv run --no-project python scripts/qa/gallery-ref-regen.py resolve reject
+```
+
 ## Run the spec suite
 
 ```sh

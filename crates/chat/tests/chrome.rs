@@ -1,6 +1,7 @@
 //! Boot chrome goldens: the surface an interactive host paints at 120x40
 //! and 80x24, and the composer status band byte-checked against pi's
-//! `.gallery-ref/surfaces/chrome-*.txt` band rows (idle, working, resized).
+//! `scripts/qa/fixtures/gallery/surfaces/chrome-*.txt` band rows (idle,
+//! working, resized).
 
 use std::time::Duration;
 
@@ -18,7 +19,8 @@ use tempfile::tempdir;
 /// pi's band row from the capture at the given geometry, for exact-byte
 /// comparison of the static content.
 fn reference_band(name: &str, row: usize) -> String {
-	let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.gallery-ref/surfaces/chrome-");
+	let path =
+		concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/qa/fixtures/gallery/surfaces/chrome-");
 	let text = std::fs::read_to_string(format!("{path}{name}.txt")).expect("reference capture");
 	text.lines().nth(row).expect("band row").to_owned()
 }
