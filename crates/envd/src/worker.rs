@@ -1215,10 +1215,12 @@ impl LifecycleHost for FrozenControlLifecycleHost {
 			deadline:  EventDeadline { at: Instant::now() + Duration::from_secs(10) },
 		};
 		async move {
-			let frozen = self
+			let mut frozen = self
 				.control
 				.dispatch(dispatch)
 				.await
+				.map_err(|error| Str::from(error.to_string()))?;
+			normalize_control_availability(&self.manifest, &mut frozen)
 				.map_err(|error| Str::from(error.to_string()))?;
 			let evidence = seal_registry_evidence(
 				Arc::clone(&self.identity),
@@ -1335,6 +1337,51 @@ impl LifecycleHost for FrozenControlLifecycleHost {
 	}
 }
 
+fn normalize_control_availability(
+	manifest: &ExtensionManifest,
+	publication: &mut serde_json::Value,
+) -> Result<(), ExtHostError> {
+	let rows = publication
+		.as_object_mut()
+		.and_then(|publication| publication.get_mut("availability"))
+		.and_then(serde_json::Value::as_array_mut)
+		.ok_or_else(|| ExtHostError::Protocol(sf!("CONTROL freeze omitted availability")))?;
+	for row in rows {
+		let row = row
+			.as_object_mut()
+			.ok_or_else(|| ExtHostError::Protocol(sf!("CONTROL availability row is malformed")))?;
+		let name = row
+			.get("name")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| ExtHostError::Protocol(sf!("CONTROL availability name is malformed")))?;
+		let revision = row
+			.get("rev")
+			.and_then(serde_json::Value::as_u64)
+			.and_then(|revision| u16::try_from(revision).ok())
+			.ok_or_else(|| {
+				ExtHostError::Protocol(sf!("CONTROL availability revision is malformed"))
+			})?;
+		let family = row
+			.get("family")
+			.and_then(serde_json::Value::as_str)
+			.ok_or_else(|| ExtHostError::Protocol(sf!("CONTROL availability family is malformed")))?;
+		let Some(declared) = manifest
+			.declarations
+			.tools()
+			.find(|declared| declared.name == name && declared.rev == revision)
+		else {
+			continue;
+		};
+		if family == manifest.provenance.extension_id() && family != declared.family.as_str() {
+			row.insert(
+				String::from("family"),
+				serde_json::Value::String(declared.family.to_string()),
+			);
+		}
+	}
+	Ok(())
+}
+
 async fn freeze_control_registry(
 	control: ControlHandle,
 	identity: Arc<ControlConnectionIdentity>,
@@ -1351,7 +1398,7 @@ async fn freeze_control_registry(
 	authority.phase = InvocationPhase::Open;
 	authority.lifecycle = LifecyclePhase::Frozen;
 	authority.event = Some(sf!("freeze"));
-	let payload = control
+	let mut payload = control
 		.dispatch(ControlDispatch {
 			operation: sf!("omp.lifecycle.freeze"),
 			arguments: serde_json::Map::new(),
@@ -1361,6 +1408,7 @@ async fn freeze_control_registry(
 		})
 		.await
 		.map_err(|error| ExtHostError::Protocol(Str::from(error.to_string())))?;
+	normalize_control_availability(manifest, &mut payload)?;
 	let evidence = seal_registry_evidence(identity, session, manifest, payload)
 		.map_err(|error| ExtHostError::Protocol(Str::from(error.to_string())))?;
 	ensure_committed_argument_tools(&evidence.tools)?;

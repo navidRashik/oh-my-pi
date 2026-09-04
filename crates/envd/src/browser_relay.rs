@@ -2016,10 +2016,10 @@ impl RelayBridge {
 		};
 		let detached = self.rpc(RpcRequest::Detach { tab_id }).await.is_ok();
 		let mut state = self.state.lock();
-		if let Some(tab) = state.tabs.get_mut(&tab_id) {
-			if tab.detaching == Some(epoch) {
-				tab.detaching = None;
-			}
+		if let Some(tab) = state.tabs.get_mut(&tab_id)
+			&& tab.detaching == Some(epoch)
+		{
+			tab.detaching = None;
 			if detached {
 				tab.detach_pending = false;
 			}
@@ -2609,9 +2609,10 @@ impl RelayBridge {
 				let Some(tab) = state.tabs.get_mut(&tab_id) else {
 					return;
 				};
-				tab.detach_pending = false;
 				let detached = !tab.reattached_after_detach;
 				if detached {
+					tab.detach_pending = false;
+					reset_detaching(tab);
 					tab.attached = false;
 					reset_runtime(tab);
 				}

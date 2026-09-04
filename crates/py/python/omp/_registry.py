@@ -846,10 +846,7 @@ class DeclarationRegistry:
             and kind in {"soft", "hard"}
             and (
                 manifest_key in self._manifest_tools
-                or (
-                    uniform is not None
-                    and uniform.module == getattr(body, "__module__", None)
-                )
+                or uniform is not None
             )
         ):
             return manifest_key
@@ -864,7 +861,17 @@ class DeclarationRegistry:
         for key in sorted(self._tools):
             control_key = self._control_tool_key(key)
             if key in self._legacy_worker_tools:
-                projected.append(self._legacy_worker_tools[key])
+                legacy = self._legacy_worker_tools[key]
+                static_key = _manifest_tool_static_key(control_key)
+                declared_kind = next(
+                    (
+                        kind
+                        for kind in ("soft", "hard")
+                        if (kind, static_key) in self._manifest_executables
+                    ),
+                    legacy.kind,
+                )
+                projected.append(replace(legacy, kind=declared_kind))
                 continue
             definition = self._device_definitions.get(key)
             if definition is None:
