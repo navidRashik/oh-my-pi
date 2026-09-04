@@ -16,7 +16,7 @@ use omp_catalog::{
 	Availability, GrammarBits, ModalityBits, ModelAvailability, ModelKey, ModelSpec, OperationKind,
 	ProviderDef, ProviderId, model::ProvenanceKind, provider::AuthSpecKind,
 };
-use omp_core::Str;
+use omp_core::{Str, format_rfc3339};
 use omp_inference::{
 	Client, ProviderResponseHooks, Registry, RetryAction,
 	answer::{
@@ -2462,6 +2462,7 @@ fn configured_search_providers(name: &str) -> Vec<ProviderId> {
 		"perplexity" => {
 			&["perplexity-cookie", "perplexity", "perplexity-openrouter", "perplexity-anonymous"]
 		},
+		"public" => &["startpage", "google-search", "duckduckgo", "ecosia", "mojeek"],
 		_ => &[omp_inference::search_settings::catalog_provider_name(name)],
 	};
 	names.iter().map(|name| ProviderId::from(*name)).collect()
@@ -3374,10 +3375,7 @@ fn search_response(answer: SearchResults) -> pb::SearchResponse {
 				snippet:      result
 					.snippet
 					.map_or_else(String::new, |snippet| snippet.as_str().to_owned()),
-				published_at: result
-					.published_at
-					.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-					.map_or_else(String::new, |duration| duration.as_secs().to_string()),
+				published_at: result.published_at.map_or_else(String::new, format_rfc3339),
 				author:       result
 					.author
 					.map_or_else(String::new, |author| author.as_str().to_owned()),
