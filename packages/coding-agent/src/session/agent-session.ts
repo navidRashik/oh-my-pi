@@ -1343,18 +1343,20 @@ export class AgentSession {
 			}
 		});
 		this.#detachUsageBeforeModelCall = this.agent.addBeforeModelCallHook(async signal => {
+			if (this.settings.get("retry.usageAwareFallback")) {
+				let preflightRequired = true;
+				if (this.#usagePreflightReadyForNextModelCall) {
+					const checkedModel = this.#usagePreflightReadyModel;
+					this.#usagePreflightReadyForNextModelCall = false;
+					this.#usagePreflightReadyModel = undefined;
+					preflightRequired = checkedModel !== this.model;
+				}
+				if (preflightRequired && !(await this.#runUsageAwarePreflight(signal))) {
+					signal?.throwIfAborted();
+					throw new DOMException("Usage preflight cancelled", "AbortError");
+				}
+			}
 			this.#ensureCodexSessionIdentity();
-			if (!this.settings.get("retry.usageAwareFallback")) return;
-			if (this.#usagePreflightReadyForNextModelCall) {
-				const checkedModel = this.#usagePreflightReadyModel;
-				this.#usagePreflightReadyForNextModelCall = false;
-				this.#usagePreflightReadyModel = undefined;
-				if (checkedModel === this.model) return;
-			}
-			if (!(await this.#runUsageAwarePreflight(signal))) {
-				signal?.throwIfAborted();
-				throw new DOMException("Usage preflight cancelled", "AbortError");
-			}
 		});
 		const statsHost: SessionStatsTrackerHost = {
 			session: this,
