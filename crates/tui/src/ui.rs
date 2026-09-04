@@ -884,6 +884,24 @@ impl Ui {
 			.map(Str::new)
 	}
 
+	/// Stable id of the topmost press target at one painted coordinate.
+	///
+	/// Drag owners use this to inspect the current drop target while the
+	/// keyboard focus and routed mouse capture correctly remain on the
+	/// component where the press began.
+	#[must_use]
+	pub fn id_at(&self, x: u16, y: u16) -> Option<Str> {
+		let source_y = y.saturating_add(
+			self
+				.viewport
+				.map_or(0, |viewport| self.frame.size().height.saturating_sub(viewport.height)),
+		);
+		let hit = self.hit_at(x, source_y, false)?;
+		find_slot_ref(&self.root, hit.slot)
+			.and_then(|cached| cached.comp().props().id())
+			.map(Str::new)
+	}
+
 	/// Returns the laid-out document rectangle of a named component.
 	///
 	/// Pointer-driven hosts use this to map coordinates onto semantic rows

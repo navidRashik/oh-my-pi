@@ -10,9 +10,9 @@ use omp_core::{Str, str::IntoStr};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 
-const MAX_CHECK_BYTES: usize = 32 * 1024;
+const MAX_CHECK_BYTES: usize = 20_000;
 #[cfg(target_os = "macos")]
-const MAX_SUGGESTIONS: usize = 8;
+const MAX_SUGGESTIONS: usize = 10;
 /// Independently configurable native spelling features.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpellingFeatures {
@@ -106,11 +106,11 @@ impl PendingRequests {
 
 	fn take(&mut self) -> Option<Request> {
 		self
-			.check
+			.correct
 			.take()
-			.or_else(|| self.complete.take())
-			.or_else(|| self.correct.take())
 			.or_else(|| self.guesses.take())
+			.or_else(|| self.complete.take())
+			.or_else(|| self.check.take())
 	}
 }
 
@@ -133,6 +133,7 @@ pub struct SpellingAssist {
 	pending:         Arc<Mutex<PendingRequests>>,
 	generation:      u64,
 	check_ticket:    Option<u64>,
+	check_source:    Option<Str>,
 	guesses_ticket:  Option<u64>,
 	complete_ticket: Option<u64>,
 	correct_ticket:  Option<u64>,
@@ -162,6 +163,7 @@ impl SpellingAssist {
 			pending,
 			generation: 0,
 			check_ticket: None,
+			check_source: None,
 			guesses_ticket: None,
 			complete_ticket: None,
 			correct_ticket: None,
@@ -186,18 +188,34 @@ impl SpellingAssist {
 	/// Schedules a latest-only check and keeps prior ranges projected while it
 	/// runs.
 	pub fn check(&mut self, text: &str, masked: &[Range<usize>]) {
-		if text.len() > MAX_CHECK_BYTES || text == self.checked_text.as_str() {
+		if text.len() > MAX_CHECK_BYTES {
+			self.check_ticket = None;
+			self.check_source = None;
+			self.checked_text = Str::default();
+			self.typos.clear();
+			self.projected.clear();
+			self.language = None;
+			return;
+		}
+		if text == self.checked_text.as_str() {
+			// Returning to the last checked text obsoletes any in-flight
+			// check for an intervening edit. Its projected ranges describe
+			// that edit, not the restored source.
+			self.check_ticket = None;
+			self.check_source = None;
+			self.projected.clear();
+			return;
+		}
+		if self.check_source.as_deref() == Some(text) {
 			return;
 		}
 		self.generation += 1;
 		self.check_ticket = Some(self.generation);
 		self.projected = project_ranges(&self.checked_text, text, &self.typos);
+		let source = text.into_str();
+		self.check_source = Some(source.clone());
 		let masked = mask_ranges(text, masked);
-		self.send(Request::Check {
-			generation: self.generation,
-			source:     text.into_str(),
-			masked:     masked.into_str(),
-		});
+		self.send(Request::Check { generation: self.generation, source, masked: masked.into_str() });
 	}
 
 	/// Requests replacements for the word under the cursor.
@@ -207,6 +225,7 @@ impl SpellingAssist {
 		}
 		self.generation += 1;
 		self.guesses_ticket = Some(self.generation);
+		self.guesses = None;
 		self.send(Request::Guesses { generation: self.generation, text: text.into_str(), range });
 	}
 
@@ -255,6 +274,7 @@ impl SpellingAssist {
 					if self.check_ticket == Some(generation) =>
 				{
 					self.check_ticket = None;
+					self.check_source = None;
 					if checked.as_str() == text {
 						self.checked_text = checked;
 						self.typos = result.typos;
@@ -315,13 +335,16 @@ impl SpellingAssist {
 
 	/// Clears cached state and invalidates outstanding results.
 	pub fn clear(&mut self) {
+		*self.pending.lock() = PendingRequests::default();
 		self.check_ticket = None;
+		self.check_source = None;
 		self.guesses_ticket = None;
 		self.complete_ticket = None;
 		self.correct_ticket = None;
 		self.checked_text = Str::default();
 		self.typos.clear();
 		self.projected.clear();
+		self.language = None;
 		self.guesses = None;
 		self.completion = None;
 		self.correction = None;
@@ -372,6 +395,28 @@ impl SpellingAssist {
 	pub(crate) fn seed_correction(&mut self, range: Range<usize>, replacement: &str) {
 		self.correction = Some((range, Str::new(replacement)));
 	}
+
+	#[cfg(test)]
+	pub(crate) fn seed_guesses(
+		&mut self,
+		text: &str,
+		range: Range<usize>,
+		items: impl IntoIterator<Item = &'static str>,
+	) {
+		self.guesses = Some((Str::new(text), range, items.into_iter().map(Str::new).collect()));
+	}
+
+	#[cfg(test)]
+	pub(crate) fn seed_typos(&mut self, text: &str, ranges: impl IntoIterator<Item = Range<usize>>) {
+		self.check_ticket = None;
+		self.check_source = None;
+		self.checked_text = Str::new(text);
+		self.typos = ranges
+			.into_iter()
+			.map(|range| TypoRange { start: range.start, end: range.end })
+			.collect();
+		self.projected.clear();
+	}
 }
 
 impl Default for SpellingAssist {
@@ -406,8 +451,9 @@ fn worker(rx: Receiver<Request>, tx: Sender<Response>, pending: Arc<Mutex<Pendin
 				},
 				Request::Correct { generation, ref text, ref range } => {
 					// An echo of the typed word is not a correction.
-					let correction = platform::correction(text, range.clone())
-						.filter(|correction| correction.as_str() != &text[range.clone()]);
+					let correction = platform::correction(text, range.clone()).filter(|correction| {
+						!correction.is_empty() && correction.as_str() != &text[range.clone()]
+					});
 					Response::Correct {
 						generation,
 						text: text.clone(),
@@ -546,16 +592,19 @@ mod platform {
 			if result.resultType() != NSTextCheckingType::Spelling {
 				continue;
 			}
-			let range = result.range();
-			if let Some(range) = utf16_to_bytes(text, range) {
-				if typos
-					.last()
-					.is_none_or(|last: &TypoRange| last.end <= range.start)
-				{
-					typos.push(range);
-				}
+			if let Some(range) = utf16_to_bytes(text, result.range()) {
+				typos.push(range);
 			}
 		}
+		typos.sort_unstable_by_key(|range| range.start);
+		let mut prior_end = 0;
+		typos.retain(|range| {
+			if range.start < prior_end {
+				return false;
+			}
+			prior_end = range.end;
+			true
+		});
 		let language = checker
 			.languageForWordRange_inString_orthography(full, &string, None)
 			.map(|value| Str::new(value.to_string()));
@@ -579,11 +628,18 @@ mod platform {
 				0,
 			)
 			.map(|values| {
-				values
-					.iter()
-					.take(MAX_SUGGESTIONS)
-					.map(|value| Str::new(value.to_string()))
-					.collect()
+				let mut items = SmallVec::new();
+				for value in values.iter() {
+					let item = Str::new(value.to_string());
+					if item.is_empty() || items.iter().any(|seen| seen == &item) {
+						continue;
+					}
+					items.push(item);
+					if items.len() == MAX_SUGGESTIONS {
+						break;
+					}
+				}
+				items
 			})
 			.unwrap_or_default()
 	}
@@ -680,7 +736,7 @@ mod platform {
 mod tests {
 	use smallvec::SmallVec;
 
-	use super::{Str, TypoRange, completion_suffix, mask_ranges, project_ranges};
+	use super::{SpellingAssist, Str, TypoRange, completion_suffix, mask_ranges, project_ranges};
 
 	#[test]
 	fn masking_preserves_offsets() {
@@ -691,6 +747,21 @@ mod tests {
 	fn typo_ranges_project_across_tail_edits() {
 		let ranges = [TypoRange { start: 0, end: 8 }];
 		assert_eq!(project_ranges("recieved", "recieved!", &ranges), ranges);
+	}
+
+	#[test]
+	fn repeated_paints_coalesce_one_check_and_restoring_checked_text_invalidates_it() {
+		let mut assist = SpellingAssist::new();
+		assist.seed_typos("eac", [0..3]);
+		assist.check("each", &[]);
+		let ticket = assist.check_ticket;
+		assert!(ticket.is_some());
+		assist.check("each", &[]);
+		assert_eq!(assist.check_ticket, ticket, "same source must not enqueue again");
+		assist.check("eac", &[]);
+		assert_eq!(assist.check_ticket, None);
+		assert_eq!(assist.check_source, None);
+		assert_eq!(assist.typo_ranges(), &[TypoRange { start: 0, end: 3 }]);
 	}
 
 	#[test]

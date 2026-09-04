@@ -958,8 +958,11 @@ mod tests {
 		assert_eq!(frame_row_text(&grown, 1), " +10│ten");
 		assert_eq!(frame_row_text(&grown, 2), "+100│hundred");
 		let gutter = frame_cell_style(&grown, 3, 0);
-		assert!(gutter.dim, "gutter is dim");
-		assert_eq!(gutter.foreground, ctx.theme.ok, "gutter keeps the row color");
+		assert!(!gutter.dim, "pi dims indentation glyphs, not the gutter");
+		assert_eq!(
+			gutter.foreground, ctx.theme.tool_diff_added,
+			"gutter uses the semantic added-line color"
+		);
 		assert!(!frame_cell_style(&grown, 5, 0).dim, "content is not dim");
 
 		let mut pair = view("-5|old\n+5|new\n 6|same\n@@ -9 +9 @@\n 9|far\n+9|inserted");
@@ -1076,7 +1079,7 @@ mod tests {
 		let mut plain = view(" \tfn main() {}");
 		let plain_frame = paint(&mut plain, 30, 1);
 		assert_eq!(frame_row_text(&plain_frame, 0), "  → fn main() {}");
-		assert_eq!(frame_cell_style(&plain_frame, 4, 0).foreground, ctx.theme.fg);
+		assert_eq!(frame_cell_style(&plain_frame, 4, 0).foreground, ctx.theme.tool_diff_context);
 
 		let mut highlighted = DiffView::new()
 			.with(Prop::Path, "src/main.rs")
@@ -1085,21 +1088,20 @@ mod tests {
 		assert_eq!(frame_row_text(&frame, 0), "    fn main() {}", "highlighted context expands tabs");
 		let keyword = frame_cell_style(&frame, 4, 0);
 		assert_eq!(keyword.foreground, ctx.theme.accent, "`fn` takes the keyword color");
-		assert!(keyword.bold);
 		assert_eq!(frame_row_text(&frame, 1), "-···fn old() {}");
 		assert_eq!(
 			frame_cell_style(&frame, 4, 1).foreground,
-			ctx.theme.err,
-			"changes keep +/- color"
+			ctx.theme.tool_diff_removed,
+			"changes keep their semantic +/- colors"
 		);
-		assert_eq!(frame_cell_style(&frame, 4, 2).foreground, ctx.theme.ok);
+		assert_eq!(frame_cell_style(&frame, 4, 2).foreground, ctx.theme.tool_diff_added);
 
 		let mut unknown = DiffView::new()
 			.with(Prop::Path, "notes.zzz")
 			.text(" \tfn main() {}");
 		let frame = paint(&mut unknown, 30, 1);
 		assert_eq!(frame_row_text(&frame, 0), "  → fn main() {}", "unknown languages stay plain");
-		assert_eq!(frame_cell_style(&frame, 4, 0).foreground, ctx.theme.fg);
+		assert_eq!(frame_cell_style(&frame, 4, 0).foreground, ctx.theme.tool_diff_context);
 	}
 
 	/// The `edit` and `apply_patch` gallery fixtures must paint exactly as
@@ -1169,10 +1171,10 @@ mod tests {
 		assert_eq!(frame_row_text(&frame, 4), " }");
 
 		let ctx = UiContext::default();
-		assert_eq!(frame_cell_style(&frame, 0, 0).foreground, ctx.theme.muted);
-		assert_eq!(frame_cell_style(&frame, 1, 1).foreground, ctx.theme.fg);
-		assert_eq!(frame_cell_style(&frame, 0, 2).foreground, ctx.theme.err);
-		assert_eq!(frame_cell_style(&frame, 0, 3).foreground, ctx.theme.ok);
+		assert_eq!(frame_cell_style(&frame, 0, 0).foreground, ctx.theme.tool_diff_context);
+		assert_eq!(frame_cell_style(&frame, 1, 1).foreground, ctx.theme.tool_diff_context);
+		assert_eq!(frame_cell_style(&frame, 0, 2).foreground, ctx.theme.tool_diff_removed);
+		assert_eq!(frame_cell_style(&frame, 0, 3).foreground, ctx.theme.tool_diff_added);
 	}
 
 	#[test]

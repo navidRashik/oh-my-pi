@@ -18,6 +18,7 @@ use crate::{
 struct TabsState {
 	titles: SmallVec<Str, 6>,
 	icons:  SmallVec<Str, 6>,
+	muted:  SmallVec<bool, 6>,
 	panes:  Vec<Cached>,
 	idx:    u16,
 	rule:   String,
@@ -72,9 +73,23 @@ impl Tabs {
 	/// leads the chip; when the bar overflows, trailing inactive chips
 	/// collapse to their icon alone.
 	pub fn pane_icon(
+		self,
+		icon: impl IntoStr,
+		title: impl IntoStr,
+		children: impl IntoChildren,
+	) -> Self {
+		self.pane_icon_muted(icon, title, false, children)
+	}
+
+	/// Appends an icon pane whose inactive chip may be visually muted.
+	///
+	/// Muted panes remain in the focus and pointer order; this is intended
+	/// for filters that retain zero-match tabs while de-emphasizing them.
+	pub fn pane_icon_muted(
 		mut self,
 		icon: impl IntoStr,
 		title: impl IntoStr,
+		muted: bool,
 		children: impl IntoChildren,
 	) -> Self {
 		let mut pane = Vec::new();
@@ -86,6 +101,7 @@ impl Tabs {
 		};
 		self.state.titles.push(title.into_str());
 		self.state.icons.push(icon.into_str());
+		self.state.muted.push(muted);
 		self.state.panes.push(pane);
 		self
 	}
@@ -276,6 +292,7 @@ impl Component for Tabs {
 		let slot = self.slot;
 		let titles = &self.state.titles;
 		let icons = &self.state.icons;
+		let muted = &self.state.muted;
 		let bar_rows = self.chip_layout(ctx, rect.width, |chip| {
 			let y = rect.y.saturating_add(chip.row);
 			if y >= pc.clip {
@@ -291,7 +308,8 @@ impl Component for Tabs {
 			let x = rect.x.saturating_add(chip.start);
 			let active = chip.index == idx;
 			let hovered = hover_chip == Some(chip.index);
-			if active {
+			let is_muted = muted.get(index).copied().unwrap_or(false);
+			if active && !is_muted {
 				pill(
 					pc.frame,
 					x,
@@ -304,7 +322,9 @@ impl Component for Tabs {
 					focused || hovered,
 				);
 			} else {
-				let mut style = Style::new().fg(if hovered {
+				let mut style = Style::new().fg(if is_muted {
+					ctx.theme.dim
+				} else if hovered {
 					ctx.theme.fg
 				} else {
 					ctx.theme.muted
@@ -549,5 +569,32 @@ mod tests {
 		let tabs = Tabs::new().pane("many", vec![Pre::new().text("a"), Pre::new().text("b")]);
 		assert_eq!(tabs.state.panes.len(), 1);
 		assert_eq!(tabs.state.panes[0].comp().children().len(), 2);
+	}
+
+	#[test]
+	fn muted_panes_retain_position_and_paint_with_the_dim_token() {
+		let ctx = UiContext::default();
+		let mut tabs = Tabs::new()
+			.pane_icon("tab.files", "Files", ())
+			.pane_icon_muted("tab.tools", "Tools", true, ());
+		assert_eq!(tabs.state.titles.as_slice(), ["Files", "Tools"]);
+		assert_eq!(tabs.state.muted.as_slice(), [false, true]);
+		assert_eq!(tabs.state.panes.len(), 2);
+
+		tabs.place(&ctx, Rect::new(0, 0, 40, 2));
+		let mut frame = Frame::new(Size::new(40, 2));
+		let mut hits = Vec::new();
+		let mut wakes = Vec::new();
+		let mut pc = PaintCtx::new(&mut frame, &ctx, &mut hits, &mut wakes);
+		tabs.paint(&mut pc, Rect::new(0, 0, 40, 2));
+		let tools = (0..40)
+			.find(|x| {
+				matches!(
+					pc.frame.cell(*x, 0).content(),
+					crate::CellContent::Grapheme { text, .. } if text == "T"
+				)
+			})
+			.expect("muted Tools label");
+		assert_eq!(pc.frame.cell(tools, 0).style().foreground_color(), ctx.theme.dim);
 	}
 }

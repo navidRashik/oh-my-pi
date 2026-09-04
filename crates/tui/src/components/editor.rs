@@ -1,6 +1,6 @@
 use std::{
 	cell::RefCell,
-	fs, io, mem,
+	fs, mem,
 	ops::Range,
 	path::Path,
 	rc::Rc,
@@ -391,6 +391,15 @@ impl KeywordAccent {
 	}
 }
 
+const MAX_SPELLING_LINE_UTF16: usize = 1_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AssistanceGuard {
+	text:   Str,
+	cursor: usize,
+	range:  Range<usize>,
+}
+
 /// Focusable editable leaf used by [`EditorPane`].
 pub struct EditInput {
 	props:             Props,
@@ -411,6 +420,8 @@ pub struct EditInput {
 	/// Cursor position an in-flight autocorrect request was made at; the
 	/// correction only applies while the cursor still sits there.
 	correction_guard:  Option<usize>,
+	/// Exact source snapshot for an in-flight replacement request.
+	guesses_guard:     Option<AssistanceGuard>,
 	/// pi `setImeSafeCursorLayout`: leave the caret row empty to its right
 	/// in side-bordered shapes so terminal-local IME preedit cannot shift the
 	/// chrome onto the next row.
@@ -437,6 +448,7 @@ impl EditInput {
 			spelling_features: SpellingFeatures::default(),
 			spelling_mask:     SmallVec::new(),
 			correction_guard:  None,
+			guesses_guard:     None,
 			ime_safe_cursor:   false,
 		}
 	}
@@ -504,6 +516,8 @@ impl EditInput {
 		let features = self.spelling_features;
 		if !features.typo_detection && !features.autocomplete && !features.autocorrect {
 			self.spelling.clear();
+			self.correction_guard = None;
+			self.guesses_guard = None;
 			return;
 		}
 		self.spelling_mask.clear();
@@ -516,6 +530,15 @@ impl EditInput {
 		);
 		self.spelling_mask.extend(code_ranges(self.editor.text()));
 		self.spelling_mask.extend(xml_ranges(self.editor.text()));
+		let mut line_start = 0;
+		for line in self.editor.text().split_inclusive('\n') {
+			let line_end = line_start + line.len();
+			let content = line.strip_suffix('\n').unwrap_or(line);
+			if content.encode_utf16().count() > MAX_SPELLING_LINE_UTF16 {
+				self.spelling_mask.push(line_start..line_end);
+			}
+			line_start = line_end;
+		}
 		if features.typo_detection {
 			self.spelling.check(self.editor.text(), &self.spelling_mask);
 		}
@@ -548,6 +571,7 @@ impl EditInput {
 		}
 		let boundary = match key {
 			Key::Space => ' ',
+			Key::ShiftEnter => '\n',
 			Key::Char(character) if is_word_boundary(character) => character,
 			_ => return,
 		};
@@ -567,8 +591,46 @@ impl EditInput {
 		self.spelling.request_correction(text, range);
 	}
 
+	fn accept_word_completion(&mut self, key: Key) -> bool {
+		if !self.spelling_features.autocomplete || self.editor.picker().is_some() {
+			return false;
+		}
+		let cursor = self.editor.buffer().cursor();
+		let text = self.editor.text();
+		let at_line_end = cursor == text.len() || text[cursor..].starts_with('\n');
+		if key != Key::Tab && !(key == Key::Right && at_line_end) {
+			return false;
+		}
+		let Some(range) = completion_prefix_range(text, cursor, &self.spelling_mask) else {
+			return false;
+		};
+		let Some(suffix) = self.spelling.completion(text, &range) else {
+			return false;
+		};
+		// pi stores logical lines without their newline: a completion at a
+		// line end therefore receives its separating space before `\n`.
+		let needs_space = text[cursor..]
+			.chars()
+			.next()
+			.is_none_or(|character| character == '\n' || !is_word_boundary(character));
+		let insert = if needs_space {
+			sf!("{suffix} ")
+		} else {
+			suffix
+		};
+		self.editor.apply_edit(cursor..cursor, &insert);
+		self.refresh_keyword_spans();
+		true
+	}
+
 	/// Applies native spelling feature gates.
 	pub fn set_spelling_features(&mut self, features: SpellingFeatures) {
+		if self.spelling_features == features {
+			return;
+		}
+		self.spelling.clear();
+		self.correction_guard = None;
+		self.guesses_guard = None;
 		self.spelling_features = features;
 		self.refresh_spelling();
 	}
@@ -675,6 +737,7 @@ impl EditInput {
 			&& let PropValue::Str(text) = &value
 		{
 			self.editor.set_text(text);
+			self.refresh_keyword_spans();
 		}
 		if prop == Prop::Rail
 			&& let PropValue::Bool(enabled) = &value
@@ -797,6 +860,50 @@ impl EditInput {
 		rows
 	}
 
+	fn picker_hit_index(&self, ctx: &UiContext, width: u16, visual_row: u16) -> Option<usize> {
+		let picker = self.editor.picker()?;
+		let max_rows = u16::try_from(picker.rows()).unwrap_or(u16::MAX);
+		let icon_width = self.picker_icon_width(ctx);
+		let mut offset = 0_u16;
+		for picker_row in picker.visible_rows() {
+			if offset >= max_rows {
+				break;
+			}
+			let (index, height) = match picker_row {
+				PickerRow::Header(_) => (None, 1),
+				PickerRow::Suggestion { index, suggestion } => {
+					let label_width = match suggestion.display() {
+						SuggestionDisplay::Text(label) => cell_width(label),
+						SuggestionDisplay::Emoji { emoji, shortcode } => cell_width(emoji)
+							.saturating_add(cell_width(shortcode))
+							.saturating_add(3),
+					};
+					let description_width = width
+						.saturating_sub(cell_width(ctx.charset.cursor()))
+						.saturating_sub(icon_width.saturating_add(u16::from(icon_width > 0)))
+						.saturating_sub(label_width)
+						.saturating_sub(2);
+					let height = if suggestion
+						.description()
+						.is_some_and(|description| cell_width(description) > description_width)
+						&& description_width > 0
+					{
+						2
+					} else {
+						1
+					};
+					(Some(index), height)
+				},
+			};
+			let height = height.min(max_rows - offset);
+			if visual_row >= offset && visual_row < offset.saturating_add(height) {
+				return index;
+			}
+			offset = offset.saturating_add(height);
+		}
+		None
+	}
+
 	fn paint_picker(&self, pc: &mut PaintCtx<'_>, rect: Rect, y: u16) {
 		let Some(picker) = self.editor.picker() else {
 			return;
@@ -804,6 +911,11 @@ impl EditInput {
 		let max_rows = u16::try_from(picker.rows()).unwrap_or(u16::MAX);
 		let right = rect.x.saturating_add(rect.width);
 		let icon_width = self.picker_icon_width(pc.ctx);
+		let hovered = pc.pointer.and_then(|(x, pointer_y)| {
+			(x >= rect.x && x < right && pointer_y >= y)
+				.then(|| self.picker_hit_index(pc.ctx, rect.width, pointer_y - y))
+				.flatten()
+		});
 		let mut offset = 0_u16;
 		for picker_row in picker.visible_rows() {
 			let row = y.saturating_add(offset);
@@ -820,7 +932,8 @@ impl EditInput {
 				continue;
 			};
 			let selected = index == picker.selected();
-			let style = Style::new().fg(if selected {
+			let highlighted = selected || hovered == Some(index);
+			let style = Style::new().fg(if highlighted {
 				pc.ctx.theme.accent
 			} else {
 				pc.ctx.theme.muted
@@ -953,6 +1066,15 @@ fn word_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
 		})
 		.unwrap_or(text.len());
 	(start < end).then_some(start..end)
+}
+
+fn assistance_word_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
+	word_range_at_cursor(text, cursor).or_else(|| {
+		let boundary = text[..cursor].chars().next_back()?;
+		is_word_boundary(boundary)
+			.then(|| word_suffix_range(text, cursor.saturating_sub(boundary.len_utf8())))
+			.flatten()
+	})
 }
 
 /// Prose word-boundary class: whitespace or clause punctuation.
@@ -1089,7 +1211,13 @@ impl Component for EditInput {
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
 		let spelling_changed = self.spelling.poll(self.editor.text());
-		if let Some((range, items)) = self.spelling.take_guesses() {
+		if let Some((range, items)) = self.spelling.take_guesses()
+			&& self.spelling_features.typo_detection
+			&& let Some(guard) = self.guesses_guard.take()
+			&& guard.text == self.editor.text()
+			&& guard.cursor == self.editor.buffer().cursor()
+			&& guard.range == range
+		{
 			let _ = self.editor.show_replacements(range, items);
 		}
 		if let Some((range, replacement)) = self.spelling.take_correction() {
@@ -1324,26 +1452,6 @@ impl Component for EditInput {
 				}
 			}
 			runs = overlay_chip_runs(&runs, &chips, content.text.len());
-			let mut typo_runs: SmallVec<(usize, usize, Style), 8> = SmallVec::new();
-			let typos: &[TypoRange] = if self.spelling_features.typo_detection {
-				self.spelling.typo_ranges()
-			} else {
-				&[]
-			};
-			let mut typo_cursor = 0;
-			for typo in typos {
-				let from = typo.start.max(start);
-				let to = typo.end.min(scanned);
-				if from < to && from >= typo_cursor {
-					typo_runs.push((
-						from - start,
-						to - start,
-						Style::new().undercurl().underline_color(pc.ctx.theme.err),
-					));
-					typo_cursor = to;
-				}
-			}
-			runs = overlay_chip_runs(&runs, &typo_runs, content.text.len());
 			let mut keyword_runs: SmallVec<(usize, usize, Style), 16> = SmallVec::new();
 			for &(keyword_start, keyword_end, keyword) in &self.keyword_spans {
 				let from = keyword_start.max(start);
@@ -1401,6 +1509,35 @@ impl Component for EditInput {
 						.bg(pc.ctx.theme.panel);
 				}
 			}
+			// Typo decoration is the last text-style layer. It adds only the
+			// semantic undercurl, preserving syntax/keyword foreground,
+			// field background, emphasis, and links under the hardware caret.
+			let typos: &[TypoRange] = if self.spelling_features.typo_detection {
+				self.spelling.typo_ranges()
+			} else {
+				&[]
+			};
+			let mut typo_runs: SmallVec<(usize, usize, Style), 8> = SmallVec::new();
+			let mut typo_cursor = 0;
+			for typo in typos {
+				let from = typo.start.max(start);
+				let to = typo.end.min(scanned);
+				if from >= to || from < typo_cursor {
+					continue;
+				}
+				let local_from = from - start;
+				let local_to = to - start;
+				for run in &runs {
+					let run_from = run.start.max(local_from);
+					let run_to = run.end.min(local_to);
+					if run_from < run_to {
+						let style = typo_squiggle_style(run.style, pc.ctx.theme.err);
+						typo_runs.push((run_from, run_to, style));
+					}
+				}
+				typo_cursor = to;
+			}
+			runs = overlay_chip_runs(&runs, &typo_runs, content.text.len());
 			let mut x = rect.x.saturating_add(layout.side_chrome);
 			if layout.gutter_width > 0 {
 				if row == 0 {
@@ -1519,34 +1656,18 @@ impl Component for EditInput {
 		if key == Key::Ctrl('.')
 			&& self.spelling_features.typo_detection
 			&& let Some(range) =
-				word_range_at_cursor(self.editor.text(), self.editor.buffer().cursor())
+				assistance_word_at_cursor(self.editor.text(), self.editor.buffer().cursor())
+			&& is_prose_word(self.editor.text(), &self.spelling_mask, &range)
 		{
+			self.guesses_guard = Some(AssistanceGuard {
+				text:   Str::new(self.editor.text()),
+				cursor: self.editor.buffer().cursor(),
+				range:  range.clone(),
+			});
 			self.spelling.request_guesses(self.editor.text(), range);
 			return Flow::Consumed;
 		}
-		if key == Key::Tab
-			&& self.spelling_features.autocomplete
-			&& self.editor.picker().is_none()
-			&& let Some(range) = completion_prefix_range(
-				self.editor.text(),
-				self.editor.buffer().cursor(),
-				&self.spelling_mask,
-			) && let Some(suffix) = self.spelling.completion(self.editor.text(), &range)
-		{
-			// pi: Tab materializes the ghost word completion, appending a
-			// space unless a boundary character already follows the cursor.
-			let cursor = self.editor.buffer().cursor();
-			let needs_space = self.editor.text()[cursor..]
-				.chars()
-				.next()
-				.is_none_or(|character| !is_word_boundary(character));
-			let insert = if needs_space {
-				sf!("{suffix} ")
-			} else {
-				suffix
-			};
-			self.editor.apply_edit(cursor..cursor, &insert);
-			self.refresh_keyword_spans();
+		if self.accept_word_completion(key) {
 			return Flow::Consumed;
 		}
 		if key == Key::Enter && self.props.flag(Prop::Submit) {
@@ -1610,6 +1731,39 @@ impl Component for EditInput {
 		rect: Rect,
 		mouse: Mouse,
 	) -> Flow {
+		let layout = self.style.layout(ec.ctx.charset);
+		let minimum_composer = 1_u16
+			.saturating_add(layout.top_rows)
+			.saturating_add(layout.bottom_rows);
+		let picker_height = self
+			.picker_height(ec.ctx, rect.width)
+			.min(rect.height.saturating_sub(minimum_composer));
+		let composer_height = rect.height.saturating_sub(picker_height);
+		let local_row = at.1.saturating_sub(rect.y);
+		if picker_height > 0 && local_row >= composer_height {
+			let index =
+				self.picker_hit_index(ec.ctx, rect.width, local_row.saturating_sub(composer_height));
+			return match mouse {
+				Mouse::Click => {
+					if let Some(index) = index
+						&& self.editor.click_picker(index) == EditOutcome::Changed
+					{
+						self.refresh_keyword_spans();
+						ec.request_layout();
+					}
+					Flow::Consumed
+				},
+				Mouse::Move => Flow::Consumed,
+				Mouse::WheelUp | Mouse::WheelDown => {
+					let _ = self.editor.wheel_picker(mouse == Mouse::WheelDown);
+					Flow::Consumed
+				},
+				Mouse::Release | Mouse::Drag => Flow::Consumed,
+				Mouse::RightClick | Mouse::MiddleClick | Mouse::WheelLeft | Mouse::WheelRight => {
+					Flow::Skip
+				},
+			};
+		}
 		match mouse {
 			Mouse::Click => {
 				let now = Instant::now();
@@ -1822,6 +1976,18 @@ fn chip_style(marker: &str) -> Option<Style> {
 #[must_use]
 pub fn marker_sized_paste(text: &str) -> bool {
 	text.len() > 1000 || text.bytes().filter(|byte| *byte == b'\n').count() >= 10
+}
+
+/// Adds a semantic typo squiggle without replacing any existing text style.
+///
+/// Background does not participate in [`Style::inherit`], so it is carried
+/// explicitly alongside foreground, emphasis, and hyperlink state.
+fn typo_squiggle_style(base: Style, error: Color) -> Style {
+	Style::new()
+		.undercurl()
+		.underline_color(error)
+		.inherit(base)
+		.bg(base.background_color())
 }
 
 /// Splices chip-styled runs over one row's syntax runs; chips win where
@@ -2900,42 +3066,6 @@ fn paint_xml_range(
 	x
 }
 
-/// Host lifecycle needed while a full-screen external editor owns the tty.
-pub trait ExternalEditorTerminal {
-	/// Leaves raw/alternate-screen modes before the child starts.
-	fn suspend_for_external_editor(&mut self) -> io::Result<()>;
-	/// Re-enters the UI and forces a complete repaint after the child exits.
-	fn restore_after_external_editor(&mut self) -> io::Result<()>;
-}
-
-/// RAII terminal suspension that restores the UI on every exit path.
-#[must_use]
-pub struct ExternalEditorSuspension<'a, T: ExternalEditorTerminal + ?Sized> {
-	terminal: Option<&'a mut T>,
-}
-
-impl<'a, T: ExternalEditorTerminal + ?Sized> ExternalEditorSuspension<'a, T> {
-	/// Suspends `terminal` and arms guaranteed restoration.
-	pub fn new(terminal: &'a mut T) -> io::Result<Self> {
-		terminal.suspend_for_external_editor()?;
-		Ok(Self { terminal: Some(terminal) })
-	}
-
-	/// Restores immediately and disarms drop restoration.
-	pub fn restore(mut self) -> io::Result<()> {
-		let terminal = self.terminal.take().expect("armed suspension");
-		terminal.restore_after_external_editor()
-	}
-}
-
-impl<T: ExternalEditorTerminal + ?Sized> Drop for ExternalEditorSuspension<'_, T> {
-	fn drop(&mut self) {
-		if let Some(terminal) = self.terminal.take() {
-			let _ = terminal.restore_after_external_editor();
-		}
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use std::{env, fs, path::PathBuf};
@@ -2946,7 +3076,7 @@ mod tests {
 		components::{ContextGaugeMode, Input, Segment, Status, StatusPlacement},
 		context::{Charset, UiContext},
 		editcore::Command,
-		frame::{Frame, Size},
+		frame::{Frame, Size, Underline},
 		test_support::frame_row_text,
 	};
 	fn temp_drop_file(test: &str, name: &str, bytes: &[u8]) -> PathBuf {
@@ -3005,6 +3135,44 @@ mod tests {
 	}
 
 	#[test]
+	fn right_arrow_accepts_word_completion_only_at_logical_line_end() {
+		let mut input = EditInput::new().with(Prop::Value, "recei");
+		input.set_spelling_features(assist_features(true, false));
+		input.spelling.seed_completion("recei", 0..5, "ved");
+		let mut ui = Ui::from_root(input, 40, UiContext::default());
+		ui.focus_first();
+		ui.handle_key(Key::Right);
+		assert_eq!(edit_input(&ui).buffer().text(), "received ");
+
+		let mut input = EditInput::new().with(Prop::Value, "recei rest");
+		input.set_spelling_features(assist_features(true, false));
+		input.spelling.seed_completion("recei rest", 0..5, "ved");
+		let mut ui = Ui::from_root(input, 40, UiContext::default());
+		ui.focus_first();
+		ui.handle_key(Key::Home);
+		for _ in 0..5 {
+			ui.handle_key(Key::Right);
+		}
+		assert_eq!(edit_input(&ui).buffer().cursor(), 5);
+		ui.handle_key(Key::Right);
+		assert_eq!(edit_input(&ui).buffer().text(), "recei rest");
+		assert_eq!(edit_input(&ui).buffer().cursor(), 6);
+
+		let mut input = EditInput::new().with(Prop::Value, "recei\nnext");
+		input.set_spelling_features(assist_features(true, false));
+		input.spelling.seed_completion("recei\nnext", 0..5, "ved");
+		let _ = input.editor.move_to_message_edge(false);
+		let mut ui = Ui::from_root(input, 40, UiContext::default());
+		ui.focus_first();
+		for _ in 0..5 {
+			ui.handle_key(Key::Right);
+		}
+		ui.handle_key(Key::Right);
+		assert_eq!(edit_input(&ui).buffer().text(), "received \nnext");
+		assert_eq!(edit_input(&ui).buffer().cursor(), 9);
+	}
+
+	#[test]
 	fn tab_word_completion_skips_space_before_boundary() {
 		let mut input = EditInput::new().with(Prop::Value, "recei.");
 		input.set_spelling_features(assist_features(true, false));
@@ -3045,6 +3213,132 @@ mod tests {
 		// A moved cursor or missing request leaves the text alone.
 		assert_eq!(corrected(Some(2)), "teh ");
 		assert_eq!(corrected(None), "teh ");
+	}
+
+	#[test]
+	fn autocorrect_preserves_a_newline_boundary() {
+		let mut input = EditInput::new().with(Prop::Value, "teh\n");
+		input.set_spelling_features(assist_features(false, true));
+		input.correction_guard = Some(4);
+		input.spelling.seed_correction(0..3, "the");
+		let mut ui = Ui::from_root(input, 40, UiContext::default());
+		let mut renderer = Renderer::new(Vec::new());
+		ui.present(&mut renderer, 10).unwrap();
+		assert_eq!(edit_input(&ui).buffer().text(), "the\n");
+		assert_eq!(edit_input(&ui).buffer().cursor(), 4);
+	}
+
+	#[test]
+	fn spelling_replacements_preserve_boundary_and_caret_offset() {
+		let text = "recieved ";
+		let mut input = EditInput::new().with(Prop::Value, text);
+		input.set_spelling_features(SpellingFeatures {
+			typo_detection: true,
+			autocomplete:   false,
+			autocorrect:    false,
+		});
+		input.guesses_guard =
+			Some(AssistanceGuard { text: Str::new(text), cursor: text.len(), range: 0..8 });
+		input
+			.spelling
+			.seed_guesses(text, 0..8, ["received", "relieved"]);
+		let mut ui = Ui::from_root(input, 40, UiContext::default());
+		ui.focus_first();
+		assert!(edit_input(&ui).editor.picker().is_some());
+		ui.handle_key(Key::Tab);
+		assert_eq!(edit_input(&ui).buffer().text(), "received ");
+		assert_eq!(edit_input(&ui).buffer().cursor(), 9);
+	}
+
+	#[test]
+	fn spelling_replacements_drop_stale_cursor_results() {
+		let text = "recieved";
+		let mut input = EditInput::new().with(Prop::Value, text);
+		input.set_spelling_features(SpellingFeatures {
+			typo_detection: true,
+			autocomplete:   false,
+			autocorrect:    false,
+		});
+		input.guesses_guard = Some(AssistanceGuard {
+			text:   Str::new(text),
+			cursor: text.len(),
+			range:  0..text.len(),
+		});
+		input
+			.spelling
+			.seed_guesses(text, 0..text.len(), ["received"]);
+		let _ = input.editor.handle(Key::Left);
+		let ui = Ui::from_root(input, 40, UiContext::default());
+		assert!(edit_input(&ui).editor.picker().is_none());
+		assert_eq!(edit_input(&ui).buffer().text(), text);
+	}
+
+	#[test]
+	fn spelling_replacements_drop_stale_source_results() {
+		let requested = "recieved";
+		let mut input = EditInput::new().with(Prop::Value, "recieved!");
+		input.set_spelling_features(SpellingFeatures {
+			typo_detection: true,
+			autocomplete:   false,
+			autocorrect:    false,
+		});
+		input.guesses_guard = Some(AssistanceGuard {
+			text:   Str::new(requested),
+			cursor: requested.len(),
+			range:  0..requested.len(),
+		});
+		input
+			.spelling
+			.seed_guesses("recieved!", 0..requested.len(), ["received"]);
+		let ui = Ui::from_root(input, 40, UiContext::default());
+		assert!(edit_input(&ui).editor.picker().is_none());
+		assert_eq!(edit_input(&ui).buffer().text(), "recieved!");
+	}
+
+	#[test]
+	fn typo_squiggle_preserves_text_and_field_surface_styles() {
+		let text = "recieved";
+		let mut input = EditInput::new()
+			.composer_style(ComposerStyle::Field)
+			.with(Prop::Value, text);
+		input.spelling.seed_typos(text, [0..text.len()]);
+		let mut context = UiContext::default();
+		context.theme.fg = Color::Rgb(0x11, 0x22, 0x33);
+		context.theme.panel = Color::Rgb(0x44, 0x55, 0x66);
+		context.theme.err = Color::Rgb(0xff, 0x5f, 0x5f);
+		let expected_foreground = context
+			.theme
+			.foreground_on(context.theme.fg, context.theme.panel);
+		let ui = Ui::from_root(input, 40, context);
+		let text_x = ComposerStyle::Field.layout(Charset::Unicode).side_chrome;
+		assert!(frame_row_text(ui.frame(), 0).contains(text));
+		let style = ui.frame().cell(text_x, 0).style().spec();
+		assert_eq!(style.foreground, expected_foreground);
+		assert_eq!(style.background, Color::Rgb(0x44, 0x55, 0x66));
+		assert_eq!(style.underline, Underline::Curly);
+		assert_eq!(style.underline_color, Color::Rgb(0xff, 0x5f, 0x5f));
+	}
+
+	#[test]
+	fn typo_squiggle_preserves_emphasis_and_link() {
+		let foreground = Color::Rgb(0x11, 0x22, 0x33);
+		let background = Color::Rgb(0x44, 0x55, 0x66);
+		let error = Color::Rgb(0xff, 0x5f, 0x5f);
+		let base = Style::new()
+			.fg(foreground)
+			.bg(background)
+			.bold()
+			.italic()
+			.link("https://example.test/typo");
+		let style = typo_squiggle_style(base, error).spec();
+
+		assert_eq!(style.foreground, foreground);
+		assert_eq!(style.background, background);
+		assert!(style.bold);
+		assert!(style.italic);
+		assert_eq!(style.link, base.spec().link);
+		assert_eq!(style.underline, Underline::Curly);
+		assert_eq!(style.underline_color, error);
 	}
 
 	#[test]
@@ -3285,10 +3579,12 @@ mod tests {
 			let style = frame.cell(x, row).style();
 			assert_ne!(style.background_color(), accent, "column {x} paints a caret block");
 		}
+		assert_ne!(frame.cell(column, row).style().foreground_color(), accent);
 		ui.handle_key(Key::Left);
 		let frame = ui.frame();
 		assert_eq!(frame.cursor(), Some((4, 0)));
 		assert_ne!(frame.cell(4, 0).style().background_color(), accent);
+		assert_ne!(frame.cell(4, 0).style().foreground_color(), accent);
 	}
 
 	/// Wide graphemes occupy two cells: the caret lands after the whole
@@ -3842,6 +4138,32 @@ mod tests {
 		assert_eq!(input.editor.picker().expect("slash popup").len(), 2);
 		assert!(ui.height() > collapsed_height);
 	}
+
+	#[test]
+	fn completion_popup_click_accepts_the_hit_row_without_moving_the_caret_first() {
+		let commands = vec![
+			crate::Command::new("help", "Show available commands", &[]),
+			crate::Command::new("models", "Choose a model", &[]),
+		];
+		let pane = EditorPane::new()
+			.with(Prop::Id, "input")
+			.completion(Box::new(SlashCommands::new(commands.into_boxed_slice())));
+		let mut ui = Ui::from_root(pane, 40, UiContext::default());
+		ui.focus_first();
+		ui.handle_key(Key::Char('/'));
+		let row = (0..ui.height())
+			.find(|row| frame_row_text(ui.frame(), *row).contains("models"))
+			.expect("models completion row");
+		ui.handle_mouse(1, row, Mouse::Click);
+		assert_eq!(ui.values()["input"], "/models ");
+		let pane = ui
+			.root()
+			.comp()
+			.downcast_ref::<EditorPane>()
+			.expect("editor pane");
+		assert!(!pane.popup_open());
+	}
+
 	#[test]
 	fn slash_completion_icons_resolve_per_charset_and_align_labels() {
 		let cases = [

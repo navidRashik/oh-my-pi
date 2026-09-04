@@ -101,7 +101,9 @@ pub use input::{
 	Chord, InputDecoder, InputEvent, Key, KeyEvent, Keymap, Mods, Mouse, MouseButton, MouseReport,
 	TerminalResponse, UiEvent, decode_keys,
 };
-pub use markup::{Border, Dim, MarkupOrigin, ParseError, parse_with_origin};
+pub use markup::{
+	Border, Dim, MarkupOrigin, ParseError, parse_component_with_origin, parse_with_origin,
+};
 pub use notify::{
 	Notification, NotificationAction, NotificationBuilder, NotificationSound, Urgency, notify,
 	notify_desktop,

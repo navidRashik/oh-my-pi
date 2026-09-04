@@ -409,6 +409,9 @@ impl Slots {
 		self.width = width;
 		self.viewport_rows = viewport_rows;
 		self.render_all();
+		if !width_changed {
+			return;
+		}
 		if let Some(index) = self
 			.blocks
 			.iter()
@@ -417,7 +420,7 @@ impl Slots {
 			self.begin_repair(Self::id(index));
 			return;
 		}
-		if !width_changed || self.policy == ResizePolicy::Preserve {
+		if self.policy == ResizePolicy::Preserve {
 			return;
 		}
 		let rows = self.replay_rows();
@@ -857,6 +860,32 @@ mod tests {
 		let mut one = Frame::new(Size::new(width, 1));
 		one.blit(frame, row, 1, 0, 0);
 		one
+	}
+
+	#[test]
+	fn height_only_resize_never_rebuilds_partly_emitted_history() {
+		let mut slots = Slots::new(16, 2, ResizePolicy::Rebuild);
+		let id = slots.open(Mode::AppendOnly);
+		slots.append(id, "one\ntwo\nthree\nfour\n");
+		let mut now = Duration::ZERO;
+		while slots.emitted(id) == 0 {
+			now += anim::FRAME + Duration::from_millis(1);
+			assert!(now < Duration::from_secs(5), "rows never left the viewport");
+			slots.tick(now);
+			let plan = slots.plan();
+			slots.commit(plan, Delivered::All);
+		}
+		let before = history(&slots);
+		slots.finalize(id);
+		slots.resize(16, 6);
+
+		let plan = slots.plan();
+		assert!(!plan.rebuild(), "height-only resize preserves the native-history epoch");
+		slots.commit(plan, Delivered::All);
+		assert!(
+			history(&slots).starts_with(&before),
+			"already-delivered history remains an exact prefix"
+		);
 	}
 
 	#[test]

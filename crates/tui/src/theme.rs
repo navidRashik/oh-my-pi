@@ -40,10 +40,20 @@ impl JsonTheme {
 	pub fn parse(source: &str) -> Result<Self, ThemeError> {
 		let file: ThemeFile = serde_json::from_str(source).map_err(ThemeError::Json)?;
 		let (dark, light) = if let Some(colors) = &file.colors {
-			(
-				apply_rich(colors, &file.vars, Theme::for_appearance(Appearance::Dark))?,
-				apply_rich(colors, &file.vars, Theme::for_appearance(Appearance::Light))?,
-			)
+			let page_background = file
+				.export
+				.as_ref()
+				.and_then(|export| export.page_bg.as_ref())
+				.map(|value| resolve_color("export.pageBg", value, &file.vars))
+				.transpose()?
+				.flatten();
+			let mut dark = apply_rich(colors, &file.vars, Theme::for_appearance(Appearance::Dark))?;
+			let mut light = apply_rich(colors, &file.vars, Theme::for_appearance(Appearance::Light))?;
+			if let Some(background) = page_background {
+				dark.code_border = fence_border_with_contrast(dark.code_border, background);
+				light.code_border = fence_border_with_contrast(light.code_border, background);
+			}
+			(dark, light)
 		} else {
 			let dark = file.dark.apply(Theme::for_appearance(Appearance::Dark))?;
 			let light = file
@@ -273,8 +283,15 @@ struct ThemeFile {
 	colors:  Option<BTreeMap<String, ColorValue>>,
 	dark:    ThemePatch,
 	light:   Option<ThemePatch>,
-	export:  Option<serde_json::Value>,
+	export:  Option<ThemeExport>,
 	symbols: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct ThemeExport {
+	#[serde(rename = "pageBg")]
+	page_bg: Option<ColorValue>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -431,6 +448,32 @@ fn apply_rich(
 			_ => {},
 		}
 	}
+
+	// Rich pi themes name concrete presentation roles while omp components
+	// consume a smaller semantic palette. Preserve an explicitly authored
+	// semantic slot, otherwise use the closest concrete role as its fallback.
+	if !colors.contains_key("accent")
+		&& let Some(value) = colors.get("borderAccent")
+	{
+		theme.accent = resolve_color("borderAccent", value, vars)?.unwrap_or(Color::Default);
+	}
+	if !colors.contains_key("success")
+		&& let Some(value) = colors.get("toolDiffAdded")
+	{
+		theme.ok = resolve_color("toolDiffAdded", value, vars)?.unwrap_or(Color::Default);
+	}
+	if !colors.contains_key("error")
+		&& let Some(value) = colors.get("toolDiffRemoved")
+	{
+		theme.err = resolve_color("toolDiffRemoved", value, vars)?.unwrap_or(Color::Default);
+	}
+	if !colors.contains_key("userMessageBg")
+		&& !colors.contains_key("customMessageBg")
+		&& !colors.contains_key("toolSuccessBg")
+		&& let Some(value) = colors.get("statusLineBg")
+	{
+		theme.panel = resolve_color("statusLineBg", value, vars)?.unwrap_or(Color::Default);
+	}
 	Ok(theme)
 }
 
@@ -465,10 +508,48 @@ fn resolve_color(
 	Err(ThemeError::Color { token: Str::new(token), value: Str::new_static("variable cycle") })
 }
 
-#[cfg(test)]
+/// Code-fence rails are intentionally subdued chrome, but below this ratio
+/// they disappear against the canvas used by the theme.
 const MIN_FENCE_CONTRAST: f64 = 2.4;
 
-#[cfg(test)]
+fn fence_border_with_contrast(border: Color, background: Color) -> Color {
+	let Some(ratio) = color_contrast(border, background) else {
+		return border;
+	};
+	if ratio >= MIN_FENCE_CONTRAST {
+		return border;
+	}
+
+	let black = Color::Rgb(0, 0, 0);
+	let white = Color::Rgb(255, 255, 255);
+	let target = if color_contrast(black, background) >= color_contrast(white, background) {
+		black
+	} else {
+		white
+	};
+	let Some(target_ratio) = color_contrast(target, background) else {
+		return border;
+	};
+	if target_ratio < MIN_FENCE_CONTRAST {
+		return border;
+	}
+
+	// Find the smallest channel-space adjustment that restores legibility, so
+	// the authored hue and the intentionally quiet fence treatment survive.
+	let mut insufficient = 0.0_f32;
+	let mut sufficient = 1.0_f32;
+	for _ in 0..16 {
+		let amount = (insufficient + sufficient) / 2.0;
+		let candidate = border.mix(target, amount);
+		if color_contrast(candidate, background).is_some_and(|ratio| ratio >= MIN_FENCE_CONTRAST) {
+			sufficient = amount;
+		} else {
+			insufficient = amount;
+		}
+	}
+	border.mix(target, sufficient)
+}
+
 fn color_contrast(left: Color, right: Color) -> Option<f64> {
 	let Color::Rgb(left_red, left_green, left_blue) = left else {
 		return None;

@@ -232,12 +232,27 @@ pub fn parse_with_origin(
 	ctx: &UiContext,
 	origin: MarkupOrigin,
 ) -> Result<Cached, ParseError> {
+	parse_component_with_origin(source, ctx, origin).map(Cached::new)
+}
+
+/// Parses runtime markup directly into a retained component.
+///
+/// This is the component-level counterpart of [`parse_with_origin`] for
+/// projection registries which need to embed extension TML inside a larger
+/// typed tree instead of creating a standalone [`crate::Ui`].
+///
+/// # Errors
+/// Returns [`ParseError`] for malformed markup.
+pub fn parse_component_with_origin(
+	source: &Str,
+	ctx: &UiContext,
+	origin: MarkupOrigin,
+) -> Result<Box<dyn Component>, ParseError> {
 	let mut parser = Parser { source, src: source, ctx, fragment: false, origin };
 	let (parts, _) = parser.parse_children(0, None, false, 0, "col", &Props::new())?;
 	let children = cached_children(parts, "col")?;
-	let root = build("col", Props::new(), children, &Str::default())
-		.expect("the root col is a catalog component");
-	Ok(Cached::new(root))
+	Ok(build("col", Props::new(), children, &Str::default())
+		.expect("the root col is a catalog component"))
 }
 
 pub fn parse_md_fragment_inheriting(

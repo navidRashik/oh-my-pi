@@ -646,6 +646,7 @@ fn whole_text_attachment_path(text: &str) -> Option<Str> {
 		|| !has_raw_anchor(text)
 		|| classify_attachment_path(text).is_none()
 		|| has_interior_anchor(text)
+		|| has_complete_media_token_before_whitespace(text)
 	{
 		return None;
 	}
@@ -661,6 +662,24 @@ fn has_raw_anchor(path: &str) -> bool {
 			.is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
 		|| path.starts_with("\\\\")
 		|| is_windows_drive_path(path)
+}
+
+fn has_complete_media_token_before_whitespace(text: &str) -> bool {
+	let mut escaped = false;
+	for (index, ch) in text.char_indices() {
+		if ch == '\\' {
+			escaped = !escaped;
+			continue;
+		}
+		if is_ascii_path_whitespace(ch)
+			&& !escaped
+			&& classify_attachment_path(text[..index].trim_end()).is_some()
+		{
+			return true;
+		}
+		escaped = false;
+	}
+	false
 }
 
 fn has_interior_anchor(text: &str) -> bool {

@@ -30,6 +30,9 @@ const KILL_CAP: usize = 60;
 const UNDO_CAP: usize = 100;
 /// Default dropdown window (pi `autocompleteMaxVisible` default).
 const PICKER_ROWS: usize = 10;
+/// Page navigation fallback before a host reports its rendered viewport (pi
+/// `DEFAULT_PAGE_SCROLL_LINES`).
+const DEFAULT_PAGE_ROWS: usize = 10;
 /// pi `setAutocompleteMaxVisible` clamps the window to `[3, 20]`.
 const PICKER_ROWS_MIN: usize = 3;
 const PICKER_ROWS_MAX: usize = 20;
@@ -388,6 +391,13 @@ impl EditBuffer {
 		self.anchor = None;
 		self.desired = None;
 		self.break_sequence();
+	}
+
+	fn restore_cursor_offset(&mut self, offset: usize) {
+		let cursor = self.cursor.saturating_add(offset).min(self.text.len());
+		if self.text.is_char_boundary(cursor) {
+			self.cursor = cursor;
+		}
 	}
 
 	/// Replaces a transient range without recording an undo snapshot.
@@ -963,35 +973,18 @@ impl EditBuffer {
 		let destination = segments[target];
 		let source_cursor = self.cursor.clamp(source.start, source.end);
 		let column = cell_width(&self.text[source.start..source_cursor]);
-		let source_max = segment_max_column(&self.text[source.start..source.end], source.last);
 		let target_max =
 			segment_max_column(&self.text[destination.start..destination.end], destination.last);
-		let target_column = match self.desired {
-			None if target_max < column => {
-				self.desired = Some(column);
-				target_max
-			},
-			None => column,
-			Some(_) if column < source_max && target_max < column => {
-				self.desired = Some(column);
-				target_max
-			},
-			Some(_) if column < source_max => {
-				self.desired = None;
-				column
-			},
-			Some(preferred) if target_max < column || target_max < preferred => target_max,
-			Some(preferred) => {
-				self.desired = None;
-				preferred
-			},
-		};
+		let preferred = self.desired.unwrap_or(column);
+		let target_column = preferred.min(target_max);
 		let at = destination.start
-			+ byte_at_column(
-				&self.text[destination.start..destination.end],
-				target_column.min(target_max),
-			);
-		self.cursor = self.snap_position(at, delta > 0);
+			+ byte_at_column(&self.text[destination.start..destination.end], target_column);
+		let cursor = self.snap_position(at, delta > 0);
+		let landed_column = self.text.get(destination.start..cursor).map(cell_width);
+		self.desired =
+			(target_column != preferred || cursor != at || landed_column != Some(preferred))
+				.then_some(preferred);
+		self.cursor = cursor;
 		BufferOutcome::Changed
 	}
 
@@ -2020,8 +2013,8 @@ pub type SuggestionList = SmallVec<Suggestion, 8>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Suggestions {
 	/// UTF-8 byte range replaced by the selected row. The editor clamps it
-	/// around the cursor and inside the text, so a drifting end shrinks the
-	/// replacement instead of closing the dropdown.
+	/// around the request cursor and inside the request text; acceptance
+	/// separately rejects a result whose text or caret snapshot went stale.
 	pub range: ops::Range<usize>,
 	/// Rows in display order; empty closes the dropdown.
 	pub items: SuggestionList,
@@ -2077,6 +2070,15 @@ pub trait EditorCompletion {
 		}
 	}
 
+	/// Whether the editor may consult its built-in emoji provider after this
+	/// engine declines. Slash-command argument contexts use this to keep
+	/// `#action`/`:emoji` text literal while still allowing their own
+	/// argument, GitHub-ref, URL, and file providers.
+	fn allow_builtin_emoji(&mut self, text: &str, cursor: usize) -> bool {
+		let _ = (text, cursor);
+		true
+	}
+
 	/// One of this engine's rows was accepted: `replaced` is the buffer
 	/// text the row's value overwrote (the typed trigger and query). Engines
 	/// whose rows are actions rather than text (pi's `#` prompt actions)
@@ -2102,13 +2104,21 @@ pub enum PickerRow<'a> {
 
 /// Active completion dropdown state.
 pub struct Picker {
-	range:       ops::Range<usize>,
-	suggestions: SuggestionList,
-	selected:    usize,
+	range:             ops::Range<usize>,
+	suggestions:       SuggestionList,
+	selected:          usize,
+	/// Exact request snapshot. Async producers may finish after another edit;
+	/// acceptance is allowed only while generation, text, and caret still match.
+	source_generation: u64,
+	source_text:       Str,
+	source_cursor:     usize,
+	/// Bytes between an assistance replacement and the request caret. These
+	/// bytes remain in the buffer and the caret is restored after them.
+	cursor_offset:     usize,
 	/// Produced by the registered engine (vs the built-in emoji dropdown).
-	provided:    bool,
+	provided:          bool,
 	/// Window height, from [`EditorOptions::picker_rows`] at open time.
-	rows:        usize,
+	rows:              usize,
 }
 
 impl Picker {
@@ -2187,19 +2197,22 @@ pub enum EditOutcome {
 /// inline ghost hints, built-in emoji expansion, and prompt history —
 /// each governed by [`EditorOptions`].
 pub struct Editor {
-	buffer:            EditBuffer,
-	picker:            Option<Picker>,
-	completion:        Option<Box<dyn EditorCompletion>>,
-	options:           EditorOptions,
-	hint:              Option<Str>,
-	history:           Vec<Str>,
-	history_index:     Option<usize>,
-	history_draft:     Str,
-	history_query:     Option<Str>,
+	buffer:                EditBuffer,
+	picker:                Option<Picker>,
+	completion:            Option<Box<dyn EditorCompletion>>,
+	/// Monotonic identity of the current completion query. Text and caret
+	/// checks reject ordinary drift; this also fences ABA snapshots.
+	completion_generation: u64,
+	options:               EditorOptions,
+	hint:                  Option<Str>,
+	history:               Vec<Str>,
+	history_index:         Option<usize>,
+	history_draft:         Str,
+	history_query:         Option<Str>,
 	/// Volatile speech-preview range and exact text in the visible buffer.
-	volatile:          Option<(Range<usize>, Str)>,
-	last_layout_width: Cell<u16>,
-	last_page_rows:    Cell<usize>,
+	volatile:              Option<(Range<usize>, Str)>,
+	last_layout_width:     Cell<u16>,
+	last_page_rows:        Cell<usize>,
 }
 
 impl Editor {
@@ -2211,6 +2224,7 @@ impl Editor {
 			buffer,
 			picker: None,
 			completion: None,
+			completion_generation: 0,
 			options,
 			hint: None,
 			history: Vec::new(),
@@ -2219,7 +2233,7 @@ impl Editor {
 			history_query: None,
 			volatile: None,
 			last_layout_width: Cell::new(80),
-			last_page_rows: Cell::new(1),
+			last_page_rows: Cell::new(DEFAULT_PAGE_ROWS),
 		}
 	}
 
@@ -2472,6 +2486,7 @@ impl Editor {
 				Key::PageDown => self.select_page(true),
 				Key::Enter => self.enter_picker(),
 				Key::Tab => self.tab_complete(),
+				Key::Right if self.cursor_at_logical_line_end() => self.tab_complete(),
 				_ => self.handle_without_picker(key),
 			};
 		}
@@ -2524,7 +2539,25 @@ impl Editor {
 		}
 	}
 
+	fn cursor_at_logical_line_end(&self) -> bool {
+		self
+			.buffer
+			.text()
+			.as_bytes()
+			.get(self.buffer.cursor())
+			.is_none_or(|byte| *byte == b'\n')
+	}
+
 	fn tab_complete(&mut self) -> EditOutcome {
+		// Fence a delayed provider result before asking that provider to act
+		// on its selected row. `accept_picker` closes it without an edit.
+		if self
+			.picker
+			.as_ref()
+			.is_some_and(|picker| !self.picker_is_current(picker))
+		{
+			return self.accept_picker();
+		}
 		// the built-in emoji dropdown accepts without consulting the engine
 		if self.picker.as_ref().is_some_and(|picker| !picker.provided) {
 			return self.accept_picker();
@@ -2742,18 +2775,25 @@ impl Editor {
 		self.buffer.atom_ranges()
 	}
 
-	/// Opens a replacement picker for `range` when it contains the cursor;
-	/// acceptance replaces that range.
+	/// Opens a replacement picker for `range` at or before the cursor;
+	/// acceptance replaces that range and preserves the cursor's trailing
+	/// offset (for example, after a word-boundary space).
 	pub fn show_replacements(
 		&mut self,
 		range: Range<usize>,
 		items: impl IntoIterator<Item = Str>,
 	) -> bool {
+		let text = self.buffer.text();
+		let cursor = self.buffer.cursor();
 		if range.start >= range.end
-			|| !completion_range_is_valid(self.buffer.text(), self.buffer.cursor(), &range)
+			|| range.end > text.len()
+			|| cursor < range.start
+			|| !text.is_char_boundary(range.start)
+			|| !text.is_char_boundary(range.end)
 		{
 			return false;
 		}
+		let cursor_offset = cursor.saturating_sub(range.end);
 		let rows = self.options.picker_rows();
 		let suggestions: SuggestionList = items
 			.into_iter()
@@ -2763,7 +2803,17 @@ impl Editor {
 		if suggestions.is_empty() {
 			return false;
 		}
-		self.picker = Some(Picker { range, suggestions, selected: 0, provided: false, rows });
+		self.picker = Some(Picker {
+			range,
+			suggestions,
+			selected: 0,
+			source_generation: self.completion_generation,
+			source_text: Str::new(self.buffer.text()),
+			source_cursor: self.buffer.cursor(),
+			cursor_offset,
+			provided: false,
+			rows,
+		});
 		true
 	}
 
@@ -2771,11 +2821,16 @@ impl Editor {
 		if self.buffer.text().trim().is_empty() {
 			return EditOutcome::Ignored;
 		}
-		let submitted = self.buffer.expanded_text();
+		let submitted = self.buffer.clear_after_submit();
+		let submitted = if self.options.emoji {
+			expand_emoticons(submitted)
+		} else {
+			submitted
+		};
 		self.add_to_history(&submitted);
 		self.picker = None;
 		self.hint = None;
-		EditOutcome::Submitted(self.buffer.clear_after_submit())
+		EditOutcome::Submitted(submitted)
 	}
 
 	const fn select_previous(&mut self) -> EditOutcome {
@@ -2807,8 +2862,46 @@ impl Editor {
 		EditOutcome::Changed
 	}
 
+	/// Moves keyboard selection one row without wrapping, as a pointer wheel
+	/// over pi's completion list does.
+	pub fn wheel_picker(&mut self, down: bool) -> EditOutcome {
+		let Some(picker) = self.picker.as_mut() else {
+			return EditOutcome::Ignored;
+		};
+		let next = if down {
+			picker.selected.saturating_add(1).min(picker.len() - 1)
+		} else {
+			picker.selected.saturating_sub(1)
+		};
+		if next == picker.selected {
+			return EditOutcome::Ignored;
+		}
+		picker.selected = next;
+		EditOutcome::Changed
+	}
+
+	/// Promotes one pointer row to keyboard selection and accepts it.
+	pub fn click_picker(&mut self, index: usize) -> EditOutcome {
+		let Some(picker) = self.picker.as_mut() else {
+			return EditOutcome::Ignored;
+		};
+		if index >= picker.len() {
+			return EditOutcome::Ignored;
+		}
+		picker.selected = index;
+		self.accept_picker()
+	}
+
 	fn accept_picker(&mut self) -> EditOutcome {
 		let picker = self.picker.take().expect("picker presence was checked");
+		if !self.picker_is_current(&picker) {
+			let cursor = self.buffer.cursor();
+			self.hint = self
+				.completion
+				.as_mut()
+				.and_then(|completion| completion.hint(self.buffer.text(), cursor));
+			return EditOutcome::Changed;
+		}
 		let suggestion = &picker.suggestions[picker.selected];
 		// Accepting an already-typed value is a no-op; re-querying would
 		// reopen the identical dropdown and trap Enter forever. Close the
@@ -2826,6 +2919,17 @@ impl Editor {
 		EditOutcome::Changed
 	}
 
+	fn picker_is_current(&self, picker: &Picker) -> bool {
+		picker.source_generation == self.completion_generation
+			&& picker.source_text == self.buffer.text()
+			&& picker.source_cursor == self.buffer.cursor()
+			&& self
+				.buffer
+				.atom_ranges()
+				.iter()
+				.all(|&(start, end)| picker.range.end <= start || picker.range.start >= end)
+	}
+
 	/// Replaces the picker's range with the row's value and, for
 	/// engine-provided rows, reports the acceptance to the engine.
 	fn apply_suggestion(&mut self, picker: &Picker, suggestion: &Suggestion) {
@@ -2833,6 +2937,7 @@ impl Editor {
 			self
 				.buffer
 				.replace_range(picker.range.clone(), &suggestion.value);
+			self.buffer.restore_cursor_offset(picker.cursor_offset);
 			return;
 		};
 		let replaced = Str::new(&self.buffer.text()[picker.range.clone()]);
@@ -2884,7 +2989,8 @@ impl Editor {
 	/// whitespace precedes its token.
 	pub fn picker_enter_submits(&self) -> bool {
 		self.picker.as_ref().is_some_and(|picker| {
-			picker.suggestions[picker.selected].submits
+			self.picker_is_current(picker)
+				&& picker.suggestions[picker.selected].submits
 				&& self.buffer.text()[..picker.range.start].trim().is_empty()
 		})
 	}
@@ -2897,6 +3003,14 @@ impl Editor {
 		let Some(picker) = self.picker.take() else {
 			return;
 		};
+		if !self.picker_is_current(&picker) {
+			let cursor = self.buffer.cursor();
+			self.hint = self
+				.completion
+				.as_mut()
+				.and_then(|completion| completion.hint(self.buffer.text(), cursor));
+			return;
+		}
 		let suggestion = &picker.suggestions[picker.selected];
 		self.apply_suggestion(&picker, suggestion);
 		self.hint = None;
@@ -2905,6 +3019,8 @@ impl Editor {
 	/// Re-queries the completion engine (dropdown and ghost hint), falling
 	/// back to the built-in emoji dropdown when the engine declines.
 	fn refresh(&mut self) {
+		self.completion_generation = self.completion_generation.wrapping_add(1);
+		let generation = self.completion_generation;
 		let cursor = self.buffer.cursor();
 		let text = self.buffer.text();
 		let atoms = self.buffer.atom_ranges();
@@ -2926,13 +3042,24 @@ impl Editor {
 					range: clamp_completion_range(text, cursor, suggestions.range),
 					suggestions: suggestions.items,
 					selected: 0,
+					source_generation: generation,
+					source_text: Str::new(text),
+					source_cursor: cursor,
+					cursor_offset: 0,
 					provided: true,
 					rows,
 				})
 			})
 			.filter(|picker| clear_of_atoms(&picker.range));
-		if picker.is_none() && self.options.emoji {
-			picker = emoji_picker(text, cursor, rows).filter(|picker| clear_of_atoms(&picker.range));
+		if picker.is_none()
+			&& self.options.emoji
+			&& self
+				.completion
+				.as_mut()
+				.is_none_or(|completion| completion.allow_builtin_emoji(text, cursor))
+		{
+			picker = emoji_picker(text, cursor, generation, rows)
+				.filter(|picker| clear_of_atoms(&picker.range));
 		}
 		self.hint = self
 			.completion
@@ -3002,18 +3129,9 @@ impl Editor {
 	}
 }
 
-fn completion_range_is_valid(text: &str, cursor: usize, range: &Range<usize>) -> bool {
-	range.start <= cursor
-		&& cursor <= range.end
-		&& range.end <= text.len()
-		&& text.is_char_boundary(range.start)
-		&& text.is_char_boundary(range.end)
-}
-
-/// Clamps an engine-supplied replacement range around the cursor: both ends
-/// are pulled onto char boundaries inside the text, so drift in an
-/// asynchronously produced range shrinks the replacement instead of hiding
-/// the dropdown.
+/// Clamps an engine-supplied replacement range around its request cursor:
+/// both ends are pulled onto char boundaries inside the request text.
+/// Picker snapshot validation separately rejects asynchronous drift.
 fn clamp_completion_range(text: &str, cursor: usize, range: Range<usize>) -> Range<usize> {
 	let mut start = range.start.min(cursor);
 	while !text.is_char_boundary(start) {
@@ -3285,16 +3403,17 @@ impl SlashCommands {
 	) -> Option<Suggestions> {
 		let (name, rest) = body.split_at(delimiter);
 		let partial = rest.trim_start_matches([' ', '\t', ':']);
-		if partial.contains(char::is_whitespace) {
-			return None;
-		}
+		let first_argument = !partial.contains(char::is_whitespace);
 		let command = self.find(name)?;
+		// Dynamic providers receive the whole argument tail. This lets
+		// declarative subcommand providers switch to a second-token source
+		// (`/mcp test <server>`) while static candidates stay first-token only.
 		let dynamic = command
 			.dynamic_args
 			.as_ref()
 			.map(|provider| provider(partial))
 			.unwrap_or_default();
-		let paths = (command.name == "move")
+		let paths = (first_argument && command.name == "move")
 			.then(|| filesystem_path_arguments(partial))
 			.unwrap_or_default();
 		if command.args.is_empty() && dynamic.is_empty() && paths.is_empty() {
@@ -3306,6 +3425,7 @@ impl SlashCommands {
 		for (arg, spaced) in command
 			.args
 			.iter()
+			.filter(|_| first_argument)
 			.map(|arg| {
 				(
 					CommandArgument {
@@ -3500,9 +3620,27 @@ impl EditorCompletion for SlashCommands {
 			},
 		}
 	}
+
+	fn allow_builtin_emoji(&mut self, text: &str, cursor: usize) -> bool {
+		let before = &text[..cursor];
+		let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+		if !before[..line_start].trim().is_empty() {
+			return true;
+		}
+		let Some(body) = before[line_start..]
+			.trim_start_matches([' ', '\t'])
+			.strip_prefix('/')
+		else {
+			return true;
+		};
+		let Some(delimiter) = body.find(char::is_whitespace) else {
+			return true;
+		};
+		self.find(&body[..delimiter]).is_none()
+	}
 }
 
-fn emoji_picker(text: &str, cursor: usize, rows: usize) -> Option<Picker> {
+fn emoji_picker(text: &str, cursor: usize, generation: u64, rows: usize) -> Option<Picker> {
 	let (prefix_start, query) = emoji_trigger(&text[..cursor])?;
 	let mut suggestions = SuggestionList::new();
 	let wanted = format!(":{query}");
@@ -3549,6 +3687,10 @@ fn emoji_picker(text: &str, cursor: usize, rows: usize) -> Option<Picker> {
 			range: prefix_start..emoji_token_end(text, cursor),
 			suggestions,
 			selected: 0,
+			source_generation: generation,
+			source_text: Str::new(text),
+			source_cursor: cursor,
+			cursor_offset: 0,
 			provided: false,
 			rows,
 		})
@@ -3598,6 +3740,47 @@ fn lookup_emoji(name: &str) -> Option<&'static str> {
 		.get(index)
 		.filter(|entry| entry[0] == name)
 		.map(|entry| entry[1])
+}
+
+fn expand_emoticons(text: String) -> String {
+	if text.len() < 2 {
+		return text;
+	}
+	let bytes = text.as_bytes();
+	let mut output: Option<String> = None;
+	let mut copied = 0;
+	let mut index = 0;
+	while index < text.len() {
+		let boundary = index == 0 || has_left_boundary(bytes, index);
+		let matched = boundary
+			.then(|| {
+				EMOTICONS.iter().find_map(|&(pattern, emoji)| {
+					let end = index.checked_add(pattern.len())?;
+					(end <= text.len()
+						&& &bytes[index..end] == pattern.as_bytes()
+						&& (end == text.len()
+							|| bytes
+								.get(end)
+								.is_some_and(|byte| matches!(*byte, b' ' | b'\t' | b'\n' | b'\r'))))
+					.then_some((end, emoji))
+				})
+			})
+			.flatten();
+		if let Some((end, emoji)) = matched {
+			let out = output.get_or_insert_with(|| String::with_capacity(text.len()));
+			out.push_str(&text[copied..index]);
+			out.push_str(emoji);
+			copied = end;
+			index = end;
+			continue;
+		}
+		index += text[index..].chars().next().map_or(1, char::len_utf8);
+	}
+	let Some(mut output) = output else {
+		return text;
+	};
+	output.push_str(&text[copied..]);
+	output
 }
 
 fn fuzzy_match_spans(candidate: &str, query: &str) -> SmallVec<(u16, u16), 8> {
@@ -3858,6 +4041,23 @@ mod tests {
 	}
 
 	#[test]
+	fn right_arrow_at_logical_line_end_accepts_the_selected_completion() {
+		let mut editor = editor();
+		type_text(&mut editor, "/se");
+		assert_eq!(editor.handle_key(Key::Right), EditOutcome::Changed);
+		assert_eq!(editor.text(), "/security ");
+	}
+
+	#[test]
+	fn emoji_popup_stays_suppressed_inside_recognized_slash_arguments() {
+		let mut editor = editor();
+		type_text(&mut editor, "/security :joy");
+		assert!(editor.picker().is_none());
+		editor.set_text("prose :joy");
+		assert!(editor.picker().is_some());
+	}
+
+	#[test]
 	fn replacement_picker_replaces_the_word_under_the_cursor() {
 		let mut editor = Editor::new(EditorOptions::default());
 		editor.replace_external("teh", true);
@@ -3865,6 +4065,16 @@ mod tests {
 		assert!(editor.show_replacements(0..3, [Str::new("the")]));
 		assert_eq!(editor.handle_key(Key::Enter), EditOutcome::Changed);
 		assert_eq!(editor.text(), "the");
+	}
+
+	#[test]
+	fn replacement_picker_preserves_caret_after_trailing_boundary() {
+		let mut editor = Editor::new(EditorOptions::default());
+		editor.replace_external("teh ", false);
+		assert!(editor.show_replacements(0..3, [Str::new("the")]));
+		assert_eq!(editor.handle_key(Key::Tab), EditOutcome::Changed);
+		assert_eq!(editor.text(), "the ");
+		assert_eq!(editor.buffer().cursor(), 4);
 	}
 
 	#[test]
@@ -3897,6 +4107,30 @@ mod tests {
 		assert!(editor.picker().is_some(), "degenerate range keeps the dropdown open");
 		assert_eq!(editor.handle_key(Key::Enter), EditOutcome::Changed);
 		assert!(editor.text().starts_with("value"), "{}", editor.text());
+	}
+
+	#[test]
+	fn stale_async_picker_snapshot_never_overwrites_a_newer_buffer_or_caret() {
+		let mut editor = editor();
+		type_text(&mut editor, "/se");
+		assert!(editor.picker().is_some());
+		// Model an async request that completed for `/se` while an input
+		// mutation advanced without installing a replacement result.
+		editor.buffer.replace_external("keep this", true);
+		assert_eq!(editor.handle_key(Key::Tab), EditOutcome::Changed);
+		assert_eq!(editor.text(), "keep this");
+		assert_eq!(editor.buffer.cursor(), 0);
+
+		// An ABA query can have the same text and caret as an old result.
+		// Generation identity still prevents that result being accepted.
+		editor.set_text("/se");
+		let stale = editor.picker.take().expect("matching picker");
+		editor.set_text("other");
+		editor.set_text("/se");
+		editor.picker = Some(stale);
+		assert_eq!(editor.handle_key(Key::Enter), EditOutcome::Changed);
+		assert_eq!(editor.text(), "/se");
+		assert_eq!(editor.buffer.cursor(), 3);
 	}
 
 	/// A `#N` chip marker looks like a `#<number>` reference trigger, but the
@@ -4224,6 +4458,13 @@ mod tests {
 		let mut editor = editor();
 		type_text(&mut editor, "é:) ");
 		assert_eq!(editor.text(), "é:) ");
+	}
+
+	#[test]
+	fn submit_expands_a_complete_emoticon_without_a_trailing_space() {
+		let mut editor = editor();
+		type_text(&mut editor, "hello :)");
+		assert_eq!(editor.handle_key(Key::Enter), EditOutcome::Submitted("hello 🙂".to_owned()));
 	}
 
 	#[test]
@@ -4691,6 +4932,51 @@ mod tests {
 		assert_eq!((editor.buffer.cursor_line(), editor.buffer.cursor_column()), (8, 3));
 		editor.handle(Key::PageUp);
 		assert_eq!((editor.buffer.cursor_line(), editor.buffer.cursor_column()), (0, 3));
+
+		// The rendered viewport, not logical lines, controls the jump. With a
+		// three-row viewport these wrapped rows move two at a time, preserving
+		// the requested display column across the short logical line.
+		editor.set_text("abcde\nx\nabcde\nx\nabcde");
+		editor.buffer.set_cursor_line_column(0, 2);
+		let _ = editor.view_rows(3, 3);
+		editor.handle(Key::PageDown);
+		assert_eq!((editor.buffer.cursor_line(), editor.buffer.cursor_column()), (1, 1));
+		editor.handle(Key::PageDown);
+		assert_eq!((editor.buffer.cursor_line(), editor.buffer.cursor_column()), (2, 5));
+
+		// A viewport resize immediately changes the page distance.
+		let _ = editor.view_rows(3, 2);
+		editor.handle(Key::PageUp);
+		assert_eq!((editor.buffer.cursor_line(), editor.buffer.cursor_column()), (2, 2));
+
+		// A display column that falls inside a wide grapheme snaps to a valid
+		// boundary without losing the sticky column on the following page.
+		editor.set_text("ab\nx\ne\u{301}界z\nx\nab");
+		editor.buffer.set_cursor_line_column(0, 2);
+		let _ = editor.view_rows(20, 3);
+		editor.handle(Key::PageDown);
+		assert_eq!((editor.buffer.cursor_line(), editor.buffer.cursor_column()), (2, 1));
+		assert_eq!(&editor.text()[..editor.buffer.cursor()], "ab\nx\né");
+		editor.handle(Key::PageDown);
+		assert_eq!((editor.buffer.cursor_line(), editor.buffer.cursor_column()), (4, 2));
+
+		// Atomic markers may only be crossed as a whole. Landing inside one
+		// chooses the motion-direction edge while retaining the requested
+		// display column for the next page.
+		editor.set_text("ab\nx\n");
+		editor.insert_reference("[chip]", "<ref/>");
+		editor.insert_text("z\nx\nab");
+		editor.buffer.set_cursor_line_column(0, 1);
+		let _ = editor.view_rows(20, 3);
+		let (atom_start, atom_end) = editor.buffer.atom_ranges()[0];
+		editor.handle(Key::PageDown);
+		assert_eq!(editor.buffer.cursor(), atom_end);
+		editor.handle(Key::PageDown);
+		assert_eq!((editor.buffer.cursor_line(), editor.buffer.cursor_column()), (4, 1));
+		editor.handle(Key::PageUp);
+		assert_eq!(editor.buffer.cursor(), atom_start);
+		editor.handle(Key::PageUp);
+		assert_eq!((editor.buffer.cursor_line(), editor.buffer.cursor_column()), (0, 1));
 	}
 
 	#[test]
