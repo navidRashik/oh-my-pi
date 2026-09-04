@@ -17,6 +17,7 @@ import readPathTemplate from "../prompts/memories/read-path.md" with { type: "te
 import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with { type: "text" };
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { sideRequestIdentity } from "../session/side-request-identity";
 import {
 	claimStage1Jobs,
 	clearMemoryData as clearMemoryDataInDb,
@@ -365,7 +366,10 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 			logger.debug("Phase1 skipped: no model available");
 			return;
 		}
-		const phase1ApiKey = await modelRegistry.getApiKey(phase1Model, session.sessionId);
+		// Rollout-memory analysis is independent background work that can overlap
+		// the next foreground turn: isolate its provider session (#10865).
+		const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, "rollout-memory");
+		const phase1ApiKey = await modelRegistry.getApiKey(phase1Model, identity.sessionId);
 		if (!phase1ApiKey) {
 			logger.debug("Phase1 skipped: no API key for phase1 model", {
 				provider: phase1Model.provider,
@@ -402,11 +406,11 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 			const result = await runStage1Job({
 				claim,
 				model: phase1Model,
-				apiKey: modelRegistry.resolver(phase1Model, session.sessionId),
-				sessionId: session.sessionId,
+				apiKey: modelRegistry.resolver(phase1Model, identity.sessionId),
+				sessionId: identity.sessionId,
 				modelMaxTokens: computeModelTokenBudget(phase1Model, config),
 				config,
-				metadata: session.agent?.metadataForProvider(phase1Model.provider),
+				metadata: identity.metadata(phase1Model.provider),
 			});
 			if (!isMemoryStartupActive(options)) return;
 
@@ -529,7 +533,8 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 			});
 			return;
 		}
-		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.sessionId);
+		const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, "rollout-memory");
+		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, identity.sessionId);
 		if (!phase2ApiKey) {
 			markPhase2FailureWithFallback(db, {
 				claim,
@@ -565,9 +570,9 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 			const consolidated = await runConsolidationModel({
 				memoryRoot,
 				model: phase2Model,
-				apiKey: modelRegistry.resolver(phase2Model, session.sessionId),
-				sessionId: session.sessionId,
-				metadata: session.agent?.metadataForProvider(phase2Model.provider),
+				apiKey: modelRegistry.resolver(phase2Model, identity.sessionId),
+				sessionId: identity.sessionId,
+				metadata: identity.metadata(phase2Model.provider),
 			});
 			if (!isMemoryStartupActive(options)) return;
 			await applyConsolidation(memoryRoot, consolidated);

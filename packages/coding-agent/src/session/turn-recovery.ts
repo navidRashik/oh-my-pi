@@ -46,6 +46,7 @@ import type {
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
 import { assistantTurnProducedOutput, isEmptyAssistantStop, isEmptyErrorTurn } from "./messages";
+import { sideRequestIdentity } from "./side-request-identity";
 import {
 	type ActiveRetryFallbackState,
 	calculateRetryBackoffDelayMs,
@@ -928,12 +929,17 @@ export class TurnRecovery {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), UNEXPECTED_STOP_TIMEOUT_MS);
 			let classification: boolean | undefined;
+			const identity = sideRequestIdentity(
+				this.#host.modelRegistry.authStorage,
+				this.#host.sessionId(),
+				"unexpected-stop",
+			);
 			try {
 				classification = await classifyUnexpectedStop(text, {
 					settings: this.#host.settings,
 					registry: this.#host.modelRegistry,
-					sessionId: this.#host.sessionId(),
-					metadataResolver: (provider: string) => this.#host.agent.metadataForProvider(provider),
+					sessionId: identity.sessionId,
+					metadataResolver: identity.metadata,
 					signal: controller.signal,
 				});
 			} finally {

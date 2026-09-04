@@ -180,6 +180,7 @@ import {
 import { getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
 import { collectMountedMCPToolRoutes, projectMountedMCPXdevGuidance } from "./session/session-tools";
+import { sideRequestIdentity } from "./session/side-request-identity";
 import { createSettingsAwareStreamFn } from "./session/settings-stream-fn";
 import { SnapcompactInlineTransformer } from "./session/snapcompact-inline";
 import { createSnapcompactSavingsRecorder } from "./session/snapcompact-savings-journal";
@@ -1198,6 +1199,13 @@ export interface AutoLearnCaptureRunnerOptions {
 	onPayload?: SimpleStreamOptions["onPayload"];
 	onResponse?: SimpleStreamOptions["onResponse"];
 	createSessionId?: () => string;
+	/**
+	 * Isolated provider metadata resolver for the capture request. When set, the
+	 * capture agent uses it instead of the foreground agent's resolver so the
+	 * capture (which can run while a new foreground turn starts) does not advance
+	 * the foreground provider session (#10865).
+	 */
+	metadataResolver?: (provider: string) => Record<string, unknown>;
 }
 
 /** Build a private capture runner over a detached message snapshot and provider session. */
@@ -1236,7 +1244,9 @@ export function createAutoLearnCaptureRunner(
 			onPayload: options.onPayload,
 			onResponse: options.onResponse,
 		});
-		captureAgent.setMetadataResolver(provider => options.sourceAgent.metadataForProvider(provider));
+		captureAgent.setMetadataResolver(
+			options.metadataResolver ?? (provider => options.sourceAgent.metadataForProvider(provider)),
+		);
 		const captureMessage: CustomMessage = {
 			role: "custom",
 			customType: "autolearn-nudge",
@@ -4130,9 +4140,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			});
 		};
 
+		const autoLearnIdentity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, "autolearn");
 		const runAutoLearnCapture = createAutoLearnCaptureRunner({
 			sourceAgent: agent,
 			captureTools: autoLearnCaptureTools,
+			createSessionId: () => autoLearnIdentity.sessionId,
+			metadataResolver: autoLearnIdentity.metadata,
 			onPayload,
 			onResponse,
 			createAgent: captureOptions => {

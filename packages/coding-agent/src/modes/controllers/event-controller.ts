@@ -33,6 +33,7 @@ import {
 	readQueueChipText,
 	resolveAbortLabel,
 } from "../../session/messages";
+import { sideRequestIdentity } from "../../session/side-request-identity";
 import { type ApprovalMode, resolveApproval } from "../../tools/approval";
 import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
@@ -230,13 +231,17 @@ export class EventController {
 		this.#detachToolApprovalPreviewWaiter = session?.extensionRunner?.setToolApprovalPreviewWaiter(toolCallId =>
 			this.#waitForToolApprovalPreview(toolCallId),
 		);
+		const speechIdentity =
+			session?.modelRegistry && session.settings
+				? sideRequestIdentity(session.modelRegistry.authStorage, session.sessionId, "speech")
+				: undefined;
 		vocalizer.setEnhancer(
-			session?.modelRegistry && session.agent && session.settings
+			session?.modelRegistry && session.agent && session.settings && speechIdentity
 				? new SpeechEnhancer({
 						settings: session.settings,
 						registry: session.modelRegistry,
-						sessionId: session.sessionId,
-						metadataResolver: provider => session.agent.metadataForProvider(provider),
+						sessionId: speechIdentity.sessionId,
+						metadataResolver: speechIdentity.metadata,
 					})
 				: null,
 		);

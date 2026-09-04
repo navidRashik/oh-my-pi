@@ -19,6 +19,7 @@ import type {
 import memoryConsolidationPrompt from "../prompts/system/memory-consolidation-system.md" with { type: "text" };
 import memoryExtractionPrompt from "../prompts/system/memory-extraction-system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { sideRequestIdentity } from "../session/side-request-identity";
 import { isTinyMemoryLocalModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
 import { shortenPath } from "../tools/render-utils";
@@ -567,11 +568,16 @@ async function resolveMnemopiProviderOptions(
 			logger.warn("Mnemopi: llmMode=smol but no tiny/smol model resolved; continuing without LLM.");
 			return base;
 		}
+		// Independent memory completion: isolate its provider session so an
+		// extraction that overlaps the next foreground prompt cannot advance the
+		// foreground provider session and 400 the waiting turn (#10865).
+		const identity = sideRequestIdentity(modelRegistry.authStorage, sessionId, "mnemopi");
 		return {
 			...base,
 			llm: async (prompt, opts) => {
 				const request = resolveMemoryCompletionInput(prompt, opts);
-				const hasApiKey = await modelRegistry.getApiKey(model, sessionId);
+				const metadata = identity.metadata(model.provider);
+				const hasApiKey = await modelRegistry.getApiKey(model, identity.sessionId);
 				if (!hasApiKey) {
 					logger.warn("Mnemopi: smol completion requested but no current API key is available.", {
 						provider: model.provider,
@@ -587,8 +593,9 @@ async function resolveMnemopiProviderOptions(
 							messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }],
 						},
 						{
-							apiKey: modelRegistry.resolver(model, sessionId),
-							sessionId,
+							apiKey: modelRegistry.resolver(model, identity.sessionId),
+							sessionId: identity.sessionId,
+							metadata,
 							maxTokens: opts?.maxTokens,
 							temperature: opts?.temperature,
 						},

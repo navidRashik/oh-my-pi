@@ -38,6 +38,7 @@ import type { EditMode } from "../utils/edit-mode";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ModelCycleResult, ResolvedRoleModel, RoleModelCycle, RoleModelCycleResult } from "./agent-session-types";
 import { formatRoleModelValue, resolveRoleModelFull } from "./role-models";
+import { sideRequestIdentity } from "./side-request-identity";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
@@ -616,14 +617,19 @@ export class ModelControls {
 				sessionId: this.#host.sessionManager.getSessionId(),
 				parentId: this.#host.sessionManager.getLeafId(),
 			};
+			const identity = sideRequestIdentity(
+				this.#host.modelRegistry.authStorage,
+				this.#host.sessionId(),
+				"auto-thinking",
+			);
 			try {
 				resolved = await classifyDifficulty(promptText, {
 					settings: this.#host.settings,
 					registry: this.#host.modelRegistry,
 					model,
-					sessionId: this.#host.sessionId(),
+					sessionId: identity.sessionId,
 					signal: controller.signal,
-					metadataResolver: provider => this.#host.agent.metadataForProvider(provider),
+					metadataResolver: identity.metadata,
 					onUsage: usage => {
 						const entryId = this.#host.sessionManager.appendModelUsage(
 							{ purpose: "auto-thinking", ...usage },
