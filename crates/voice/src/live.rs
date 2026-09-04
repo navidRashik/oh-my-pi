@@ -16,6 +16,7 @@ use bytes::Bytes;
 use flume::Receiver;
 use opus::{Application, Channels, Decoder, Encoder};
 use parking_lot::Mutex;
+use strum::{Display, IntoStaticStr};
 use tokio::{sync::watch, task::JoinHandle, time, time::MissedTickBehavior};
 use webrtc::{
 	api::{
@@ -24,7 +25,10 @@ use webrtc::{
 		media_engine::{MIME_TYPE_OPUS, MediaEngine},
 	},
 	data_channel::{RTCDataChannel, data_channel_message::DataChannelMessage},
-	ice_transport::ice_connection_state::RTCIceConnectionState,
+	ice_transport::{
+		ice_candidate_pair::RTCIceCandidatePair, ice_candidate_type::RTCIceCandidateType,
+		ice_connection_state::RTCIceConnectionState,
+	},
 	interceptor::registry::Registry,
 	media::Sample,
 	peer_connection::{
@@ -72,6 +76,47 @@ const OPUS_CAPABILITY: RTCRtpCodecCapability = RTCRtpCodecCapability {
 	rtcp_feedback: Vec::new(),
 };
 
+/// Privacy-safe ICE candidate class for a selected media path.
+///
+/// Addresses, ports, foundations, protocols, and related candidates are
+/// discarded before this value crosses the native media boundary.
+#[derive(Clone, Copy, Debug, Display, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "kebab-case")]
+pub enum LiveIceCandidateClass {
+	/// Candidate gathered from a local interface.
+	Host,
+	/// Candidate discovered through a STUN binding.
+	ServerReflexive,
+	/// Candidate discovered from the remote peer during connectivity checks.
+	PeerReflexive,
+	/// Candidate allocated through a relay.
+	Relay,
+}
+
+/// Aggregate routing mode of one selected ICE candidate pair.
+#[derive(Clone, Copy, Debug, Display, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
+pub enum LiveIcePathKind {
+	/// Neither selected candidate uses a relay.
+	Direct,
+	/// At least one selected candidate uses a relay.
+	Relay,
+}
+
+/// Privacy-redacted selected ICE path emitted by the native media peer.
+///
+/// This is deliberately closed over candidate classes and aggregate routing;
+/// it cannot carry addresses, ports, credentials, interface names, or SSIDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveIcePath {
+	/// Local candidate class.
+	pub local:  LiveIceCandidateClass,
+	/// Remote candidate class.
+	pub remote: LiveIceCandidateClass,
+	/// Aggregate relay/direct routing mode.
+	pub kind:   LiveIcePathKind,
+}
+
 /// Typed terminal failure from an established native media peer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum LiveMediaFailure {
@@ -115,6 +160,8 @@ pub struct LiveCallbacks {
 	pub input_level:  Box<dyn Fn(f64) + Send + Sync>,
 	/// RMS output level in `[0, 1]`, one report per level window.
 	pub output_level: Box<dyn Fn(f64) + Send + Sync>,
+	/// Privacy-redacted selected ICE candidate pair.
+	pub ice_path:     Box<dyn Fn(LiveIcePath) + Send + Sync>,
 	/// Typed terminal transport failure; reported at most once per peer.
 	pub failure:      Box<dyn Fn(LiveMediaFailure) + Send + Sync>,
 }
@@ -326,6 +373,7 @@ impl LivePeerCore {
 		};
 
 		install_peer_callbacks(&peer, Arc::downgrade(self), playback_tx);
+		install_ice_path_callback(&peer, Arc::downgrade(self));
 		let data_channel = match peer.create_data_channel(DATA_CHANNEL_LABEL, None).await {
 			Ok(channel) => channel,
 			Err(error) => {
@@ -481,6 +529,12 @@ impl LivePeerCore {
 		(self.callbacks.output_level)(level.clamp(0.0, 1.0));
 	}
 
+	fn report_ice_path(&self, path: LiveIcePath) {
+		if !self.closing.load(Ordering::Acquire) {
+			(self.callbacks.ice_path)(path);
+		}
+	}
+
 	fn mark_open(&self) {
 		if !self.closing.load(Ordering::Acquire) {
 			self.signal_tx.send_replace(PeerSignal::Open);
@@ -546,6 +600,42 @@ fn opus_capability() -> RTCRtpCodecCapability {
 		sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
 		rtcp_feedback: Vec::new(),
 	}
+}
+
+fn candidate_class(candidate: RTCIceCandidateType) -> Option<LiveIceCandidateClass> {
+	match candidate {
+		RTCIceCandidateType::Host => Some(LiveIceCandidateClass::Host),
+		RTCIceCandidateType::Srflx => Some(LiveIceCandidateClass::ServerReflexive),
+		RTCIceCandidateType::Prflx => Some(LiveIceCandidateClass::PeerReflexive),
+		RTCIceCandidateType::Relay => Some(LiveIceCandidateClass::Relay),
+		RTCIceCandidateType::Unspecified => None,
+	}
+}
+
+fn redact_ice_pair(pair: &RTCIceCandidatePair) -> Option<LiveIcePath> {
+	let local = candidate_class(pair.local.typ)?;
+	let remote = candidate_class(pair.remote.typ)?;
+	let kind = if local == LiveIceCandidateClass::Relay || remote == LiveIceCandidateClass::Relay {
+		LiveIcePathKind::Relay
+	} else {
+		LiveIcePathKind::Direct
+	};
+	Some(LiveIcePath { local, remote, kind })
+}
+
+fn install_ice_path_callback(peer: &Arc<RTCPeerConnection>, core: Weak<LivePeerCore>) {
+	peer
+		.dtls_transport()
+		.ice_transport()
+		.on_selected_candidate_pair_change(Box::new(move |pair| {
+			let core = core.clone();
+			let path = redact_ice_pair(&pair);
+			Box::pin(async move {
+				if let (Some(core), Some(path)) = (core.upgrade(), path) {
+					core.report_ice_path(path);
+				}
+			})
+		}));
 }
 
 fn install_peer_callbacks(
@@ -911,5 +1001,60 @@ impl OutputLevel {
 				self.samples = 0;
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
+
+	use super::*;
+
+	fn candidate(typ: RTCIceCandidateType, address: &str, port: u16) -> RTCIceCandidate {
+		RTCIceCandidate {
+			address: address.to_owned(),
+			port,
+			related_address: "198.51.100.9".to_owned(),
+			related_port: 65_000,
+			typ,
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn selected_ice_pair_is_redacted_before_leaving_the_native_peer() {
+		let pair = RTCIceCandidatePair::new(
+			candidate(RTCIceCandidateType::Relay, "203.0.113.4", 34_789),
+			candidate(RTCIceCandidateType::Host, "10.0.0.8", 5_555),
+		);
+		let redacted = redact_ice_pair(&pair).expect("known candidate classes");
+
+		assert_eq!(redacted, LiveIcePath {
+			local:  LiveIceCandidateClass::Relay,
+			remote: LiveIceCandidateClass::Host,
+			kind:   LiveIcePathKind::Relay,
+		});
+		let debug = format!("{redacted:?}");
+		for secret in ["203.0.113.4", "10.0.0.8", "198.51.100.9", "34789", "5555", "65000"] {
+			assert!(!debug.contains(secret), "redacted event leaked {secret}: {debug}");
+		}
+	}
+
+	#[test]
+	fn relay_aggregate_depends_only_on_candidate_classes() {
+		let direct = RTCIceCandidatePair::new(
+			candidate(RTCIceCandidateType::Host, "private", 1),
+			candidate(RTCIceCandidateType::Srflx, "public", 2),
+		);
+		assert_eq!(
+			redact_ice_pair(&direct).expect("known direct pair").kind,
+			LiveIcePathKind::Direct
+		);
+
+		let unspecified = RTCIceCandidatePair::new(
+			candidate(RTCIceCandidateType::Unspecified, "secret", 3),
+			candidate(RTCIceCandidateType::Host, "secret", 4),
+		);
+		assert_eq!(redact_ice_pair(&unspecified), None);
 	}
 }
