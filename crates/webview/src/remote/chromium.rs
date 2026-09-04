@@ -105,16 +105,8 @@ pub async fn drive_attached(
 	ctx: DriverCtx,
 ) -> Result<()> {
 	let DriverCtx { commands, cancelled, events, state, page, ready } = ctx;
-	match connect_attached(
-		&endpoint,
-		target.as_deref(),
-		config,
-		&page,
-		events,
-		state,
-		cancelled,
-	)
-	.await
+	match connect_attached(&endpoint, target.as_deref(), config, &page, events, state, cancelled)
+		.await
 	{
 		Ok(cdp) => {
 			let _ = ready.send(Ok(()));
@@ -136,20 +128,21 @@ async fn connect_attached(
 	state: SharedState,
 	cancelled: Arc<AtomicBool>,
 ) -> Result<Cdp> {
-	let websocket = resolve_cdp_websocket(
-		endpoint,
-		page.connect_timeout.unwrap_or(Duration::from_secs(35)),
-	)
-	.await?;
-	let link = timeout(
-		page.connect_timeout.unwrap_or(Duration::from_secs(35)),
-		WsLink::connect(&websocket),
-	)
-	.await
-	.map_err(|_| Error::Timeout("connecting to the CDP endpoint"))??;
+	let websocket =
+		resolve_cdp_websocket(endpoint, page.connect_timeout.unwrap_or(Duration::from_secs(35)))
+			.await?;
+	let relay = is_relay_websocket(&websocket);
+	let link =
+		timeout(page.connect_timeout.unwrap_or(Duration::from_secs(35)), WsLink::connect(&websocket))
+			.await
+			.map_err(|_| Error::Timeout("connecting to the CDP endpoint"))??;
 	let mut cdp = Cdp::new(link, events, state, None, cancelled);
-	wire_attached(&mut cdp, target_matcher, config, page).await?;
+	wire_attached(&mut cdp, target_matcher, config, page, relay).await?;
 	Ok(cdp)
+}
+
+fn is_relay_websocket(endpoint: &str) -> bool {
+	url::Url::parse(endpoint).is_ok_and(|url| url.path().trim_end_matches('/') == "/cdp")
 }
 
 async fn resolve_cdp_websocket(endpoint: &str, connect_timeout: Duration) -> Result<Str> {
@@ -158,9 +151,7 @@ async fn resolve_cdp_websocket(endpoint: &str, connect_timeout: Duration) -> Res
 		return Ok(endpoint.to_str());
 	}
 	if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-		return Err(Error::Protocol(
-			"CDP endpoint must use http, https, ws, or wss".to_str(),
-		));
+		return Err(Error::Protocol("CDP endpoint must use http, https, ws, or wss".to_str()));
 	}
 	let mut discovery = url::Url::parse(endpoint)
 		.map_err(|_| Error::Protocol("invalid CDP endpoint URL".to_str()))?;
@@ -180,8 +171,7 @@ async fn resolve_cdp_websocket(endpoint: &str, connect_timeout: Duration) -> Res
 			.send()
 			.await
 			.map_err(Error::CdpDiscovery)?;
-		if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
-			&& Instant::now() < deadline
+		if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE && Instant::now() < deadline
 		{
 			sleep(Duration::from_millis(250)).await;
 			continue;
@@ -390,6 +380,7 @@ async fn wire_attached(
 	target_matcher: Option<&str>,
 	config: FrameConfig,
 	page: &PageOptions,
+	relay: bool,
 ) -> Result<()> {
 	let targets = cdp.browser("Target.getTargets", json!({})).await?;
 	let infos = targets
@@ -412,10 +403,9 @@ async fn wire_attached(
 					.is_some_and(|title| title.contains(matcher))
 		})
 	};
-	let info = infos
-		.iter()
-		.find(eligible)
-		.ok_or_else(|| Error::Protocol("no eligible CDP page matched the requested target".to_str()))?;
+	let info = infos.iter().find(eligible).ok_or_else(|| {
+		Error::Protocol("no eligible CDP page matched the requested target".to_str())
+	})?;
 	let target = info
 		.get("targetId")
 		.and_then(Value::as_str)
@@ -432,6 +422,9 @@ async fn wire_attached(
 		.unwrap_or_default()
 		.to_str();
 	cdp.attach(target).await?;
+	if relay {
+		cdp.cmd("OMP.claimTarget", json!({})).await?;
+	}
 	wire_page(cdp, page).await?;
 	cdp.set_metrics(&config).await?;
 	{
@@ -647,10 +640,11 @@ impl Cdp {
 			if remaining.is_zero() {
 				return Err(Error::Timeout("waiting for a CDP reply"));
 			}
-			let reply = match timeout(remaining.min(Duration::from_millis(25)), self.link.recv_json()).await {
-				Ok(reply) => reply?,
-				Err(_) => continue,
-			};
+			let reply =
+				match timeout(remaining.min(Duration::from_millis(25)), self.link.recv_json()).await {
+					Ok(reply) => reply?,
+					Err(_) => continue,
+				};
 			let Some(reply) = reply else {
 				self.closed = true;
 				return Err(Error::Closed);
@@ -1370,5 +1364,13 @@ mod ipc_tests {
 		assert!(binding_is_from_main_context(&json!({ "executionContextId": 41 }), &contexts,));
 		assert!(!binding_is_from_main_context(&json!({ "executionContextId": 42 }), &contexts,));
 		assert!(!binding_is_from_main_context(&json!({}), &contexts));
+	}
+
+	#[test]
+	fn relay_private_commands_are_limited_to_the_relay_websocket() {
+		assert!(is_relay_websocket("ws://127.0.0.1:9224/cdp"));
+		assert!(is_relay_websocket("wss://relay.example/cdp/"));
+		assert!(!is_relay_websocket("ws://127.0.0.1:9222/devtools/browser/abc"));
+		assert!(!is_relay_websocket("http://127.0.0.1:9224"));
 	}
 }

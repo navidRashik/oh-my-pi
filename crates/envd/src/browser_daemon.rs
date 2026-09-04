@@ -2,7 +2,7 @@
 
 use std::{
 	collections::HashMap,
-	net::{SocketAddr, TcpStream, ToSocketAddrs as _},
+	net::{SocketAddr, ToSocketAddrs as _},
 	path::PathBuf,
 	process::{Child, Command, Stdio},
 	sync::{
@@ -21,18 +21,14 @@ use omp_tools::browser::{
 	Action, Artifact, BrowserHost, Fault, Params, Payload, Update, WaitUntil, mode_name,
 };
 use omp_webview::{
-	Engine, FrameConfig, SurfaceKind, WebView,
+	Engine, FrameConfig, SurfaceKind, WebView, WebViewBuilder, WindowConfig,
 	automation::{ExtractFormat, ObserveOptions, Selector},
-	WebViewBuilder, WindowConfig,
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-	blobs::BlobHost,
-	pi_settings::{SV_BROWSER_CDP_URL, SV_BROWSER_RELAY, SV_BROWSER_RELAY_URL},
-};
+use crate::{SV_BROWSER_CDP_URL, SV_BROWSER_RELAY, SV_BROWSER_RELAY_URL, blobs::BlobHost};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TIMEOUT: Duration = Duration::from_mins(5);
@@ -42,19 +38,31 @@ const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
 
 /// Process cache only: weak leases prevent one session from tearing down a
 /// relay still used by another; no browser/session state lives here.
-static RELAYS: LazyLock<Mutex<HashMap<String, Weak<RelayLease>>>> =
+static RELAYS: LazyLock<Mutex<HashMap<Str, Weak<RelayLease>>>> =
 	LazyLock::new(|| Mutex::new(HashMap::new()));
 
 omp_con::var! {
-	/// Enable the browser tool for scripted web automation.
+	/// Enable the browser eval prelude for scripted Chromium automation (Puppeteer).
 	pub static SV_BROWSER_ENABLED = sv_browser_enabled: bool {
 		default: true,
 		flags: archive,
+		meta: {
+			"ui.tab": "tools",
+			"ui.group": "Available Tools",
+			"ui.label": "Browser",
+			"legacy.path": "browser.enabled",
+		},
 	};
-	/// Run browser automation offscreen instead of showing a browser window.
+	/// Launch browser in headless mode (disable to show browser UI).
 	pub static SV_BROWSER_HEADLESS = sv_browser_headless: bool {
 		default: true,
 		flags: archive,
+		meta: {
+			"ui.tab": "tools",
+			"ui.group": "Grep & Browser",
+			"ui.label": "Headless Browser",
+			"legacy.path": "browser.headless",
+		},
 	};
 }
 
@@ -108,9 +116,13 @@ mod settings_tests {
 		let ctx = Ctx::new();
 		SV_BROWSER_ENABLED.set(&ctx, false).expect("set enabled");
 		SV_BROWSER_HEADLESS.set(&ctx, false).expect("set headless");
-		SV_BROWSER_CDP_URL.set(&ctx, sf!("http://127.0.0.1:9333")).expect("set cdp");
+		SV_BROWSER_CDP_URL
+			.set(&ctx, sf!("http://127.0.0.1:9333"))
+			.expect("set cdp");
 		SV_BROWSER_RELAY.set(&ctx, true).expect("set relay");
-		SV_BROWSER_RELAY_URL.set(&ctx, sf!("http://127.0.0.1:9444")).expect("set relay url");
+		SV_BROWSER_RELAY_URL
+			.set(&ctx, sf!("http://127.0.0.1:9444"))
+			.expect("set relay url");
 		assert_eq!(BrowserSettings::from_con(&ctx), BrowserSettings {
 			enabled:   false,
 			headless:  false,
@@ -129,8 +141,13 @@ enum Request {
 		updates:      flume::Sender<Update>,
 		reply:        flume::Sender<Result<Payload, Fault>>,
 	},
-	ReleaseOwner { owner: Str },
-	Restart { headless: bool, reply: flume::Sender<Result<(), Fault>> },
+	ReleaseOwner {
+		owner: Str,
+	},
+	Restart {
+		headless: bool,
+		reply:    flume::Sender<Result<(), Fault>>,
+	},
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -188,7 +205,9 @@ impl BrowserHost for BrowserDaemon {
 	}
 
 	fn release_owner(&self, owner: &str) {
-		let _ = self.requests.send(Request::ReleaseOwner { owner: owner.to_str() });
+		let _ = self
+			.requests
+			.send(Request::ReleaseOwner { owner: owner.to_str() });
 	}
 
 	async fn restart_for_mode_change(&self, headless: bool) -> Result<(), Fault> {
@@ -282,8 +301,8 @@ fn open(
 		ensure_relay(endpoint, relay, cancellation, deadline)?;
 	}
 	let _ = updates.send(Update::Started {
-		name: key.name.clone(),
-		action: Action::Open,
+		name:    key.name.clone(),
+		action:  Action::Open,
 		browser: backend.clone(),
 	});
 	let mut builder = WebViewBuilder::new(engine)
@@ -295,25 +314,31 @@ fn open(
 	if let Some(args) = params.app.as_ref().and_then(|app| app.args.as_ref()) {
 		builder = builder.arguments(args.iter().cloned());
 	}
-	let width = params.viewport.map_or(1280, |viewport| viewport.width).clamp(320, 4096);
-	let height = params.viewport.map_or(800, |viewport| viewport.height).clamp(240, 4096);
+	let width = params
+		.viewport
+		.map_or(1280, |viewport| viewport.width)
+		.clamp(320, 4096);
+	let height = params
+		.viewport
+		.map_or(800, |viewport| viewport.height)
+		.clamp(240, 4096);
 	let view = match surface {
 		SurfaceKind::Frames => builder.build_frames(FrameConfig {
 			width,
 			height,
-			scale: params.viewport.and_then(|viewport| viewport.scale).unwrap_or(1.0).clamp(0.5, 4.0),
+			scale: params
+				.viewport
+				.and_then(|viewport| viewport.scale)
+				.unwrap_or(1.0)
+				.clamp(0.5, 4.0),
 			..FrameConfig::default()
 		}),
 		SurfaceKind::Window => builder.build_window(WindowConfig { width, height }),
 		SurfaceKind::Child => unreachable!("browser tool never creates child surfaces"),
 	}
 	.map_err(|error| browser_fault("open", error))?;
-	let open_watch = SurfaceWatch::start(
-		&view,
-		cancellation.clone(),
-		Some(deadline),
-		Duration::ZERO,
-	);
+	let open_watch =
+		SurfaceWatch::start(&view, cancellation.clone(), Some(deadline), Duration::ZERO);
 	if cancellation.is_cancelled() {
 		drop(view);
 		return Err(cancelled("opening browser tab"));
@@ -327,20 +352,20 @@ fn open(
 		params.wait_until,
 		deadline.saturating_duration_since(Instant::now()),
 	)
-		.map_err(|fault| tab_fault(fault, &key.name, &view, &backend))?;
+	.map_err(|fault| tab_fault(fault, &key.name, &view, &backend))?;
 	let url = view.url();
 	let title = view.title();
 	drop(open_watch);
 	tabs.insert(key.clone(), TabSession { view, backend: backend.clone() });
 	Ok(Payload {
-		action: Action::Open,
-		name: key.name,
-		url: Some(url),
-		title: Some(title),
-		display: Vec::new(),
-		result: None,
+		action:    Action::Open,
+		name:      key.name,
+		url:       Some(url),
+		title:     Some(title),
+		display:   Vec::new(),
+		result:    None,
 		artifacts: Vec::new(),
-		browser: Some(backend),
+		browser:   Some(backend),
 	})
 }
 
@@ -384,16 +409,19 @@ fn close(
 		}
 		backend
 	};
-	let remaining = tabs.keys().filter(|candidate| candidate.owner == key.owner).count();
+	let remaining = tabs
+		.keys()
+		.filter(|candidate| candidate.owner == key.owner)
+		.count();
 	Ok(Payload {
-		action: Action::Close,
-		name: key.name,
-		url: None,
-		title: None,
-		display: Vec::new(),
-		result: Some(json!({ "remaining_tabs": remaining, "kill_requested": params.kill })),
+		action:    Action::Close,
+		name:      key.name,
+		url:       None,
+		title:     None,
+		display:   Vec::new(),
+		result:    Some(json!({ "remaining_tabs": remaining, "kill_requested": params.kill })),
 		artifacts: Vec::new(),
-		browser: Some(backend),
+		browser:   Some(backend),
 	})
 }
 
@@ -437,36 +465,46 @@ fn ensure_relay(
 	cancellation: &CancellationToken,
 	deadline: Instant,
 ) -> Result<(), Fault> {
-	let url = url::Url::parse(endpoint)
-		.map_err(|_| invalid("browser relay URL is invalid"))?;
+	let url = url::Url::parse(endpoint).map_err(|_| invalid("browser relay URL is invalid"))?;
 	let host = url
 		.host_str()
 		.filter(|host| matches!(*host, "127.0.0.1" | "localhost" | "::1"))
 		.ok_or_else(|| invalid("browser relay auto-start requires a loopback URL"))?;
-	let port = url.port_or_known_default().ok_or_else(|| invalid("browser relay URL has no port"))?;
+	let port = url
+		.port_or_known_default()
+		.ok_or_else(|| invalid("browser relay URL has no port"))?;
 	let address = (host, port)
 		.to_socket_addrs()
 		.map_err(|_| invalid("browser relay address is invalid"))?
 		.next()
 		.ok_or_else(|| invalid("browser relay address did not resolve"))?;
 	if let Some(existing) = RELAYS.lock().get(endpoint).and_then(Weak::upgrade) {
-		let exited = existing.process.lock().child.try_wait().ok().flatten().is_some();
+		let exited = existing
+			.process
+			.lock()
+			.child
+			.try_wait()
+			.ok()
+			.flatten()
+			.is_some();
 		if !exited {
 			*relay = Some(existing);
 			return wait_for_relay(address, cancellation, deadline);
 		}
 		RELAYS.lock().remove(endpoint);
 	}
-	if TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok() {
+	if crate::browser_relay::probe_relay_address_with_timeout(
+		address,
+		host,
+		port,
+		Duration::from_millis(150),
+	) {
 		return Ok(());
 	}
-	let executable = std::env::current_exe().map_err(|_| relay_fault("could not locate the omp executable"))?;
-	let mut arguments = vec![
-		"browser-relay".to_owned(),
-		"serve".to_owned(),
-		"--port".to_owned(),
-		port.to_string(),
-	];
+	let executable =
+		std::env::current_exe().map_err(|_| relay_fault("could not locate the omp executable"))?;
+	let mut arguments =
+		vec!["browser-relay".to_owned(), "serve".to_owned(), "--port".to_owned(), port.to_string()];
 	if let Some((_, token)) = url.query_pairs().find(|(key, _)| key == "token") {
 		arguments.extend(["--token".to_owned(), token.into_owned()]);
 	}
@@ -481,12 +519,14 @@ fn ensure_relay(
 		use std::os::unix::process::CommandExt as _;
 		command.process_group(0);
 	}
-	let child = command.spawn().map_err(|_| relay_fault("browser relay failed to start"))?;
+	let child = command
+		.spawn()
+		.map_err(|_| relay_fault("browser relay failed to start"))?;
 	let pid = child.id();
 	let lease = Arc::new(RelayLease { process: Mutex::new(RelayChild { child, pid }) });
 	RELAYS
 		.lock()
-		.insert(endpoint.to_owned(), Arc::downgrade(&lease));
+		.insert(endpoint.to_str(), Arc::downgrade(&lease));
 	*relay = Some(lease);
 	wait_for_relay(address, cancellation, deadline)
 }
@@ -500,7 +540,12 @@ fn wait_for_relay(
 		if cancellation.is_cancelled() {
 			return Err(cancelled("starting browser relay"));
 		}
-		if TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok() {
+		if crate::browser_relay::probe_relay_address_with_timeout(
+			address,
+			&address.ip().to_string(),
+			address.port(),
+			Duration::from_millis(150),
+		) {
 			return Ok(());
 		}
 		if Instant::now() >= deadline {
@@ -520,34 +565,37 @@ fn run_tab(
 ) -> Result<Payload, Fault> {
 	let result = {
 		let session = tabs.get(key).ok_or_else(|| not_found(&key.name))?;
-	let _ = updates.send(Update::Started {
-		name: key.name.clone(),
-		action: Action::Run,
-		browser: session.backend.clone(),
-	});
-	if let Some(url) = params.url.as_ref() {
-		session
-			.view
-			.automation()
-			.goto(url, timeout(&params))
-			.map_err(|error| tab_fault(browser_fault("goto", error), &key.name, &session.view, &session.backend))?;
-		wait_for_condition(&session.view, params.wait_until, timeout(&params))
-			.map_err(|fault| tab_fault(fault, &key.name, &session.view, &session.backend))?;
-	}
-	install_dialog_policy(&session.view, params.dialogs)?;
-	let code = required(params.code.as_deref(), "run requires `code`")?;
-	let result = run_code(session, blobs, &key.name, code, timeout(&params), cancellation, updates);
-	cleanup_interception(&session.view);
+		let _ = updates.send(Update::Started {
+			name:    key.name.clone(),
+			action:  Action::Run,
+			browser: session.backend.clone(),
+		});
+		if let Some(url) = params.url.as_ref() {
+			session
+				.view
+				.automation()
+				.goto(url, timeout(&params))
+				.map_err(|error| {
+					tab_fault(browser_fault("goto", error), &key.name, &session.view, &session.backend)
+				})?;
+			wait_for_condition(&session.view, params.wait_until, timeout(&params))
+				.map_err(|fault| tab_fault(fault, &key.name, &session.view, &session.backend))?;
+		}
+		install_dialog_policy(&session.view, params.dialogs)?;
+		let code = required(params.code.as_deref(), "run requires `code`")?;
+		let result =
+			run_code(session, blobs, &key.name, code, timeout(&params), cancellation, updates);
+		cleanup_interception(&session.view);
 		match result {
 			Ok((display, result, artifacts)) => Ok(Payload {
-			action: Action::Run,
-			name: key.name.clone(),
-			url: Some(session.view.url()),
-			title: Some(session.view.title()),
-			display,
-			result,
-			artifacts,
-			browser: Some(session.backend.clone()),
+				action: Action::Run,
+				name: key.name.clone(),
+				url: Some(session.view.url()),
+				title: Some(session.view.title()),
+				display,
+				result,
+				artifacts,
+				browser: Some(session.backend.clone()),
 			}),
 			Err(mut fault) => {
 				fault.name = Some(key.name.clone());
@@ -558,7 +606,10 @@ fn run_tab(
 			},
 		}
 	};
-	if result.as_ref().is_err_and(|fault| fault.code == "browser_cancelled") {
+	if result
+		.as_ref()
+		.is_err_and(|fault| fault.code == "browser_cancelled")
+	{
 		tabs.remove(key);
 	}
 	result
@@ -599,7 +650,11 @@ fn resolve_backend(
 			sf!("cdp"),
 		));
 	}
-	let surface = if settings.headless { SurfaceKind::Frames } else { SurfaceKind::Window };
+	let surface = if settings.headless {
+		SurfaceKind::Frames
+	} else {
+		SurfaceKind::Window
+	};
 	let engine = Engine::find(surface).map_err(|error| browser_fault("discover", error))?;
 	Ok((engine, surface, mode_name(settings.headless)))
 }
@@ -614,38 +669,30 @@ fn run_code(
 	updates: &flume::Sender<Update>,
 ) -> Result<(Vec<Value>, Option<Value>, Vec<Artifact>), Fault> {
 	let deadline = Instant::now() + budget;
-	let _target_watch = SurfaceWatch::start(
-		&session.view,
-		cancellation.clone(),
-		None,
-		Duration::from_millis(500),
-	);
-	let engine = Engine::find(SurfaceKind::Frames).map_err(|error| browser_fault("runtime", error))?;
+	let _target_watch =
+		SurfaceWatch::start(&session.view, cancellation.clone(), None, Duration::from_millis(500));
+	let engine =
+		Engine::find(SurfaceKind::Frames).map_err(|error| browser_fault("runtime", error))?;
 	let runtime = WebViewBuilder::new(engine)
 		.html("<!doctype html><meta charset=utf-8><title>omp browser run</title>")
 		.incognito(true)
 		.connect_timeout(deadline.saturating_duration_since(Instant::now()))
 		.build_frames(FrameConfig { width: 320, height: 240, ..FrameConfig::default() })
 		.map_err(|error| browser_fault("runtime", error))?;
-	let _runtime_watch = SurfaceWatch::start(
-		&runtime,
-		cancellation.clone(),
-		Some(deadline),
-		Duration::ZERO,
-	);
+	let _runtime_watch =
+		SurfaceWatch::start(&runtime, cancellation.clone(), Some(deadline), Duration::ZERO);
 	runtime
 		.automation()
 		.wait_for_navigation(deadline.saturating_duration_since(Instant::now()))
 		.map_err(|error| browser_fault("runtime", error))?;
 	runtime
 		.automation()
-		.evaluate(
-			RUN_RUNTIME,
-			deadline.saturating_duration_since(Instant::now()),
-		)
+		.evaluate(RUN_RUNTIME, deadline.saturating_duration_since(Instant::now()))
 		.map_err(|error| browser_fault("runtime", error))?;
-	let code = serde_json::to_string(code).map_err(|_| invalid("browser code is not serializable"))?;
-	let name_json = serde_json::to_string(name).map_err(|_| invalid("tab name is not serializable"))?;
+	let code =
+		serde_json::to_string(code).map_err(|_| invalid("browser code is not serializable"))?;
+	let name_json =
+		serde_json::to_string(name).map_err(|_| invalid("tab name is not serializable"))?;
 	let url_json = serde_json::to_string(session.view.url().as_str())
 		.map_err(|_| invalid("tab URL is not serializable"))?;
 	runtime
@@ -673,11 +720,18 @@ fn run_code(
 			.evaluate("globalThis.__ompTake()", Duration::from_secs(1))
 			.map_err(|error| browser_fault("runtime", error))?;
 		for request in requests.as_array().into_iter().flatten() {
-			let id = request.get("id").and_then(Value::as_u64).ok_or_else(|| invalid("runtime request omitted id"))?;
-			let op = request.get("op").and_then(Value::as_str).ok_or_else(|| invalid("runtime request omitted op"))?;
+			let id = request
+				.get("id")
+				.and_then(Value::as_u64)
+				.ok_or_else(|| invalid("runtime request omitted id"))?;
+			let op = request
+				.get("op")
+				.and_then(Value::as_str)
+				.ok_or_else(|| invalid("runtime request omitted op"))?;
 			let args = request.get("args").cloned().unwrap_or_else(|| json!([]));
 			let _ = updates.send(Update::Helper { operation: sf!("tab.{op}") });
-			match dispatch_helper(&session.view, blobs, op, &args, deadline, activity, &mut artifacts)? {
+			match dispatch_helper(&session.view, blobs, op, &args, deadline, activity, &mut artifacts)?
+			{
 				HelperReply::Ready(value) => reply_runtime(&runtime, id, Ok(value))?,
 				HelperReply::Pending(kind) => pending.push(PendingCall { id, kind }),
 			}
@@ -717,18 +771,28 @@ fn run_code(
 			.map_err(|error| browser_fault("runtime", error))?;
 		match state.get("status").and_then(Value::as_str) {
 			Some("done") if pending.is_empty() && requests.as_array().is_none_or(Vec::is_empty) => {
-				let display = state.get("display").and_then(Value::as_array).cloned().unwrap_or_default();
-				let result = state.get("result").cloned().filter(|value| !value.is_null());
+				let display = state
+					.get("display")
+					.and_then(Value::as_array)
+					.cloned()
+					.unwrap_or_default();
+				let result = state
+					.get("result")
+					.cloned()
+					.filter(|value| !value.is_null());
 				for artifact in &artifacts {
 					let _ = updates.send(Update::Artifact {
-						uri: artifact.uri.clone(),
+						uri:  artifact.uri.clone(),
 						mime: artifact.mime.clone(),
 					});
 				}
 				return Ok((display, result, artifacts));
 			},
 			Some("error") => {
-				let message = state.get("error").and_then(Value::as_str).unwrap_or("browser code failed");
+				let message = state
+					.get("error")
+					.and_then(Value::as_str)
+					.unwrap_or("browser code failed");
 				return Err(code_fault(message));
 			},
 			_ => thread::sleep(POLL),
@@ -809,15 +873,20 @@ fn dispatch_helper(
 	activity: u64,
 	artifacts: &mut Vec<Artifact>,
 ) -> Result<HelperReply, Fault> {
-	let values = args.as_array().ok_or_else(|| invalid("browser helper args must be an array"))?;
-	let remaining = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+	let values = args
+		.as_array()
+		.ok_or_else(|| invalid("browser helper args must be an array"))?;
+	let remaining = deadline
+		.saturating_duration_since(Instant::now())
+		.max(Duration::from_millis(1));
 	let tab = view.automation();
 	let document = tab.document();
 	let ready = match op {
 		"url" => json!(view.url()),
 		"title" => json!(view.title()),
 		"goto" => {
-			tab.goto(arg_str(values, 0, "goto requires a URL")?, remaining).map_err(|error| browser_fault("tab.goto", error))?;
+			tab.goto(arg_str(values, 0, "goto requires a URL")?, remaining)
+				.map_err(|error| browser_fault("tab.goto", error))?;
 			let wait_until = values
 				.get(1)
 				.and_then(Value::as_object)
@@ -830,11 +899,19 @@ fn dispatch_helper(
 		},
 		"observe" => {
 			let options = values.first().and_then(Value::as_object);
-			let observation = document.observe(ObserveOptions {
-				include_all: options.and_then(|value| value.get("includeAll")).and_then(Value::as_bool).unwrap_or(false),
-				viewport_only: options.and_then(|value| value.get("viewportOnly")).and_then(Value::as_bool).unwrap_or(true),
-				limit: 500,
-			}).map_err(|error| browser_fault("tab.observe", error))?;
+			let observation = document
+				.observe(ObserveOptions {
+					include_all:   options
+						.and_then(|value| value.get("includeAll"))
+						.and_then(Value::as_bool)
+						.unwrap_or(false),
+					viewport_only: options
+						.and_then(|value| value.get("viewportOnly"))
+						.and_then(Value::as_bool)
+						.unwrap_or(true),
+					limit:         500,
+				})
+				.map_err(|error| browser_fault("tab.observe", error))?;
 			json!({
 				"url": observation.url,
 				"title": observation.title,
@@ -852,20 +929,39 @@ fn dispatch_helper(
 			})
 		},
 		"ariaSnapshot" => {
-			let selector = values.first().and_then(Value::as_str).map(Selector::parse).transpose().map_err(|error| browser_fault("tab.ariaSnapshot", error))?;
-			json!(document.aria_snapshot(selector).map_err(|error| browser_fault("tab.ariaSnapshot", error))?)
+			let selector = values
+				.first()
+				.and_then(Value::as_str)
+				.map(Selector::parse)
+				.transpose()
+				.map_err(|error| browser_fault("tab.ariaSnapshot", error))?;
+			json!(
+				document
+					.aria_snapshot(selector)
+					.map_err(|error| browser_fault("tab.ariaSnapshot", error))?
+			)
 		},
 		"screenshot" => {
 			let options = values.first().and_then(Value::as_object);
-			let selector = options.and_then(|value| value.get("selector")).and_then(Value::as_str).map(Selector::parse).transpose().map_err(|error| browser_fault("tab.screenshot", error))?;
-			let full_page = options.and_then(|value| value.get("fullPage")).and_then(Value::as_bool).unwrap_or(false);
-			let screenshot = tab.screenshot(selector, full_page, remaining).map_err(|error| browser_fault("tab.screenshot", error))?;
+			let selector = options
+				.and_then(|value| value.get("selector"))
+				.and_then(Value::as_str)
+				.map(Selector::parse)
+				.transpose()
+				.map_err(|error| browser_fault("tab.screenshot", error))?;
+			let full_page = options
+				.and_then(|value| value.get("fullPage"))
+				.and_then(Value::as_bool)
+				.unwrap_or(false);
+			let screenshot = tab
+				.screenshot(selector, full_page, remaining)
+				.map_err(|error| browser_fault("tab.screenshot", error))?;
 			let uri = store_artifact(blobs, &screenshot.data)?;
 			artifacts.push(Artifact {
-				uri: uri.clone(),
-				mime: sf!("image/png"),
-				kind: sf!("screenshot"),
-				visible: !options
+				uri:      uri.clone(),
+				mime:     sf!("image/png"),
+				kind:     sf!("screenshot"),
+				visible:  !options
 					.and_then(|value| value.get("silent"))
 					.and_then(Value::as_bool)
 					.unwrap_or(false),
@@ -875,7 +971,13 @@ fn dispatch_helper(
 		},
 		"extract" => {
 			let format = values.first().and_then(Value::as_str).unwrap_or("text");
-			let extracted = tab.extract(if format == "text" { ExtractFormat::Text } else { ExtractFormat::Html }).map_err(|error| browser_fault("tab.extract", error))?;
+			let extracted = tab
+				.extract(if format == "text" {
+					ExtractFormat::Text
+				} else {
+					ExtractFormat::Html
+				})
+				.map_err(|error| browser_fault("tab.extract", error))?;
 			if format == "markdown" {
 				let converted = omp_tools::read::web::html_to_markdown(&extracted)
 					.map_err(|_| invalid("readable Markdown extraction failed"))?;
@@ -885,52 +987,67 @@ fn dispatch_helper(
 			}
 		},
 		"click" => {
-			document.resolve(selector(values, 0)?).map_err(|error| browser_fault("tab.click", error))?.click().map_err(|error| browser_fault("tab.click", error))?;
+			document
+				.resolve(selector(values, 0)?)
+				.map_err(|error| browser_fault("tab.click", error))?
+				.click()
+				.map_err(|error| browser_fault("tab.click", error))?;
 			Value::Null
 		},
 		"type" => {
-			document.resolve(selector(values, 0)?).map_err(|error| browser_fault("tab.type", error))?.type_text(arg_str(values, 1, "type requires text")?).map_err(|error| browser_fault("tab.type", error))?;
+			document
+				.resolve(selector(values, 0)?)
+				.map_err(|error| browser_fault("tab.type", error))?
+				.type_text(arg_str(values, 1, "type requires text")?)
+				.map_err(|error| browser_fault("tab.type", error))?;
 			Value::Null
 		},
 		"fill" => {
-			document.resolve(selector(values, 0)?).map_err(|error| browser_fault("tab.fill", error))?.fill(arg_str(values, 1, "fill requires a value")?).map_err(|error| browser_fault("tab.fill", error))?;
+			document
+				.resolve(selector(values, 0)?)
+				.map_err(|error| browser_fault("tab.fill", error))?
+				.fill(arg_str(values, 1, "fill requires a value")?)
+				.map_err(|error| browser_fault("tab.fill", error))?;
 			Value::Null
 		},
 		"press" => {
 			let key = arg_str(values, 0, "press requires a key")?;
 			if let Some(selector) = values.get(1).and_then(Value::as_str) {
 				document
-					.resolve(Selector::parse(selector).map_err(|error| browser_fault("tab.press", error))?)
+					.resolve(
+						Selector::parse(selector).map_err(|error| browser_fault("tab.press", error))?,
+					)
 					.map_err(|error| browser_fault("tab.press", error))?
 					.press(key)
 					.map_err(|error| browser_fault("tab.press", error))?;
 			} else {
-				let key = serde_json::to_string(key)
-					.map_err(|_| invalid("press key is not serializable"))?;
-				tab
-					.evaluate(
-						&format!(
-							"(()=>{{const el=document.activeElement||document.body;el.dispatchEvent(new KeyboardEvent('keydown',{{key:{key},bubbles:true}}));el.dispatchEvent(new KeyboardEvent('keyup',{{key:{key},bubbles:true}}));return true}})()"
-						),
-						remaining,
-					)
-					.map_err(|error| browser_fault("tab.press", error))?;
+				let key =
+					serde_json::to_string(key).map_err(|_| invalid("press key is not serializable"))?;
+				tab.evaluate(
+					&format!(
+						"(()=>{{const el=document.activeElement||document.body;el.dispatchEvent(new \
+						 KeyboardEvent('keydown',{{key:{key},bubbles:true}}));el.dispatchEvent(new \
+						 KeyboardEvent('keyup',{{key:{key},bubbles:true}}));return true}})()"
+					),
+					remaining,
+				)
+				.map_err(|error| browser_fault("tab.press", error))?;
 			}
 			Value::Null
 		},
 		"scroll" => {
 			let dx = values.first().and_then(Value::as_f64).unwrap_or(0.0);
 			let dy = values.get(1).and_then(Value::as_f64).unwrap_or(0.0);
-			tab
-				.evaluate(
-					&format!("(()=>{{window.scrollBy({dx},{dy});return true}})()"),
-					remaining,
-				)
+			tab.evaluate(&format!("(()=>{{window.scrollBy({dx},{dy});return true}})()"), remaining)
 				.map_err(|error| browser_fault("tab.scroll", error))?;
 			Value::Null
 		},
 		"scrollIntoView" => {
-			document.resolve(selector(values, 0)?).map_err(|error| browser_fault("tab.scrollIntoView", error))?.scroll_into_view().map_err(|error| browser_fault("tab.scrollIntoView", error))?;
+			document
+				.resolve(selector(values, 0)?)
+				.map_err(|error| browser_fault("tab.scrollIntoView", error))?
+				.scroll_into_view()
+				.map_err(|error| browser_fault("tab.scrollIntoView", error))?;
 			Value::Null
 		},
 		"drag" => {
@@ -943,7 +1060,8 @@ fn dispatch_helper(
 				let to = document
 					.resolve(selector(values, 1)?)
 					.map_err(|error| browser_fault("tab.drag", error))?;
-				from.drag_to(&to)
+				from
+					.drag_to(&to)
 					.map_err(|error| browser_fault("tab.drag", error))?;
 			} else {
 				let point = |value: &Value| -> Result<(f64, f64), Fault> {
@@ -951,15 +1069,39 @@ fn dispatch_helper(
 						.as_object()
 						.ok_or_else(|| invalid("drag points require x and y"))?;
 					Ok((
-						object.get("x").and_then(Value::as_f64).ok_or_else(|| invalid("drag point requires x"))?,
-						object.get("y").and_then(Value::as_f64).ok_or_else(|| invalid("drag point requires y"))?,
+						object
+							.get("x")
+							.and_then(Value::as_f64)
+							.ok_or_else(|| invalid("drag point requires x"))?,
+						object
+							.get("y")
+							.and_then(Value::as_f64)
+							.ok_or_else(|| invalid("drag point requires y"))?,
 					))
 				};
-				let (from_x, from_y) = point(values.first().ok_or_else(|| invalid("drag requires a source"))?)?;
-				let (to_x, to_y) = point(values.get(1).ok_or_else(|| invalid("drag requires a target"))?)?;
+				let (from_x, from_y) = point(
+					values
+						.first()
+						.ok_or_else(|| invalid("drag requires a source"))?,
+				)?;
+				let (to_x, to_y) = point(
+					values
+						.get(1)
+						.ok_or_else(|| invalid("drag requires a target"))?,
+				)?;
 				tab.evaluate(
 					&format!(
-						"(()=>{{const from=document.elementFromPoint({from_x},{from_y}),to=document.elementFromPoint({to_x},{to_y});if(!from||!to)throw new Error('drag point did not resolve');const data=new DataTransfer();from.dispatchEvent(new DragEvent('dragstart',{{bubbles:true,dataTransfer:data}}));to.dispatchEvent(new DragEvent('dragenter',{{bubbles:true,dataTransfer:data}}));to.dispatchEvent(new DragEvent('dragover',{{bubbles:true,dataTransfer:data}}));to.dispatchEvent(new DragEvent('drop',{{bubbles:true,dataTransfer:data}}));from.dispatchEvent(new DragEvent('dragend',{{bubbles:true,dataTransfer:data}}));return true}})()"
+						"(()=>{{const \
+						 from=document.elementFromPoint({from_x},{from_y}),to=document.\
+						 elementFromPoint({to_x},{to_y});if(!from||!to)throw new Error('drag point did \
+						 not resolve');const data=new DataTransfer();from.dispatchEvent(new \
+						 DragEvent('dragstart',{{bubbles:true,dataTransfer:data}}));to.\
+						 dispatchEvent(new \
+						 DragEvent('dragenter',{{bubbles:true,dataTransfer:data}}));to.\
+						 dispatchEvent(new \
+						 DragEvent('dragover',{{bubbles:true,dataTransfer:data}}));to.dispatchEvent(new \
+						 DragEvent('drop',{{bubbles:true,dataTransfer:data}}));from.dispatchEvent(new \
+						 DragEvent('dragend',{{bubbles:true,dataTransfer:data}}));return true}})()"
 					),
 					remaining,
 				)
@@ -968,43 +1110,79 @@ fn dispatch_helper(
 			Value::Null
 		},
 		"select" => {
-			let handle = document.resolve(selector(values, 0)?).map_err(|error| browser_fault("tab.select", error))?;
-			let selected = values.iter().skip(1).filter_map(Value::as_str).map(Str::new).collect::<Vec<_>>();
-			handle.select(&selected).map_err(|error| browser_fault("tab.select", error))?;
+			let handle = document
+				.resolve(selector(values, 0)?)
+				.map_err(|error| browser_fault("tab.select", error))?;
+			let selected = values
+				.iter()
+				.skip(1)
+				.filter_map(Value::as_str)
+				.map(Str::new)
+				.collect::<Vec<_>>();
+			handle
+				.select(&selected)
+				.map_err(|error| browser_fault("tab.select", error))?;
 			json!(selected)
 		},
 		"uploadFile" => {
-			let paths = values.iter().skip(1).filter_map(Value::as_str).map(PathBuf::from).collect::<Vec<_>>();
-			tab.upload_files(selector(values, 0)?, &paths, remaining).map_err(|error| browser_fault("tab.uploadFile", error))?;
+			let paths = values
+				.iter()
+				.skip(1)
+				.filter_map(Value::as_str)
+				.map(PathBuf::from)
+				.collect::<Vec<_>>();
+			tab.upload_files(selector(values, 0)?, &paths, remaining)
+				.map_err(|error| browser_fault("tab.uploadFile", error))?;
 			Value::Null
 		},
 		"evaluate" => {
 			let source = arg_str(values, 0, "evaluate requires code")?;
 			let call_args = values.get(1).cloned().unwrap_or_else(|| json!([]));
-			let args_json = serde_json::to_string(&call_args).map_err(|_| invalid("evaluate args are not serializable"))?;
+			let args_json = serde_json::to_string(&call_args)
+				.map_err(|_| invalid("evaluate args are not serializable"))?;
 			let script = if values.get(2).and_then(Value::as_bool).unwrap_or(false) {
 				format!("(async()=>await ({source})(...{args_json}))()")
 			} else {
 				format!("(async()=>{{ {source} }})()")
 			};
-			tab.evaluate(&script, remaining).map_err(|error| browser_fault("tab.evaluate", error))?
+			tab.evaluate(&script, remaining)
+				.map_err(|error| browser_fault("tab.evaluate", error))?
 		},
 		"waitFor" | "waitForSelector" => {
-			let handle = document.wait_for_selector(selector(values, 0)?, remaining).map_err(|error| browser_fault("tab.waitForSelector", error))?;
+			let handle = document
+				.wait_for_selector(selector(values, 0)?, remaining)
+				.map_err(|error| browser_fault("tab.waitForSelector", error))?;
 			json!({ "selector": values.first(), "metadata": {
 				"id": handle.metadata().map_err(|error| browser_fault("tab.waitForSelector", error))?.id
 			} })
 		},
-		"waitForUrl" => json!(tab.wait_for_url(arg_str(values, 0, "waitForUrl requires a pattern")?, remaining).map_err(|error| browser_fault("tab.waitForUrl", error))?),
-		"waitForResponse" => return Ok(HelperReply::Pending(PendingKind::Response { pattern: arg_str(values, 0, "waitForResponse requires a pattern")?.to_str() })),
-		"waitForNavigation" => return Ok(HelperReply::Pending(PendingKind::Navigation { url: view.url(), activity })),
+		"waitForUrl" => json!(
+			tab.wait_for_url(arg_str(values, 0, "waitForUrl requires a pattern")?, remaining)
+				.map_err(|error| browser_fault("tab.waitForUrl", error))?
+		),
+		"waitForResponse" => {
+			return Ok(HelperReply::Pending(PendingKind::Response {
+				pattern: arg_str(values, 0, "waitForResponse requires a pattern")?.to_str(),
+			}));
+		},
+		"waitForNavigation" => {
+			return Ok(HelperReply::Pending(PendingKind::Navigation { url: view.url(), activity }));
+		},
 		"download" => {
 			let url = arg_str(values, 0, "download requires a URL")?;
-			let encoded_url = serde_json::to_string(url).map_err(|_| invalid("download URL is not serializable"))?;
+			let encoded_url =
+				serde_json::to_string(url).map_err(|_| invalid("download URL is not serializable"))?;
 			let downloaded = tab.evaluate(&format!(r#"(async()=>{{const r=await fetch({encoded_url},{{credentials:'include'}});if(!r.ok)throw new Error(`download HTTP ${{r.status}}`);const b=new Uint8Array(await r.arrayBuffer());if(b.length>{MAX_DOWNLOAD_BYTES})throw new Error('download exceeds byte limit');let s='';for(let i=0;i<b.length;i+=32768)s+=String.fromCharCode(...b.subarray(i,i+32768));return {{data:btoa(s),mime:r.headers.get('content-type')||'application/octet-stream'}};}})()"#), remaining).map_err(|error| browser_fault("tab.download", error))?;
-			let data = downloaded.get("data").and_then(Value::as_str).ok_or_else(|| invalid("download returned no bytes"))?;
-			let bytes = base64::decode(data.as_bytes()).into_vec().map_err(|_| invalid("download returned invalid base64"))?;
-			if bytes.len() > MAX_DOWNLOAD_BYTES { return Err(invalid("download exceeds byte limit")); }
+			let data = downloaded
+				.get("data")
+				.and_then(Value::as_str)
+				.ok_or_else(|| invalid("download returned no bytes"))?;
+			let bytes = base64::decode(data.as_bytes())
+				.into_vec()
+				.map_err(|_| invalid("download returned invalid base64"))?;
+			if bytes.len() > MAX_DOWNLOAD_BYTES {
+				return Err(invalid("download exceeds byte limit"));
+			}
 			let uri = store_artifact(blobs, &bytes)?;
 			let mime = downloaded
 				.get("mime")
@@ -1012,10 +1190,10 @@ fn dispatch_helper(
 				.unwrap_or("application/octet-stream")
 				.to_str();
 			artifacts.push(Artifact {
-				uri: uri.clone(),
-				mime: mime.clone(),
-				kind: sf!("download"),
-				visible: true,
+				uri:      uri.clone(),
+				mime:     mime.clone(),
+				kind:     sf!("download"),
+				visible:  true,
 				byte_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
 			});
 			json!({ "artifact": uri, "mime": mime, "bytes": bytes.len() })
@@ -1032,7 +1210,12 @@ fn dispatch_helper(
 			clear_request_handlers(view)?;
 			Value::Null
 		},
-		_ => return Err(invalid_owned(sf!("unsupported browser helper `tab.{op}`"), Some(sf!("tab.{op}")))),
+		_ => {
+			return Err(invalid_owned(
+				sf!("unsupported browser helper `tab.{op}`"),
+				Some(sf!("tab.{op}")),
+			));
+		},
 	};
 	Ok(HelperReply::Ready(ready))
 }
@@ -1042,7 +1225,8 @@ fn reply_runtime(runtime: &WebView, id: u64, result: Result<Value, Fault>) -> Re
 		Ok(value) => json!({ "ok": true, "value": value }),
 		Err(fault) => json!({ "ok": false, "error": fault.message }),
 	};
-	let envelope = serde_json::to_string(&envelope).map_err(|_| invalid("runtime reply is not serializable"))?;
+	let envelope =
+		serde_json::to_string(&envelope).map_err(|_| invalid("runtime reply is not serializable"))?;
 	runtime
 		.automation()
 		.evaluate(&format!("globalThis.__ompReply({id},{envelope})"), Duration::from_secs(1))
@@ -1050,12 +1234,18 @@ fn reply_runtime(runtime: &WebView, id: u64, result: Result<Value, Fault>) -> Re
 		.map_err(|error| browser_fault("runtime", error))
 }
 
-fn install_dialog_policy(view: &WebView, policy: Option<omp_tools::browser::Dialogs>) -> Result<(), Fault> {
-	let Some(policy) = policy else { return Ok(()); };
+fn install_dialog_policy(
+	view: &WebView,
+	policy: Option<omp_tools::browser::Dialogs>,
+) -> Result<(), Fault> {
+	let Some(policy) = policy else {
+		return Ok(());
+	};
 	let accept = matches!(policy, omp_tools::browser::Dialogs::Accept);
 	let prompt = if accept { "''" } else { "null" };
 	let script = format!(
-		"(()=>{{window.alert=()=>undefined;window.confirm=()=>{accept};window.prompt=()=>{prompt};return true}})()"
+		"(()=>{{window.alert=()=>undefined;window.confirm=()=>{accept};window.prompt=()=>{prompt};\
+		 return true}})()"
 	);
 	view
 		.automation()
@@ -1065,15 +1255,26 @@ fn install_dialog_policy(view: &WebView, policy: Option<omp_tools::browser::Dial
 }
 
 fn set_interception(view: &WebView, enabled: bool) -> Result<(), Fault> {
-	let script = if enabled { INTERCEPTION_INSTALL } else { INTERCEPTION_CLEANUP };
-	view.automation().evaluate(script, Duration::from_secs(2)).map(drop).map_err(|error| browser_fault("page.setRequestInterception", error))
+	let script = if enabled {
+		INTERCEPTION_INSTALL
+	} else {
+		INTERCEPTION_CLEANUP
+	};
+	view
+		.automation()
+		.evaluate(script, Duration::from_secs(2))
+		.map(drop)
+		.map_err(|error| browser_fault("page.setRequestInterception", error))
 }
 
 fn install_request_handler(view: &WebView, source: &str) -> Result<(), Fault> {
-	let source = serde_json::to_string(source).map_err(|_| invalid("request handler is not serializable"))?;
+	let source =
+		serde_json::to_string(source).map_err(|_| invalid("request handler is not serializable"))?;
 	let script = format!(
 		"(()=>{{const source={source};if(!globalThis.__ompIntercept)throw new Error('request \
-		 interception is not enabled');globalThis.__ompIntercept.handlers.push((0,eval)('('+source+')'));return true}})()"
+		 interception is not \
+		 enabled');globalThis.__ompIntercept.handlers.push((0,eval)('('+source+')'));return \
+		 true}})()"
 	);
 	view
 		.automation()
@@ -1083,11 +1284,20 @@ fn install_request_handler(view: &WebView, source: &str) -> Result<(), Fault> {
 }
 
 fn clear_request_handlers(view: &WebView) -> Result<(), Fault> {
-	view.automation().evaluate("(()=>{if(globalThis.__ompIntercept)globalThis.__ompIntercept.handlers=[];return true})()", Duration::from_secs(2)).map(drop).map_err(|error| browser_fault("page.removeAllListeners", error))
+	view
+		.automation()
+		.evaluate(
+			"(()=>{if(globalThis.__ompIntercept)globalThis.__ompIntercept.handlers=[];return true})()",
+			Duration::from_secs(2),
+		)
+		.map(drop)
+		.map_err(|error| browser_fault("page.removeAllListeners", error))
 }
 
 fn cleanup_interception(view: &WebView) {
-	let _ = view.automation().evaluate(INTERCEPTION_CLEANUP, Duration::from_millis(500));
+	let _ = view
+		.automation()
+		.evaluate(INTERCEPTION_CLEANUP, Duration::from_millis(500));
 }
 
 fn wait_for_navigation(
@@ -1115,12 +1325,19 @@ fn wait_for_condition(
 		let state = view
 			.automation()
 			.evaluate(
-				"({ready:document.readyState,resources:performance.getEntriesByType('resource').length})",
+				"({ready:document.readyState,resources:performance.getEntriesByType('resource').\
+				 length})",
 				Duration::from_secs(2),
 			)
 			.map_err(|error| browser_fault("waitForNavigation", error))?;
-		let ready = state.get("ready").and_then(Value::as_str).unwrap_or_default();
-		let resources = state.get("resources").and_then(Value::as_u64).unwrap_or_default();
+		let ready = state
+			.get("ready")
+			.and_then(Value::as_str)
+			.unwrap_or_default();
+		let resources = state
+			.get("resources")
+			.and_then(Value::as_u64)
+			.unwrap_or_default();
 		if last_resources != Some(resources) {
 			last_resources = Some(resources);
 			quiet_since = Instant::now();
@@ -1160,22 +1377,32 @@ fn mutates_page(op: &str) -> bool {
 }
 
 fn selector(values: &[Value], index: usize) -> Result<Selector, Fault> {
-	Selector::parse(arg_str(values, index, "selector is required")?).map_err(|error| browser_fault("selector", error))
+	Selector::parse(arg_str(values, index, "selector is required")?)
+		.map_err(|error| browser_fault("selector", error))
 }
 
 fn arg_str<'a>(values: &'a [Value], index: usize, message: &'static str) -> Result<&'a str, Fault> {
-	values.get(index).and_then(Value::as_str).ok_or_else(|| invalid(message))
+	values
+		.get(index)
+		.and_then(Value::as_str)
+		.ok_or_else(|| invalid(message))
 }
 
 fn store_artifact(blobs: &BlobHost, bytes: &[u8]) -> Result<Str, Fault> {
 	let id = blobs.put(bytes).map_err(|_| artifact_fault())?;
-	let hash = id.hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+	let hash = id
+		.hash
+		.iter()
+		.map(|byte| format!("{byte:02x}"))
+		.collect::<String>();
 	Ok(sf!("artifact://sha256/{hash}"))
 }
 
 fn validate(params: &Params) -> Result<(), Fault> {
 	if let Some(app) = &params.app {
-		let choices = usize::from(app.path.is_some()) + usize::from(app.cdp_url.is_some()) + usize::from(app.relay == Some(true));
+		let choices = usize::from(app.path.is_some())
+			+ usize::from(app.cdp_url.is_some())
+			+ usize::from(app.relay == Some(true));
 		if choices > 1 {
 			return Err(invalid("app.path, app.cdp_url, and app.relay are mutually exclusive"));
 		}
@@ -1186,13 +1413,20 @@ fn validate(params: &Params) -> Result<(), Fault> {
 	match params.action {
 		Action::Open if params.code.is_some() => Err(invalid("open does not accept code")),
 		Action::Run if params.code.is_none() => Err(invalid("run requires `code`")),
-		Action::Close if params.code.is_some() || params.url.is_some() || params.app.is_some() => Err(invalid("close accepts only name, all, and kill")),
+		Action::Close if params.code.is_some() || params.url.is_some() || params.app.is_some() => {
+			Err(invalid("close accepts only name, all, and kill"))
+		},
 		_ => Ok(()),
 	}
 }
 
 fn timeout(params: &Params) -> Duration {
-	Duration::from_secs_f64(params.timeout.unwrap_or(DEFAULT_TIMEOUT.as_secs_f64()).clamp(0.001, MAX_TIMEOUT.as_secs_f64()))
+	Duration::from_secs_f64(
+		params
+			.timeout
+			.unwrap_or(DEFAULT_TIMEOUT.as_secs_f64())
+			.clamp(0.001, MAX_TIMEOUT.as_secs_f64()),
+	)
 }
 
 fn required<'a>(value: Option<&'a str>, message: &'static str) -> Result<&'a str, Fault> {
@@ -1204,51 +1438,112 @@ fn invalid(message: &'static str) -> Fault {
 }
 
 fn invalid_owned(message: Str, operation: Option<Str>) -> Fault {
-	Fault { code: sf!("invalid_browser_request"), message, name: None, url: None, title: None, browser: None, operation }
+	Fault {
+		code: sf!("invalid_browser_request"),
+		message,
+		name: None,
+		url: None,
+		title: None,
+		browser: None,
+		operation,
+	}
 }
 
 fn not_found(name: &str) -> Fault {
-	Fault { code: sf!("browser_tab_not_found"), message: sf!("browser tab `{name}` is not open"), name: Some(name.to_str()), url: None, title: None, browser: None, operation: None }
+	Fault {
+		code:      sf!("browser_tab_not_found"),
+		message:   sf!("browser tab `{name}` is not open"),
+		name:      Some(name.to_str()),
+		url:       None,
+		title:     None,
+		browser:   None,
+		operation: None,
+	}
 }
 
 fn daemon_closed() -> Fault {
-	Fault { code: sf!("browser_daemon_closed"), message: sf!("browser daemon is not available"), name: None, url: None, title: None, browser: None, operation: None }
+	Fault {
+		code:      sf!("browser_daemon_closed"),
+		message:   sf!("browser daemon is not available"),
+		name:      None,
+		url:       None,
+		title:     None,
+		browser:   None,
+		operation: None,
+	}
 }
 
 fn cancelled(operation: &'static str) -> Fault {
-	Fault { code: sf!("browser_cancelled"), message: sf!("browser operation was cancelled"), name: None, url: None, title: None, browser: None, operation: Some(Str::new_static(operation)) }
+	Fault {
+		code:      sf!("browser_cancelled"),
+		message:   sf!("browser operation was cancelled"),
+		name:      None,
+		url:       None,
+		title:     None,
+		browser:   None,
+		operation: Some(Str::new_static(operation)),
+	}
 }
 
 fn timed_out(operation: &'static str) -> Fault {
-	Fault { code: sf!("browser_timeout"), message: sf!("browser operation timed out while {operation}"), name: None, url: None, title: None, browser: None, operation: Some(Str::new_static(operation)) }
+	Fault {
+		code:      sf!("browser_timeout"),
+		message:   sf!("browser operation timed out while {operation}"),
+		name:      None,
+		url:       None,
+		title:     None,
+		browser:   None,
+		operation: Some(Str::new_static(operation)),
+	}
 }
 
 fn code_fault(message: &str) -> Fault {
-	Fault { code: sf!("browser_code_failed"), message: redact(message), name: None, url: None, title: None, browser: None, operation: Some(sf!("run")) }
+	Fault {
+		code:      sf!("browser_code_failed"),
+		message:   redact(message),
+		name:      None,
+		url:       None,
+		title:     None,
+		browser:   None,
+		operation: Some(sf!("run")),
+	}
 }
 
 fn artifact_fault() -> Fault {
-	Fault { code: sf!("browser_artifact_failed"), message: sf!("browser output could not be retained"), name: None, url: None, title: None, browser: None, operation: Some(sf!("artifact")) }
+	Fault {
+		code:      sf!("browser_artifact_failed"),
+		message:   sf!("browser output could not be retained"),
+		name:      None,
+		url:       None,
+		title:     None,
+		browser:   None,
+		operation: Some(sf!("artifact")),
+	}
 }
 
 fn relay_fault(message: &'static str) -> Fault {
-	Fault { code: sf!("browser_relay_failed"), message: Str::new_static(message), name: None, url: None, title: None, browser: Some(sf!("relay")), operation: Some(sf!("open")) }
+	Fault {
+		code:      sf!("browser_relay_failed"),
+		message:   Str::new_static(message),
+		name:      None,
+		url:       None,
+		title:     None,
+		browser:   Some(sf!("relay")),
+		operation: Some(sf!("open")),
+	}
 }
 
 fn browser_fault(operation: &'static str, error: omp_webview::Error) -> Fault {
 	let (code, message) = match &error {
-		omp_webview::Error::NoEngine(_) => (
-			sf!("browser_engine_unavailable"),
-			sf!("no supported browser engine is installed"),
-		),
-		omp_webview::Error::CdpDiscovery(_) => (
-			sf!("browser_cdp_unavailable"),
-			sf!("CDP endpoint discovery failed"),
-		),
-		omp_webview::Error::Launch { .. } => (
-			sf!("browser_launch_failed"),
-			sf!("browser process failed to launch"),
-		),
+		omp_webview::Error::NoEngine(_) => {
+			(sf!("browser_engine_unavailable"), sf!("no supported browser engine is installed"))
+		},
+		omp_webview::Error::CdpDiscovery(_) => {
+			(sf!("browser_cdp_unavailable"), sf!("CDP endpoint discovery failed"))
+		},
+		omp_webview::Error::Launch { .. } => {
+			(sf!("browser_launch_failed"), sf!("browser process failed to launch"))
+		},
 		omp_webview::Error::Timeout(_) => (sf!("browser_timeout"), redact(&error.to_string())),
 		omp_webview::Error::Closed => (sf!("browser_closed"), sf!("browser connection closed")),
 		omp_webview::Error::Protocol(_) => {
@@ -1290,11 +1585,21 @@ fn redact_url(raw: &str) -> Str {
 }
 
 fn redact(message: &str) -> Str {
-	let mut words = message.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+	let mut words = message
+		.split_whitespace()
+		.map(str::to_owned)
+		.collect::<Vec<_>>();
 	for word in &mut words {
-		if (word.starts_with("http://") || word.starts_with("https://") || word.starts_with("ws://") || word.starts_with("wss://")) && (word.contains('?') || word.contains('@')) {
+		if (word.starts_with("http://")
+			|| word.starts_with("https://")
+			|| word.starts_with("ws://")
+			|| word.starts_with("wss://"))
+			&& (word.contains('?') || word.contains('@'))
+		{
 			*word = "<redacted-url>".to_owned();
-		} else if word.to_ascii_lowercase().contains("token=") || word.to_ascii_lowercase().contains("authorization") {
+		} else if word.to_ascii_lowercase().contains("token=")
+			|| word.to_ascii_lowercase().contains("authorization")
+		{
 			*word = "<redacted>".to_owned();
 		}
 	}
@@ -1393,16 +1698,18 @@ mod tests {
 	#[test]
 	fn run_requires_code_and_app_backends_are_exclusive() {
 		assert_eq!(
-			validate(&params(Action::Run)).expect_err("missing code").code,
+			validate(&params(Action::Run))
+				.expect_err("missing code")
+				.code,
 			"invalid_browser_request"
 		);
 		let mut request = params(Action::Open);
 		request.app = Some(omp_tools::browser::App {
-			path: Some(sf!("/Applications/Browser")),
+			path:    Some(sf!("/Applications/Browser")),
 			cdp_url: Some(sf!("http://127.0.0.1:9222")),
-			relay: None,
-			args: None,
-			target: None,
+			relay:   None,
+			args:    None,
+			target:  None,
 		});
 		assert!(validate(&request).is_err());
 	}

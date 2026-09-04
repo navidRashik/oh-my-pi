@@ -410,19 +410,17 @@ impl WebViewBuilder {
 						);
 					})?
 			},
-			Engine::ChromiumCdp { endpoint, target } => {
-				remote::spawn(self.page, move |ctx| {
-					chromium::drive_attached(endpoint, target, config, ctx)
-				})
-				.inspect_err(|error| {
-					tracing::warn!(
-						engine = %engine,
-						surface = "frames",
-						error = error.kind(),
-						"attached webview initialization failed"
-					);
-				})?
-			},
+			Engine::ChromiumCdp { endpoint, target } => remote::spawn(self.page, move |ctx| {
+				chromium::drive_attached(endpoint, target, config, ctx)
+			})
+			.inspect_err(|error| {
+				tracing::warn!(
+					engine = %engine,
+					surface = "frames",
+					error = error.kind(),
+					"attached webview initialization failed"
+				);
+			})?,
 			Engine::Firefox { binary } => {
 				remote::spawn(self.page, move |ctx| firefox::drive_frames(binary, config, ctx))
 					.inspect_err(|error| {
@@ -492,23 +490,22 @@ impl WebViewBuilder {
 						);
 					})?
 			},
-			Engine::ChromiumCdp { endpoint, target } => {
-				remote::spawn(self.page, move |ctx| {
-					chromium::drive_attached(endpoint, target, FrameConfig {
-						width: config.width,
-						height: config.height,
-						..FrameConfig::default()
-					}, ctx)
-				})
-				.inspect_err(|error| {
-					tracing::warn!(
-						engine = %engine,
-						surface = "window",
-						error = error.kind(),
-						"attached webview initialization failed"
-					);
-				})?
-			},
+			Engine::ChromiumCdp { endpoint, target } => remote::spawn(self.page, move |ctx| {
+				chromium::drive_attached(
+					endpoint,
+					target,
+					FrameConfig { width: config.width, height: config.height, ..FrameConfig::default() },
+					ctx,
+				)
+			})
+			.inspect_err(|error| {
+				tracing::warn!(
+					engine = %engine,
+					surface = "window",
+					error = error.kind(),
+					"attached webview initialization failed"
+				);
+			})?,
 			Engine::Firefox { binary } => {
 				remote::spawn(self.page, move |ctx| firefox::drive_window(binary, config, ctx))
 					.inspect_err(|error| {

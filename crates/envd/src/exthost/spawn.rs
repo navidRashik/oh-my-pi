@@ -128,9 +128,12 @@ pub struct RunningHost {
 	cancellation: CancellationLadder,
 	restart_spec: SpawnSpec,
 	identity:     ControlConnectionIdentity,
-	authority:    Arc<dyn ControlAuthority>,
 	snapshot:     ControlAuthoritySnapshot,
 	sandbox:      Option<PreparedSandbox>,
+}
+
+const fn cancellation_stops_child(outcome: &CancellationOutcome) -> bool {
+	matches!(outcome, CancellationOutcome::Killed(_) | CancellationOutcome::Disabled(_))
 }
 
 /// Failure while driving a live child or its cancellation ladder.
@@ -170,7 +173,7 @@ impl SpawnedHost {
 	) -> Result<RunningHost, RunningHostError> {
 		let Self { key, mut child, control, logs, restart_spec, sandbox } = self;
 		let (runtime, handle) =
-			ControlRuntime::new(control, key.clone(), identity.clone(), Arc::clone(&authority));
+			ControlRuntime::new(control, key.clone(), identity.clone(), authority);
 		let pump = tokio::spawn(runtime.serve());
 		if let Err(error) = handle.install_authority_snapshot(snapshot).await {
 			pump.abort();
@@ -205,7 +208,6 @@ impl SpawnedHost {
 			cancellation: CancellationLadder::default(),
 			restart_spec,
 			identity,
-			authority,
 			snapshot: snapshot.clone(),
 			sandbox,
 		})
@@ -242,14 +244,6 @@ impl RunningHost {
 		self.cancellation.disabled(&self.key)
 	}
 
-	/// Reaps the current process group and starts its next authenticated
-	/// generation.
-	pub async fn restart(&mut self) -> Result<(), RunningHostError> {
-		self
-			.restart_with_authority(Arc::clone(&self.authority))
-			.await
-	}
-
 	/// Reaps the current process group and starts its next generation with a
 	/// freshly identity-bound CONTROL authority.
 	pub async fn restart_with_authority(
@@ -281,6 +275,10 @@ impl RunningHost {
 
 	/// Runs all three cancellation stages, killing only this process group when
 	/// Python remains live after both courtesy graces.
+	///
+	/// A forced kill leaves the host stopped. The supervisor must acquire a
+	/// freshly generation-bound authority before calling
+	/// [`Self::restart_with_authority`].
 	pub async fn cancel_dispatch(
 		&mut self,
 		invocation: &str,
@@ -299,10 +297,8 @@ impl RunningHost {
 			self
 				.cancellation
 				.kill_after_grace(self.key.clone(), &mut self.child, last_frame)?;
-		match outcome {
-			CancellationOutcome::Killed(_) => self.restart().await?,
-			CancellationOutcome::Disabled(_) => self.terminate().await,
-			CancellationOutcome::DispatchCancel | CancellationOutcome::InterruptThread => {},
+		if cancellation_stops_child(&outcome) {
+			self.terminate().await;
 		}
 		Ok(outcome)
 	}
@@ -764,6 +760,20 @@ fn install_package_snapshot(engine: &omp_py::Engine) -> Result<(), SpawnError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::exthost::cancel::{CancelStage, CancellationJournal};
+
+	#[test]
+	fn forced_cancellation_stops_before_authorized_restart() {
+		assert!(!cancellation_stops_child(&CancellationOutcome::DispatchCancel));
+		assert!(!cancellation_stops_child(&CancellationOutcome::InterruptThread));
+		let journal = CancellationJournal {
+			extension:  HostKey::new("project", "trusted", "fixture"),
+			last_frame: 7,
+			stage:      CancelStage::ProcessGroupKill,
+		};
+		assert!(cancellation_stops_child(&CancellationOutcome::Killed(journal.clone())));
+		assert!(cancellation_stops_child(&CancellationOutcome::Disabled(journal)));
+	}
 
 	#[tokio::test]
 	async fn unknown_trust_tier_never_falls_back_to_raw_spawn() {

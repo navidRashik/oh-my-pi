@@ -15,11 +15,13 @@ use http::{
 	HeaderMap, HeaderValue,
 	header::{ACCEPT, LOCATION, RETRY_AFTER, USER_AGENT},
 };
+use omp_ai::auth::HeaderPlacement;
 use omp_cache::github_cache::GithubCache;
 use omp_core::{Str, sf};
 use omp_journal::blob::BlobRef;
-use omp_inference::auth::HeaderPlacement;
-use omp_tools::github::{Artifact, DateField, Fault, GithubHost, Operation, Params, Payload, Update};
+use omp_tools::github::{
+	Artifact, DateField, Fault, GithubHost, Operation, Params, Payload, Update,
+};
 use omp_vcs::{PushOptions, git::GitRepo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -88,10 +90,7 @@ impl GithubService {
 	) -> Result<ApiResponse, Fault> {
 		let mut headers = self.api_headers(cancellation).await?;
 		if method == Method::GetTextMatch {
-			headers.insert(
-				ACCEPT,
-				HeaderValue::from_static("application/vnd.github.text-match+json"),
-			);
+			headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.text-match+json"));
 		}
 		let url = github_url::api_url_for_host(host, path);
 		let request = match method {
@@ -135,12 +134,10 @@ impl GithubService {
 				});
 			let rate_limited = status == 429
 				|| remaining == Some(0)
-				|| remote_message
-					.as_deref()
-					.is_some_and(|message| {
-						message.to_ascii_lowercase().contains("rate limit")
-							|| message.to_ascii_lowercase().contains("abuse detection")
-					});
+				|| remote_message.as_deref().is_some_and(|message| {
+					message.to_ascii_lowercase().contains("rate limit")
+						|| message.to_ascii_lowercase().contains("abuse detection")
+				});
 			let (code, message) = if rate_limited {
 				(
 					sf!("github_rate_limited"),
@@ -187,18 +184,13 @@ impl GithubService {
 			result = self.credentials.lease() => result,
 			() = cancellation.cancelled() => return Err(cancelled_fault()),
 		}
-		.map_err(|_| {
-			fault(
-				"github_credentials_failed",
-				"GitHub credential lease failed",
-			)
-		})? {
+		.map_err(|_| fault("github_credentials_failed", "GitHub credential lease failed"))?
+		{
 			lease
 				.apply_header(&HeaderPlacement::bearer(), &mut headers)
-				.map_err(|_| fault(
-					"github_credentials_failed",
-					"GitHub credential projection failed",
-				))?;
+				.map_err(|_| {
+					fault("github_credentials_failed", "GitHub credential projection failed")
+				})?;
 		}
 		Ok(headers)
 	}
@@ -258,10 +250,7 @@ impl GithubService {
 			},
 			|repo| {
 				GithubRepo::parse(repo).map_err(|_| {
-					fault(
-						"github_invalid_repo",
-						"GitHub repository must be [host/]owner/repo",
-					)
+					fault("github_invalid_repo", "GitHub repository must be [host/]owner/repo")
 				})
 			},
 		)
@@ -276,12 +265,9 @@ impl GithubService {
 			let Some((repo, _)) = parse_pr_url(pr)? else {
 				continue;
 			};
-			if from_url
-				.as_ref()
-				.is_some_and(|current: &GithubRepo| {
-					!current.identity().eq_ignore_ascii_case(repo.identity())
-				})
-			{
+			if from_url.as_ref().is_some_and(|current: &GithubRepo| {
+				!current.identity().eq_ignore_ascii_case(repo.identity())
+			}) {
 				return Err(fault(
 					"github_repo_mismatch",
 					"pull request URLs in one batch must belong to one repository",
@@ -298,10 +284,7 @@ impl GithubService {
 			.invalidate_repo(repo.identity())
 			.map(|_| ())
 			.map_err(|_| {
-				fault(
-					"github_cache_failed",
-					"GitHub cache invalidation failed after mutation",
-				)
+				fault("github_cache_failed", "GitHub cache invalidation failed after mutation")
 			})
 	}
 }
@@ -350,13 +333,8 @@ impl GithubHost for GithubService {
 				let mut response = self
 					.request(repo.host(), Method::Get, &endpoint, None, &cancellation)
 					.await?;
-				let (value, artifact) = decode_file_response(
-					&response.value,
-					repo.identity(),
-					path,
-					branch,
-					&self.blobs,
-				)?;
+				let (value, artifact) =
+					decode_file_response(&response.value, repo.identity(), path, branch, &self.blobs)?;
 				response.value = value;
 				response.artifact = artifact;
 				response
@@ -734,15 +712,16 @@ impl GithubService {
 			}
 		}
 		if checkouts.is_empty() {
-			return Err(first_failure.unwrap_or_else(|| {
-				fault("github_git_failed", "all pull request checkouts failed")
-			}));
+			return Err(
+				first_failure
+					.unwrap_or_else(|| fault("github_git_failed", "all pull request checkouts failed")),
+			);
 		}
 		Ok(ApiResponse {
-			value: json!({ "checkouts": checkouts, "failures": failures }),
+			value:     json!({ "checkouts": checkouts, "failures": failures }),
 			remaining: None,
-			reset: None,
-			artifact: None,
+			reset:     None,
+			artifact:  None,
 		})
 	}
 
@@ -791,9 +770,9 @@ impl GithubService {
 		}
 		fs::create_dir_all(&path).map_err(io_fault)?;
 		let metadata = CheckoutMetadata {
-			repo: repo.identity().to_owned(),
-			clone_url: clone_url.to_owned(),
-			head: head.to_owned(),
+			repo:          repo.identity().to_owned(),
+			clone_url:     clone_url.to_owned(),
+			head:          head.to_owned(),
 			expected_head: expected_head.to_owned(),
 		};
 		fs::write(
@@ -850,15 +829,16 @@ impl GithubService {
 			}
 		}
 		if pushed.is_empty() {
-			return Err(first_failure.unwrap_or_else(|| {
-				fault("github_git_failed", "all pull request pushes failed")
-			}));
+			return Err(
+				first_failure
+					.unwrap_or_else(|| fault("github_git_failed", "all pull request pushes failed")),
+			);
 		}
 		Ok(ApiResponse {
-			value: json!({ "pushed": pushed, "failures": failures }),
+			value:     json!({ "pushed": pushed, "failures": failures }),
 			remaining: None,
-			reset: None,
-			artifact: None,
+			reset:     None,
+			artifact:  None,
 		})
 	}
 
@@ -878,9 +858,7 @@ impl GithubService {
 		let mut metadata: CheckoutMetadata = serde_json::from_slice(
 			&fs::read(self.worktrees.join(format!("pr-{number}.json"))).map_err(io_fault)?,
 		)
-		.map_err(|_| {
-			fault("github_checkout_missing", "pull request checkout metadata is invalid")
-		})?;
+		.map_err(|_| fault("github_checkout_missing", "pull request checkout metadata is invalid"))?;
 		if !metadata.repo.eq_ignore_ascii_case(repo.identity()) {
 			return Err(fault(
 				"github_repo_mismatch",
@@ -956,15 +934,14 @@ impl GithubService {
 		updates: &flume::Sender<Update>,
 	) -> Result<ApiResponse, Fault> {
 		let tail = tail_limit(params.tail)?;
-		let run = params
-			.run
-			.as_deref()
-			.map(parse_run_reference)
-			.transpose()?;
+		let run = params.run.as_deref().map(parse_run_reference).transpose()?;
 		let repo = match (params.repo.as_deref(), run.as_ref().and_then(|run| run.repo.as_ref())) {
 			(Some(requested), Some(from_run)) => {
 				let requested = self.repo(Some(requested))?;
-				if !requested.identity().eq_ignore_ascii_case(from_run.identity()) {
+				if !requested
+					.identity()
+					.eq_ignore_ascii_case(from_run.identity())
+				{
 					return Err(fault(
 						"github_repo_mismatch",
 						"Actions run URL belongs to a different repository",
@@ -996,7 +973,10 @@ impl GithubService {
 			WatchTarget::Commit { branch: Str::new(branch), head_sha: Str::new(head_sha) }
 		} else {
 			let current_repo = self.repo(None)?;
-			if !current_repo.identity().eq_ignore_ascii_case(repo.identity()) {
+			if !current_repo
+				.identity()
+				.eq_ignore_ascii_case(repo.identity())
+			{
 				return Err(fault(
 					"github_repo_mismatch",
 					"current checkout does not match `repo`; pass `branch` or `run`",
@@ -1028,8 +1008,7 @@ impl GithubService {
 					response
 				},
 				Err(error)
-					if error.is_rate_limited()
-						&& rate_limit_failures < RUN_WATCH_RATE_LIMIT_RETRIES =>
+					if error.is_rate_limited() && rate_limit_failures < RUN_WATCH_RATE_LIMIT_RETRIES =>
 				{
 					rate_limit_failures += 1;
 					let delay = Duration::from_secs(error.retry_after_seconds.unwrap_or(15).min(60));
@@ -1047,14 +1026,12 @@ impl GithubService {
 			let state = actions_state(&response.value);
 			if let Some(object) = response.value.as_object_mut() {
 				object.insert("poll_count".to_owned(), Value::from(poll_count));
-				object.insert(
-					"outcome".to_owned(),
-					Value::String(<&'static str>::from(state).to_owned()),
-				);
+				object
+					.insert("outcome".to_owned(), Value::String(<&'static str>::from(state).to_owned()));
 			}
 			let output = render_output(Operation::RunWatch, &response.value, None);
 			let _ = updates.try_send(Update {
-				op: Operation::RunWatch,
+				op:     Operation::RunWatch,
 				result: response.value.clone(),
 				output: Str::new(output),
 			});
@@ -1063,8 +1040,7 @@ impl GithubService {
 				poll_sleep(Duration::from_secs(5), cancellation).await?;
 				if let Ok(mut refetched) = self
 					.fetch_watch_snapshot(&repo, &target, cancellation)
-					.await
-					&& actions_state(&refetched.value) == ActionsState::Failure
+					.await && actions_state(&refetched.value) == ActionsState::Failure
 				{
 					if let Some(object) = refetched.value.as_object_mut() {
 						object.insert("poll_count".to_owned(), Value::from(poll_count));
@@ -1127,34 +1103,25 @@ impl GithubService {
 			let full = self.job_log(repo, job_id, cancellation).await?;
 			let tail_text = full.as_deref().and_then(|log| tail_lines(log, tail));
 			if let Some(full) = &full {
-				let name = job.get("name").and_then(Value::as_str).unwrap_or("unnamed job");
+				let name = job
+					.get("name")
+					.and_then(Value::as_str)
+					.unwrap_or("unnamed job");
 				let stage = match complete.as_mut() {
 					Some(stage) => stage,
 					None => complete.insert(self.blobs.begin_spill().map_err(|_| {
-						fault(
-							"github_artifact_failed",
-							"GitHub output artifact could not be opened",
-						)
+						fault("github_artifact_failed", "GitHub output artifact could not be opened")
 					})?),
 				};
 				let heading = format!("## {name} (run {run_id}, job {job_id})\n\n");
 				io::Write::write_all(stage, heading.as_bytes()).map_err(|_| {
-					fault(
-						"github_artifact_failed",
-						"GitHub output artifact could not be written",
-					)
+					fault("github_artifact_failed", "GitHub output artifact could not be written")
 				})?;
 				io::Write::write_all(stage, full.as_bytes()).map_err(|_| {
-					fault(
-						"github_artifact_failed",
-						"GitHub output artifact could not be written",
-					)
+					fault("github_artifact_failed", "GitHub output artifact could not be written")
 				})?;
 				io::Write::write_all(stage, b"\n\n").map_err(|_| {
-					fault(
-						"github_artifact_failed",
-						"GitHub output artifact could not be written",
-					)
+					fault("github_artifact_failed", "GitHub output artifact could not be written")
 				})?;
 			}
 			rows.push(json!({
@@ -1171,17 +1138,14 @@ impl GithubService {
 				stage
 					.finish()
 					.map_err(|_| {
-						fault(
-							"github_artifact_failed",
-							"GitHub output artifact could not be committed",
-						)
+						fault("github_artifact_failed", "GitHub output artifact could not be committed")
 					})
 					.map(|reference| Artifact {
-						uri: Str::new(format!(
+						uri:        Str::new(format!(
 							"artifact://sha256/{}",
 							reference.to_hex().as_str()
 						)),
-						size: reference.size,
+						size:       reference.size,
 						media_type: sf!("text/plain"),
 					})
 			})
@@ -1404,8 +1368,8 @@ async fn push_git(
 	repo
 		.push(
 			&PushOptions {
-				remote: Some(metadata.clone_url.clone()),
-				refspec: Some(format!("HEAD:refs/heads/{}", metadata.head)),
+				remote:           Some(metadata.clone_url.clone()),
+				refspec:          Some(format!("HEAD:refs/heads/{}", metadata.head)),
 				force_with_lease: if force {
 					if metadata.expected_head.is_empty() {
 						return Err(fault(
@@ -1413,10 +1377,7 @@ async fn push_git(
 							"checkout metadata has no remote head for force-with-lease",
 						));
 					}
-					Some(format!(
-						"refs/heads/{}:{}",
-						metadata.head, metadata.expected_head
-					))
+					Some(format!("refs/heads/{}:{}", metadata.head, metadata.expected_head))
 				} else {
 					None
 				},
@@ -1448,9 +1409,11 @@ fn current_git_snapshot(root: &Path) -> Result<(Str, Str), Fault> {
 fn has_scope(query: &str) -> bool {
 	query.split_whitespace().any(|part| {
 		let part = part.strip_prefix('-').unwrap_or(part);
-		["repo:", "org:", "user:", "owner:"]
-			.iter()
-			.any(|prefix| part.get(..prefix.len()).is_some_and(|value| value.eq_ignore_ascii_case(prefix)))
+		["repo:", "org:", "user:", "owner:"].iter().any(|prefix| {
+			part
+				.get(..prefix.len())
+				.is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+		})
 	})
 }
 fn parse_pr_number(value: &str, repo: &GithubRepo) -> Result<Option<u64>, Fault> {
@@ -1680,16 +1643,13 @@ fn decode_file_response(
 		)),
 		_ => {
 			let id = blobs.put(&decoded).map_err(|_| {
-				fault(
-					"github_artifact_failed",
-					"GitHub file artifact could not be retained",
-				)
+				fault("github_artifact_failed", "GitHub file artifact could not be retained")
 			})?;
 			let reference = BlobRef::from(id);
 			let image = omp_tools::read::image::sniff_metadata(&decoded);
 			let artifact = Artifact {
-				uri: Str::new(format!("artifact://sha256/{}", reference.to_hex().as_str())),
-				size: id.size,
+				uri:        Str::new(format!("artifact://sha256/{}", reference.to_hex().as_str())),
+				size:       id.size,
 				media_type: image.map_or_else(
 					|| sf!("application/octet-stream"),
 					|metadata| Str::new_static(metadata.kind.media_type()),
@@ -2304,7 +2264,11 @@ fn render_repo(value: &Value) -> String {
 		}
 	}
 	if let Some(topics) = value.get("topics").and_then(Value::as_array) {
-		let topics = topics.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ");
+		let topics = topics
+			.iter()
+			.filter_map(Value::as_str)
+			.collect::<Vec<_>>()
+			.join(", ");
 		if !topics.is_empty() {
 			let _ = write!(output, "\nTopics: {topics}");
 		}
@@ -2313,9 +2277,15 @@ fn render_repo(value: &Value) -> String {
 }
 
 fn render_file(value: &Value) -> String {
-	let path = value.get("path").and_then(Value::as_str).unwrap_or("(unknown path)");
+	let path = value
+		.get("path")
+		.and_then(Value::as_str)
+		.unwrap_or("(unknown path)");
 	if value.get("binary").and_then(Value::as_bool) == Some(true) {
-		let size = value.get("size").and_then(Value::as_u64).unwrap_or_default();
+		let size = value
+			.get("size")
+			.and_then(Value::as_u64)
+			.unwrap_or_default();
 		if let Some(media_type) = value
 			.get("media_type")
 			.and_then(Value::as_str)
@@ -2341,7 +2311,10 @@ fn render_file(value: &Value) -> String {
 
 fn render_created_pr(value: &Value) -> String {
 	let number = value.get("number").and_then(Value::as_u64);
-	let title = value.get("title").and_then(Value::as_str).unwrap_or("Untitled");
+	let title = value
+		.get("title")
+		.and_then(Value::as_str)
+		.unwrap_or("Untitled");
 	let mut output = match number {
 		Some(number) => format!("# Pull Request #{number}: {title}"),
 		None => format!("# Pull Request: {title}"),
@@ -2367,7 +2340,10 @@ fn render_checkout(value: &Value) -> String {
 	let mut output = format!("# {} Pull Request Worktree(s)", rows.len());
 	for row in rows {
 		let number = row.get("pr").and_then(Value::as_u64).unwrap_or_default();
-		let branch = row.get("branch").and_then(Value::as_str).unwrap_or("unknown");
+		let branch = row
+			.get("branch")
+			.and_then(Value::as_str)
+			.unwrap_or("unknown");
 		let path = row.get("path").and_then(Value::as_str).unwrap_or("unknown");
 		let reused = row.get("reused").and_then(Value::as_bool).unwrap_or(false);
 		let _ = write!(
@@ -2421,8 +2397,14 @@ fn render_batch_failures(output: &mut String, value: &Value) {
 	}
 	output.push_str("\n\n## Failed");
 	for failure in failures {
-		let reference = failure.get("pr").and_then(Value::as_str).unwrap_or("unknown");
-		let message = failure.get("message").and_then(Value::as_str).unwrap_or("failed");
+		let reference = failure
+			.get("pr")
+			.and_then(Value::as_str)
+			.unwrap_or("unknown");
+		let message = failure
+			.get("message")
+			.and_then(Value::as_str)
+			.unwrap_or("failed");
 		let _ = write!(output, "\n- {reference}: {message}");
 	}
 }
@@ -2445,9 +2427,18 @@ fn render_search(op: Operation, value: &Value) -> String {
 	for row in rows {
 		match op {
 			Operation::SearchIssues | Operation::SearchPrs => {
-				let number = row.get("number").and_then(Value::as_u64).unwrap_or_default();
-				let title = row.get("title").and_then(Value::as_str).unwrap_or("Untitled");
-				let state = row.get("state").and_then(Value::as_str).unwrap_or("unknown");
+				let number = row
+					.get("number")
+					.and_then(Value::as_u64)
+					.unwrap_or_default();
+				let title = row
+					.get("title")
+					.and_then(Value::as_str)
+					.unwrap_or("Untitled");
+				let state = row
+					.get("state")
+					.and_then(Value::as_str)
+					.unwrap_or("unknown");
 				let _ = write!(output, "\n- [{state}] #{number} {title}");
 			},
 			Operation::SearchCode => {
@@ -2455,7 +2446,10 @@ fn render_search(op: Operation, value: &Value) -> String {
 					.pointer("/repository/full_name")
 					.and_then(Value::as_str)
 					.unwrap_or("unknown repository");
-				let path = row.get("path").and_then(Value::as_str).unwrap_or("unknown path");
+				let path = row
+					.get("path")
+					.and_then(Value::as_str)
+					.unwrap_or("unknown path");
 				let _ = write!(output, "\n- {repo}:{path}");
 				if let Some(fragment) = row
 					.pointer("/text_matches/0/fragment")
@@ -2466,10 +2460,7 @@ fn render_search(op: Operation, value: &Value) -> String {
 				}
 			},
 			Operation::SearchCommits => {
-				let sha = row
-					.get("sha")
-					.and_then(Value::as_str)
-					.unwrap_or("unknown");
+				let sha = row.get("sha").and_then(Value::as_str).unwrap_or("unknown");
 				let subject = row
 					.pointer("/commit/message")
 					.and_then(Value::as_str)
@@ -2565,22 +2556,19 @@ fn required<'a>(value: Option<&'a str>, message: &'static str) -> Result<&'a str
 }
 fn fault(code: &'static str, message: &'static str) -> Fault {
 	Fault {
-		code: Str::new_static(code),
-		message: Str::new_static(message),
-		status: None,
+		code:                 Str::new_static(code),
+		message:              Str::new_static(message),
+		status:               None,
 		rate_limit_remaining: None,
-		rate_limit_reset: None,
-		retry_after_seconds: None,
+		rate_limit_reset:     None,
+		retry_after_seconds:  None,
 	}
 }
 fn cancelled_fault() -> Fault {
 	fault("github_cancelled", "GitHub operation was cancelled")
 }
 fn http_fault(_: reqwest::Error) -> Fault {
-	fault(
-		"github_transport_failed",
-		"GitHub transport failed before a response was received",
-	)
+	fault("github_transport_failed", "GitHub transport failed before a response was received")
 }
 fn git_fault(_: omp_vcs::Error) -> Fault {
 	fault("github_git_failed", "Git operation failed")
@@ -2818,10 +2806,8 @@ mod tests {
 				.expect("enterprise URL"),
 			Some(23),
 		);
-		let run = parse_run_reference(
-			"https://ghe.example.com/OWNER/REPO/actions/runs/987/jobs/1",
-		)
-		.expect("enterprise run URL");
+		let run = parse_run_reference("https://ghe.example.com/OWNER/REPO/actions/runs/987/jobs/1")
+			.expect("enterprise run URL");
 		assert_eq!(run.id, 987);
 		assert_eq!(
 			run.repo.expect("run repo").identity().to_ascii_lowercase(),

@@ -311,7 +311,7 @@ class Host:
         sys.stdout, sys.stderr = _Capture(self, "stdout"), _Capture(self, "stderr")
 
     def bootstrap_registry(self) -> None:
-        """Import, freeze, and publish the admitted declaration registry."""
+        """Import and freeze the admitted declaration registry for CONTROL."""
         try:
             manifest_json = os.environ["OMP_EXT_MANIFEST_SNAPSHOT"]
             modules_value = json.loads(os.environ["OMP_EXT_DECLARATION_MODULES"])
@@ -323,21 +323,7 @@ class Host:
         ):
             raise HostDisconnected("declaration modules must be non-empty strings")
         registry = importlib.import_module("omp._registry")
-        tools, metadata_json = registry.bootstrap_worker_registry(
-            manifest_json, modules_value
-        )
-        self._write(
-            {
-                "kind": "Registry",
-                "body": {
-                    "registry": {
-                        "tools": tools,
-                        "metadata_json": metadata_json,
-                    },
-                    "authority": self._authority(),
-                },
-            }
-        )
+        registry.bootstrap_extension_registry(manifest_json, modules_value)
 
     def current_session(self) -> Any:
         """Return the immutable Core-issued current-session snapshot."""
@@ -513,6 +499,54 @@ class Host:
             registry.services._install_control_transport(self)
             self._backend_installed = True
             return
+        if frame.kind == "ResourceReceipt":
+            if (
+                frame.body.get("host_generation") != self._host_generation
+                or frame.body.get("session_generation") != self._session_generation
+            ):
+                raise HostDisconnected("invalid or stale CONTROL resource receipt")
+            receipt = frame.body.get("receipt")
+            if not isinstance(receipt, dict):
+                raise HostDisconnected("CONTROL resource receipt must be an object")
+            quotas = receipt.get("quotas")
+            dropped = receipt.get("dropped")
+            if not isinstance(quotas, dict) or not isinstance(dropped, dict):
+                raise HostDisconnected("CONTROL resource receipt tables are malformed")
+            quota_rows: list[tuple[str, int, int, str | None]] = []
+            for name, status in quotas.items():
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or not isinstance(status, dict)
+                    or isinstance(status.get("limit"), bool)
+                    or not isinstance(status.get("limit"), int)
+                    or status["limit"] < 0
+                    or isinstance(status.get("used"), bool)
+                    or not isinstance(status.get("used"), int)
+                    or status["used"] < 0
+                    or (
+                        status.get("window") is not None
+                        and not isinstance(status.get("window"), str)
+                    )
+                ):
+                    raise HostDisconnected("CONTROL resource quota row is malformed")
+                quota_rows.append(
+                    (name, status["limit"], status["used"], status.get("window"))
+                )
+            dropped_rows: list[tuple[str, int]] = []
+            for name, count in dropped.items():
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count < 0
+                ):
+                    raise HostDisconnected("CONTROL resource drop row is malformed")
+                dropped_rows.append((name, count))
+            native = importlib.import_module("_omp")
+            native._set_resource_receipt(quota_rows, dropped_rows)
+            return
         if frame.kind == "CancelDispatch":
             self._cancel_dispatch(str(frame.body.get("invocation", "")))
             return
@@ -574,7 +608,9 @@ class Host:
                 f"stale CONTROL response correlation {frame.correlation}"
             )
         if future.done():
-            return
+            raise HostDisconnected(
+                f"duplicate CONTROL response correlation {frame.correlation}"
+            )
         if frame.kind == "Response":
             error = frame.body.get("error")
             if error is not None:
@@ -823,24 +859,15 @@ def _scope_from_wire(invocation: str, authority: Mapping[str, Any]) -> _scope.Sc
 
 
 def _freeze_registry_ack() -> dict[str, object]:
-    """Seal declarations and return the authoritative host publication tables."""
-    registry = importlib.import_module("omp._registry").registry
+    """Return the complete frozen declaration table over authenticated CONTROL."""
+    registry_module = importlib.import_module("omp._registry")
+    registry = registry_module.registry
     if not registry.sealed:
         registry.freeze()
-    registry_module = importlib.import_module("omp._registry")
-    snapshot = registry.snapshot()
+    publication = registry_module.project_control_registry()
     provider = importlib.import_module("omp.provider")
-    return {
-        "directors": [
-            registry_module._worker_wire_value(value)
-            for value in snapshot.directors
-        ],
-        "components": [
-            registry_module._worker_wire_value(value)
-            for value in snapshot.components
-        ],
-        "providers": list(provider._sealed_provider_declarations()),
-    }
+    publication["providers"] = list(provider._sealed_provider_declarations())
+    return publication
 
 
 async def _dispatch_lifecycle_activate(
@@ -890,6 +917,7 @@ def _builtin_dispatch(operation: str) -> DispatchHandler | None:
             "omp.extensions", "_dispatch_component_apply"
         ),
         "omp.devices.call": ("omp.devices", "_dispatch_device"),
+        "omp.prompts.render": ("omp._registry", "dispatch_prompt_slot"),
         "omp.ui.completion": ("omp.ui", "_dispatch_completion"),
         "omp.ui.command_completion": ("omp.ui", "_dispatch_command_completion"),
         "omp.ui.shortcut": ("omp.ui", "_dispatch_shortcut"),
@@ -997,6 +1025,12 @@ def _remote_error(value: object) -> BaseException:
         )
     if code == "deadline_exceeded":
         return DeadlineExceeded(detail_map.get("deadline", message))
+    if code == "QuotaExceeded":
+        omp = importlib.import_module("omp")
+        return omp.QuotaExceeded(
+            str(detail_map.get("quota", message)),
+            omp.resources(),
+        )
     if code == "permission_denied":
         from . import PermissionDenied
 

@@ -225,10 +225,7 @@ pub fn admit_direct_filesystem(
 use std::{env, io, iter, mem};
 
 use async_trait::async_trait;
-use omp_con::{
-	Ctx, DynamicUiOption, DynamicUiSpec, DynamicUiWidget, DynamicVarSpec, SettingTab, TypeSpec,
-	Value as ConValue, ValueKind, VarFlags,
-};
+use omp_con::{Ctx, DynamicVarSpec, TypeSpec, Value as ConValue, ValueKind, VarFlags};
 use omp_core::{
 	Hash32, InvocationPhase, LifecyclePhase, Principal, Provenance, Str, encoding::hex, sf,
 };
@@ -266,8 +263,9 @@ use tokio::{
 	task::AbortHandle,
 };
 
-use super::dispatch::{
-	CallbackConcurrency, DispatchError, DispatchRequest, DispatchRouter, EventDeadline,
+use super::{
+	dispatch::{CallbackConcurrency, DispatchError, DispatchRequest, DispatchRouter, EventDeadline},
+	quota::{ChargeOutcome, ControlQuotaRuntime, QuotaError, ResourceReceipt, names, request_quota},
 };
 use crate::worker::HostKey;
 
@@ -1364,8 +1362,6 @@ fn session_transition_denied(
 /// One authoritative fire-and-forget child observation.
 #[derive(Clone, Debug)]
 pub enum ControlEffect {
-	/// Frozen runtime declaration evidence requiring manifest verification.
-	Registry(Value),
 	/// Session intent contribution requiring provider arbitration.
 	Intent(Value),
 	/// Retained UI effect data.
@@ -1643,7 +1639,7 @@ impl ConvarControlAuthority {
 				.with(VarFlags::SESSION)
 				.with(VarFlags::REPLICATED),
 			default,
-			ui: declaration_ui(arguments, name.as_str(), ty)?,
+			meta: declaration_metadata(arguments, name.as_str(), ty)?,
 		};
 		if let Some(existing) = self.ctx.dynamic_var_spec(name.as_str()) {
 			if existing != spec {
@@ -1715,13 +1711,13 @@ fn required_convar_argument<'a>(
 		})
 }
 
-fn declaration_ui(
+fn declaration_metadata(
 	arguments: &serde_json::Map<String, Value>,
 	convar: &str,
 	ty: &TypeSpec,
-) -> Result<Option<DynamicUiSpec>, ControlProtocolError> {
+) -> Result<Arc<[(Str, Str)]>, ControlProtocolError> {
 	let Some(value) = arguments.get("ui") else {
-		return Ok(None);
+		return Ok(Arc::from([]));
 	};
 	let object = value.as_object().ok_or_else(|| {
 		ControlProtocolError::new(
@@ -1729,14 +1725,7 @@ fn declaration_ui(
 			"extension convar ui metadata must be an object",
 		)
 	})?;
-	let tab = required_convar_argument(object, "tab")?
-		.parse::<SettingTab>()
-		.map_err(|_| {
-			ControlProtocolError::new(
-				"InvalidConvarDeclaration",
-				"extension convar ui metadata names an unknown tab",
-			)
-		})?;
+	let tab = Str::new(required_convar_argument(object, "tab")?);
 	let group = Str::new(required_convar_argument(object, "group")?);
 	let label = Str::new(required_convar_argument(object, "label")?);
 	let description = Str::new(required_convar_argument(object, "description")?);
@@ -1758,55 +1747,57 @@ fn declaration_ui(
 						"extension convar ui option must be an object",
 					)
 				})?;
-				Ok(DynamicUiOption {
-					value:       Str::new(required_convar_argument(option, "value")?),
-					label:       Str::new(required_convar_argument(option, "label")?),
-					description: option
+				Ok((
+					Str::new(required_convar_argument(option, "value")?),
+					Str::new(required_convar_argument(option, "label")?),
+					option
 						.get("description")
 						.and_then(Value::as_str)
 						.map_or_else(Str::default, Str::new),
-				})
+				))
 			})
 			.collect::<Result<Vec<_>, ControlProtocolError>>()
 	})?;
-	if options.iter().enumerate().any(|(index, option)| {
-		option.label.trim().is_empty()
-			|| options[..index]
-				.iter()
-				.any(|previous| previous.value == option.value)
-	}) {
+	if tab.trim().is_empty()
+		|| group.trim().is_empty()
+		|| label.trim().is_empty()
+		|| label == convar
+		|| label.contains("::")
+		|| options.iter().enumerate().any(|(index, option)| {
+			option.1.trim().is_empty()
+				|| options[..index]
+					.iter()
+					.any(|previous| previous.0 == option.0)
+		}) {
 		return Err(ControlProtocolError::new(
 			"InvalidConvarDeclaration",
-			"extension convar ui options require non-empty labels and unique values",
+			"extension convar ui metadata requires a non-technical label and unique option values",
 		));
 	}
-	let widget = if options.is_empty() {
-		if ty.kind == ValueKind::List {
-			return Err(ControlProtocolError::new(
-				"InvalidConvarDeclaration",
-				"list convar ui metadata requires finite options",
-			));
-		}
-		DynamicUiWidget::Auto
-	} else if ty.kind == ValueKind::List {
-		DynamicUiWidget::MultiSelect {
-			options,
-			ordered: object
-				.get("ordered")
-				.and_then(Value::as_bool)
-				.unwrap_or(false),
-		}
-	} else {
-		DynamicUiWidget::Submenu(options)
-	};
-	let ui = DynamicUiSpec { tab, group, label, description, warning, widget };
-	if !ui.is_valid(convar) {
+	if options.is_empty() && ty.kind == ValueKind::List {
 		return Err(ControlProtocolError::new(
 			"InvalidConvarDeclaration",
-			"extension convar ui metadata requires a curated label and a valid tab section",
+			"list convar ui metadata requires finite options",
 		));
 	}
-	Ok(Some(ui))
+
+	let mut meta = vec![
+		(Str::new("ui.tab"), tab),
+		(Str::new("ui.group"), group),
+		(Str::new("ui.label"), label),
+		(Str::new("ui.description"), description),
+	];
+	if let Some(warning) = warning {
+		meta.push((Str::new("ui.warning"), warning));
+	}
+	for (value, label, description) in options {
+		meta.push((sf!("ui.option.{value}"), label));
+		meta.push((sf!("ui.option.{value}.desc"), description));
+	}
+	if object.get("ordered").and_then(Value::as_bool) == Some(true) {
+		meta.push((Str::new("ui.ordered"), Str::new("true")));
+	}
+	Ok(meta.into())
 }
 
 fn declaration_value(
@@ -1932,21 +1923,19 @@ fn control_convar_error(source: omp_con::ConError) -> ControlProtocolError {
 	}
 }
 
-/// Registry, device, and hook authorities owned by envd.
+/// Device and hook authorities owned by envd.
 pub struct RegistryControlAuthorities {
-	registry: Arc<dyn ControlAuthorityFactory>,
-	devices:  Arc<dyn ControlAuthorityFactory>,
-	hooks:    Arc<dyn ControlAuthorityFactory>,
+	devices: Arc<dyn ControlAuthorityFactory>,
+	hooks:   Arc<dyn ControlAuthorityFactory>,
 }
 
 impl RegistryControlAuthorities {
-	/// Installs every declaration and device-routing owner.
+	/// Installs device-routing and hook owners.
 	pub fn new(
-		registry: Arc<dyn ControlAuthorityFactory>,
 		devices: Arc<dyn ControlAuthorityFactory>,
 		hooks: Arc<dyn ControlAuthorityFactory>,
 	) -> Self {
-		Self { registry, devices, hooks }
+		Self { devices, hooks }
 	}
 }
 
@@ -2064,12 +2053,20 @@ impl ExternalControlAuthorities {
 pub struct HostControlAuthorityFactory {
 	envd:     EnvdControlAuthorities,
 	external: ExternalControlAuthorities,
+	quota:    Option<ControlQuotaRuntime>,
 }
 
 impl HostControlAuthorityFactory {
 	/// Combines envd authorities with the required app/driver hooks.
 	pub fn new(envd: EnvdControlAuthorities, external: ExternalControlAuthorities) -> Self {
-		Self { envd, external }
+		Self { envd, external, quota: None }
+	}
+
+	/// Installs the sole shared quota runtime around every authenticated domain.
+	#[must_use]
+	pub fn with_quota_runtime(mut self, quota: ControlQuotaRuntime) -> Self {
+		self.quota = Some(quota);
+		self
 	}
 
 	/// Binds every required owner and returns the live disjoint router.
@@ -2088,7 +2085,6 @@ impl HostControlAuthorityFactory {
 		agents: Arc<dyn ControlAuthorityFactory>,
 	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
 		let factories = [
-			(ControlDomain::Registry, "registry", &self.envd.registry.registry),
 			(ControlDomain::Devices, "devices", &self.envd.registry.devices),
 			(ControlDomain::Hooks, "hooks", &self.envd.registry.hooks),
 			(ControlDomain::Sessions, "sessions", &self.envd.persistence.sessions),
@@ -2106,7 +2102,6 @@ impl HostControlAuthorityFactory {
 			(ControlDomain::Mcp, "mcp", &self.external.mcp),
 		];
 		let mut domains = Vec::<Arc<dyn ControlAuthority>>::with_capacity(factories.len());
-		let mut registry_effect = None;
 		let mut ui_effect = None;
 		let mut telemetry_effect = None;
 		for (domain, name, factory) in factories {
@@ -2114,7 +2109,6 @@ impl HostControlAuthorityFactory {
 				.bind(Arc::clone(&identity))
 				.map_err(|error| error.in_domain(name))?;
 			match domain {
-				ControlDomain::Registry => registry_effect = Some(Arc::clone(&authority)),
 				ControlDomain::Ui => ui_effect = Some(Arc::clone(&authority)),
 				ControlDomain::Telemetry => telemetry_effect = Some(Arc::clone(&authority)),
 				_ => {},
@@ -2124,19 +2118,132 @@ impl HostControlAuthorityFactory {
 		let effect_owner = self
 			.envd
 			.effects
-			.bind(identity)
+			.bind(Arc::clone(&identity))
 			.map_err(|error| error.in_domain("effects"))?;
 		let effect_owner = Arc::new(DomainEffectAuthority {
-			registry:  registry_effect.expect("registry domain was bound"),
 			ui:        ui_effect.expect("UI domain was bound"),
 			telemetry: telemetry_effect.expect("telemetry domain was bound"),
 			fallback:  effect_owner,
 		});
-		Ok(Arc::new(CompositeControlAuthority::new(domains, effect_owner)))
+		let authority: Arc<dyn ControlAuthority> =
+			Arc::new(CompositeControlAuthority::new(domains, effect_owner));
+		Ok(if let Some(quota) = &self.quota {
+			Arc::new(QuotaControlAuthority {
+				inner: authority,
+				owner: HostKey::new(
+					identity.layer.clone(),
+					identity.tier.clone(),
+					identity.extension.clone(),
+				),
+				quota: quota.clone(),
+			})
+		} else {
+			authority
+		})
 	}
 }
+
+struct QuotaControlAuthority {
+	inner: Arc<dyn ControlAuthority>,
+	owner: HostKey,
+	quota: ControlQuotaRuntime,
+}
+
+impl QuotaControlAuthority {
+	fn charge(
+		&self,
+		context: &ControlRequestContext,
+		quota: &str,
+	) -> Result<ChargeOutcome, ControlProtocolError> {
+		let session = context
+			.invocation
+			.as_ref()
+			.map(|authority| authority.session.as_str())
+			.ok_or_else(|| {
+				ControlProtocolError::new(
+					"InvalidPhase",
+					"quota-accounted CONTROL work requires live invocation authority",
+				)
+			})?;
+		self
+			.quota
+			.charge(session, &self.owner, quota, 1)
+			.map_err(quota_protocol_error)
+	}
+}
+
+#[async_trait]
+impl ControlAuthority for QuotaControlAuthority {
+	fn handles(&self, operation: &str) -> bool {
+		self.inner.handles(operation)
+	}
+
+	fn authorize(
+		&self,
+		context: &ControlRequestContext,
+		operation: &str,
+		arguments: &serde_json::Map<String, Value>,
+	) -> Result<(), ControlProtocolError> {
+		self.inner.authorize(context, operation, arguments)
+	}
+
+	async fn request(
+		&self,
+		context: ControlRequestContext,
+		operation: Str,
+		arguments: serde_json::Map<String, Value>,
+	) -> Result<Value, ControlProtocolError> {
+		if let Some(quota) = request_quota(operation.as_str())
+			&& self.charge(&context, quota)? == ChargeOutcome::Dropped
+		{
+			return Ok(Value::Null);
+		}
+		self.inner.request(context, operation, arguments).await
+	}
+
+	async fn effect(
+		&self,
+		context: ControlRequestContext,
+		effect: ControlEffect,
+	) -> Result<(), ControlProtocolError> {
+		let quota = match &effect {
+			ControlEffect::Ui(_) => Some(names::UI_EFFECTS),
+			ControlEffect::Instrument(_) => Some(names::TELEMETRY_CARDINALITY),
+			ControlEffect::Intent(payload) => payload
+				.get("operation")
+				.and_then(Value::as_str)
+				.and_then(request_quota),
+			ControlEffect::Log(_) => None,
+		};
+		if let Some(quota) = quota
+			&& self.charge(&context, quota)? == ChargeOutcome::Dropped
+		{
+			return Ok(());
+		}
+		self.inner.effect(context, effect).await
+	}
+}
+
+fn quota_protocol_error(error: QuotaError) -> ControlProtocolError {
+	match error {
+		QuotaError::Exceeded(exceeded) => {
+			ControlProtocolError::new("QuotaExceeded", "extension CONTROL resource quota was exceeded")
+				.with_details(json!({
+					"quota": exceeded.quota.as_str(),
+					"scope": match exceeded.scope {
+						super::quota::QuotaScope::Extension => "extension",
+						super::quota::QuotaScope::Session => "session",
+					},
+				}))
+		},
+		_ => ControlProtocolError::new(
+			"QuotaUnavailable",
+			"extension CONTROL resource accounting is unavailable",
+		),
+	}
+}
+
 struct DomainEffectAuthority {
-	registry:  Arc<dyn ControlAuthority>,
 	ui:        Arc<dyn ControlAuthority>,
 	telemetry: Arc<dyn ControlAuthority>,
 	fallback:  Arc<dyn ControlAuthority>,
@@ -2178,7 +2285,6 @@ impl ControlAuthority for DomainEffectAuthority {
 		effect: ControlEffect,
 	) -> Result<(), ControlProtocolError> {
 		let owner = match &effect {
-			ControlEffect::Registry(_) => &self.registry,
 			ControlEffect::Ui(_) => &self.ui,
 			ControlEffect::Instrument(_) => &self.telemetry,
 			ControlEffect::Intent(_) => &self.fallback,
@@ -2190,7 +2296,6 @@ impl ControlAuthority for DomainEffectAuthority {
 
 #[derive(Clone, Copy)]
 enum ControlDomain {
-	Registry,
 	Devices,
 	Hooks,
 	Sessions,
@@ -2211,7 +2316,6 @@ enum ControlDomain {
 impl ControlDomain {
 	fn handles(self, operation: &str) -> bool {
 		match self {
-			Self::Registry => operation.starts_with("omp.registry."),
 			Self::Devices => operation.starts_with("omp.devices."),
 			Self::Hooks => operation.starts_with("omp.hooks."),
 			Self::Sessions => operation.starts_with("omp.sessions."),
@@ -2564,11 +2668,6 @@ impl ControlRuntime {
 				"Request" => self.accept_request(frame).await?,
 				"CancelRequest" => self.accept_request_cancel(frame)?,
 				"DispatchResponse" => self.accept_dispatch_response(frame).await?,
-				"Registry" => {
-					self
-						.accept_effect(frame, ControlEffectKind::Registry)
-						.await?
-				},
 				"IntentEffect" => {
 					if let Err(error) = self.accept_effect(frame, ControlEffectKind::Intent).await {
 						tracing::warn!(%error, "extension intent effect was rejected");
@@ -2669,7 +2768,6 @@ impl ControlRuntime {
 				ControlProtocolError::malformed(format!("{field} payload is missing"))
 			})?;
 		let effect = match kind {
-			ControlEffectKind::Registry => ControlEffect::Registry(payload),
 			ControlEffectKind::Intent => ControlEffect::Intent(payload),
 			ControlEffectKind::Ui => ControlEffect::Ui(payload),
 			ControlEffectKind::Log => ControlEffect::Log(payload),
@@ -2719,7 +2817,6 @@ impl ControlRuntime {
 
 #[derive(Clone, Copy)]
 enum ControlEffectKind {
-	Registry,
 	Intent,
 	Ui,
 	Log,
@@ -2729,7 +2826,6 @@ enum ControlEffectKind {
 impl ControlEffectKind {
 	const fn field(self) -> &'static str {
 		match self {
-			Self::Registry => "registry",
 			Self::Intent => "effect",
 			Self::Ui => "effect",
 			Self::Log => "log",
@@ -2793,6 +2889,46 @@ impl ControlHandle {
 		);
 		write_json_control_frame(&self.shared, JsonControlFrame {
 			kind: String::from("AuthoritySnapshot"),
+			correlation: None,
+			body,
+		})
+		.await
+	}
+
+	/// Pushes the current daemon-owned quota receipt into the child cache.
+	pub async fn install_resource_receipt(
+		&self,
+		receipt: &ResourceReceipt,
+	) -> Result<(), ControlRuntimeError> {
+		let mut body = serde_json::Map::new();
+		body.insert(
+			String::from("host_generation"),
+			Value::from(self.shared.identity.host_generation),
+		);
+		body.insert(
+			String::from("session_generation"),
+			Value::from(self.shared.identity.session_generation),
+		);
+		body.insert(
+			String::from("receipt"),
+			json!({
+				"quotas": receipt.quotas.iter().map(|(name, status)| {
+					(
+						name.to_string(),
+						json!({
+							"limit": status.limit,
+							"used": status.used,
+							"window": status.window.map(|window| window.to_string()),
+						}),
+					)
+				}).collect::<serde_json::Map<_, _>>(),
+				"dropped": receipt.dropped.iter().map(|(name, count)| {
+					(name.to_string(), Value::from(*count))
+				}).collect::<serde_json::Map<_, _>>(),
+			}),
+		);
+		write_json_control_frame(&self.shared, JsonControlFrame {
+			kind: String::from("ResourceReceipt"),
 			correlation: None,
 			body,
 		})
@@ -3233,10 +3369,20 @@ mod convar_tests {
 					"default": false,
 					"description": "Enable demo behavior",
 					"ui": {
-						"tab": "tools",
-						"group": "Extensions",
+						"tab": "extension-tools",
+						"group": "Extension Controls",
 						"label": "Demo Behavior",
 						"description": "Enable demo behavior",
+						"warning": "Changes take effect immediately",
+						"options": [
+							{
+								"value": "false",
+								"label": "Disabled",
+								"description": "Keep demo behavior disabled",
+							},
+							{"value": "true", "label": "Enabled"},
+						],
+						"ordered": true,
 					},
 				})
 				.as_object()
@@ -3247,11 +3393,27 @@ mod convar_tests {
 			.expect("declare convar");
 		assert_eq!(declared["name"], "ext::dev.example.demo::enabled");
 		assert_eq!(ctx.get("ext::dev.example.demo::enabled"), Some(ConValue::Bool(false)),);
+		let spec = ctx
+			.dynamic_var_spec("ext::dev.example.demo::enabled")
+			.expect("dynamic declaration");
 		assert_eq!(
-			ctx.dynamic_var_spec("ext::dev.example.demo::enabled")
-				.and_then(|spec| spec.ui)
-				.map(|ui| ui.label),
-			Some(sf!("Demo Behavior")),
+			spec
+				.meta
+				.iter()
+				.map(|(key, value)| (key.as_str(), value.as_str()))
+				.collect::<Vec<_>>(),
+			vec![
+				("ui.tab", "extension-tools"),
+				("ui.group", "Extension Controls"),
+				("ui.label", "Demo Behavior"),
+				("ui.description", "Enable demo behavior"),
+				("ui.warning", "Changes take effect immediately"),
+				("ui.option.false", "Disabled"),
+				("ui.option.false.desc", "Keep demo behavior disabled"),
+				("ui.option.true", "Enabled"),
+				("ui.option.true.desc", ""),
+				("ui.ordered", "true"),
+			]
 		);
 
 		let observed = authority.request(

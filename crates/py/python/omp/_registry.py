@@ -291,7 +291,7 @@ class PreludeDefinition:
 
 @dataclass(frozen=True, slots=True)
 class WorkerToolDefinition:
-    """One runnable tool projection retained by the sealed worker registry."""
+    """One runnable tool projection retained by the sealed CONTROL registry."""
 
     name: str
     family: str
@@ -307,6 +307,11 @@ class WorkerToolDefinition:
     effects: object | None
     constraint: object | None
     serial: bool
+    precedence: int = 0
+    replaces: str | None = None
+    summary: str | None = None
+    docs: object | None = None
+    examples: tuple[object, ...] = ()
     legacy: bool = False
 
 
@@ -808,6 +813,7 @@ class DeclarationRegistry:
             effects=None,
             constraint=None,
             serial=False,
+            summary=description or None,
             legacy=True,
         )
         self.register_tool(name, family, rev, handler)
@@ -815,10 +821,10 @@ class DeclarationRegistry:
         return projected
 
     def worker_tool_definitions(self) -> tuple[WorkerToolDefinition, ...]:
-        """Project every sealed tool identity to one runnable worker row."""
+        """Project every sealed tool identity to one runnable CONTROL row."""
 
         if not self._verified:
-            raise RuntimeError("worker tools are unavailable before FREEZE")
+            raise RuntimeError("CONTROL tools are unavailable before FREEZE")
         projected: list[WorkerToolDefinition] = []
         for key in sorted(self._tools):
             if key in self._legacy_worker_tools:
@@ -848,6 +854,11 @@ class DeclarationRegistry:
                     effects=definition.effects,
                     constraint=definition.constraint,
                     serial=definition.serial,
+                    precedence=definition.precedence,
+                    replaces=definition.replaces,
+                    summary=definition.summary,
+                    docs=definition.docs,
+                    examples=definition.examples,
                 )
             )
         return tuple(projected)
@@ -1767,15 +1778,15 @@ def prelude_definitions() -> tuple[PreludeDefinition, ...]:
 
     return registry.prelude_definitions()
 
-def bootstrap_worker_registry(
+def bootstrap_extension_registry(
     manifest_json: str,
     modules: Iterable[str],
-) -> tuple[tuple[WorkerToolDefinition, ...], str]:
-    """Configure, sequentially import, seal, and project one admitted worker."""
+) -> DeclarationSnapshot:
+    """Configure, sequentially import, and seal one admitted extension host."""
 
     manifest = json.loads(manifest_json)
     if not isinstance(manifest, Mapping):
-        raise TypeError("worker manifest snapshot must encode an object")
+        raise TypeError("extension manifest snapshot must encode an object")
     configure_manifest(
         tools=manifest.get("tools", ()),
         hooks=manifest.get("hooks", ()),
@@ -1800,7 +1811,7 @@ def bootstrap_worker_registry(
         for declaration in legacy:
             register_legacy_worker_tool(declaration)
     freeze_declarations()
-    return project_worker_registry()
+    return registry.snapshot()
 
 def register_legacy_worker_tool(
     declaration: Mapping[str, object],
@@ -1810,22 +1821,44 @@ def register_legacy_worker_tool(
     return registry.register_legacy_worker_tool(declaration)
 
 
-def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
-    """Project the complete sealed registry for the production stdio worker."""
+def project_control_registry() -> dict[str, object]:
+    """Project every frozen declaration needed by the Rust CONTROL supervisor."""
 
     if not registry.sealed:
-        raise RuntimeError("worker registry projection requires FREEZE")
+        raise RuntimeError("CONTROL registry projection requires FREEZE")
     snapshot = registry.snapshot()
     tools = registry.worker_tool_definitions()
-    metadata = {
+    return {
+        "declaration_keys": [
+            {"kind": kind, "key": key}
+            for kind, key in sorted(registry._decorated_executable_keys())
+        ],
         "tools": [
             {
                 "name": tool.name,
                 "family": tool.family,
                 "rev": tool.rev,
+                "description": tool.description,
+                "schema": _control_wire_value(tool.schema),
+                "strict": tool.strict,
+                "streams_args": tool.streams_args,
+                "source_module": tool.source_module,
                 "kind": tool.kind,
                 "place": str(tool.place),
-                "source_module": tool.source_module,
+                "effects": _control_wire_value(tool.effects),
+                "constraint": _control_wire_value(tool.constraint),
+                "serial": tool.serial,
+                "precedence": max(0, tool.precedence),
+                "replaces": tool.replaces,
+                "summary": tool.summary,
+                "docs": _control_wire_value(tool.docs),
+                "examples": _control_wire_value(tool.examples),
+                "callback": {
+                    "operation": "omp.devices.call",
+                    "path": tool.name,
+                    "family": tool.family,
+                    "rev": tool.rev,
+                },
             }
             for tool in tools
         ],
@@ -1840,16 +1873,16 @@ def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
                     if declaration.on_failure is None
                     else declaration.on_failure.value
                 ),
-                "timeout": _worker_wire_value(declaration.timeout),
+                "timeout": _control_wire_value(declaration.timeout),
                 "concurrency": declaration.concurrency,
                 "threadsafe": declaration.threadsafe,
-                "when": _worker_wire_value(declaration.when),
+                "when": _control_wire_value(declaration.when),
                 "event_rev": _hook_catalog(declaration.event).rev,
                 "event_on_failure": _hook_catalog(declaration.event).on_failure.value,
                 "event_default": (
                     "allow" if _hook_catalog(declaration.event).gateable else None
                 ),
-                "event_timeout": _worker_wire_value(
+                "event_timeout": _control_wire_value(
                     _hook_catalog(declaration.event).default_timeout
                 ),
                 "composition": {
@@ -1872,34 +1905,43 @@ def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
                 "rev": definition.rev,
                 "source_module": definition.implementation.__module__,
                 "methods": [
-                    _worker_wire_value(method)
+                    _control_wire_value(method)
                     for method in definition.method_schemas
                 ],
+                "callback": {"operation": "omp.services.dispatch"},
             }
             for definition in snapshot.service_definitions
         ],
-        "providers": [_worker_wire_value(value) for value in snapshot.providers],
-        "directors": [_worker_wire_value(value) for value in snapshot.directors],
-        "components": [_worker_wire_value(value) for value in snapshot.components],
-        "commands": [_worker_wire_value(value) for value in snapshot.commands],
-        "shortcuts": [_worker_wire_value(value) for value in snapshot.shortcuts],
-        "telemetry": [_worker_wire_value(value) for value in snapshot.telemetry],
-        "prompt_slots": [_worker_wire_value(value) for value in snapshot.prompt_slots],
-        "workers": [_worker_wire_value(value) for value in snapshot.workers],
-        "exports": [_worker_wire_value(value) for value in snapshot.exports],
-        "approvers": [_worker_wire_value(value) for value in snapshot.approvers],
-        "completions": [_worker_wire_value(value) for value in snapshot.completions],
+        "prompt_slots": [
+            {
+                "slot": definition.slot,
+                "priority": definition.priority,
+                "class": definition.cls,
+                "callback": _control_wire_value(definition.renderer),
+                "trigger": definition.trigger.value,
+            }
+            for definition in snapshot.prompt_slots
+        ],
+        "providers": [_control_wire_value(value) for value in snapshot.providers],
+        "directors": [_control_wire_value(value) for value in snapshot.directors],
+        "components": [_control_wire_value(value) for value in snapshot.components],
+        "commands": [_control_wire_value(value) for value in snapshot.commands],
+        "shortcuts": [_control_wire_value(value) for value in snapshot.shortcuts],
+        "telemetry": [_control_wire_value(value) for value in snapshot.telemetry],
+        "workers": [_control_wire_value(value) for value in snapshot.workers],
+        "exports": [_control_wire_value(value) for value in snapshot.exports],
+        "approvers": [_control_wire_value(value) for value in snapshot.approvers],
+        "completions": [_control_wire_value(value) for value in snapshot.completions],
         "message_renderers": [
-            _worker_wire_value(value) for value in snapshot.message_renderers
+            _control_wire_value(value) for value in snapshot.message_renderers
         ],
         "markdown_transformers": [
-            _worker_wire_value(value) for value in snapshot.markdown_transformers
+            _control_wire_value(value) for value in snapshot.markdown_transformers
         ],
         "verdict_renderers": [
-            _worker_wire_value(value) for value in snapshot.verdict_renderers
+            _control_wire_value(value) for value in snapshot.verdict_renderers
         ],
     }
-    return tools, json.dumps(metadata, sort_keys=True, separators=(",", ":"))
 
 
 def _hook_catalog(event: str) -> object:
@@ -1910,7 +1952,7 @@ def _hook_catalog(event: str) -> object:
     return spec(event)
 
 
-def _worker_wire_value(value: object) -> object:
+def _control_wire_value(value: object) -> object:
     """Lower declaration metadata without serializing executable Python objects."""
 
     if callable(value):
@@ -1922,24 +1964,24 @@ def _worker_wire_value(value: object) -> object:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, Enum):
-        return _worker_wire_value(value.value)
+        return _control_wire_value(value.value)
     if isinstance(value, bytes):
         return value.hex()
     if isinstance(value, Mapping):
         return {
-            str(key): _worker_wire_value(item)
+            str(key): _control_wire_value(item)
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
         }
     if isinstance(value, (tuple, list)):
-        return [_worker_wire_value(item) for item in value]
+        return [_control_wire_value(item) for item in value]
     if isinstance(value, (set, frozenset)):
         return [
-            _worker_wire_value(item)
+            _control_wire_value(item)
             for item in sorted(value, key=lambda item: repr(item))
         ]
     if is_dataclass(value) and not isinstance(value, type):
         return {
-            field.name: _worker_wire_value(getattr(value, field.name))
+            field.name: _control_wire_value(getattr(value, field.name))
             for field in fields(value)
         }
     return str(value)
@@ -2097,6 +2139,43 @@ async def dispatch_service(
     instance = registry.service_instance(name, rev)
     result = await getattr(instance, method)(*args, **dict(kwargs))
     return request_id, result
+
+
+def dispatch_prompt_slot(
+    slot: str,
+    callback: str,
+    context: Mapping[str, object],
+) -> dict[str, object]:
+    """Render one exact frozen prompt contribution received over CONTROL."""
+
+    if not isinstance(slot, str) or not slot:
+        raise ValueError("prompt dispatch slot must be a non-empty string")
+    if not isinstance(callback, str) or not callback:
+        raise ValueError("prompt dispatch callback must be a non-empty string")
+    if not isinstance(context, Mapping):
+        raise TypeError("prompt dispatch context must be a mapping")
+    matches = tuple(
+        definition
+        for definition in registry.snapshot().prompt_slots
+        if definition.slot == slot
+        and _control_wire_value(definition.renderer).get("$omp.callable") == callback
+    )
+    if len(matches) != 1:
+        raise LookupError("prompt dispatch does not match one frozen declaration")
+    from .prompts import PromptContext, SlotClass, VolatilePrompt
+
+    values = dict(context)
+    values["slot"] = slot
+    values["cls"] = SlotClass(str(values.get("cls", matches[0].cls)))
+    values["roots"] = tuple(map(str, values.get("roots", ())))
+    prompt_context = PromptContext(**values)
+    first = matches[0].renderer(prompt_context)
+    second = matches[0].renderer(prompt_context)
+    if not isinstance(first, str) or not isinstance(second, str):
+        raise TypeError("prompt-slot renderers must return str")
+    if first != second:
+        raise VolatilePrompt(f"prompt-slot renderer {callback!r} returned unstable bytes")
+    return {"slot": slot, "callback": callback, "content": first}
 
 
 
@@ -2571,7 +2650,7 @@ def _schema_for_annotation(annotation: object) -> dict[str, object]:
 def _bind_tool_arguments(
     body: object, params: Mapping[str, object], context: object
 ) -> tuple[list[object], dict[str, object]]:
-    """Ergonomic parameter binding shared by worker and CONTROL dispatch.
+    """Ergonomic parameter binding shared by decorated and legacy CONTROL tools.
 
     ``ctx`` parameters receive ``context``; every other parameter binds from
     ``params`` with defaults honored, unknown arguments rejected unless the
@@ -2649,7 +2728,7 @@ def _worker_handler(
 def _lower_worker_result(
     result: object, streamed_updates: list[object] | None = None
 ) -> object:
-    """Lower one Python result to the shared stdio/CONTROL completion shape."""
+    """Lower one Python result to the CONTROL completion shape."""
 
     from . import Fault
     from ._verdicts import Faulted, Ok, Payload, _canonical_json
@@ -2795,10 +2874,13 @@ __all__ = (
     "ServiceMethodDefinition",
     "Services",
     "WorkerToolDefinition",
+    "bootstrap_extension_registry",
     "configure_manifest",
+    "dispatch_prompt_slot",
     "dispatch_service",
     "freeze_declarations",
     "prelude_definitions",
+    "project_control_registry",
     "registry",
     "resources",
     "service",
