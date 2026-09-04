@@ -14,12 +14,13 @@ function createGuard(
 	streamingAbort: boolean,
 	cwd = process.cwd(),
 	settings = Settings.isolated({ "edit.streamingAbort": streamingAbort }),
-): { guard: StreamingEditGuard; aborts: { count: number } } {
-	const aborts = { count: 0 };
+): { guard: StreamingEditGuard; aborts: { count: number; reason: unknown } } {
+	const aborts: { count: number; reason: unknown } = { count: 0, reason: undefined };
 	const guard = new StreamingEditGuard({
 		agent: {
-			abort() {
+			abort(reason?: unknown) {
 				aborts.count++;
+				aborts.reason = reason;
 			},
 		} as Agent,
 		settings,
@@ -108,6 +109,34 @@ describe("streaming edit abort", () => {
 		);
 		expect(aborts.count).toBe(1);
 		expect(guard.abortTriggered).toBe(true);
+	});
+
+	test("carries the failing file and native diagnostic through a tool-scoped abort reason", () => {
+		// Regression for #10808: a bare agent.abort() collapsed the patch-preview
+		// failure into the generic "Request was aborted" sentinel, discarding the
+		// diagnostic so the model could not correct the patch. The abort must now
+		// name the failure and attach the native diagnostic to the failing edit
+		// call so it reaches that call's synthetic tool result and errorMessage.
+		const { guard, aborts } = createGuard(true);
+		guard.maybeAbort(
+			previewEvent(false, [
+				{ path: "src/ok.ts" },
+				{ path: "src/broken.ts", error: "Line 99 does not exist (file has 4 lines)" },
+			]),
+		);
+		expect(aborts.count).toBe(1);
+		const reason = aborts.reason as {
+			kind: string;
+			message: string;
+			toolCallMessages: Record<string, string>;
+			defaultToolCallMessage: string;
+		};
+		expect(reason.kind).toBe("tool-scoped-abort");
+		expect(reason.message).toBe("Streaming edit preview failed");
+		expect(reason.message).not.toBe("Request was aborted");
+		const scoped = reason.toolCallMessages["call-edit-1"];
+		expect(scoped).toContain("src/broken.ts");
+		expect(scoped).toContain("Line 99 does not exist (file has 4 lines)");
 	});
 
 	test("does not abort for transient streaming errors", () => {
