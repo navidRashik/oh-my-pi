@@ -484,7 +484,7 @@ mod tests {
 				&PushOptions {
 					remote:           Some("sink".to_owned()),
 					refspec:          Some("refs/remotes/origin/main:refs/heads/main".to_owned()),
-					force_with_lease: false,
+					force_with_lease: None,
 				},
 				None,
 			)

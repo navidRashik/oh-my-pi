@@ -328,8 +328,12 @@ impl GitRepo {
 		cancel: Option<CancellationToken>,
 	) -> Result<()> {
 		let mut args = vec!["push".to_owned(), "--no-follow-tags".to_owned()];
-		if options.force_with_lease {
-			args.push("--force-with-lease".to_owned());
+		if let Some(lease) = &options.force_with_lease {
+			args.push(if lease.is_empty() {
+				"--force-with-lease".to_owned()
+			} else {
+				format!("--force-with-lease={lease}")
+			});
 		}
 		if let Some(remote) = &options.remote {
 			args.push(remote.clone());

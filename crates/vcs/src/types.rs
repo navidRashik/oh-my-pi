@@ -292,8 +292,8 @@ pub struct PushOptions {
 	pub remote:           Option<String>,
 	/// Refspec to push; the current branch when absent.
 	pub refspec:          Option<String>,
-	/// Use `--force-with-lease`.
-	pub force_with_lease: bool,
+	/// Exact `refname[:expected]` lease; an empty string requests Git's default lease.
+	pub force_with_lease: Option<String>,
 }
 
 /// Options for the CLI-backed `clone`.
