@@ -32,6 +32,32 @@ function baseResult(overrides: Record<string, unknown> = {}) {
 	};
 }
 
+async function renderDisplay(
+	value: unknown,
+	theme: Theme,
+	expanded: boolean,
+): Promise<{ modelText: string; rendered: string[]; boxBottom: number }> {
+	vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+	vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
+		baseResult({ displayOutputs: [{ type: "json", data: value }] }) as never,
+	);
+
+	const tool = new EvalTool(makeSession());
+	const result = await tool.execute("call-display-json", {
+		language: "js",
+		code: "```js\nconst result = await tool.bash({ command: 'printf test' });\ndisplay(result);\n```\n",
+	});
+	const modelText = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
+	const component = evalToolRenderer.renderResult(
+		{ content: result.content, details: result.details },
+		{ expanded, isPartial: false, spinnerFrame: 0 },
+		theme,
+	);
+	const rendered = Bun.stripANSI(component.render(120).join("\n")).split("\n");
+	const boxBottom = rendered.findIndex(line => line.includes(theme.boxRound.bottomRight));
+	return { modelText, rendered, boxBottom };
+}
+
 /**
  * Regression for #10778: a single structured `display()` value must render
  * exactly once in the rich TUI (the expandable JSON tree), not twice (a JSON
@@ -58,39 +84,39 @@ describe("eval renderer: structured display() value renders once", () => {
 	});
 
 	it("shows the display value in the JSON tree only, not inside the cell box", async () => {
-		vi.spyOn(pyKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
-		vi.spyOn(evalIndex.jsBackend, "execute").mockResolvedValue(
-			baseResult({
-				displayOutputs: [{ type: "json", data: { marker: "ZZUNIQUE", exit_code: 0 } }],
-			}) as never,
+		const { modelText, rendered, boxBottom } = await renderDisplay(
+			{ marker: "ZZUNIQUE", exit_code: 0 },
+			theme,
+			false,
 		);
 
-		const tool = new EvalTool(makeSession());
-		const result = await tool.execute("call-display-json", {
-			language: "js",
-			code: "```js\nconst result = await tool.bash({ command: 'printf test' });\ndisplay(result);\n```\n",
-		});
-		const modelText = result.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
 		expect(modelText).toContain("display[1]");
 		expect(modelText).toContain('"marker": "ZZUNIQUE"');
-
-		// Render the rich TUI and split around the code-cell box border.
-		const component = evalToolRenderer.renderResult(
-			{ content: result.content, details: result.details },
-			{ expanded: true, isPartial: false, spinnerFrame: 0 },
-			theme,
-		);
-		const rendered = Bun.stripANSI(component.render(120).join("\n")).split("\n");
-		const boxBottom = rendered.findIndex(line => line.includes(theme.boxRound.bottomRight));
 		expect(boxBottom).toBeGreaterThanOrEqual(0);
 
 		const insideBox = rendered.slice(0, boxBottom + 1);
 		const belowBox = rendered.slice(boxBottom + 1);
 
-		// The structured value must appear only once — in the tree below the box.
 		expect(insideBox.some(line => line.includes("ZZUNIQUE"))).toBe(false);
 		expect(insideBox.some(line => line.includes("display[1]"))).toBe(false);
 		expect(belowBox.some(line => line.includes("ZZUNIQUE"))).toBe(true);
 		expect(rendered.filter(line => line.includes("ZZUNIQUE")).length).toBe(1);
+	});
+
+	it("shows content beyond every JSON tree preview cap when expanded", async () => {
+		const manyNodes = Object.fromEntries(Array.from({ length: 210 }, (_, index) => [`key_${index}`, index]));
+		const value = {
+			...manyNodes,
+			deep: { one: { two: { three: { four: { five: { marker: "DEEP_TAIL" } } } } } },
+			long: `${"x".repeat(2100)}SCALAR_TAIL`,
+		};
+
+		const { rendered, boxBottom } = await renderDisplay(value, theme, true);
+		const belowBox = rendered.slice(boxBottom + 1).join("\n");
+
+		expect(boxBottom).toBeGreaterThanOrEqual(0);
+		expect(belowBox).toContain('"key_209": 209');
+		expect(belowBox).toContain('"marker": "DEEP_TAIL"');
+		expect(belowBox).toContain("SCALAR_TAIL");
 	});
 });

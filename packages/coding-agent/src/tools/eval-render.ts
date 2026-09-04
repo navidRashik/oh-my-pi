@@ -22,13 +22,11 @@ import { markFramedBlockComponent, outputBlockContentWidth, renderCodeCell } fro
 import { formatEvalCodeForDisplay } from "./eval-format";
 import {
 	JSON_TREE_MAX_DEPTH_COLLAPSED,
-	JSON_TREE_MAX_DEPTH_EXPANDED,
 	JSON_TREE_MAX_LINES_COLLAPSED,
-	JSON_TREE_MAX_LINES_EXPANDED,
 	JSON_TREE_SCALAR_LEN_COLLAPSED,
-	JSON_TREE_SCALAR_LEN_EXPANDED,
 	renderJsonTreeLines,
 } from "./json-tree";
+import { formatDisplayJsonForText } from "./eval-display";
 import { formatStyledTruncationWarning, stripOutputNotice } from "./output-meta";
 import {
 	formatBadge,
@@ -499,6 +497,20 @@ function formatCellOutputLines(
 	return { lines: visualLines, hiddenCount: skippedCount };
 }
 
+function formatExpandedDisplayLines(values: readonly unknown[], theme: Theme, width: number): string[] {
+	const lines: string[] = [];
+	for (let index = 0; index < values.length; index++) {
+		if (index > 0) lines.push("");
+		const text = `display[${index + 1}]:\n${formatDisplayJsonForText(values[index])}`;
+		const styled = text
+			.split("\n")
+			.map(line => theme.fg("toolOutput", replaceTabs(line)))
+			.join("\n");
+		lines.push(...Bun.wrapAnsi(styled, Math.max(1, width), { hard: true, wordWrap: false, trim: false }).split("\n"));
+	}
+	return lines;
+}
+
 export const evalToolRenderer = {
 	animatedPendingPreview: true,
 	animatedPartialResult: true,
@@ -572,13 +584,16 @@ export const evalToolRenderer = {
 		const output = stripOutputNotice(rawOutput, details?.meta).trimEnd();
 
 		const jsonOutputs = details?.jsonOutputs ?? [];
-		const treeExpanded = options.renderContext?.expanded ?? options.expanded;
-		const treeDepth = treeExpanded ? JSON_TREE_MAX_DEPTH_EXPANDED : JSON_TREE_MAX_DEPTH_COLLAPSED;
-		const treeLineCap = treeExpanded ? JSON_TREE_MAX_LINES_EXPANDED : JSON_TREE_MAX_LINES_COLLAPSED;
-		const treeScalarLen = treeExpanded ? JSON_TREE_SCALAR_LEN_EXPANDED : JSON_TREE_SCALAR_LEN_COLLAPSED;
+		const expanded = options.renderContext?.expanded ?? options.expanded;
 		const labelOutputs = jsonOutputs.length > 1;
-		const jsonLines = jsonOutputs.flatMap((value, index) => {
-			const tree = renderJsonTreeLines(value, uiTheme, treeDepth, treeLineCap, treeScalarLen);
+		const jsonTreeLines = jsonOutputs.flatMap((value, index) => {
+			const tree = renderJsonTreeLines(
+				value,
+				uiTheme,
+				JSON_TREE_MAX_DEPTH_COLLAPSED,
+				JSON_TREE_MAX_LINES_COLLAPSED,
+				JSON_TREE_SCALAR_LEN_COLLAPSED,
+			);
 			const body = tree.truncated ? [...tree.lines, uiTheme.fg("dim", "…")] : tree.lines;
 			return labelOutputs ? [uiTheme.fg("dim", `display[${index + 1}]`), ...body] : body;
 		});
@@ -669,11 +684,12 @@ export const evalToolRenderer = {
 							lines.push("");
 						}
 					}
-					if (jsonLines.length > 0) {
+					const displayLines = expanded ? formatExpandedDisplayLines(jsonOutputs, uiTheme, width) : jsonTreeLines;
+					if (displayLines.length > 0) {
 						if (lines.length > 0) {
 							lines.push("");
 						}
-						lines.push(...jsonLines);
+						lines.push(...displayLines);
 					}
 					if (timeoutLine) {
 						lines.push(timeoutLine);
@@ -697,7 +713,7 @@ export const evalToolRenderer = {
 		}
 
 		const displayOutput = output;
-		const combinedOutput = [displayOutput, ...jsonLines].filter(Boolean).join("\n");
+		const combinedOutput = [displayOutput, ...(expanded ? [] : jsonTreeLines)].filter(Boolean).join("\n");
 
 		const statusEvents = details?.statusEvents ?? [];
 		const statusLines = renderStatusEvents(

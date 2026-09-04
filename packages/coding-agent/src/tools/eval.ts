@@ -24,6 +24,7 @@ import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import { type EvalBackendsAllowance, resolveEvalBackends } from "./eval-backends";
+import { formatDisplayJsonForText } from "./eval-display";
 import { generateCodeModeDeclarations } from "./eval-format/code-mode-declarations";
 import { upsertStatusEvent } from "./eval-render";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "./output-meta";
@@ -119,22 +120,6 @@ export type EvalToolResult = {
 };
 
 export type EvalProxyExecutor = (params: EvalToolParams, signal?: AbortSignal) => Promise<EvalToolResult>;
-
-/** Cap per `display()` value sent back to the model. */
-const MAX_DISPLAY_TEXT_BYTES = 8000;
-
-function formatDisplayJsonForText(value: unknown): string {
-	let text: string;
-	try {
-		text = JSON.stringify(value, null, 2) ?? String(value);
-	} catch {
-		text = String(value);
-	}
-	if (text.length > MAX_DISPLAY_TEXT_BYTES) {
-		text = `${text.slice(0, MAX_DISPLAY_TEXT_BYTES)}\n[…${text.length - MAX_DISPLAY_TEXT_BYTES}ch elided…]`;
-	}
-	return text;
-}
 
 /**
  * Format display() JSON values into text the model can see. Images are surfaced
