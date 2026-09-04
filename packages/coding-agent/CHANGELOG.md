@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `lsp diagnostics` now surfaces diagnostics from push-only language servers (those without pull-diagnostics support) that publish once and do not re-publish on refresh, instead of reporting `OK` ([#10787](https://github.com/can1357/oh-my-pi/issues/10787)).
+
 ## [18.1.9] - 2026-09-04
 
 ### Breaking Changes
