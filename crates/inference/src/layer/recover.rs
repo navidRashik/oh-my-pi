@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures::StreamExt;
-use omp_catalog::{PriceUnit, pricing::UsageDimensions};
+use omp_catalog::{PriceUnit, id::WirePolicyId, pricing::UsageDimensions};
 use omp_core::Str;
 use tower::{Layer, Service};
 
@@ -16,7 +16,10 @@ use crate::{
 	answer::{AnswerBody, ModelDiscoveryPage},
 	body::AttemptBodyEvidence,
 	call::{Call, DiscoveryRequest, OperationCall, Setting, StructuredOutput, ToolDefinition},
-	codec::{HandshakeMeta, HandshakenResponse, RawCompletion, RawEvent, UnvalidatedToolCall},
+	codec::{
+		HandshakeMeta, HandshakenResponse, RawCompletion, RawEvent, RawEventStream,
+		UnvalidatedToolCall,
+	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, Completion, FinishReason},
 	layer::{ExecutionContext, LayerCall},
@@ -28,6 +31,7 @@ use crate::{
 	recovery::{
 		Stage,
 		empty::{EmptyCompletionKind, EmptyCompletionStage, EmptyEvent, EmptyInput},
+		harmony::normalize_attempt as normalize_harmony_attempt,
 		json::{JsonEnforcement, JsonRepairLimits, JsonRepairStage},
 		projection::{
 			DialectRecoveryConfig, DialectRecoveryPipeline, ProjectionBatch, ProjectionFailure,
@@ -164,12 +168,23 @@ where
 					)
 				})
 			});
+			let harmony_guard = projection_config.as_ref().and_then(|config| {
+				config
+					.harmony_mitigation
+					.then(|| (config.wire_policy.clone(), config.attempt))
+			});
+			let harmony_structured = harmony_guard.as_ref().and_then(|_| structured.clone());
+			let recovery_structured = harmony_guard
+				.is_none()
+				.then(|| structured.clone())
+				.flatten();
 			let empty_policy = plan
 				.as_ref()
 				.and_then(|plan| plan.policy_model.as_ref())
 				.map(|model| model.wire_policy.clone());
+			let harmony_empty_policy = harmony_guard.as_ref().and_then(|_| empty_policy.clone());
 			let mut structured_index = None;
-			let mut json = structured.as_ref().and_then(|output| {
+			let mut json = recovery_structured.as_ref().and_then(|output| {
 				empty_policy.clone().map(|policy| {
 					let enforcement = match output {
 						StructuredOutput::JsonSchema { strict: true, .. } => JsonEnforcement::Strict,
@@ -347,7 +362,7 @@ where
 						yield Err(error);
 						return;
 					}
-					if let Some(output) = structured.as_ref() {
+					if let Some(output) = recovery_structured.as_ref() {
 						let repaired = match finish_json(&mut json, &output_context) {
 							Ok(text) => text,
 							Err(error) => { yield Err(error); return; },
@@ -366,10 +381,173 @@ where
 					yield Ok(RawEvent::Chat(finalized));
 				}
 			}));
+			if let Some((wire_policy, attempt)) = harmony_guard {
+				let events = response
+					.events
+					.take()
+					.expect("recovery stream was installed immediately above");
+				response.events = Some(harmony_audit_stream(
+					events,
+					context,
+					wire_policy,
+					attempt,
+					harmony_structured,
+					harmony_empty_policy,
+				));
+			}
 			Ok(response)
 		}
 	}
 }
+
+fn harmony_audit_stream(
+	mut input: RawEventStream,
+	context: ExecutionContext,
+	wire_policy: WirePolicyId,
+	attempt: u32,
+	structured: Option<StructuredOutput>,
+	empty_policy: Option<WirePolicyId>,
+) -> RawEventStream {
+	Box::pin(async_stream::stream! {
+		let mut held = Vec::new();
+		let mut held_bytes = 0_u64;
+		let limit = context.budget().max_provisional_bytes;
+		while let Some(item) = input.next().await {
+			match item {
+				Ok(RawEvent::Chat(event)) => {
+					if event.is_workflow_control() {
+						yield Err(recovery_error("harmony.workflow-control-incompatible", &context));
+						return;
+					}
+					held_bytes = held_bytes.saturating_add(harmony_event_bytes(&event));
+					if held_bytes > limit {
+						yield Err(recovery_error("harmony.provisional-output-limit", &context));
+						return;
+					}
+					let terminal = matches!(event, ChatEvent::Completed(_));
+					held.push(event);
+					if !terminal {
+						continue;
+					}
+					let (mut normalized, recoveries) =
+						match normalize_harmony_attempt(held, &wire_policy, attempt) {
+							Ok(normalized) => normalized,
+							Err(leak) => {
+								record_recovery(&context, leak.recovery);
+								yield Err(recovery_error("harmony.provable-leak", &context));
+								return;
+							},
+						};
+					record_recoveries(&context, recoveries);
+					if let Some(policy) = empty_policy.as_ref() {
+						normalized =
+							match validate_harmony_empty(normalized, policy.clone(), attempt, &context) {
+								Ok(events) => events,
+								Err(error) => {
+									yield Err(error);
+									return;
+								},
+							};
+					}
+					if let Some(output) = structured.as_ref() {
+						let text = harmony_structured_text(&normalized);
+						if let Err(error) = validate_structured_output(output, &text, &context) {
+							yield Err(error);
+							return;
+						}
+						context.mark_structured_output_valid();
+					}
+					for event in &mut normalized {
+						if let ChatEvent::Completed(completion) = event {
+							completion.receipt = Box::new(context.receipt());
+						}
+					}
+					for event in normalized {
+						yield Ok(RawEvent::Chat(event));
+					}
+					return;
+				},
+				Ok(_) => {
+					yield Err(recovery_error("harmony.non-chat-event", &context));
+					return;
+				},
+				Err(error) => {
+					match normalize_harmony_attempt(held, &wire_policy, attempt) {
+						Err(leak) => {
+							record_recovery(&context, leak.recovery);
+							yield Err(recovery_error("harmony.provable-leak", &context));
+						},
+						Ok((_, recoveries)) if !recoveries.is_empty() => {
+							record_recoveries(&context, recoveries);
+							yield Err(recovery_error("harmony.upstream-failed-after-repair", &context));
+						},
+						Ok(_) => yield Err(error),
+					}
+					return;
+				},
+			}
+		}
+		yield Err(recovery_error("harmony.missing-completion", &context));
+	})
+}
+
+fn validate_harmony_empty(
+	events: Vec<ChatEvent>,
+	policy: WirePolicyId,
+	attempt: u32,
+	context: &ExecutionContext,
+) -> Result<Vec<ChatEvent>, Error> {
+	let mut stage = Some(EmptyCompletionStage::new(policy, attempt));
+	let mut output = Vec::with_capacity(events.len());
+	let mut completion = None;
+	for event in events {
+		if matches!(event, ChatEvent::Completed(_)) {
+			completion = Some(event);
+			continue;
+		}
+		output.push(observe_empty(&mut stage, event, context)?);
+	}
+	let completion =
+		completion.ok_or_else(|| recovery_error("harmony.missing-completion", context))?;
+	finish_empty(&mut stage, &completion, context)?;
+	output.push(completion);
+	Ok(output)
+}
+
+fn harmony_structured_text(events: &[ChatEvent]) -> String {
+	let bytes = events.iter().fold(0_usize, |total, event| {
+		total.saturating_add(match event {
+			ChatEvent::TextDelta { text, .. } => text.len(),
+			_ => 0,
+		})
+	});
+	let mut output = String::with_capacity(bytes);
+	for event in events {
+		if let ChatEvent::TextDelta { text, .. } = event {
+			output.push_str(text.as_str());
+		}
+	}
+	output
+}
+
+fn harmony_event_bytes(event: &ChatEvent) -> u64 {
+	let bytes = match event {
+		ChatEvent::TextDelta { text, .. } | ChatEvent::ThinkingDelta { text, .. } => text.len(),
+		ChatEvent::ToolArgumentsDelta { bytes, .. } => bytes.len(),
+		ChatEvent::ToolCallReady { call, .. } => call.name.len(),
+		ChatEvent::ToolCallStarted { name, .. } => name.len(),
+		ChatEvent::Started(_)
+		| ChatEvent::BlockStarted { .. }
+		| ChatEvent::Artifact { .. }
+		| ChatEvent::Usage(_)
+		| ChatEvent::WorkflowAction(_)
+		| ChatEvent::WorkflowResume(_)
+		| ChatEvent::WorkflowCancelled { .. }
+		| ChatEvent::Completed(_) => 0,
+	};
+	u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
 fn structured_preference_dropped(plan: Option<&ExecutionPlan>, context: &ExecutionContext) -> bool {
 	let decision_dropped = plan.is_some_and(|plan| {
 		plan.decisions.iter().any(|decision| {
@@ -915,6 +1093,77 @@ mod tests {
 				})),
 			},
 		}
+	}
+
+	#[tokio::test]
+	async fn harmony_leak_rejection_is_transactional_and_retryable() {
+		let context =
+			ExecutionContext::new(ExecutionBudget { max_attempts: 3, ..ExecutionBudget::default() });
+		let completion = ChatEvent::Completed(Completion {
+			reason:  FinishReason::Stop,
+			blocks:  1,
+			usage:   Default::default(),
+			receipt: Default::default(),
+		});
+		let source: RawEventStream = Box::pin(futures::stream::iter(vec![
+			Ok(RawEvent::Chat(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text })),
+			Ok(RawEvent::Chat(ChatEvent::TextDelta {
+				index: 0,
+				text:  sf!("safe prefix analysis to=functions.edit code contaminated"),
+			})),
+			Ok(RawEvent::Chat(completion)),
+		]));
+		let mut audited =
+			harmony_audit_stream(source, context, WirePolicyId::new("codex"), 1, None, None);
+		let error = match audited.next().await.expect("terminal error") {
+			Err(error) => error,
+			Ok(_) => panic!("provable leak must reject the provisional attempt"),
+		};
+		assert_eq!(error.action, RetryAction::SemanticRetry);
+		assert!(!error.committed);
+		assert!(matches!(error.receipt().recoveries.as_slice(), [RecoveryRecord {
+			attempt: 1,
+			kind: crate::receipt::RecoveryKind::HarmonyLeakDetection,
+			..
+		}]));
+		assert!(audited.next().await.is_none(), "no contaminated event becomes visible");
+	}
+
+	#[tokio::test]
+	async fn harmony_analysis_only_completion_remains_empty_output() {
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let leaked = concat!("<", "|channel|>analysis<|message|>private only<|end|>");
+		let source: RawEventStream = Box::pin(futures::stream::iter(vec![
+			Ok(RawEvent::Chat(ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text })),
+			Ok(RawEvent::Chat(ChatEvent::TextDelta { index: 0, text: Str::new(leaked) })),
+			Ok(RawEvent::Chat(ChatEvent::Completed(Completion {
+				reason:  FinishReason::Stop,
+				blocks:  1,
+				usage:   Default::default(),
+				receipt: Default::default(),
+			}))),
+		]));
+		let mut audited = harmony_audit_stream(
+			source,
+			context,
+			WirePolicyId::new("codex"),
+			0,
+			None,
+			Some(WirePolicyId::new("codex")),
+		);
+		let error = match audited.next().await.expect("terminal error") {
+			Err(error) => error,
+			Ok(_) => panic!("thinking-only output must stay terminal"),
+		};
+		assert_eq!(error.kind, ErrorKind::EmptyOutput);
+		assert_eq!(error.action, RetryAction::Never);
+		assert!(
+			error
+				.receipt()
+				.recoveries
+				.iter()
+				.any(|record| record.kind == crate::receipt::RecoveryKind::HarmonyLeakRepair)
+		);
 	}
 
 	#[test]

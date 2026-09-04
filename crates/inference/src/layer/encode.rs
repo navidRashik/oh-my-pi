@@ -14,7 +14,7 @@ use tokio::time;
 use tower::{Layer, Service};
 
 use crate::{
-	auth::{AuthSpec, CredentialLease, lease::AppliedCredentials},
+	auth::{AuthScheme, AuthSpec, CredentialLease, lease::AppliedCredentials},
 	body::BodySource,
 	codec::{BeforeRequestMutation, Cancellation, ProviderSignHookRequest, TransportRequest},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
@@ -171,6 +171,12 @@ pub trait CredentialApplier<A, L>: Clone + Send + 'static {
 		request: &mut TransportRequest,
 		context: &ExecutionContext,
 	) -> Result<(), Error>;
+
+	/// Refines a wire failure using the non-secret authentication scheme
+	/// selected for the attempt.
+	fn map_response_error(&self, _scheme: Option<AuthScheme>, error: Error) -> Error {
+		error
+	}
 }
 
 /// Attaches an auth-owned opaque credential envelope without materializing
@@ -287,6 +293,7 @@ where
 		let EncodedAttempt { account, mut transport, lease } = request.payload;
 		let context = request.context;
 		let hook = self.hook.clone();
+		let applier = self.applier.clone();
 		let applied = context
 			.checkpoint(ErrorPhase::Authentication)
 			.and_then(|()| {
@@ -330,13 +337,19 @@ where
 						Err(_) => return Err(provider_sign_timeout(&context, budget)),
 					}
 				}
+				let auth_scheme = transport
+					.credentials
+					.as_ref()
+					.map(AppliedCredentials::scheme);
 				let future = {
 					let mut service = inner.lock();
 					let future = service.call(transport);
 					drop(service);
 					future
 				};
-				future.await
+				future
+					.await
+					.map_err(|error| applier.map_response_error(auth_scheme, error))
 			}
 		});
 		async move { future?.await }
@@ -391,6 +404,7 @@ mod tests {
 	};
 	use crate::{
 		BeforeRequestMutation,
+		auth::AuthScheme,
 		body::BodySource,
 		codec::{
 			Cancellation, Decoder, EncodedRequest, ProviderHookError, ProviderHookObserver,
@@ -398,7 +412,7 @@ mod tests {
 			ProviderSignHookRequest, ProviderSignature, RawEvent, RequestMethod, SizeBounds,
 			TransportAttempt, TransportRequest,
 		},
-		error::{Error, ErrorKind, RetryAction},
+		error::{Error, ErrorKind, ErrorPhase, RetryAction},
 		id::RequestId,
 		layer::{
 			ExecutionContext, LayerCall,
@@ -553,6 +567,66 @@ mod tests {
 			self.0.store(request.signature.is_some(), Ordering::Release);
 			ready(Ok(()))
 		}
+	}
+
+	#[derive(Clone, Copy)]
+	struct MappingApplier;
+
+	impl CredentialApplier<(), ()> for MappingApplier {
+		fn apply(
+			&self,
+			&(): &(),
+			(): (),
+			_: &mut TransportRequest,
+			_: &ExecutionContext,
+		) -> Result<(), Error> {
+			Ok(())
+		}
+
+		fn map_response_error(&self, _: Option<AuthScheme>, mut error: Error) -> Error {
+			error.action = RetryAction::RotateAccount;
+			error
+		}
+	}
+
+	#[derive(Clone, Copy)]
+	struct FailingWire;
+
+	impl Service<TransportRequest> for FailingWire {
+		type Error = Error;
+		type Future = Ready<Result<(), Error>>;
+		type Response = ();
+
+		fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn call(&mut self, _: TransportRequest) -> Self::Future {
+			ready(Err(Error::new(
+				ErrorKind::Authorization,
+				ErrorPhase::Handshake,
+				RetryAction::Never,
+				Default::default(),
+			)))
+		}
+	}
+
+	#[tokio::test]
+	async fn credential_policy_refines_wire_errors_before_attempt_recovery() {
+		let mut service = CredentialApplyService::<_, _, NoHookHandle> {
+			inner:   Arc::new(Mutex::new(FailingWire)),
+			applier: MappingApplier,
+			hook:    None,
+		};
+		let error = service
+			.call(LayerCall {
+				payload: EncodedAttempt { account: (), transport: transport(), lease: () },
+				context: ExecutionContext::new(ExecutionBudget::default()),
+			})
+			.await
+			.expect_err("credential policy maps the wire rejection");
+		assert_eq!(error.kind, ErrorKind::Authorization);
+		assert_eq!(error.action, RetryAction::RotateAccount);
 	}
 
 	#[tokio::test]

@@ -2044,8 +2044,9 @@ mod tests {
 	use parking_lot::Mutex;
 
 	use super::{
-		AwsCredentialEnvironment, AwsCredentialError, AwsCredentialOptions, AwsCredentialSource,
-		AwsEnvironmentError, parse_aws_ini, tokenize_credential_process,
+		AWS_FILE_SESSION_CREDENTIAL_TTL, AwsCredentialEnvironment, AwsCredentialError,
+		AwsCredentialOptions, AwsCredentialSource, AwsEnvironmentError, parse_aws_ini,
+		tokenize_credential_process,
 	};
 	use crate::auth::{
 		CredentialKind, CredentialNeed, OAuthHttpClient, OAuthHttpRequest, OAuthHttpResponse,
@@ -2246,8 +2247,12 @@ mod tests {
 		std::fs::create_dir(&aws).expect("create AWS directory");
 		std::fs::write(
 			aws.join("credentials"),
-			"[default]\naws_access_key_id=AKIAPROFILE\naws_secret_access_key=profile-secret\\
-			 naws_session_token=profile-token\n",
+			concat!(
+				"[default]\n",
+				"aws_access_key_id = AKIAPROFILE\n",
+				"aws_secret_access_key = profile-secret\n",
+				"aws_session_token = profile-token\n",
+			),
 		)
 		.expect("write credentials");
 		let environment =
@@ -2261,11 +2266,13 @@ mod tests {
 		let before = SystemTime::now();
 
 		let lease = resolver.resolve(&need()).await.expect("profile lease");
+		let after = SystemTime::now();
 		let expiration = lease.meta().expires_at.expect("session TTL");
 
 		assert_eq!(http.calls.load(Ordering::Relaxed), 0);
-		assert!(expiration >= before + Duration::from_secs(4 * 60 + 59));
-		assert!(expiration <= SystemTime::now() + Duration::from_secs(5 * 60));
+		assert_eq!(AWS_FILE_SESSION_CREDENTIAL_TTL, Duration::from_secs(5 * 60));
+		assert!(expiration >= before + AWS_FILE_SESSION_CREDENTIAL_TTL);
+		assert!(expiration <= after + AWS_FILE_SESSION_CREDENTIAL_TTL);
 	}
 
 	#[tokio::test]
@@ -2350,13 +2357,21 @@ mod tests {
 		let credentials = aws.join("credentials");
 		std::fs::write(
 			&credentials,
-			"[base]\naws_access_key_id=AKIAPROFILE\naws_secret_access_key=profile-secret\n",
+			concat!(
+				"[base]\n",
+				"aws_access_key_id = AKIAPROFILE\n",
+				"aws_secret_access_key = profile-secret\n",
+			),
 		)
 		.expect("write credentials");
 		std::fs::write(
 			aws.join("config"),
-			"[profile team]\nregion=eu-west-2\nrole_arn=arn:aws:iam::123456789012:role/team\\
-			 nsource_profile=base\n",
+			concat!(
+				"[profile team]\n",
+				"region = eu-west-2\n",
+				"role_arn = arn:aws:iam::123456789012:role/team\n",
+				"source_profile = base\n",
+			),
 		)
 		.expect("write config");
 		let options = AwsCredentialOptions { profile: Some(sf!("team")), region: None };
@@ -2367,14 +2382,22 @@ mod tests {
 			),
 			Arc::new(ScriptedHttp::new([])),
 		);
+		let mut other_region = resolver.clone();
+		other_region.options.region = Some(sf!("us-west-2"));
 
 		let initial = resolver
 			.registry_availability()
 			.await
 			.expect("initial discovery");
+		let other_initial = other_region
+			.registry_availability()
+			.await
+			.expect("other-region discovery");
 		assert_eq!(initial.profile(), "team");
 		assert_eq!(initial.region(), "eu-west-2");
 		assert!(initial.has_shared_profile());
+		assert_eq!(other_initial.region(), "us-west-2");
+		assert!(other_initial.has_shared_profile());
 
 		std::fs::write(&credentials, "[base]\n").expect("remove profile credentials");
 		assert!(
@@ -2388,12 +2411,19 @@ mod tests {
 		resolver
 			.invalidate(options)
 			.await
-			.expect("invalidate scope");
+			.expect("invalidate exact scope");
 		assert!(
 			!resolver
 				.registry_availability()
 				.await
 				.expect("refreshed discovery")
+				.has_shared_profile()
+		);
+		assert!(
+			other_region
+				.registry_availability()
+				.await
+				.expect("other scope remains cached")
 				.has_shared_profile()
 		);
 	}

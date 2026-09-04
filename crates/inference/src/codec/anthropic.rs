@@ -2317,20 +2317,8 @@ pub(crate) fn region_serves_geo(region: &str, geo: &str) -> bool {
 
 /// Extracts a concrete region from a Bedrock runtime endpoint.
 pub(crate) fn endpoint_region(base_url: &str) -> Option<&str> {
-	let host = base_url
-		.strip_prefix("https://")
-		.or_else(|| base_url.strip_prefix("http://"))?
-		.split(['/', ':'])
-		.next()?;
-	host
-		.strip_prefix("bedrock-runtime.")
-		.or_else(|| host.strip_prefix("bedrock-runtime-fips."))?
-		.strip_suffix(".amazonaws.com")
-		.or_else(|| {
-			host
-				.strip_prefix("bedrock-runtime.")?
-				.strip_suffix(".amazonaws.com.cn")
-		})
+	let (service, region) = crate::auth::sigv4::endpoint_scope(base_url)?;
+	(service == "bedrock").then_some(region)
 }
 #[derive(Debug)]
 pub(crate) struct AnthropicWireDecoder {

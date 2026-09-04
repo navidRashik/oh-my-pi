@@ -4,6 +4,7 @@ use std::{
 	array,
 	collections::BTreeMap,
 	future::{Future, Ready, ready},
+	mem,
 	num::NonZeroU32,
 	pin::Pin,
 	sync::Arc,
@@ -32,7 +33,7 @@ use crate::{
 		AuthManager, AuthScheme, AwsCredentialError, AwsRegistryAvailability, CredentialApplyError,
 		CredentialBroker, CredentialError, CredentialKind, CredentialLease, CredentialNeed,
 		CredentialShaperRegistry, CredentialSource, OAuthHttpClient, OAuthHttpRequest,
-		ProviderShaper, spec::AuthSpec,
+		ProviderShaper, sigv4::endpoint_scope, spec::AuthSpec,
 	},
 	body::BodySource,
 	call::{
@@ -46,8 +47,15 @@ use crate::{
 		HandshakenResponse, NativeResponseFormat, ProviderStateEvent, RawEvent,
 		RealtimeWireCodecState, RequestHeader, TransportAttempt, TransportRequest,
 		anthropic::AnthropicCodec,
-		bedrock::{BedrockConverseCodec, BedrockGuardrail, BedrockOptions, guardrail_arn_region},
-		bedrock_mantle::{BedrockMantleCodec, expand_endpoint as expand_mantle_endpoint},
+		bedrock::{
+			BedrockConverseCodec, BedrockGuardrail, BedrockOptions, guardrail_arn_region,
+			sanitize_request_metadata_value,
+		},
+		bedrock_mantle::{
+			BedrockMantleCodec, BedrockMantleDiscoveryCodec,
+			expand_endpoint as expand_mantle_endpoint,
+			map_auth_rejection as map_mantle_auth_rejection,
+		},
 		cursor::CursorCodec,
 		devin::DevinCodec,
 		discovery::{
@@ -523,6 +531,8 @@ impl RouteComposer for ProductionRouteComposer {
 			}
 		}
 		let bedrock_guardrail = configured_bedrock_guardrail(&self.dependencies.settings, route);
+		let bedrock_request_metadata =
+			configured_bedrock_request_metadata(&self.dependencies.settings, route);
 		let bedrock_ambient_region = self
 			.dependencies
 			.auth_application
@@ -563,6 +573,7 @@ impl RouteComposer for ProductionRouteComposer {
 					self.dependencies.settings.retry.server_side_fallback,
 					stateful_responses(catalog, route),
 					bedrock_guardrail,
+					bedrock_request_metadata,
 					bedrock_ambient_region,
 				)?,
 				WireService::new(ProtocolTransport {
@@ -578,6 +589,7 @@ impl RouteComposer for ProductionRouteComposer {
 					self.dependencies.settings.retry.server_side_fallback,
 					stateful_responses(catalog, route),
 					bedrock_guardrail,
+					bedrock_request_metadata,
 					bedrock_ambient_region,
 				)?,
 				WireService::new(ProtocolTransport {
@@ -781,6 +793,7 @@ impl RouteComposer for ProductionRouteComposer {
 			credential_apply: CredentialApplyLayer::new(RouteCredentialApplier {
 				auth:     auth_specs.into_iter().map(|(_, auth)| auth).collect(),
 				required: credential_required,
+				mantle:   route.codec.as_str() == "bedrock-mantle",
 			}),
 			provider_error: ProviderErrorLayer::new(),
 		});
@@ -822,6 +835,20 @@ fn configured_bedrock_guardrail<'a>(
 			settings
 				.providers
 				.bedrock_guardrails
+				.get(route.provider.as_str())
+		})
+		.flatten()
+}
+
+fn configured_bedrock_request_metadata<'a>(
+	settings: &'a InferenceSettings,
+	route: &RouteDef,
+) -> Option<&'a BTreeMap<Str, Str>> {
+	(route.codec.as_str() == "bedrock-converse")
+		.then(|| {
+			settings
+				.providers
+				.bedrock_request_metadata
 				.get(route.provider.as_str())
 		})
 		.flatten()
@@ -885,6 +912,7 @@ fn codec_binding(
 	server_side_fallback: bool,
 	stateful_responses: bool,
 	bedrock_guardrail: Option<&BedrockGuardrail>,
+	bedrock_request_metadata: Option<&BTreeMap<Str, Str>>,
 	bedrock_ambient_region: Option<&Str>,
 ) -> Result<CodecBinding, RouteUnavailable> {
 	let (primary, supported, embedding, openai_embedding_override): (
@@ -905,6 +933,7 @@ fn codec_binding(
 			Arc::new(
 				BedrockConverseCodec::new(BedrockOptions {
 					guardrail: bedrock_guardrail.cloned(),
+					request_metadata: bedrock_request_metadata.cloned().unwrap_or_default(),
 					..BedrockOptions::default()
 				})
 				.with_ambient_region(bedrock_ambient_region.cloned()),
@@ -1114,6 +1143,15 @@ fn discovery_codec(
 		.discovery_spec(discovery)
 		.ok_or_else(|| unavailable(route, "catalog-discovery-spec-missing"))?;
 	let codec: Arc<dyn Codec> = match spec.kind {
+		DiscoveryKind::OpenAiModels if route.codec.as_str() == "bedrock-mantle" => {
+			Arc::new(BedrockMantleDiscoveryCodec::from_spec(spec).map_err(|source| {
+				discovery_codec_unavailable(
+					route,
+					"bedrock-mantle-models-discovery-codec-invalid",
+					source,
+				)
+			})?)
+		},
 		DiscoveryKind::OpenAiModels => {
 			Arc::new(OpenAiModelsDiscoveryCodec::from_spec(spec).map_err(|source| {
 				discovery_codec_unavailable(route, "openai-models-discovery-codec-invalid", source)
@@ -1626,7 +1664,13 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			route.endpoint.api_version.as_deref(),
 			execution,
 		)?;
-		merge_static_headers(&mut encoded.headers, &self.headers, execution)?;
+		let bedrock_converse =
+			route.codec.as_str() == "bedrock-converse" && operation.kind() == OperationKind::Chat;
+		if bedrock_converse {
+			merge_bedrock_headers(&mut encoded.headers, &self.headers);
+		} else {
+			merge_static_headers(&mut encoded.headers, &self.headers, execution)?;
+		}
 		// Copilot bills by initiator (pi `buildCopilotDynamicHeaders`): the
 		// headers declare it and the attempt's usage charges it.
 		let premium_requests_millionths = if super::copilot::is_copilot(&route.provider)
@@ -1646,7 +1690,13 @@ impl AttemptEncoder<Call, Option<CredentialLease>> for RouteEncoder {
 			0
 		};
 		execution.set_premium_requests_millionths(premium_requests_millionths);
-		apply_before_request_mutation(&mut encoded, mutation, execution)?;
+		apply_before_request_mutation(&mut encoded, mutation, execution, bedrock_converse)?;
+		if bedrock_converse && mutation.body.contains_key("requestMetadata") {
+			sanitize_bedrock_request_metadata(&mut encoded, execution)?;
+		}
+		if bedrock_converse {
+			protect_owned_headers(&mut encoded.headers, true);
+		}
 		let header_names = encoded
 			.headers
 			.iter()
@@ -1898,9 +1948,11 @@ fn apply_before_request_mutation(
 	encoded: &mut EncodedRequest,
 	mutation: &BeforeRequestMutation,
 	execution: &ExecutionContext,
+	allow_message_mutation: bool,
 ) -> Result<(), Error> {
 	if !mutation.body.is_empty() {
 		if encoded.operation == OperationKind::Chat
+			&& !allow_message_mutation
 			&& mutation
 				.body
 				.keys()
@@ -1981,6 +2033,33 @@ fn before_request_denied(execution: &ExecutionContext, denial: BeforeRequestDeni
 	error
 }
 
+fn sanitize_bedrock_request_metadata(
+	encoded: &mut EncodedRequest,
+	execution: &ExecutionContext,
+) -> Result<(), Error> {
+	let BodySource::Bytes(bytes) = &encoded.body else {
+		return Err(before_request_contract(execution, "bedrock-request-body-is-not-bounded-json"));
+	};
+	let mut body = serde_json::from_slice::<JsonValue>(bytes)
+		.map_err(|_| before_request_contract(execution, "bedrock-request-body-is-not-json"))?;
+	let object = body
+		.as_object_mut()
+		.ok_or_else(|| before_request_contract(execution, "bedrock-request-body-is-not-object"))?;
+	let Some(metadata) = object.remove("requestMetadata") else {
+		return Ok(());
+	};
+	if let Some(metadata) = sanitize_request_metadata_value(metadata) {
+		object.insert("requestMetadata".to_owned(), metadata);
+	}
+	let bytes = serde_json::to_vec(&body)
+		.map_err(|_| before_request_contract(execution, "bedrock-request-body-encode-failed"))?;
+	if bytes.len() as u64 > encoded.bounds.request_body {
+		return Err(before_request_contract(execution, "bedrock-request-body-limit-exceeded"));
+	}
+	encoded.body = BodySource::bytes(bytes.into());
+	Ok(())
+}
+
 fn before_request_contract(execution: &ExecutionContext, reason: &'static str) -> Error {
 	Error::new(
 		ErrorKind::InvalidRequest,
@@ -1989,6 +2068,26 @@ fn before_request_contract(execution: &ExecutionContext, reason: &'static str) -
 		execution.receipt(),
 	)
 	.detail(ErrorDetail::protocol(ReasonId(Str::new_static(reason))))
+}
+
+fn merge_bedrock_headers(destination: &mut Box<[RequestHeader]>, configured: &[RequestHeader]) {
+	let mut headers = destination
+		.iter()
+		.map(|header| (header.name.to_ascii_lowercase(), header.clone()))
+		.collect::<BTreeMap<_, _>>();
+	for header in configured {
+		let name = header.name.to_ascii_lowercase();
+		if SIGV4_OWNED_HEADERS.contains(&name.as_str())
+			|| matches!(name.as_str(), "accept" | "content-type")
+		{
+			continue;
+		}
+		headers.insert(name.clone(), RequestHeader {
+			name:  Str::new(name),
+			value: header.value.clone(),
+		});
+	}
+	*destination = headers.into_values().collect::<Vec<_>>().into_boxed_slice();
 }
 
 fn merge_static_headers(
@@ -2241,10 +2340,43 @@ fn shaper_deadline(call: &Call, context: &ExecutionContext) -> Option<Instant> {
 	}
 }
 
+const SIGV4_OWNED_HEADERS: [&str; 6] = [
+	"authorization",
+	"content-length",
+	"host",
+	"x-amz-content-sha256",
+	"x-amz-date",
+	"x-amz-security-token",
+];
+
+fn protect_owned_headers(headers: &mut Box<[RequestHeader]>, bedrock_invocation: bool) {
+	let original = mem::take(headers).into_vec();
+	let mut retained = Vec::with_capacity(original.len() + usize::from(bedrock_invocation) * 2);
+	for header in original {
+		let name = header.name.to_ascii_lowercase();
+		if SIGV4_OWNED_HEADERS.contains(&name.as_str())
+			|| (bedrock_invocation && matches!(name.as_str(), "accept" | "content-type"))
+		{
+			continue;
+		}
+		retained.push(RequestHeader { name: Str::new(name), value: header.value });
+	}
+	if bedrock_invocation {
+		retained.push(RequestHeader::new_static("content-type", "application/json"));
+		retained.push(RequestHeader::new_static("accept", "application/vnd.amazon.eventstream"));
+	}
+	*headers = retained.into_boxed_slice();
+}
+
+fn protect_sigv4_headers(request: &mut TransportRequest, bedrock_invocation: bool) {
+	protect_owned_headers(&mut request.encoded.headers, bedrock_invocation);
+}
+
 #[derive(Clone)]
 struct RouteCredentialApplier {
 	auth:     Box<[AuthSpec]>,
 	required: bool,
+	mantle:   bool,
 }
 
 impl CredentialApplier<RouteAccount, Option<CredentialLease>> for RouteCredentialApplier {
@@ -2264,19 +2396,28 @@ impl CredentialApplier<RouteAccount, Option<CredentialLease>> for RouteCredentia
 			(_, None) if !self.required => Ok(()),
 			(_, None) => Err(authentication_error(context, "credential-lease-missing")),
 			(_, Some(lease)) => {
-				let signing_region =
-					crate::codec::anthropic::endpoint_region(request.encoded.uri.as_str()).map(Str::new);
+				let signing_scope = endpoint_scope(request.encoded.uri.as_str());
 				for auth in &self.auth {
-					let prepared = match (auth, signing_region.as_ref()) {
-						(AuthSpec::AwsSigV4(spec), Some(region)) if &spec.region != region => {
+					let prepared = match (auth, signing_scope) {
+						(AuthSpec::AwsSigV4(spec), Some((service, region)))
+							if spec.service != service || spec.region != region =>
+						{
 							let mut resolved = spec.clone();
-							resolved.region = region.clone();
+							resolved.service = Str::new(service);
+							resolved.region = Str::new(region);
 							lease.prepare(&AuthSpec::AwsSigV4(resolved), SystemTime::now())
 						},
 						_ => lease.prepare(auth, SystemTime::now()),
 					};
 					match prepared {
 						Ok(credentials) => {
+							if let AuthSpec::AwsSigV4(spec) = auth {
+								let bedrock_invocation = request.encoded.operation == OperationKind::Chat
+									&& signing_scope.map_or(spec.service == "bedrock", |(service, _)| {
+										service == "bedrock"
+									});
+								protect_sigv4_headers(request, bedrock_invocation);
+							}
 							request.credentials = Some(credentials);
 							return Ok(());
 						},
@@ -2288,6 +2429,14 @@ impl CredentialApplier<RouteAccount, Option<CredentialLease>> for RouteCredentia
 				}
 				Err(authentication_error(context, "credential-application-failed"))
 			},
+		}
+	}
+
+	fn map_response_error(&self, scheme: Option<AuthScheme>, error: Error) -> Error {
+		if self.mantle {
+			map_mantle_auth_rejection(scheme, error)
+		} else {
+			error
 		}
 	}
 }
@@ -2367,6 +2516,12 @@ impl SemanticPolicy<Call> for CanonicalSemantic {
 		let OperationCall::Chat(chat) = &call.operation else {
 			return None;
 		};
+		if call.execution.as_ref().is_some_and(|plan| {
+			plan.policy_model.is_some()
+				&& plan.wire_policy.streaming.harmony_leak_mitigation == Some(true)
+		}) {
+			return Some(GateCondition::WholeAttempt);
+		}
 		if let Setting::Require(ToolChoice::Named(tool)) = &chat.tool_choice {
 			return Some(GateCondition::ToolCallReady { tool: tool.clone() });
 		}
@@ -2776,8 +2931,8 @@ mod tests {
 		let policy = catalog
 			.wire_policy(&model.wire_policy)
 			.expect("CCA model wire policy");
-		let binding =
-			codec_binding(route, &test_cca(), false, false, None, None).expect("CCA codec binding");
+		let binding = codec_binding(route, &test_cca(), false, false, None, None, None)
+			.expect("CCA codec binding");
 		let request = ChatRequest {
 			messages:          Arc::from([Message {
 				role:    Role::Assistant,
@@ -2886,7 +3041,7 @@ mod tests {
 		);
 
 		let (mut encoder, mut call, ..) = discovery_fixture();
-		let binding = codec_binding(&route, &test_cca(), false, false, None, None)
+		let binding = codec_binding(&route, &test_cca(), false, false, None, None, None)
 			.expect("Anthropic codec binding");
 		encoder.route = route.clone();
 		encoder.codec = binding.primary;
@@ -2995,7 +3150,7 @@ mod tests {
 			.find(|(candidate, _)| candidate == &route.id)
 			.map(|(_, wire_model)| wire_model.clone())
 			.expect("Copilot wire model");
-		let binding = codec_binding(&route, &test_cca(), false, false, None, None)
+		let binding = codec_binding(&route, &test_cca(), false, false, None, None, None)
 			.expect("Copilot codec binding");
 		encoder.codec = binding.primary;
 		let plan = Arc::make_mut(call.execution.as_mut().expect("execution plan"));
@@ -3159,6 +3314,40 @@ mod tests {
 	}
 
 	#[test]
+	fn mantle_wire_auth_errors_refine_retry_without_changing_shared_routes() {
+		let mantle =
+			RouteCredentialApplier { auth: Box::new([]), required: true, mantle: true };
+		let shared =
+			RouteCredentialApplier { auth: Box::new([]), required: true, mantle: false };
+		let rejected = Error::new(
+			ErrorKind::Authorization,
+			ErrorPhase::Handshake,
+			RetryAction::Never,
+			ExecutionReceipt::default(),
+		)
+		.status(Some(403));
+
+		assert_eq!(
+			mantle
+				.map_response_error(Some(AuthScheme::AwsSigV4), rejected.clone())
+				.action,
+			RetryAction::RefreshCredentialOnce,
+		);
+		assert_eq!(
+			mantle
+				.map_response_error(Some(AuthScheme::OAuth), rejected.clone())
+				.action,
+			RetryAction::RotateAccount,
+		);
+		assert_eq!(
+			shared
+				.map_response_error(Some(AuthScheme::AwsSigV4), rejected)
+				.action,
+			RetryAction::Never,
+		);
+	}
+
+	#[test]
 	fn mantle_sigv4_signs_the_final_responses_request_with_its_service_scope() {
 		let catalog = Catalog::embedded();
 		let route = catalog
@@ -3209,7 +3398,7 @@ mod tests {
 	}
 
 	#[test]
-	fn static_and_runtime_bedrock_routes_inherit_provider_guardrails() {
+	fn static_and_runtime_bedrock_routes_inherit_provider_options() {
 		let catalog = Catalog::embedded();
 		let static_route = catalog
 			.routes()
@@ -3224,8 +3413,8 @@ mod tests {
 		let static_guardrail = BedrockGuardrail {
 			identifier:  sf!("arn:aws:bedrock:eu-west-1:123456789012:guardrail/static"),
 			version:     sf!("7"),
-			trace:       crate::codec::bedrock::GuardrailTraceMode::EnabledFull,
-			stream_mode: crate::codec::bedrock::GuardrailStreamMode::Sync,
+			trace:       Some(crate::codec::bedrock::GuardrailTraceMode::EnabledFull),
+			stream_mode: Some(crate::codec::bedrock::GuardrailStreamMode::Sync),
 		};
 		let runtime_guardrail =
 			BedrockGuardrail { identifier: sf!("runtime-guardrail"), ..static_guardrail.clone() };
@@ -3238,8 +3427,26 @@ mod tests {
 			.providers
 			.bedrock_guardrails
 			.insert(sf!("runtime-bedrock"), runtime_guardrail.clone());
+		let static_metadata = BTreeMap::from([(sf!("team"), sf!("growth"))]);
+		let runtime_metadata = BTreeMap::from([(sf!("team"), sf!("runtime"))]);
+		settings
+			.providers
+			.bedrock_request_metadata
+			.insert(sf!("amazon-bedrock"), static_metadata.clone());
+		settings
+			.providers
+			.bedrock_request_metadata
+			.insert(sf!("runtime-bedrock"), runtime_metadata.clone());
 		assert_eq!(configured_bedrock_guardrail(&settings, static_route), Some(&static_guardrail),);
 		assert_eq!(configured_bedrock_guardrail(&settings, &runtime_route), Some(&runtime_guardrail),);
+		assert_eq!(
+			configured_bedrock_request_metadata(&settings, static_route),
+			Some(&static_metadata),
+		);
+		assert_eq!(
+			configured_bedrock_request_metadata(&settings, &runtime_route),
+			Some(&runtime_metadata),
+		);
 	}
 
 	fn test_cca() -> GoogleCcaConfig {
@@ -3266,7 +3473,7 @@ mod tests {
 		let provider = catalog.provider(&route.provider).expect("provider");
 		let cca = test_cca();
 		let binding =
-			codec_binding(&route, &cca, false, false, None, None).expect("route codec binding");
+			codec_binding(&route, &cca, false, false, None, None, None).expect("route codec binding");
 		let codec = discovery_codec(catalog, &route, &binding)
 			.expect("discovery codec")
 			.expect("route supports discovery");
@@ -3400,9 +3607,90 @@ mod tests {
 			crate::transport::FramingProtocol::Raw,
 			SizeBounds { request_body: 1024, frame: 1024, response: 1024 },
 		);
-		apply_before_request_mutation(&mut encoded, &mutation, &context)
+		apply_before_request_mutation(&mut encoded, &mutation, &context, false)
 			.expect("header mutation applies");
 		assert_eq!(encoded.headers.as_ref(), [RequestHeader::new_static("x-extension", "enabled")]);
+	}
+
+	#[test]
+	fn bedrock_payload_hook_replaces_messages_and_sanitizes_metadata_before_signing() {
+		let (_, call, ..) = discovery_fixture();
+		let context = ExecutionContext::new(call.budget.clone());
+		let mut mutation = BeforeRequestMutation::default();
+		mutation.body.insert(
+			"messages".to_owned(),
+			serde_json::json!([{"role":"user","content":[{"text":"replacement"}]}]),
+		);
+		mutation.body.insert(
+			"requestMetadata".to_owned(),
+			serde_json::json!({"bad*key":"drop","valid":"yes","notString":7}),
+		);
+		mutation.headers = Box::new([
+			(sf!("Content-Type"), Some(sf!("text/plain"))),
+			(sf!("Host"), Some(sf!("evil.example"))),
+			(sf!("X-Trace"), Some(sf!("kept"))),
+		]);
+		let mut encoded = EncodedRequest::new(
+			OperationKind::Chat,
+			RequestMethod::Post,
+			sf!("https://bedrock-runtime.us-east-1.amazonaws.com/model/test/converse-stream"),
+			Box::new([]),
+			BodySource::bytes(Bytes::from_static(
+				br#"{"messages":[{"role":"user","content":[{"text":"original"}]}]}"#,
+			)),
+			crate::transport::FramingProtocol::AwsEventStream,
+			SizeBounds { request_body: 1024, frame: 1024, response: 1024 },
+		);
+		apply_before_request_mutation(&mut encoded, &mutation, &context, true)
+			.expect("Bedrock accepts wire-body replacement");
+		sanitize_bedrock_request_metadata(&mut encoded, &context)
+			.expect("metadata sanitation succeeds");
+		protect_owned_headers(&mut encoded.headers, true);
+		let BodySource::Bytes(body) = &encoded.body else {
+			panic!("bounded request remains buffered");
+		};
+		let body: JsonValue = serde_json::from_slice(body).expect("mutated body is JSON");
+		assert_eq!(
+			body["messages"],
+			serde_json::json!([{"role":"user","content":[{"text":"replacement"}]}]),
+		);
+		assert_eq!(body["requestMetadata"], serde_json::json!({"valid":"yes"}));
+		let headers = encoded
+			.headers
+			.iter()
+			.map(|header| (header.name.as_str(), header.value.as_str()))
+			.collect::<BTreeMap<_, _>>();
+		assert_eq!(headers["accept"], "application/vnd.amazon.eventstream");
+		assert_eq!(headers["content-type"], "application/json");
+		assert_eq!(headers["x-trace"], "kept");
+		assert!(!headers.contains_key("host"));
+	}
+
+	#[test]
+	fn bedrock_header_merge_preserves_caller_headers_and_filters_owned_fields() {
+		let mut headers = vec![
+			RequestHeader::new_static("content-type", "application/json"),
+			RequestHeader::new_static("accept", "application/vnd.amazon.eventstream"),
+			RequestHeader::new_static("user-agent", omp_core::USER_AGENT),
+		]
+		.into_boxed_slice();
+		merge_bedrock_headers(&mut headers, &[
+			RequestHeader::new_static("Host", "evil.example"),
+			RequestHeader::new_static("Content-Type", "text/plain"),
+			RequestHeader::new_static("Authorization", "forged"),
+			RequestHeader::new_static("User-Agent", "caller-agent"),
+			RequestHeader::new_static("X-Trace", "kept"),
+		]);
+		let headers = headers
+			.iter()
+			.map(|header| (header.name.as_str(), header.value.as_str()))
+			.collect::<BTreeMap<_, _>>();
+		assert_eq!(headers["accept"], "application/vnd.amazon.eventstream");
+		assert_eq!(headers["content-type"], "application/json");
+		assert_eq!(headers["user-agent"], "caller-agent");
+		assert_eq!(headers["x-trace"], "kept");
+		assert!(!headers.contains_key("host"));
+		assert!(!headers.contains_key("authorization"));
 	}
 
 	#[tokio::test]
@@ -3456,7 +3744,7 @@ mod tests {
 		context: &ExecutionContext,
 		expected: &str,
 	) {
-		RouteCredentialApplier { auth: Box::new([auth]), required: true }
+		RouteCredentialApplier { auth: Box::new([auth]), required: true, mantle: false }
 			.apply(account, Some(lease), &mut transport, context)
 			.expect("prepare credentials");
 		let credentials = transport.credentials.take().expect("prepared credentials");
@@ -3550,14 +3838,14 @@ mod tests {
 				Cancellation::default(),
 			)
 			.expect("encode anonymous-capable request");
-		RouteCredentialApplier { auth: Box::new([auth]), required: false }
+		RouteCredentialApplier { auth: Box::new([auth]), required: false, mantle: false }
 			.apply(&account, None, &mut transport, &context)
 			.expect("optional bearer permits no credential");
 		assert!(transport.credentials.is_none());
 	}
 
 	#[test]
-	fn bedrock_endpoint_region_overrides_the_sigv4_scope() {
+	fn bedrock_endpoint_scope_overrides_the_catalog_fallback() {
 		let (encoder, call, account, _, provider, _) = discovery_fixture();
 		let context = ExecutionContext::new(call.budget.clone());
 		let mut transport = encoder
@@ -3574,7 +3862,7 @@ mod tests {
 		transport.encoded.uri =
 			sf!("https://bedrock-runtime.eu-west-2.amazonaws.com/model/test/converse-stream");
 		let auth = AuthSpec::AwsSigV4(crate::auth::SigV4Spec {
-			service:          sf!("bedrock"),
+			service:          sf!("catalog-fallback"),
 			region:           sf!("us-east-1"),
 			unsigned_headers: Vec::new(),
 		});
@@ -3589,7 +3877,7 @@ mod tests {
 			SecretString::from("secret".to_owned()),
 			None,
 		);
-		RouteCredentialApplier { auth: Box::new([auth]), required: true }
+		RouteCredentialApplier { auth: Box::new([auth]), required: true, mantle: false }
 			.apply(&account, Some(aws), &mut transport, &context)
 			.expect("prepare SigV4 credentials");
 		let credentials = transport.credentials.take().expect("prepared credentials");
@@ -3608,7 +3896,99 @@ mod tests {
 			.to_str()
 			.expect("ASCII authorization");
 		assert!(authorization.contains("/eu-west-2/bedrock/aws4_request"));
-		assert!(!authorization.contains("/us-east-1/bedrock/aws4_request"));
+		assert!(!authorization.contains("/us-east-1/catalog-fallback/aws4_request"));
+	}
+
+	#[test]
+	fn bedrock_invocation_protects_owned_headers_and_signs_caller_headers() {
+		let (encoder, call, account, _, provider, _) = discovery_fixture();
+		let context = ExecutionContext::new(call.budget.clone());
+		let mut transport = encoder
+			.encode(
+				&call,
+				&Some(lease(&provider, "unused")),
+				&BeforeRequestMutation::default(),
+				&context,
+				0,
+				false,
+				Cancellation::default(),
+			)
+			.expect("encode request");
+		transport.encoded.operation = OperationKind::Chat;
+		transport.encoded.uri =
+			sf!("https://bedrock-runtime-fips.cn-north-1.amazonaws.com.cn/model/test/converse-stream");
+		transport.encoded.headers = vec![
+			RequestHeader::new_static("Content-Type", "text/plain"),
+			RequestHeader::new_static("Accept", "text/plain"),
+			RequestHeader::new_static("Host", "evil.example"),
+			RequestHeader::new_static("Content-Length", "999"),
+			RequestHeader::new_static("X-Amz-Date", "19700101T000000Z"),
+			RequestHeader::new_static("X-Amz-Content-Sha256", "deadbeef"),
+			RequestHeader::new_static("X-Amz-Security-Token", "forged"),
+			RequestHeader::new_static("Authorization", "Bearer forged"),
+			RequestHeader::new_static("X-Trace", "kept"),
+		]
+		.into_boxed_slice();
+		let auth = AuthSpec::AwsSigV4(crate::auth::SigV4Spec {
+			service:          sf!("catalog-fallback"),
+			region:           sf!("us-east-1"),
+			unsigned_headers: Vec::new(),
+		});
+		let before = SystemTime::now();
+		let aws = CredentialLease::aws_sigv4(
+			LeaseMeta {
+				account:    AccountId::new("aws"),
+				principal:  PrincipalId::new("amazon-bedrock"),
+				generation: 1,
+				expires_at: None,
+			},
+			SecretString::from("AKIDEXAMPLE".to_owned()),
+			SecretString::from("secret".to_owned()),
+			Some(SecretString::from("session".to_owned())),
+		);
+		RouteCredentialApplier { auth: Box::new([auth]), required: true, mantle: false }
+			.apply(&account, Some(aws), &mut transport, &context)
+			.expect("prepare SigV4 credentials");
+		let after = SystemTime::now();
+		let credentials = transport.credentials.take().expect("prepared credentials");
+		assert!(credentials.signed_at() >= before);
+		assert!(credentials.signed_at() <= after);
+		assert_eq!(transport.encoded.headers.as_ref(), [
+			RequestHeader::new_static("x-trace", "kept"),
+			RequestHeader::new_static("content-type", "application/json"),
+			RequestHeader::new_static("accept", "application/vnd.amazon.eventstream"),
+		],);
+
+		let body = Bytes::from_static(br#"{"hello":"world"}"#);
+		let mut request = Request::builder()
+			.method("POST")
+			.uri(transport.encoded.uri.as_str())
+			.body(body)
+			.expect("HTTP request");
+		for header in &transport.encoded.headers {
+			request.headers_mut().insert(
+				HeaderName::from_bytes(header.name.as_bytes()).expect("header name"),
+				HeaderValue::from_str(header.value.as_str()).expect("header value"),
+			);
+		}
+		credentials
+			.finalize_buffered(&mut request)
+			.expect("apply SigV4 credentials");
+		let authorization = request
+			.headers()
+			.get(AUTHORIZATION)
+			.expect("authorization")
+			.to_str()
+			.expect("ASCII authorization");
+		assert!(authorization.contains("/cn-north-1/bedrock/aws4_request"));
+		assert!(authorization.contains(
+			"SignedHeaders=accept;content-type;host;x-amz-content-sha256;x-amz-date;\
+			 x-amz-security-token;x-trace",
+		));
+		assert_eq!(request.headers()["x-amz-security-token"], "session");
+		assert!(!request.headers().contains_key("content-length"));
+		assert!(!authorization.contains("evil.example"));
+		assert!(!authorization.contains("forged"));
 	}
 
 	#[test]
@@ -3683,7 +4063,7 @@ mod tests {
 		route.transport = TransportKind::Websocket;
 		let cca = test_cca();
 		let binding =
-			codec_binding(&route, &cca, false, false, None, None).expect("route codec binding");
+			codec_binding(&route, &cca, false, false, None, None, None).expect("route codec binding");
 		let codec = RouteCodecSet::for_route(
 			&route,
 			OperationBits::for_kind(OperationKind::Realtime),

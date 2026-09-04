@@ -26,9 +26,9 @@ use crate::{
 	},
 	codec::{
 		Codec, DecodeContext, Decoder, DecoderState, EncodeContext, EncodedRequest,
-		ProviderStateEvent, ProviderTelemetryEvent, RawCompletion, RawEvent, RequestHeader,
-		RequestMethod, SafetyAction, SafetyConfidence, SafetyFinding, SafetyFindingKind,
-		SafetyStrength, SizeBounds, ToolInputKind, UnvalidatedToolCall,
+		ProviderMetadataEvent, ProviderStateEvent, ProviderTelemetryEvent, RawCompletion, RawEvent,
+		RequestHeader, RequestMethod, SafetyAction, SafetyConfidence, SafetyFinding,
+		SafetyFindingKind, SafetyStrength, SizeBounds, ToolInputKind, UnvalidatedToolCall,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, UsageUpdate},
@@ -42,11 +42,10 @@ use crate::{
 pub const NO_TOOLS_SENTINEL_NAME: &str = "__no_tools__";
 
 /// Bedrock Guardrail stream trace level.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailTraceMode {
 	/// Do not request trace details.
-	#[default]
 	Disabled,
 	/// Request the standard guardrail trace.
 	Enabled,
@@ -55,11 +54,10 @@ pub enum GuardrailTraceMode {
 }
 
 /// Bedrock Guardrail streaming assessment mode.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardrailStreamMode {
 	/// Assess each stream segment synchronously.
-	#[default]
 	Sync,
 	/// Allow asynchronous stream assessment.
 	Async,
@@ -75,12 +73,12 @@ pub struct BedrockGuardrail {
 	/// Immutable or named guardrail version.
 	#[serde(default = "draft_guardrail_version", alias = "guardrailVersion")]
 	pub version:     Str,
-	/// Requested trace detail.
-	#[serde(default, alias = "guardrailTrace")]
-	pub trace:       GuardrailTraceMode,
-	/// Streaming assessment mode.
-	#[serde(default)]
-	pub stream_mode: GuardrailStreamMode,
+	/// Requested trace detail; absent preserves Bedrock's default.
+	#[serde(default, alias = "guardrailTrace", skip_serializing_if = "Option::is_none")]
+	pub trace:       Option<GuardrailTraceMode>,
+	/// Streaming assessment mode; absent preserves Bedrock's default.
+	#[serde(default, alias = "streamProcessingMode", skip_serializing_if = "Option::is_none")]
+	pub stream_mode: Option<GuardrailStreamMode>,
 }
 fn draft_guardrail_version() -> Str {
 	sf!("DRAFT")
@@ -92,6 +90,8 @@ fn draft_guardrail_version() -> Str {
 pub struct BedrockOptions {
 	/// Optional typed Guardrail configuration.
 	pub guardrail:          Option<BedrockGuardrail>,
+	/// Bedrock invocation-log attribution tags.
+	pub request_metadata:   BTreeMap<Str, Str>,
 	/// Maximum encoded request body.
 	pub max_request_bytes:  u64,
 	/// Maximum CRC-validated `EventStream` payload.
@@ -104,6 +104,7 @@ impl Default for BedrockOptions {
 	fn default() -> Self {
 		Self {
 			guardrail:          None,
+			request_metadata:   BTreeMap::new(),
 			max_request_bytes:  16 * 1024 * 1024,
 			max_frame_bytes:    16 * 1024 * 1024,
 			max_response_bytes: 128 * 1024 * 1024,
@@ -158,7 +159,7 @@ impl Codec for BedrockConverseCodec {
 					target.endpoint.base_url.as_str(),
 					target.wire_model.as_str(),
 					region.as_str(),
-				);
+				)?;
 				Ok(EncodedRequest::new(
 					OperationKind::Chat,
 					RequestMethod::Post,
@@ -168,6 +169,10 @@ impl Codec for BedrockConverseCodec {
 						RequestHeader {
 							name:  sf!("accept"),
 							value: sf!("application/vnd.amazon.eventstream"),
+						},
+						RequestHeader {
+							name:  sf!("user-agent"),
+							value: Str::new_static(omp_core::USER_AGENT),
 						},
 					]
 					.into_boxed_slice(),
@@ -250,6 +255,8 @@ struct ConverseStreamRequest {
 	guardrail_config: Option<GuardrailConfig>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	additional_model_request_fields: Option<AdditionalModelRequestFields>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	request_metadata: Option<Value>,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	additional_model_response_field_paths: Vec<&'static str>,
 }
@@ -440,8 +447,10 @@ struct NamedToolChoice {
 struct GuardrailConfig {
 	guardrail_identifier:   Str,
 	guardrail_version:      Str,
-	trace:                  GuardrailTraceMode,
-	stream_processing_mode: GuardrailStreamMode,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	trace:                  Option<GuardrailTraceMode>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	stream_processing_mode: Option<GuardrailStreamMode>,
 }
 
 #[derive(Serialize)]
@@ -623,6 +632,16 @@ fn encode_converse_request(
 	let additional_model_response_field_paths = prefix_binding
 		.then_some(vec!["/input_transformations"])
 		.unwrap_or_default();
+	let request_metadata = (!options.request_metadata.is_empty())
+		.then(|| {
+			let object = options
+				.request_metadata
+				.iter()
+				.map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
+				.collect();
+			sanitize_request_metadata_value(Value::Object(object))
+		})
+		.flatten();
 	let wire = ConverseStreamRequest {
 		messages,
 		system,
@@ -630,6 +649,7 @@ fn encode_converse_request(
 		tool_config,
 		guardrail_config,
 		additional_model_request_fields,
+		request_metadata,
 		additional_model_response_field_paths,
 	};
 	serde_json::to_vec(&wire)
@@ -909,6 +929,50 @@ fn tool_result_content(content: &ToolResultContent) -> Result<WireToolResultCont
 
 const fn cache_point(long_retention: bool) -> CachePoint {
 	CachePoint { kind: "default", ttl: if long_retention { Some("1h") } else { None } }
+}
+
+const REQUEST_METADATA_MAX_ENTRIES: usize = 16;
+const REQUEST_METADATA_MAX_LENGTH: usize = 256;
+
+fn request_metadata_text_is_valid(text: &str, allow_empty: bool) -> bool {
+	(allow_empty || !text.is_empty())
+		&& text.chars().count() <= REQUEST_METADATA_MAX_LENGTH
+		&& text.chars().all(|character| {
+			character.is_ascii_alphanumeric()
+				|| character.is_whitespace()
+				|| matches!(character, ':' | '_' | '@' | '$' | '#' | '=' | '/' | '+' | ',' | '-' | '.')
+		})
+}
+
+/// Applies Bedrock's invocation-log metadata limits after all request hooks.
+///
+/// Invalid siblings are dropped instead of failing an inference turn. A
+/// non-object or empty result omits `requestMetadata` entirely.
+pub(crate) fn sanitize_request_metadata_value(raw: Value) -> Option<Value> {
+	let Value::Object(entries) = raw else {
+		tracing::warn!("Bedrock requestMetadata dropped because it is not an object");
+		return None;
+	};
+	let mut kept = serde_json::Map::new();
+	let mut dropped = 0_usize;
+	for (key, value) in entries {
+		let Some(value) = value.as_str() else {
+			dropped += 1;
+			continue;
+		};
+		if kept.len() >= REQUEST_METADATA_MAX_ENTRIES
+			|| !request_metadata_text_is_valid(&key, false)
+			|| !request_metadata_text_is_valid(value, true)
+		{
+			dropped += 1;
+			continue;
+		}
+		kept.insert(key, Value::String(value.to_owned()));
+	}
+	if dropped > 0 {
+		tracing::warn!(dropped, "Bedrock requestMetadata entries dropped");
+	}
+	(!kept.is_empty()).then_some(Value::Object(kept))
 }
 
 fn inference_config(request: &ChatRequest) -> Option<InferenceConfig> {
@@ -1241,7 +1305,9 @@ fn bedrock_runtime_endpoint(base: &str, region: &str) -> String {
 	else {
 		return expanded;
 	};
-	let suffix = if region.starts_with("cn-") {
+	let suffix = if host.ends_with(".api.aws") {
+		"api.aws"
+	} else if host.ends_with(".amazonaws.com.cn") || region.starts_with("cn-") {
 		"amazonaws.com.cn"
 	} else {
 		"amazonaws.com"
@@ -1255,8 +1321,19 @@ fn bedrock_runtime_endpoint(base: &str, region: &str) -> String {
 	uri.to_string()
 }
 
-fn converse_stream_uri(base: &str, model: &str, region: &str) -> String {
+fn converse_stream_uri(base: &str, model: &str, region: &str) -> Result<String, Error> {
 	let base = bedrock_runtime_endpoint(base, region);
+	let mut endpoint = Url::parse(&base)
+		.map_err(|_| encoding_error(ErrorKind::InvalidRequest, "bedrock.endpoint.invalid"))?;
+	if !matches!(endpoint.scheme(), "http" | "https") {
+		return Err(encoding_error(ErrorKind::InvalidRequest, "bedrock.endpoint.scheme"));
+	}
+	if endpoint.host_str().is_none() {
+		return Err(encoding_error(ErrorKind::InvalidRequest, "bedrock.endpoint.host_missing"));
+	}
+	endpoint.set_query(None);
+	endpoint.set_fragment(None);
+	let base = endpoint.to_string();
 	let mut uri = String::with_capacity(base.len() + model.len() + 32);
 	uri.push_str(base.trim_end_matches('/'));
 	uri.push_str("/model/");
@@ -1271,7 +1348,7 @@ fn converse_stream_uri(base: &str, model: &str, region: &str) -> String {
 		}
 	}
 	uri.push_str("/converse-stream");
-	uri
+	Ok(uri)
 }
 
 const REGION_PLACEHOLDER: &str = "{region}";
@@ -1600,7 +1677,7 @@ impl BedrockDecoder {
 
 	fn project_event(
 		&mut self,
-		event: WireEvent,
+		mut event: WireEvent,
 		emit: &mut dyn FnMut(RawEvent),
 	) -> Result<(), Error> {
 		if let Some(role) = event.role {
@@ -1728,33 +1805,43 @@ impl BedrockDecoder {
 			}
 			return Ok(());
 		}
+		if let Some(fields) = event.additional_model_response_fields.take() {
+			emit_input_transformations(fields, self.committed, emit)?;
+		}
 		if let Some(reason) = event.stop_reason {
+			let explanation = match reason.as_str() {
+				"guardrail_intervened" => Some("Response blocked by Amazon Bedrock guardrail."),
+				"content_filtered" => Some("Response filtered by Amazon Bedrock content filters."),
+				_ => None,
+			};
+			if let Some(explanation) = explanation {
+				emit(RawEvent::Metadata(ProviderMetadataEvent::FinishMessage {
+					candidate: 0,
+					message:   Str::new_static(explanation),
+				}));
+			}
 			self.stop = Some(map_stop(reason.as_str(), self.sentinel_injected)?);
 			if self.usage.is_some() {
 				self.complete(emit);
 			}
 			return Ok(());
 		}
-		let mut saw_metadata = false;
 		if let Some(usage) = event.usage {
 			let usage = usage.into_usage();
 			self.usage = Some(usage);
-			saw_metadata = true;
 			emit(RawEvent::Chat(ChatEvent::Usage(UsageUpdate { usage, final_update: true })));
 		}
 		if let Some(metrics) = event.metrics
 			&& let Some(latency_ms) = metrics.latency_ms
 		{
-			saw_metadata = true;
 			emit(RawEvent::Telemetry(ProviderTelemetryEvent::ModelLatency(Duration::from_millis(
 				latency_ms,
 			))));
 		}
 		if let Some(trace) = event.trace.and_then(|trace| trace.guardrail) {
-			saw_metadata = true;
 			emit(RawEvent::Telemetry(trace.into_telemetry()));
 		}
-		if saw_metadata && self.stop.is_some() {
+		if self.stop.is_some() && self.usage.is_some() {
 			self.complete(emit);
 		}
 		Ok(())
@@ -1857,14 +1944,15 @@ enum WireEventKind {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireEvent {
-	role:                Option<Str>,
+	role: Option<Str>,
 	content_block_index: Option<u32>,
-	start:               Option<WireStart>,
-	delta:               Option<WireDelta>,
-	stop_reason:         Option<Str>,
-	usage:               Option<WireUsage>,
-	metrics:             Option<WireMetrics>,
-	trace:               Option<WireTrace>,
+	start: Option<WireStart>,
+	delta: Option<WireDelta>,
+	stop_reason: Option<Str>,
+	additional_model_response_fields: Option<Value>,
+	usage: Option<WireUsage>,
+	metrics: Option<WireMetrics>,
+	trace: Option<WireTrace>,
 }
 
 impl WireEvent {
@@ -1920,6 +2008,39 @@ struct WireToolDelta {
 struct WireReasoningDelta {
 	text:      Option<Str>,
 	signature: Option<Str>,
+}
+
+fn emit_input_transformations(
+	fields: Value,
+	committed: bool,
+	emit: &mut dyn FnMut(RawEvent),
+) -> Result<(), Error> {
+	let Value::Object(mut fields) = fields else {
+		return Ok(());
+	};
+	let Some(Value::Array(transformations)) = fields.remove("input_transformations") else {
+		return Ok(());
+	};
+	for transformation in transformations {
+		let Value::Object(object) = transformation else {
+			continue;
+		};
+		let Some(kind) = object.get("type").and_then(Value::as_str).map(Str::new) else {
+			continue;
+		};
+		let path = object.get("path").and_then(Value::as_str).map(Str::new);
+		let reason = object.get("reason").and_then(Value::as_str).map(Str::new);
+		let data = serde_json::to_vec(&object).map(Bytes::from).map_err(|_| {
+			stream_error(ErrorKind::Protocol, "bedrock.input_transformation.serialization", committed)
+		})?;
+		emit(RawEvent::Metadata(ProviderMetadataEvent::InputTransformation {
+			kind,
+			path,
+			reason,
+			data,
+		}));
+	}
+	Ok(())
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -2994,8 +3115,8 @@ mod tests {
 			guardrail: Some(BedrockGuardrail {
 				identifier:  sf!("guardrail-1"),
 				version:     sf!("7"),
-				trace:       GuardrailTraceMode::EnabledFull,
-				stream_mode: GuardrailStreamMode::Async,
+				trace:       Some(GuardrailTraceMode::EnabledFull),
+				stream_mode: Some(GuardrailStreamMode::Async),
 			}),
 			..BedrockOptions::default()
 		};
@@ -3032,8 +3153,60 @@ mod tests {
 		)
 		.expect("typed guardrail settings");
 		assert_eq!(guardrail.version, "DRAFT");
-		assert_eq!(guardrail.trace, GuardrailTraceMode::Disabled);
-		assert_eq!(guardrail.stream_mode, GuardrailStreamMode::Sync);
+		assert_eq!(guardrail.trace, None);
+		assert_eq!(guardrail.stream_mode, None);
+		let request = base_request(vec![text_message(Role::User, "Check this.")]);
+		let body: Value = serde_json::from_slice(&encode_fixture(&request, &BedrockOptions {
+			guardrail: Some(guardrail),
+			..BedrockOptions::default()
+		}))
+		.expect("guardrail request is JSON");
+		assert_eq!(
+			body["guardrailConfig"],
+			serde_json::json!({
+				"guardrailIdentifier":
+					"arn:aws:bedrock:eu-west-2:123456789012:guardrail/example",
+				"guardrailVersion": "DRAFT"
+			}),
+		);
+	}
+
+	#[test]
+	fn request_metadata_is_sanitized_capped_and_omitted_when_empty() {
+		let request = base_request(vec![text_message(Role::User, "attribute this")]);
+		let mut request_metadata = BTreeMap::new();
+		request_metadata.insert(sf!("bad*key"), sf!("dropped"));
+		request_metadata.insert(sf!("long"), Str::new("x".repeat(257)));
+		request_metadata.insert(sf!("good"), sf!("kept"));
+		for index in 0..20 {
+			request_metadata.insert(Str::new(format!("tag{index:02}")), sf!("value"));
+		}
+		let body: Value = serde_json::from_slice(&encode_fixture(&request, &BedrockOptions {
+			request_metadata,
+			..BedrockOptions::default()
+		}))
+		.expect("metadata request is JSON");
+		let metadata = body["requestMetadata"]
+			.as_object()
+			.expect("valid metadata remains");
+		assert_eq!(metadata.len(), 16);
+		assert_eq!(metadata.get("good"), Some(&Value::String("kept".to_owned())));
+		assert!(!metadata.contains_key("bad*key"));
+		assert!(!metadata.contains_key("long"));
+
+		let empty: Value =
+			serde_json::from_slice(&encode_fixture(&request, &BedrockOptions::default()))
+				.expect("plain request is JSON");
+		assert!(empty.get("requestMetadata").is_none());
+		assert_eq!(
+			sanitize_request_metadata_value(serde_json::json!({
+				"valid": "yes",
+				"bad*key": "no",
+				"nonString": 7
+			})),
+			Some(serde_json::json!({"valid":"yes"})),
+		);
+		assert_eq!(sanitize_request_metadata_value(serde_json::json!([])), None);
 	}
 
 	#[test]
@@ -3041,8 +3214,8 @@ mod tests {
 		let guardrail = BedrockGuardrail {
 			identifier:  sf!("arn:aws:bedrock:eu-west-2:123456789012:guardrail/example"),
 			version:     sf!("7"),
-			trace:       GuardrailTraceMode::Enabled,
-			stream_mode: GuardrailStreamMode::Sync,
+			trace:       Some(GuardrailTraceMode::Enabled),
+			stream_mode: Some(GuardrailStreamMode::Sync),
 		};
 		assert_eq!(
 			guardrail_arn_region("arn:aws:bedrock:eu-west-2:123456789012:foundation-model/example"),
@@ -3092,6 +3265,89 @@ mod tests {
 			bedrock_runtime_endpoint("https://bedrock-runtime.us-east-1.amazonaws.com", "eu-west-2",),
 			"https://bedrock-runtime.eu-west-2.amazonaws.com/",
 		);
+		assert_eq!(
+			resolve_bedrock_region(
+				None,
+				Some("us-east-1"),
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"au.anthropic.claude-opus-4-8",
+				None,
+			),
+			"ap-southeast-2",
+		);
+		assert_eq!(
+			resolve_bedrock_region(
+				None,
+				Some("ap-northeast-3"),
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"jp.anthropic.claude-opus-4-8",
+				None,
+			),
+			"ap-northeast-3",
+		);
+		assert_eq!(
+			resolve_bedrock_region(
+				None,
+				Some("eu-west-1"),
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"us-gov.anthropic.claude-opus-4-8",
+				None,
+			),
+			"us-gov-west-1",
+		);
+		assert_eq!(
+			resolve_bedrock_region(
+				None,
+				Some("eu-west-1"),
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"arn:aws:bedrock:us-east-2:123456789012:application-inference-profile/example",
+				None,
+			),
+			"us-east-2",
+		);
+		assert_eq!(
+			resolve_bedrock_region(
+				None,
+				Some("eu-central-1"),
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"global.anthropic.claude-opus-4-8",
+				None,
+			),
+			"eu-central-1",
+		);
+		assert_eq!(
+			bedrock_runtime_endpoint("https://bedrock-runtime.us-east-1.api.aws", "eu-west-2"),
+			"https://bedrock-runtime.eu-west-2.api.aws/",
+		);
+		assert_eq!(
+			bedrock_runtime_endpoint("https://bedrock-runtime.us-east-1.amazonaws.com", "cn-north-1",),
+			"https://bedrock-runtime.cn-north-1.amazonaws.com.cn/",
+		);
+		assert_eq!(
+			bedrock_runtime_endpoint("https://bedrock.proxy.example/base", "eu-west-2"),
+			"https://bedrock.proxy.example/base",
+		);
+		assert_eq!(
+			converse_stream_uri(
+				"https://bedrock-runtime.us-east-1.amazonaws.com",
+				"arn:aws:bedrock:us-east-2:123:application-inference-profile/example",
+				"us-east-2",
+			)
+			.expect("valid Bedrock endpoint"),
+			"https://bedrock-runtime.us-east-2.amazonaws.com/model/arn%3Aaws%3Abedrock%3Aus-east-2%3A123%3Aapplication-inference-profile%2Fexample/converse-stream",
+		);
+		assert_eq!(
+			converse_stream_uri(
+				"https://proxy.example/runtime?stale=true#fragment",
+				"model",
+				"eu-west-2"
+			)
+			.expect("custom endpoint"),
+			"https://proxy.example/runtime/model/model/converse-stream",
+		);
+		let error =
+			converse_stream_uri("not a URL", "model", "us-east-1").expect_err("invalid endpoint");
+		assert_eq!(error.kind, ErrorKind::InvalidRequest);
 	}
 
 	fn replay(bytes: &'static [u8], fragmented: bool) -> Vec<RawEvent> {
@@ -3176,19 +3432,20 @@ mod tests {
 	#[test]
 	fn sentinel_name_is_suppressed_only_when_this_request_injected_it() {
 		let start = || WireEvent {
-			role:                None,
+			role: None,
 			content_block_index: Some(0),
-			start:               Some(WireStart {
+			start: Some(WireStart {
 				tool_use: Some(WireToolStart {
 					tool_use_id: sf!("call-1"),
 					name:        sf!(NO_TOOLS_SENTINEL_NAME),
 				}),
 			}),
-			delta:               None,
-			stop_reason:         None,
-			usage:               None,
-			metrics:             None,
-			trace:               None,
+			delta: None,
+			stop_reason: None,
+			additional_model_response_fields: None,
+			usage: None,
+			metrics: None,
+			trace: None,
 		};
 
 		let mut legitimate = BedrockDecoder::default();
@@ -3208,6 +3465,96 @@ mod tests {
 			.project_event(start(), &mut |event| events.push(event))
 			.expect("injected sentinel is ignored");
 		assert!(events.is_empty());
+	}
+
+	#[test]
+	fn response_semantics_project_transformations_and_distinct_stop_reasons() {
+		let mut decoder = BedrockDecoder::default();
+		let mut events = Vec::new();
+		let event: WireEvent = serde_json::from_value(serde_json::json!({
+			"stopReason": "guardrail_intervened",
+			"additionalModelResponseFields": {
+				"input_transformations": [
+					{
+						"type": "thinking",
+						"path": "/messages/1/content/0",
+						"reason": "prefix_binding_mismatch",
+						"future": true
+					},
+					{"missing": "type"}
+				]
+			}
+		}))
+		.expect("message stop event");
+		decoder
+			.project_event(event, &mut |event| events.push(event))
+			.expect("message stop projects");
+		assert!(matches!(
+			events.first(),
+			Some(RawEvent::Metadata(ProviderMetadataEvent::InputTransformation {
+				kind,
+				path: Some(path),
+				reason: Some(reason),
+				data,
+			})) if kind == "thinking"
+				&& path == "/messages/1/content/0"
+				&& reason == "prefix_binding_mismatch"
+				&& serde_json::from_slice::<Value>(data)
+					.expect("preserved transformation")["future"] == true
+		));
+		assert!(matches!(
+			events.get(1),
+			Some(RawEvent::Metadata(ProviderMetadataEvent::FinishMessage { message, .. }))
+				if message == "Response blocked by Amazon Bedrock guardrail."
+		));
+		assert_eq!(decoder.stop, Some(FinishReason::ContentFilter));
+		assert_eq!(
+			map_stop("content_filtered", false).expect("known stop"),
+			FinishReason::ContentFilter,
+		);
+		assert_eq!(map_stop("tool_use", false).expect("known stop"), FinishReason::ToolCalls);
+		assert_eq!(map_stop("tool_use", true).expect("known stop"), FinishReason::Stop);
+		assert_eq!(
+			map_stop("future_reason", false).expect("forward-compatible stop"),
+			FinishReason::Other(sf!("future_reason")),
+		);
+	}
+
+	#[test]
+	fn response_waits_for_usage_when_metrics_arrive_after_stop() {
+		let mut decoder = BedrockDecoder::default();
+		let mut events = Vec::new();
+		for value in [
+			serde_json::json!({"stopReason":"end_turn"}),
+			serde_json::json!({"metrics":{"latencyMs":17}}),
+		] {
+			let event: WireEvent = serde_json::from_value(value).expect("response event");
+			decoder
+				.project_event(event, &mut |event| events.push(event))
+				.expect("response event projects");
+		}
+		assert!(!decoder.terminal);
+		assert!(matches!(
+			events.as_slice(),
+			[RawEvent::Telemetry(ProviderTelemetryEvent::ModelLatency(duration))]
+				if *duration == Duration::from_millis(17)
+		));
+		let usage: WireEvent = serde_json::from_value(serde_json::json!({
+			"usage":{"inputTokens":3,"outputTokens":2,"totalTokens":5}
+		}))
+		.expect("usage event");
+		decoder
+			.project_event(usage, &mut |event| events.push(event))
+			.expect("usage projects");
+		assert!(decoder.terminal);
+		assert!(matches!(
+			events.last(),
+			Some(RawEvent::Completion(RawCompletion {
+				reason: FinishReason::Stop,
+				usage: Usage { input_tokens: 3, output_tokens: 2, .. },
+				..
+			}))
+		));
 	}
 
 	#[test]

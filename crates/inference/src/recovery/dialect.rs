@@ -41,11 +41,18 @@ static DEEPSEEK: &[Delimiter] = &[Delimiter {
 	open:  "<｜tool▁call▁begin｜>".as_bytes(),
 	close: "<｜tool▁call▁end｜>".as_bytes(),
 }];
-static HARMONY: &[Delimiter] = &[Delimiter {
-	id:    DelimiterId("harmony-tool-call"),
-	open:  b"<\x7cstart\x7c>assistant<\x7cchannel\x7c>analysis to=functions.",
-	close: b"<\x7ccall\x7c>",
-}];
+static HARMONY: &[Delimiter] = &[
+	Delimiter {
+		id:    DelimiterId("harmony-commentary-tool-call"),
+		open:  b"<\x7cstart\x7c>assistant<\x7cchannel\x7c>commentary to=functions.",
+		close: b"<\x7ccall\x7c>",
+	},
+	Delimiter {
+		id:    DelimiterId("harmony-analysis-tool-call"),
+		open:  b"<\x7cstart\x7c>assistant<\x7cchannel\x7c>analysis to=functions.",
+		close: b"<\x7ccall\x7c>",
+	},
+];
 static GLM: &[Delimiter] = &[Delimiter {
 	id:    DelimiterId("glm-tool-call"),
 	open:  b"<tool_call>",
@@ -359,12 +366,12 @@ fn parse_envelope(dialect: Dialect, raw: &[u8]) -> Option<(Option<Str>, Bytes)> 
 			"<｜tool▁sep｜>".as_bytes(),
 			"<｜tool▁call▁end｜>".as_bytes(),
 		),
-		Dialect::Harmony => parse_token_pair(
-			raw,
-			b"<\x7cstart\x7c>assistant<\x7cchannel\x7c>analysis to=functions.",
-			b"<\x7cmessage\x7c>",
-			b"<\x7ccall\x7c>",
-		),
+		Dialect::Harmony => [
+			b"<\x7cstart\x7c>assistant<\x7cchannel\x7c>commentary to=functions.".as_slice(),
+			b"<\x7cstart\x7c>assistant<\x7cchannel\x7c>analysis to=functions.".as_slice(),
+		]
+		.into_iter()
+		.find_map(|open| parse_token_pair(raw, open, b"<\x7cmessage\x7c>", b"<\x7ccall\x7c>")),
 		Dialect::Glm => parse_glm(raw),
 		Dialect::Xml | Dialect::Anthropic | Dialect::MiniMax => parse_xml(raw),
 	}
@@ -933,7 +940,7 @@ mod tests {
 			(Dialect::Xml, b"<invoke name=\"echo\"><parameter name=\"x\">1</parameter></invoke>"),
 			(Dialect::Anthropic, b"<function_calls><invoke name=\"echo\"><parameter name=\"x\">1</parameter></invoke></function_calls>"),
 			(Dialect::DeepSeek, "<｜tool▁call▁begin｜>echo<｜tool▁sep｜>{\"x\":1}<｜tool▁call▁end｜>".as_bytes()),
-			(Dialect::Harmony, b"<\x7cstart\x7c>assistant<\x7cchannel\x7c>analysis to=functions.echo<\x7cmessage\x7c>{\"x\":1}<\x7ccall\x7c>"),
+			(Dialect::Harmony, b"<\x7cstart\x7c>assistant<\x7cchannel\x7c>commentary to=functions.echo<\x7cmessage\x7c>{\"x\":1}<\x7ccall\x7c>"),
 			(Dialect::Qwen3, b"<tool_call>{\"name\":\"echo\",\"arguments\":{\"x\":1}}</tool_call>"),
 			(Dialect::QwenXml, b"<tool_calls><echo x=\"1\" /></tool_calls>"),
 			(Dialect::Gemini, b"```tool_code\ndefault_api.echo(x=1)\n```"),

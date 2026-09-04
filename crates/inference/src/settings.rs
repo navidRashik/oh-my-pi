@@ -412,26 +412,29 @@ impl SamplingSettings {
 pub struct ProviderRuntimeSettings {
 	/// Maximum concurrent requests keyed by provider id; absent or zero is
 	/// unlimited.
-	pub max_in_flight:        BTreeMap<Str, usize>,
+	pub max_in_flight:            BTreeMap<Str, usize>,
 	/// Maximum queued callers per provider before backpressure fails fast.
-	pub max_queued:           usize,
+	pub max_queued:               usize,
 	/// Per-transport-attempt timeout in seconds.
-	pub timeout_seconds:      u64,
+	pub timeout_seconds:          u64,
 	/// Overall logical-call timeout in seconds; zero leaves caller deadlines
 	/// authoritative.
-	pub call_timeout_seconds: u64,
+	pub call_timeout_seconds:     u64,
 	/// Bedrock guardrail policy keyed by provider id.
-	pub bedrock_guardrails:   BTreeMap<Str, crate::codec::bedrock::BedrockGuardrail>,
+	pub bedrock_guardrails:       BTreeMap<Str, crate::codec::bedrock::BedrockGuardrail>,
+	/// Bedrock invocation-log attribution tags keyed by provider id.
+	pub bedrock_request_metadata: BTreeMap<Str, BTreeMap<Str, Str>>,
 }
 
 impl Default for ProviderRuntimeSettings {
 	fn default() -> Self {
 		Self {
-			max_in_flight:        BTreeMap::new(),
-			max_queued:           64,
-			timeout_seconds:      300,
-			call_timeout_seconds: 0,
-			bedrock_guardrails:   BTreeMap::new(),
+			max_in_flight:            BTreeMap::new(),
+			max_queued:               64,
+			timeout_seconds:          300,
+			call_timeout_seconds:     0,
+			bedrock_guardrails:       BTreeMap::new(),
+			bedrock_request_metadata: BTreeMap::new(),
 		}
 	}
 }
@@ -467,11 +470,12 @@ impl ProviderRuntimeSettings {
 	#[must_use]
 	pub fn from_con(ctx: &Ctx) -> Self {
 		Self {
-			max_in_flight:        deserialize_table(AI_PROVIDER_MAX_IN_FLIGHT.get(ctx)),
-			max_queued:           AI_PROVIDER_MAX_QUEUED.get(ctx) as usize,
-			timeout_seconds:      u64::from(AI_PROVIDER_TIMEOUT_SECONDS.get(ctx)),
-			call_timeout_seconds: u64::from(AI_PROVIDER_CALL_TIMEOUT_SECONDS.get(ctx)),
-			bedrock_guardrails:   deserialize_table(AI_PROVIDER_BEDROCK_GUARDRAILS.get(ctx)),
+			max_in_flight:            deserialize_table(AI_PROVIDER_MAX_IN_FLIGHT.get(ctx)),
+			max_queued:               AI_PROVIDER_MAX_QUEUED.get(ctx) as usize,
+			timeout_seconds:          u64::from(AI_PROVIDER_TIMEOUT_SECONDS.get(ctx)),
+			call_timeout_seconds:     u64::from(AI_PROVIDER_CALL_TIMEOUT_SECONDS.get(ctx)),
+			bedrock_guardrails:       deserialize_table(AI_PROVIDER_BEDROCK_GUARDRAILS.get(ctx)),
+			bedrock_request_metadata: deserialize_table(AI_PROVIDER_BEDROCK_REQUEST_METADATA.get(ctx)),
 		}
 	}
 
@@ -490,7 +494,10 @@ impl ProviderRuntimeSettings {
 				!provider.trim().is_empty()
 					&& !guardrail.identifier.trim().is_empty()
 					&& !guardrail.version.trim().is_empty()
-			})
+			}) && self
+			.bedrock_request_metadata
+			.keys()
+			.all(|provider| !provider.trim().is_empty())
 	}
 }
 
@@ -698,6 +705,18 @@ fn validate_bedrock_guardrails(_: &Ctx, value: &Kv) -> Result<(), Str> {
 	}
 }
 
+fn validate_bedrock_request_metadata(_: &Ctx, value: &Kv) -> Result<(), Str> {
+	let Some(metadata) = try_deserialize_table::<BTreeMap<Str, BTreeMap<Str, Str>>>(value.clone())
+	else {
+		return invalid("Bedrock request metadata must map provider names to string tag maps");
+	};
+	if metadata.keys().all(|provider| !provider.trim().is_empty()) {
+		Ok(())
+	} else {
+		invalid("Bedrock request metadata requires non-empty provider names")
+	}
+}
+
 fn validate_finite(_: &Ctx, value: &f32) -> Result<(), Str> {
 	if value.is_finite() {
 		Ok(())
@@ -875,6 +894,12 @@ omp_con::var! {
 		validate: validate_bedrock_guardrails,
 		flags: archive,
 	};
+	/// Bedrock invocation-log attribution tags keyed by provider id.
+	pub static AI_PROVIDER_BEDROCK_REQUEST_METADATA = ai_provider_bedrock_request_metadata: Kv {
+		default: serialize_table(&BTreeMap::<Str, BTreeMap<Str, Str>>::new()),
+		validate: validate_bedrock_request_metadata,
+		flags: archive,
+	};
 }
 
 /// One-shot migration map from reflected TOML paths to convar names.
@@ -903,6 +928,7 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("provider_runtime.timeout_seconds", "ai_provider_timeout_seconds"),
 	("provider_runtime.call_timeout_seconds", "ai_provider_call_timeout_seconds"),
 	("provider_runtime.bedrock_guardrails", "ai_provider_bedrock_guardrails"),
+	("provider_runtime.bedrock_request_metadata", "ai_provider_bedrock_request_metadata"),
 	("web_search.order", "ai_search_order"),
 	("web_search.exclusions", "ai_search_exclusions"),
 	("web_search.timeout_seconds", "ai_search_timeout_seconds"),
@@ -954,6 +980,13 @@ mod tests {
 		AI_SAMPLING_VERBOSITY
 			.set(&ctx, TextVerbositySetting::High)
 			.expect("set verbosity");
+		let metadata = BTreeMap::from([(
+			Str::new_static("amazon-bedrock"),
+			BTreeMap::from([(Str::new_static("team"), Str::new_static("growth"))]),
+		)]);
+		AI_PROVIDER_BEDROCK_REQUEST_METADATA
+			.set(&ctx, serialize_table(&metadata))
+			.expect("set Bedrock request metadata");
 		crate::pi_settings::AI_CONTEXT_PROMOTION_ENABLED
 			.set(&ctx, true)
 			.expect("enable context promotion");
@@ -961,6 +994,7 @@ mod tests {
 		assert_eq!(settings.retry.max_retries, 3);
 		assert!(settings.context_promotion_enabled);
 		assert_eq!(settings.sampling.verbosity, TextVerbositySetting::High);
+		assert_eq!(settings.providers.bedrock_request_metadata, metadata);
 		assert!(settings.retry.validate());
 		assert!(settings.sampling.validate());
 		assert!(settings.providers.validate());
@@ -995,6 +1029,7 @@ mod tests {
 			"provider_runtime.timeout_seconds",
 			"provider_runtime.call_timeout_seconds",
 			"provider_runtime.bedrock_guardrails",
+			"provider_runtime.bedrock_request_metadata",
 			"web_search.order",
 			"web_search.exclusions",
 			"web_search.timeout_seconds",
@@ -1028,6 +1063,7 @@ mod tests {
 			AI_PROVIDER_TIMEOUT_SECONDS.name(),
 			AI_PROVIDER_CALL_TIMEOUT_SECONDS.name(),
 			AI_PROVIDER_BEDROCK_GUARDRAILS.name(),
+			AI_PROVIDER_BEDROCK_REQUEST_METADATA.name(),
 			AI_SEARCH_ORDER.name(),
 			AI_SEARCH_EXCLUSIONS.name(),
 			AI_SEARCH_TIMEOUT_SECONDS.name(),

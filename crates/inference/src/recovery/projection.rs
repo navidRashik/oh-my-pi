@@ -89,6 +89,8 @@ pub struct DialectRecoveryConfig {
 	pub wire_policy:          WirePolicyId,
 	/// Catalog-selected model-authored tool syntax, if any.
 	pub dialect:              Option<Dialect>,
+	/// Whether the route requires whole-attempt Harmony leak auditing.
+	pub harmony_mitigation:   bool,
 	/// Attempt number written to recovery receipts.
 	pub attempt:              u32,
 	/// Maximum bytes retained for one model-authored envelope.
@@ -102,6 +104,7 @@ pub struct DialectRecoveryConfig {
 impl DialectRecoveryConfig {
 	/// Builds recovery configuration solely from compiled catalog policy.
 	pub fn from_wire_policy(wire_policy: WirePolicyId, policy: &WirePolicy, attempt: u32) -> Self {
+		let harmony_mitigation = policy.streaming.harmony_leak_mitigation == Some(true);
 		let dialect = policy
 			.streaming
 			.markup_healing_pattern
@@ -115,6 +118,7 @@ impl DialectRecoveryConfig {
 		Self {
 			wire_policy,
 			dialect,
+			harmony_mitigation,
 			attempt,
 			max_block_bytes: ToolAssemblyLimits::default().max_argument_bytes,
 			max_diagnostic_bytes: 128,
@@ -812,11 +816,28 @@ mod tests {
 	}
 
 	#[test]
+	fn harmony_audit_is_selected_only_by_compiled_policy() {
+		let mut policy = WirePolicy::baseline();
+		let plain = DialectRecoveryConfig::from_wire_policy(WirePolicyId::new("plain"), &policy, 0);
+		assert!(!plain.harmony_mitigation);
+		assert_eq!(plain.dialect, None);
+
+		policy.streaming.harmony_leak_mitigation = Some(true);
+		let harmony = DialectRecoveryConfig::from_wire_policy(WirePolicyId::new("codex"), &policy, 0);
+		assert!(harmony.harmony_mitigation);
+		assert_eq!(
+			harmony.dialect, None,
+			"mitigation audits provider text but does not turn arbitrary fenced examples into calls"
+		);
+	}
+
+	#[test]
 	fn passthrough_and_recovered_blocks_share_one_collision_free_allocator() {
 		let definitions = [definition()];
 		let config = DialectRecoveryConfig {
 			wire_policy:          WirePolicyId::new("hermes-wire"),
 			dialect:              Some(Dialect::Hermes),
+			harmony_mitigation:   false,
 			attempt:              0,
 			max_block_bytes:      1024,
 			max_diagnostic_bytes: 32,
@@ -861,6 +882,7 @@ mod tests {
 		let config = DialectRecoveryConfig {
 			wire_policy:          WirePolicyId::new("hermes-wire"),
 			dialect:              Some(Dialect::Hermes),
+			harmony_mitigation:   false,
 			attempt:              0,
 			max_block_bytes:      1024,
 			max_diagnostic_bytes: 32,
@@ -918,6 +940,7 @@ mod tests {
 		let config = DialectRecoveryConfig {
 			wire_policy:          WirePolicyId::new("wire"),
 			dialect:              None,
+			harmony_mitigation:   false,
 			attempt:              0,
 			max_block_bytes:      1024,
 			max_diagnostic_bytes: 32,
@@ -950,6 +973,7 @@ mod tests {
 		let config = DialectRecoveryConfig {
 			wire_policy:          WirePolicyId::new("bounded-wire"),
 			dialect:              Some(Dialect::Hermes),
+			harmony_mitigation:   false,
 			attempt:              0,
 			max_block_bytes:      24,
 			max_diagnostic_bytes: 8,

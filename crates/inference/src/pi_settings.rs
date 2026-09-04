@@ -574,11 +574,6 @@ omp_con::var! {
 		default: false,
 		flags: archive,
 	};
-	/// pi `irc.timeoutMs` (number, default: 120_000).
-	pub static AI_IRC_TIMEOUT_MS = ai_irc_timeout_ms: i64 {
-		default: 120000,
-		flags: archive,
-	};
 	/// pi `plan.enabled` (boolean, default: true).
 	pub static AI_PLAN_ENABLED = ai_plan_enabled: bool {
 		default: true,
@@ -824,7 +819,6 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("ttsr.disabledRules", "ai_ttsr_disabled_rules"),
 	("web_search.enabled", "ai_web_search_enabled"),
 	("security.enabled", "ai_security_enabled"),
-	("irc.timeoutMs", "ai_irc_timeout_ms"),
 	("plan.enabled", "ai_plan_enabled"),
 	("plan.defaultOnStartup", "ai_plan_default_on_startup"),
 	("providers.ollama-cloud.maxConcurrency", "ai_providers_ollama_cloud_max_concurrency"),

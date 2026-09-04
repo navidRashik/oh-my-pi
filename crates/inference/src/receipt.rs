@@ -371,7 +371,7 @@ mod recovery_kind {
 	use strum::IntoStaticStr;
 
 	/// Kind of deterministic recovery applied to canonical output.
-	#[derive(Clone, Debug, Deserialize, Eq, IntoStaticStr, PartialEq, Serialize)]
+	#[derive(Clone, Copy, Debug, Deserialize, Eq, IntoStaticStr, PartialEq, Serialize)]
 	#[strum(serialize_all = "snake_case", const_into_str)]
 	pub enum RecoveryKind {
 		/// Malformed JSON was repaired within configured bounds.
@@ -382,6 +382,10 @@ mod recovery_kind {
 		ToolAssembly,
 		/// Leaked reasoning was classified into a thinking block.
 		ThinkingClassification,
+		/// Exactly framed Harmony analysis/final markup was normalized.
+		HarmonyLeakRepair,
+		/// Provable Harmony protocol leakage rejected a provisional attempt.
+		HarmonyLeakDetection,
 		/// Reasoning stopped making bounded forward progress.
 		ReasoningStall,
 		/// Repetition was detected within one attempt.

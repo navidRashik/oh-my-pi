@@ -9,10 +9,11 @@ pub mod store;
 pub use accounts::{AccountCatalog, AccountDiscoveredModel, merge_account_catalogs};
 pub use endpoints::{
 	DiscoveryEndpoint, DiscoveryEndpointKind, EndpointError, EndpointOrigin, configured_endpoint,
-	known_loopback_endpoints, supported_endpoint_types,
+	configured_endpoint_with_options, known_loopback_endpoints,
 };
 pub use probe::{
 	DiscoveryHttpClient, DiscoveryProbe, ProbeError, ProbeHttpFuture, ProbeHttpRequest,
+	ProbeTransportError, ProxyDiscoveryRoutes,
 };
 pub use store::{
 	CachedDiscovery, DiscoveryCacheKey, DiscoveryStore, DiscoveryStoreError, ProviderDiscoveryState,

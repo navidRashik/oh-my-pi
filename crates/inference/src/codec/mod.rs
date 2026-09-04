@@ -565,6 +565,17 @@ pub enum ProviderMetadataEvent {
 		/// Provider finish explanation.
 		message:   Str,
 	},
+	/// Provider-reported rewrite of canonical request input.
+	InputTransformation {
+		/// Provider transformation kind.
+		kind:   Str,
+		/// Rewritten request path, when reported.
+		path:   Option<Str>,
+		/// Provider transformation reason, when reported.
+		reason: Option<Str>,
+		/// Complete bounded transformation object for forward compatibility.
+		data:   Bytes,
+	},
 	/// Typed auxiliary candidate part whose provider kind is preserved without
 	/// interpretation.
 	AuxiliaryPart {

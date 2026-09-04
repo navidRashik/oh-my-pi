@@ -120,6 +120,7 @@ pub enum RecoveryError {
 
 pub mod dialect;
 pub mod empty;
+pub mod harmony;
 pub mod json;
 pub mod scanner;
 pub mod thinking;

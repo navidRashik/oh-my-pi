@@ -72,7 +72,39 @@ pub enum SigV4Error {
 	InvalidSpec,
 }
 
+/// Infers the signing service and region from a regional AWS endpoint.
+///
+/// Catalog data remains the fallback for custom endpoints. Standard regional
+/// endpoints override it because the credential scope must match the actual
+/// invocation host, including FIPS, China, and `api.aws` endpoints.
+pub(crate) fn endpoint_scope(endpoint: &str) -> Option<(&str, &str)> {
+	let authority = endpoint
+		.strip_prefix("https://")
+		.or_else(|| endpoint.strip_prefix("http://"))?
+		.split('/')
+		.next()?;
+	let host = authority.split(':').next()?;
+	let stem = host
+		.strip_suffix(".amazonaws.com.cn")
+		.or_else(|| host.strip_suffix(".amazonaws.com"))
+		.or_else(|| host.strip_suffix(".api.aws"))?;
+	let (service, region) = stem.split_once('.')?;
+	if service.is_empty() || region.is_empty() || region.contains('.') {
+		return None;
+	}
+	let service = service.strip_suffix("-fips").unwrap_or(service);
+	let service = if service == "bedrock-runtime" {
+		"bedrock"
+	} else {
+		service
+	};
+	Some((service, region))
+}
+
 /// Signs the exact method, URI, headers, and buffered body in place.
+///
+/// Header mutation is transactional: malformed public input or signing
+/// material leaves the original request untouched.
 ///
 /// This function is crate-private so AWS key material cannot be used outside a
 /// [`super::lease::CredentialLease`].
@@ -95,31 +127,30 @@ pub(crate) fn sign_request(
 		.transpose()?
 		.or_else(|| request.headers().get(HOST).cloned())
 		.ok_or(SigV4Error::MissingHost)?;
-	request.headers_mut().insert(HOST, host);
-	request.headers_mut().insert(
-		HeaderName::from_static("x-amz-date"),
-		HeaderValue::from_str(&amz_date).map_err(|_| SigV4Error::InvalidHeaderValue)?,
-	);
+	let amz_date_header =
+		HeaderValue::from_str(&amz_date).map_err(|_| SigV4Error::InvalidHeaderValue)?;
 	let payload_hash = Sha256::digest(request.body());
 	let payload_hash = hex::encode(&payload_hash).into_string();
-	request.headers_mut().insert(
-		HeaderName::from_static("x-amz-content-sha256"),
-		HeaderValue::from_str(&payload_hash).map_err(|_| SigV4Error::InvalidHeaderValue)?,
-	);
-	if let Some(token) = &credential.session_token {
-		let mut value = HeaderValue::from_str(token.expose_secret())
-			.map_err(|_| SigV4Error::InvalidHeaderValue)?;
-		value.set_sensitive(true);
-		request
-			.headers_mut()
-			.insert(HeaderName::from_static("x-amz-security-token"), value);
-	} else {
-		request
-			.headers_mut()
-			.remove(HeaderName::from_static("x-amz-security-token"));
-	}
+	let payload_hash_header =
+		HeaderValue::from_str(&payload_hash).map_err(|_| SigV4Error::InvalidHeaderValue)?;
+	let session_token = credential
+		.session_token
+		.as_ref()
+		.map(|token| {
+			let mut value = HeaderValue::from_str(token.expose_secret())
+				.map_err(|_| SigV4Error::InvalidHeaderValue)?;
+			value.set_sensitive(true);
+			Ok(value)
+		})
+		.transpose()?;
 
-	let (canonical_hash, signed_headers) = canonical_request(request, &payload_hash, spec)?;
+	let owned = SignerHeaders {
+		host,
+		amz_date: amz_date_header,
+		payload_hash: payload_hash_header,
+		session_token,
+	};
+	let (canonical_hash, signed_headers) = canonical_request(request, &payload_hash, spec, &owned)?;
 	let scope = format!("{short_date}/{}/{}/aws4_request", spec.region, spec.service);
 	let string_to_sign = format!(
 		"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
@@ -150,32 +181,56 @@ pub(crate) fn sign_request(
 	authorization.extend_from_slice(signed_headers.as_bytes());
 	authorization.extend_from_slice(b", Signature=");
 	authorization.extend_from_slice(signature_hex.as_bytes());
-	let mut value =
+	let mut authorization =
 		HeaderValue::from_bytes(&authorization).map_err(|_| SigV4Error::InvalidHeaderValue)?;
-	value.set_sensitive(true);
-	request.headers_mut().insert(AUTHORIZATION, value);
+	authorization.set_sensitive(true);
 	signature.zeroize();
+
+	let headers = request.headers_mut();
+	headers.insert(HOST, owned.host);
+	headers.insert(HeaderName::from_static("x-amz-date"), owned.amz_date);
+	headers.insert(HeaderName::from_static("x-amz-content-sha256"), owned.payload_hash);
+	if let Some(token) = owned.session_token {
+		headers.insert(HeaderName::from_static("x-amz-security-token"), token);
+	} else {
+		headers.remove(HeaderName::from_static("x-amz-security-token"));
+	}
+	headers.insert(AUTHORIZATION, authorization);
 	Ok(())
+}
+
+struct SignerHeaders {
+	host:          HeaderValue,
+	amz_date:      HeaderValue,
+	payload_hash:  HeaderValue,
+	session_token: Option<HeaderValue>,
 }
 
 fn canonical_request(
 	request: &Request<Bytes>,
 	payload_hash: &str,
 	spec: &SigV4Spec,
+	owned: &SignerHeaders,
 ) -> Result<([u8; 32], String), SigV4Error> {
 	let mut headers: BTreeMap<&str, Vec<&HeaderValue>> = BTreeMap::new();
 	for (name, value) in request.headers() {
 		let name = name.as_str();
 		if default_unsigned_header(name)
-			|| (!signer_owned_header(name)
-				&& spec
-					.unsigned_headers
-					.iter()
-					.any(|excluded| excluded == name))
+			|| signer_owned_header(name)
+			|| spec
+				.unsigned_headers
+				.iter()
+				.any(|excluded| excluded == name)
 		{
 			continue;
 		}
 		headers.entry(name).or_default().push(value);
+	}
+	headers.insert("host", vec![&owned.host]);
+	headers.insert("x-amz-content-sha256", vec![&owned.payload_hash]);
+	headers.insert("x-amz-date", vec![&owned.amz_date]);
+	if let Some(token) = owned.session_token.as_ref() {
+		headers.insert("x-amz-security-token", vec![token]);
 	}
 	let signed_headers = headers.keys().copied().collect::<Vec<_>>().join(";");
 	let mut canonical = Zeroizing::new(Vec::new());
@@ -592,6 +647,24 @@ mod tests {
 	}
 
 	#[test]
+	fn endpoint_scope_infers_standard_fips_china_and_api_aws_hosts() {
+		assert_eq!(
+			endpoint_scope("https://bedrock-runtime.eu-west-2.amazonaws.com/model/id"),
+			Some(("bedrock", "eu-west-2")),
+		);
+		assert_eq!(
+			endpoint_scope("https://bedrock-runtime-fips.cn-north-1.amazonaws.com.cn/model/id"),
+			Some(("bedrock", "cn-north-1")),
+		);
+		assert_eq!(
+			endpoint_scope("https://bedrock-mantle.us-east-2.api.aws/v1/responses"),
+			Some(("bedrock-mantle", "us-east-2")),
+		);
+		assert_eq!(endpoint_scope("https://custom.example/v1"), None);
+		assert_eq!(endpoint_scope("https://sts.amazonaws.com/"), None);
+	}
+
+	#[test]
 	fn standard_transport_and_proxy_headers_are_never_signed() {
 		for name in [
 			"authorization",
@@ -662,12 +735,17 @@ mod tests {
 	}
 
 	#[test]
-	fn malformed_input_errors_are_typed_and_do_not_expose_values() {
+	fn malformed_input_errors_are_typed_redacted_and_atomic() {
 		let mut missing_host = Request::builder()
 			.method("GET")
 			.uri("/")
+			.header("x-amz-date", "caller-date")
+			.header("x-amz-content-sha256", "caller-hash")
+			.header("x-amz-security-token", "caller-token")
+			.header(AUTHORIZATION, "Bearer caller-secret")
 			.body(Bytes::new())
 			.expect("request");
+		let original_headers = missing_host.headers().clone();
 		assert_eq!(
 			sign_request(
 				&credential(None),
@@ -677,6 +755,28 @@ mod tests {
 			),
 			Err(SigV4Error::MissingHost)
 		);
+		assert_eq!(missing_host.headers(), &original_headers);
+
+		let mut invalid_query = Request::builder()
+			.method("GET")
+			.uri("https://example.amazonaws.com/?secret=%FF")
+			.header("x-amz-date", "caller-date")
+			.header("x-amz-content-sha256", "caller-hash")
+			.header("x-amz-security-token", "caller-token")
+			.header(AUTHORIZATION, "Bearer caller-secret")
+			.body(Bytes::new())
+			.expect("request");
+		let original_headers = invalid_query.headers().clone();
+		assert_eq!(
+			sign_request(
+				&credential(Some("session-secret")),
+				&spec(Vec::new()),
+				UNIX_EPOCH + Duration::from_secs(VECTOR_SECONDS),
+				&mut invalid_query,
+			),
+			Err(SigV4Error::InvalidQueryEncoding),
+		);
+		assert_eq!(invalid_query.headers(), &original_headers);
 
 		let secret_value = "secret\nheader";
 		let bad_credential = credential(Some(secret_value));

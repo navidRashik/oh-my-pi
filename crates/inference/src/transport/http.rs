@@ -1293,8 +1293,13 @@ fn classify_http_error_with_hint(
 		};
 		(kind, RetryAction::RotateAccount)
 	} else if concurrent_shedding {
+		let default_delay = if status == 429 {
+			time::Duration::from_secs(30)
+		} else {
+			time::Duration::from_secs(5)
+		};
 		(ErrorKind::RateLimited, RetryAction::SameRoute {
-			after: retry_hint.unwrap_or_else(|| time::Duration::from_secs(5)),
+			after: retry_hint.unwrap_or(default_delay),
 		})
 	} else if let Some(kind) = classified_rejection {
 		(kind, RetryAction::Never)

@@ -24,6 +24,8 @@ pub enum DiscoveryEndpointKind {
 	LiteLlm,
 	/// Generic OpenAI-compatible model API.
 	OpenAi,
+	/// Dual Anthropic/OpenAI proxy advertising per-model endpoint types.
+	Proxy,
 }
 
 /// Why an endpoint may be probed.
@@ -36,24 +38,46 @@ pub enum EndpointOrigin {
 }
 
 /// One typed discovery endpoint and its deadline class.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiscoveryEndpoint {
 	/// Expected endpoint family.
-	pub kind:     DiscoveryEndpointKind,
+	pub kind:              DiscoveryEndpointKind,
 	/// Base URL.
-	pub base_url: Str,
+	pub base_url:          Str,
 	/// Whether the endpoint was auto-known or explicitly configured.
-	pub origin:   EndpointOrigin,
+	pub origin:            EndpointOrigin,
+	/// Explicit complete-probe deadline in milliseconds.
+	pub timeout_ms:        Option<u64>,
+	/// Whether generic OpenAI discovery injects `/v1` before `/models`.
+	pub inject_openai_v1: bool,
+}
+
+impl std::fmt::Debug for DiscoveryEndpoint {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("DiscoveryEndpoint")
+			.field("kind", &self.kind)
+			.field("base_url", &self.redacted_label())
+			.field("origin", &self.origin)
+			.field("timeout_ms", &self.timeout_ms)
+			.field("inject_openai_v1", &self.inject_openai_v1)
+			.finish()
+	}
 }
 
 impl DiscoveryEndpoint {
 	/// Returns the complete-request deadline for this endpoint.
 	pub fn deadline(&self) -> Duration {
-		if self.is_loopback() {
-			Duration::from_millis(900)
-		} else {
-			Duration::from_secs(6)
-		}
+		self.timeout_ms.map_or_else(
+			|| {
+				if self.is_loopback() {
+					Duration::from_millis(900)
+				} else {
+					Duration::from_secs(10)
+				}
+			},
+			Duration::from_millis,
+		)
 	}
 
 	/// Reports whether the configured host is an IP loopback or `localhost`.
@@ -63,10 +87,24 @@ impl DiscoveryEndpoint {
 			.and_then(|url| url.host_str().map(str::to_owned))
 			.is_some_and(|host| {
 				host.eq_ignore_ascii_case("localhost")
+					|| host == "0.0.0.0"
 					|| host
 						.parse::<IpAddr>()
 						.is_ok_and(|address| address.is_loopback())
 			})
+	}
+
+	/// Returns a diagnostic/cache label with credentials and query parameters removed.
+	pub fn redacted_label(&self) -> Str {
+		let Ok(mut url) = Url::parse(self.base_url.as_str()) else {
+			return Str::new_static("<invalid-endpoint>");
+		};
+		let _ = url.set_password(None);
+		let _ = url.set_username("");
+		url.set_path("/");
+		url.set_query(None);
+		url.set_fragment(None);
+		Str::new(url.as_str())
 	}
 }
 
@@ -74,19 +112,25 @@ impl DiscoveryEndpoint {
 pub fn known_loopback_endpoints() -> Box<[DiscoveryEndpoint]> {
 	Box::new([
 		DiscoveryEndpoint {
-			kind:     DiscoveryEndpointKind::Ollama,
-			base_url: Str::new_static("http://127.0.0.1:11434"),
-			origin:   EndpointOrigin::KnownLoopback,
+			kind:              DiscoveryEndpointKind::Ollama,
+			base_url:          Str::new_static("http://127.0.0.1:11434"),
+			origin:            EndpointOrigin::KnownLoopback,
+			timeout_ms:        Some(250),
+			inject_openai_v1: true,
 		},
 		DiscoveryEndpoint {
-			kind:     DiscoveryEndpointKind::LlamaCpp,
-			base_url: Str::new_static("http://127.0.0.1:8080"),
-			origin:   EndpointOrigin::KnownLoopback,
+			kind:              DiscoveryEndpointKind::LlamaCpp,
+			base_url:          Str::new_static("http://127.0.0.1:8080"),
+			origin:            EndpointOrigin::KnownLoopback,
+			timeout_ms:        Some(250),
+			inject_openai_v1: true,
 		},
 		DiscoveryEndpoint {
-			kind:     DiscoveryEndpointKind::LmStudio,
-			base_url: Str::new_static("http://127.0.0.1:1234"),
-			origin:   EndpointOrigin::KnownLoopback,
+			kind:              DiscoveryEndpointKind::LmStudio,
+			base_url:          Str::new_static("http://127.0.0.1:1234"),
+			origin:            EndpointOrigin::KnownLoopback,
+			timeout_ms:        Some(250),
+			inject_openai_v1: true,
 		},
 	])
 }
@@ -100,31 +144,33 @@ pub fn configured_endpoint(
 	kind: DiscoveryEndpointKind,
 	base_url: &str,
 ) -> Result<DiscoveryEndpoint, EndpointError> {
+	configured_endpoint_with_options(kind, base_url, None, None)
+}
+
+/// Converts a configured endpoint plus discovery policy into a typed endpoint.
+pub fn configured_endpoint_with_options(
+	kind: DiscoveryEndpointKind,
+	base_url: &str,
+	timeout_ms: Option<u64>,
+	inject_openai_v1: Option<bool>,
+) -> Result<DiscoveryEndpoint, EndpointError> {
 	let parsed = Url::parse(base_url).map_err(|_| EndpointError::InvalidUrl)?;
 	if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
 		return Err(EndpointError::InvalidUrl);
+	}
+	if timeout_ms == Some(0) {
+		return Err(EndpointError::InvalidTimeout);
+	}
+	if inject_openai_v1.is_some() && kind != DiscoveryEndpointKind::OpenAi {
+		return Err(EndpointError::InvalidOpenAiV1Policy);
 	}
 	Ok(DiscoveryEndpoint {
 		kind,
 		base_url: Str::new(base_url.trim_end_matches('/')),
 		origin: EndpointOrigin::Configured,
+		timeout_ms,
+		inject_openai_v1: inject_openai_v1.unwrap_or(true),
 	})
-}
-
-/// Detects likely proxy families without turning detection into authority.
-pub fn supported_endpoint_types(base_url: &str) -> Box<[DiscoveryEndpointKind]> {
-	let lower = base_url.to_ascii_lowercase();
-	if lower.contains("11434") || lower.contains("ollama") {
-		Box::new([DiscoveryEndpointKind::Ollama, DiscoveryEndpointKind::OpenAi])
-	} else if lower.contains("1234") || lower.contains("lmstudio") || lower.contains("lm-studio") {
-		Box::new([DiscoveryEndpointKind::LmStudio, DiscoveryEndpointKind::OpenAi])
-	} else if lower.contains("litellm") || lower.contains("4000") {
-		Box::new([DiscoveryEndpointKind::LiteLlm, DiscoveryEndpointKind::OpenAi])
-	} else if lower.contains("8080") || lower.contains("llama") {
-		Box::new([DiscoveryEndpointKind::LlamaCpp, DiscoveryEndpointKind::OpenAi])
-	} else {
-		Box::new([DiscoveryEndpointKind::OpenAi])
-	}
 }
 
 /// Invalid configured endpoint.
@@ -133,6 +179,12 @@ pub enum EndpointError {
 	/// The URL is not an absolute HTTP(S) endpoint.
 	#[error("configured discovery endpoint must be an absolute HTTP(S) URL")]
 	InvalidUrl,
+	/// The explicit deadline was zero.
+	#[error("configured discovery timeout must be positive")]
+	InvalidTimeout,
+	/// `/v1` injection was configured for a non-OpenAI listing.
+	#[error("configured `/v1` injection is valid only for OpenAI model-list discovery")]
+	InvalidOpenAiV1Policy,
 }
 
 #[cfg(test)]
@@ -151,5 +203,34 @@ mod tests {
 		assert_eq!(remote.origin, EndpointOrigin::Configured);
 		assert!(!remote.is_loopback());
 		assert!(remote.deadline() > known_loopback_endpoints()[0].deadline());
+	}
+
+	#[test]
+	fn configured_policy_is_typed_and_redacted() {
+		let endpoint = configured_endpoint_with_options(
+			DiscoveryEndpointKind::OpenAi,
+			"https://user:password@models.example/v3/compat?token=secret",
+			Some(3210),
+			Some(false),
+		)
+		.expect("configured endpoint");
+		assert_eq!(endpoint.deadline(), Duration::from_millis(3210));
+		assert!(!endpoint.inject_openai_v1);
+		let label = endpoint.redacted_label();
+		assert!(!label.contains("user"));
+		assert!(!label.contains("password"));
+		assert!(!label.contains("secret"));
+		let debug = format!("{endpoint:?}");
+		assert!(!debug.contains("password"));
+		assert!(!debug.contains("secret"));
+		assert_eq!(
+			configured_endpoint_with_options(
+				DiscoveryEndpointKind::LlamaCpp,
+				"http://localhost:8080",
+				None,
+				Some(false),
+			),
+			Err(EndpointError::InvalidOpenAiV1Policy)
+		);
 	}
 }
