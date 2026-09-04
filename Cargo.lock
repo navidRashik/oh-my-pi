@@ -7833,6 +7833,7 @@ dependencies = [
  "omp-dom",
  "omp-inference",
  "omp-journal",
+ "omp-proto",
  "omp-session",
  "omp-tool",
  "omp-tools",
@@ -8161,6 +8162,7 @@ dependencies = [
 name = "omp-envd"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "async-stream",
  "async-trait",
  "bytecount",
@@ -8431,6 +8433,7 @@ version = "0.1.0"
 dependencies = [
  "fastembed",
  "flume",
+ "jiff",
  "omp-core",
  "parking_lot",
  "rusqlite",
@@ -9030,6 +9033,7 @@ dependencies = [
  "parking_lot",
  "png 0.18.1",
  "raw-window-handle",
+ "reqwest 0.13.4",
  "serde_json",
  "strum",
  "tempfile",
@@ -9037,6 +9041,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "url",
  "winit",
  "zune-jpeg 0.5.15",
 ]

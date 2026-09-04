@@ -72,6 +72,10 @@ codegen-backend = "cranelift"
 
 [profile.dev.package."*"]
 codegen-backend = "llvm"
+# omp-ar monomorphizes xutf's AArch64 NEON transcoder; Cranelift replaces its
+# unsupported `vsli` intrinsic with a trap.
+[profile.dev.package.omp-ar]
+codegen-backend = "llvm"
 # omp-con declarations use linkme distributed slices so vars, commands, and
 # actions declared by downstream crates register without a central roster.
 [profile.dev.package.omp-con]
