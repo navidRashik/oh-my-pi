@@ -10,7 +10,10 @@ use omp_core::Str;
 use serde::{Deserialize, Serialize};
 use toml::map;
 
-use super::{ExtensionCode, ExtensionError, Layer, TrustTier};
+use super::{
+	ExtensionCode, ExtensionError, Layer, TrustTier,
+	resolver::{normalize_distribution_name, validate_abi},
+};
 
 /// Current `omp.lock` format version.
 pub const LOCK_VERSION: u32 = 2;
@@ -157,6 +160,20 @@ impl LockFile {
 				"lock does not use first-index",
 			));
 		}
+		if !is_unique_nonempty(&self.targets) {
+			return Err(ExtensionError::new(
+				ExtensionCode::ELockDrift,
+				"lock targets must be non-empty, unique target triples",
+			));
+		}
+		if self.indexes.iter().any(String::is_empty)
+			|| self.indexes.iter().collect::<BTreeSet<_>>().len() != self.indexes.len()
+		{
+			return Err(ExtensionError::new(
+				ExtensionCode::EIndexDrift,
+				"lock indexes must be non-empty and unique while preserving first-index order",
+			));
+		}
 		let mut ids = BTreeSet::new();
 		for extension in &self.extensions {
 			if !ids.insert(&extension.id) {
@@ -166,16 +183,25 @@ impl LockFile {
 				));
 			}
 			validate_canonical_features(&extension.features)?;
-			if extension.manifest_digest.is_empty()
-				|| extension.declaration_digest.is_empty()
-				|| extension.capability_digest.is_empty()
-				|| extension.manifest_capability_digest.is_empty()
+			if !valid_digest(extension.manifest_digest.as_str(), "b3:")
+				|| !valid_digest(extension.declaration_digest.as_str(), "b3:")
+				|| !valid_digest(extension.capability_digest.as_str(), "b3:")
+				|| !valid_digest(extension.manifest_capability_digest.as_str(), "b3:")
+				|| !valid_digest(extension.wheel.blake3.as_str(), "b3:")
+				|| !valid_digest(extension.wheel.sha256.as_str(), "sha256:")
 			{
 				return Err(ExtensionError::new(
 					ExtensionCode::ELockDrift,
-					format!("{} has an incomplete digest set", extension.id),
+					format!("{} has an incomplete or malformed digest set", extension.id),
 				));
 			}
+			if extension.wheel.file.is_empty() || extension.wheel.size == 0 {
+				return Err(ExtensionError::new(
+					ExtensionCode::ELockDrift,
+					format!("{} has incomplete wheel identity", extension.id),
+				));
+			}
+			validate_abi(extension.wheel.tag.as_str())?;
 			if extension
 				.source
 				.as_table()
@@ -189,7 +215,14 @@ impl LockFile {
 		}
 		let mut package_versions = BTreeMap::new();
 		for package in &self.packages {
-			if let Some(version) = package_versions.insert(&package.name, &package.version)
+			let normalized = normalize_distribution_name(package.name.as_str());
+			if normalized != package.name.as_str() {
+				return Err(ExtensionError::new(
+					ExtensionCode::ELockDrift,
+					format!("package name {} is not PEP 503-normalized", package.name),
+				));
+			}
+			if let Some(version) = package_versions.insert(normalized, &package.version)
 				&& version != &package.version
 			{
 				return Err(ExtensionError::new(
@@ -197,8 +230,55 @@ impl LockFile {
 					format!("multiple versions of {} in one host child", package.name),
 				));
 			}
+			for wheel in &package.wheels {
+				if wheel.file.is_empty()
+					|| wheel.size == 0
+					|| !valid_digest(wheel.blake3.as_str(), "b3:")
+					|| !valid_digest(wheel.sha256.as_str(), "sha256:")
+				{
+					return Err(ExtensionError::new(
+						ExtensionCode::ELockDrift,
+						format!("package {} has incomplete wheel identity", package.name),
+					));
+				}
+				validate_abi(wheel.tag.as_str())?;
+			}
 		}
 		Ok(())
+	}
+
+	/// Computes the immutable resolution identity used to fence package
+	/// snapshots and extension-host generations. Writer metadata is excluded:
+	/// regenerating an identical lock must retain the same identity.
+	pub fn resolution_digest(&self) -> Result<Str, ExtensionError> {
+		self.validate_for(self.layer)?;
+		#[derive(Serialize)]
+		struct Resolution<'a> {
+			layer:           Layer,
+			requires_python: &'a Str,
+			abi:             &'a Str,
+			targets:         &'a [Str],
+			exclude_newer:   Option<&'a Str>,
+			indexes:         &'a [String],
+			index_strategy:  &'a Str,
+			extensions:      &'a [LockedExtension],
+			packages:        &'a [LockedPackage],
+			frozen:          &'a [FrozenDistribution],
+		}
+		let bytes = serde_json::to_vec(&Resolution {
+			layer: self.layer,
+			requires_python: &self.requires_python,
+			abi: &self.abi,
+			targets: &self.targets,
+			exclude_newer: self.exclude_newer.as_ref(),
+			indexes: &self.indexes,
+			index_strategy: &self.index_strategy,
+			extensions: &self.extensions,
+			packages: &self.packages,
+			frozen: &self.frozen,
+		})
+		.map_err(|error| ExtensionError::new(ExtensionCode::ELockDrift, error.to_string()))?;
+		Ok(Str::new(format!("b3:{}", blake3::hash(&bytes).to_hex())))
 	}
 
 	/// Reads and validates one `omp.lock`.
@@ -287,6 +367,18 @@ impl LockFile {
 	}
 }
 
+fn is_unique_nonempty(values: &[Str]) -> bool {
+	!values.is_empty()
+		&& values.iter().all(|value| !value.is_empty())
+		&& values.iter().collect::<BTreeSet<_>>().len() == values.len()
+}
+
+fn valid_digest(value: &str, prefix: &str) -> bool {
+	value
+		.strip_prefix(prefix)
+		.is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 /// Local-only record of materialized extension selections, including `link`
 /// overlays that are intentionally excluded from `omp.lock`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -354,6 +446,16 @@ pub fn package_snapshot(
 ) -> Result<Option<Str>, ExtensionError> {
 	if development_source(&installed.source) {
 		return Ok(None);
+	}
+	let expected_resolution = lock.resolution_digest()?;
+	if site.resolution != expected_resolution {
+		return Err(ExtensionError::new(
+			ExtensionCode::ELockDrift,
+			format!(
+				"materialized site resolution {} does not match lock {}",
+				site.resolution, expected_resolution
+			),
+		));
 	}
 	let extension = lock
 		.extensions
@@ -611,5 +713,23 @@ mod tests {
 		let path = directory.path().join("omp.lock");
 		lock().write(&path).expect("write lock");
 		assert_eq!(LockFile::read(&path, Layer::Workspace).expect("read lock"), lock());
+	}
+
+	#[test]
+	fn resolution_digest_ignores_writer_metadata_but_not_index_order() {
+		let first = lock();
+		let mut regenerated = first.clone();
+		regenerated.generated_by = "different writer".to_owned();
+		regenerated.generated_at = "2026-09-04T00:00:00Z".to_owned();
+		assert_eq!(
+			first.resolution_digest().expect("first digest"),
+			regenerated.resolution_digest().expect("regenerated digest")
+		);
+
+		regenerated.indexes.insert(0, "https://private.example/simple".to_owned());
+		assert_ne!(
+			first.resolution_digest().expect("first digest"),
+			regenerated.resolution_digest().expect("changed digest")
+		);
 	}
 }

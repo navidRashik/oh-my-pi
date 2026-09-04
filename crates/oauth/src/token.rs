@@ -2,6 +2,7 @@ use std::{fmt, time::Duration};
 
 use omp_core::{ExposeSecret as _, SecretString, Str};
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 use url::form_urlencoded;
 use zeroize::Zeroizing;
 
@@ -17,6 +18,8 @@ pub struct TokenRequest<'a> {
 	pub client_secret: Option<&'a SecretString>,
 	/// RFC 8707 resource indicator.
 	pub resource:      Option<&'a str>,
+	/// Caller cancellation propagated into the HTTP exchange.
+	pub cancellation:  Option<&'a CancellationToken>,
 }
 
 /// Validated secret-bearing token endpoint result.
@@ -100,7 +103,7 @@ pub fn parse_token_response(
 	let parsed: RawTokenResponse = serde_json::from_str(body).map_err(|_| TokenError::Malformed)?;
 	if let Some(code) = parsed.error.filter(|value| !value.is_empty()) {
 		let _ = parsed.error_description;
-		return Err(TokenError::Provider { code: Str::from(code) });
+		return Err(TokenError::Provider { code: sanitized_provider_code(&code) });
 	}
 	let access_token = parsed
 		.access_token
@@ -122,6 +125,18 @@ pub fn parse_token_response(
 	})
 }
 
+fn sanitized_provider_code(code: &str) -> Str {
+	if code.len() <= 64
+		&& code
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+	{
+		Str::from(code)
+	} else {
+		Str::new_static("unknown")
+	}
+}
+
 /// Exchanges an authorization code using PKCE S256.
 pub async fn exchange_authorization_code(
 	http: &dyn OAuthHttpClient,
@@ -137,7 +152,7 @@ pub async fn exchange_authorization_code(
 		("code_verifier", verifier.expose_secret()),
 	];
 	append_public_fields(&mut fields, request);
-	post_form(http, request.endpoint, &fields, None).await
+	post_form(http, request.endpoint, &fields, None, request.cancellation).await
 }
 
 /// Refreshes a grant and retains `refresh` when the server omits rotation.
@@ -163,7 +178,8 @@ pub async fn refresh_token(
 		append_public_fields(&mut fields, request);
 		encode_form(&fields)
 	};
-	let result = post_encoded_form(http, request.endpoint, body, Some(refresh)).await;
+	let result =
+		post_encoded_form(http, request.endpoint, body, Some(refresh), request.cancellation).await;
 	match &result {
 		Ok(grant) => tracing::debug!(
 			refreshable = grant.is_refreshable(),
@@ -192,8 +208,9 @@ async fn post_form(
 	endpoint: &str,
 	fields: &[(&str, &str)],
 	fallback_refresh: Option<SecretString>,
+	cancellation: Option<&CancellationToken>,
 ) -> Result<TokenGrant, TokenError> {
-	post_encoded_form(http, endpoint, encode_form(fields), fallback_refresh).await
+	post_encoded_form(http, endpoint, encode_form(fields), fallback_refresh, cancellation).await
 }
 
 fn encode_form(fields: &[(&str, &str)]) -> Zeroizing<String> {
@@ -207,15 +224,18 @@ fn encode_form(fields: &[(&str, &str)]) -> Zeroizing<String> {
 async fn post_encoded_form(
 	http: &dyn OAuthHttpClient,
 	endpoint: &str,
-	body: Zeroizing<String>,
+	mut body: Zeroizing<String>,
 	fallback_refresh: Option<SecretString>,
+	cancellation: Option<&CancellationToken>,
 ) -> Result<TokenGrant, TokenError> {
-	let response = http
-		.execute(OAuthHttpRequest::secret_form(
-			endpoint,
-			SecretString::from(body.as_str().to_owned()),
-		)?)
-		.await?;
+	let request =
+		OAuthHttpRequest::secret_form(endpoint, SecretString::from(std::mem::take(&mut *body)))?;
+	let request = if let Some(cancellation) = cancellation {
+		request.with_cancellation(cancellation.child_token())
+	} else {
+		request
+	};
+	let response = http.execute(request).await?;
 	if !(200..300).contains(&response.status) {
 		return Err(TokenError::Rejected { status: response.status });
 	}
@@ -246,5 +266,18 @@ mod tests {
 			parse_token_response(r#"{"error":"invalid_grant","error_description":"expired"}"#, None)
 				.expect_err("provider error");
 		assert!(matches!(error, TokenError::Provider { .. }));
+	}
+
+	#[test]
+	fn provider_error_code_never_carries_untrusted_diagnostics() {
+		let error = parse_token_response(
+			r#"{"error":"secret token=do-not-render","error_description":"also secret"}"#,
+			None,
+		)
+		.expect_err("provider error");
+		assert!(matches!(
+			error,
+			TokenError::Provider { code } if code.as_str() == "unknown"
+		));
 	}
 }

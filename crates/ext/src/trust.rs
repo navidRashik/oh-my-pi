@@ -319,6 +319,34 @@ impl KeysFile {
 		atomic_toml(path, self)
 	}
 
+	/// Records an operator-confirmed publisher key after validating its Ed25519
+	/// shape. This is the only intentional bypass of TOFU continuity and is
+	/// reserved for `omp ext trust --key`; ordinary installs must use
+	/// [`Self::verify_or_pin`].
+	pub fn accept_operator_key(
+		&mut self,
+		id: &Str,
+		key: &Str,
+		version: &Str,
+		now: &Str,
+	) -> Result<bool, ExtensionError> {
+		validate_public_key(key.as_str())?;
+		let replacement = KeyPin {
+			id:                 id.clone(),
+			key:                key.clone(),
+			introduced_version: version.clone(),
+			introduced_at:      now.clone(),
+		};
+		if let Some(pin) = self.keys.iter_mut().find(|pin| pin.id == *id) {
+			let changed = pin != &replacement;
+			*pin = replacement;
+			Ok(changed)
+		} else {
+			self.keys.push(replacement);
+			Ok(true)
+		}
+	}
+
 	/// Pins a first-seen key, rejects a changed key, or accepts a rotation only
 	/// when its signature verifies against the old pin.
 	#[tracing::instrument(
@@ -593,6 +621,17 @@ pub fn verify_signed_payload(
 	verify_signature(key, message, signature)
 }
 
+fn validate_public_key(key: &str) -> Result<(), ExtensionError> {
+	let key = key.strip_prefix("ed25519:").unwrap_or(key);
+	let key = base64::decode(key.as_bytes())
+		.into_vec()
+		.map_err(|_| ExtensionError::new(ExtensionCode::ESig, "publisher key is not base64"))?;
+	if key.len() != 32 {
+		return Err(ExtensionError::new(ExtensionCode::ESig, "publisher key is not 32 bytes"));
+	}
+	Ok(())
+}
+
 fn verify_signature(key: &str, message: &[u8], signature: &str) -> Result<(), ExtensionError> {
 	let key = key.strip_prefix("ed25519:").unwrap_or(key);
 	let signature = signature.strip_prefix("ed25519:sig:").unwrap_or(signature);
@@ -649,6 +688,33 @@ mod tests {
 		assert_eq!(
 			list.freshness("2026-01-03T00:00:00Z", true),
 			RevocationFreshness::Reject(ExtensionCode::ERevoked)
+		);
+	}
+
+	#[test]
+	fn operator_key_acceptance_replaces_tofu_pin_but_rejects_malformed_keys() {
+		let id = sf!("acme.reviewer");
+		let first = Str::new(base64::encode(&[1_u8; 32]).into_string());
+		let second = Str::new(base64::encode(&[2_u8; 32]).into_string());
+		let mut keys = KeysFile::default();
+		assert!(
+			keys
+				.accept_operator_key(&id, &first, &sf!("1.0.0"), &sf!("first"))
+				.expect("first key")
+		);
+		assert!(
+			keys
+				.accept_operator_key(&id, &second, &sf!("2.0.0"), &sf!("second"))
+				.expect("replacement key")
+		);
+		assert_eq!(keys.keys.len(), 1);
+		assert_eq!(keys.keys[0].key, second);
+		assert_eq!(
+			keys
+				.accept_operator_key(&id, &sf!("invalid"), &sf!("3.0.0"), &sf!("third"))
+				.unwrap_err()
+				.code,
+			ExtensionCode::ESig
 		);
 	}
 

@@ -5,7 +5,7 @@ use std::{
 	time::Duration,
 };
 
-use omp_core::{SecretString, Str};
+use omp_core::{SecretString, Str, ct_eq};
 use tokio::{
 	io::{AsyncReadExt as _, AsyncWriteExt as _},
 	net::{TcpListener, TcpStream},
@@ -30,6 +30,10 @@ pub fn validate_redirect_pair(
 	let listener = Url::parse(listener_uri).map_err(|_| CallbackBindError::InvalidRedirect)?;
 	if listener.scheme() != "http"
 		|| !is_loopback_host(listener.host())
+		|| !listener.username().is_empty()
+		|| listener.password().is_some()
+		|| !redirect.username().is_empty()
+		|| redirect.password().is_some()
 		|| listener.fragment().is_some()
 		|| redirect.fragment().is_some()
 		|| !matches!(redirect.scheme(), "http" | "https")
@@ -149,7 +153,7 @@ impl LoopbackCallback {
 			}
 			let mut code = query_value(query, "code")?.ok_or(CallbackError::MissingCode)?;
 			let state = query_value(query, "state")?.ok_or(CallbackError::StateMismatch)?;
-			if state.as_str() != self.state.as_str() {
+			if !ct_eq(state.as_bytes(), self.state.as_bytes()) {
 				write_response(&mut stream, 400, "State mismatch").await?;
 				return Err(CallbackError::StateMismatch);
 			}
@@ -256,8 +260,8 @@ fn decode_form_component(value: &str) -> Result<Zeroizing<String>, CallbackError
 	Ok(Zeroizing::new(decoded))
 }
 
-async fn read_request_target(stream: &mut TcpStream) -> io::Result<String> {
-	let mut request = [0_u8; MAX_REQUEST_BYTES];
+async fn read_request_target(stream: &mut TcpStream) -> io::Result<Zeroizing<String>> {
+	let mut request = Zeroizing::new([0_u8; MAX_REQUEST_BYTES]);
 	let mut length = 0;
 	loop {
 		if length == request.len() {
@@ -288,7 +292,7 @@ async fn read_request_target(stream: &mut TcpStream) -> io::Result<String> {
 	line
 		.next()
 		.filter(|target| target.starts_with('/'))
-		.map(ToOwned::to_owned)
+		.map(|target| Zeroizing::new(target.to_owned()))
 		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "request target is invalid"))
 }
 
