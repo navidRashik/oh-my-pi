@@ -26,7 +26,6 @@ import {
 	JSON_TREE_SCALAR_LEN_COLLAPSED,
 	renderJsonTreeLines,
 } from "./json-tree";
-import { formatDisplayJsonForText } from "./eval-display";
 import { formatStyledTruncationWarning, stripOutputNotice } from "./output-meta";
 import {
 	formatBadge,
@@ -40,6 +39,16 @@ import {
 	wrapBrackets,
 } from "./render-utils";
 export const EVAL_DEFAULT_PREVIEW_LINES = 10;
+
+/**
+ * Ctrl+O expands a structured `display()` value to its full, structure-aware
+ * JSON tree. This effectively-unbounded cap lets the tree renderer surface
+ * every field, depth level, and scalar tail on demand, while the collapsed
+ * view keeps the tight `JSON_TREE_*_COLLAPSED` preview. Capped at the signed
+ * 32-bit max because the native `truncateToWidth` width argument is i32 and
+ * silently truncates to empty past `2**31`.
+ */
+const DISPLAY_TREE_UNBOUNDED = 0x7fff_ffff;
 
 function languageForHighlighter(language: EvalLanguage | undefined): "python" | "javascript" {
 	if (language === "js") return "javascript";
@@ -497,20 +506,6 @@ function formatCellOutputLines(
 	return { lines: visualLines, hiddenCount: skippedCount };
 }
 
-function formatExpandedDisplayLines(values: readonly unknown[], theme: Theme, width: number): string[] {
-	const lines: string[] = [];
-	for (let index = 0; index < values.length; index++) {
-		if (index > 0) lines.push("");
-		const text = `display[${index + 1}]:\n${formatDisplayJsonForText(values[index])}`;
-		const styled = text
-			.split("\n")
-			.map(line => theme.fg("toolOutput", replaceTabs(line)))
-			.join("\n");
-		lines.push(...Bun.wrapAnsi(styled, Math.max(1, width), { hard: true, wordWrap: false, trim: false }).split("\n"));
-	}
-	return lines;
-}
-
 export const evalToolRenderer = {
 	animatedPendingPreview: true,
 	animatedPartialResult: true,
@@ -586,13 +581,18 @@ export const evalToolRenderer = {
 		const jsonOutputs = details?.jsonOutputs ?? [];
 		const expanded = options.renderContext?.expanded ?? options.expanded;
 		const labelOutputs = jsonOutputs.length > 1;
-		const jsonTreeLines = jsonOutputs.flatMap((value, index) => {
+		// One structure-aware tree per display() value. Collapsed uses the tight
+		// preview caps; Ctrl+O expands the same tree with unbounded caps so no
+		// field is hidden. Keeping the tree (never JSON.stringify) preserves
+		// structured-clone values — undefined, NaN, bigint — that JSON encoding
+		// would drop or corrupt (#10779 review).
+		const jsonLines = jsonOutputs.flatMap((value, index) => {
 			const tree = renderJsonTreeLines(
 				value,
 				uiTheme,
-				JSON_TREE_MAX_DEPTH_COLLAPSED,
-				JSON_TREE_MAX_LINES_COLLAPSED,
-				JSON_TREE_SCALAR_LEN_COLLAPSED,
+				expanded ? DISPLAY_TREE_UNBOUNDED : JSON_TREE_MAX_DEPTH_COLLAPSED,
+				expanded ? DISPLAY_TREE_UNBOUNDED : JSON_TREE_MAX_LINES_COLLAPSED,
+				expanded ? DISPLAY_TREE_UNBOUNDED : JSON_TREE_SCALAR_LEN_COLLAPSED,
 			);
 			const body = tree.truncated ? [...tree.lines, uiTheme.fg("dim", "…")] : tree.lines;
 			return labelOutputs ? [uiTheme.fg("dim", `display[${index + 1}]`), ...body] : body;
@@ -684,12 +684,11 @@ export const evalToolRenderer = {
 							lines.push("");
 						}
 					}
-					const displayLines = expanded ? formatExpandedDisplayLines(jsonOutputs, uiTheme, width) : jsonTreeLines;
-					if (displayLines.length > 0) {
+					if (jsonLines.length > 0) {
 						if (lines.length > 0) {
 							lines.push("");
 						}
-						lines.push(...displayLines);
+						lines.push(...jsonLines);
 					}
 					if (timeoutLine) {
 						lines.push(timeoutLine);
@@ -713,7 +712,7 @@ export const evalToolRenderer = {
 		}
 
 		const displayOutput = output;
-		const combinedOutput = [displayOutput, ...(expanded ? [] : jsonTreeLines)].filter(Boolean).join("\n");
+		const combinedOutput = [displayOutput, ...jsonLines].filter(Boolean).join("\n");
 
 		const statusEvents = details?.statusEvents ?? [];
 		const statusLines = renderStatusEvents(

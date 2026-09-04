@@ -115,8 +115,23 @@ describe("eval renderer: structured display() value renders once", () => {
 		const belowBox = rendered.slice(boxBottom + 1).join("\n");
 
 		expect(boxBottom).toBeGreaterThanOrEqual(0);
-		expect(belowBox).toContain('"key_209": 209');
-		expect(belowBox).toContain('"marker": "DEEP_TAIL"');
+		// Past the collapsed line cap (200), depth cap (6), and scalar cap (2000).
+		expect(belowBox).toContain("key_209: 209");
+		expect(belowBox).toContain('marker: "DEEP_TAIL"');
 		expect(belowBox).toContain("SCALAR_TAIL");
+	});
+
+	it("renders structured-clone values faithfully when expanded", async () => {
+		const value = { missing: undefined, num: Number.NaN, big: 10n };
+
+		const { rendered, boxBottom } = await renderDisplay(value, theme, true);
+		const belowBox = rendered.slice(boxBottom + 1).join("\n");
+
+		// JSON.stringify would drop `missing`, coerce NaN to null, and stringify
+		// the bigint object to `[object Object]`; the structure-aware tree keeps them.
+		expect(belowBox).toContain("missing: undefined");
+		expect(belowBox).toContain("num: NaN");
+		expect(belowBox).toContain("big: 10");
+		expect(belowBox).not.toContain("[object Object]");
 	});
 });
