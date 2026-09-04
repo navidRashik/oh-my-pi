@@ -7,7 +7,10 @@ use omp_journal::{
 	EntryDraft, Journal, Kind,
 	blob::{BlobStore, GcPolicy},
 	data::{Attachment, Compaction},
-	gc::{collect_blobs, copy_journal_blobs, prune_abandoned},
+	gc::{
+		BlobGcOptions, GcCancellation, GcError, collect_blobs, collect_blobs_with,
+		copy_journal_blobs, prune_abandoned,
+	},
 	kind::KindName,
 	live_chain,
 };
@@ -108,6 +111,45 @@ fn prune_in_another_process_refuses_a_live_writer() {
 		.status()
 		.expect("run GC contender");
 	assert!(status.success(), "subprocess GC must observe the held writer lock");
+}
+
+/// Subprocess half of the namespace-wide mark-boundary exclusion test.
+#[test]
+#[ignore = "subprocess helper"]
+fn gc_namespace_lock_subprocess_helper() {
+	let path = std::path::PathBuf::from(
+		env::var_os("OMP_JOURNAL_GC_NAMESPACE_TEST_PATH").expect("journal test path"),
+	);
+	let root = path.parent().expect("namespace");
+	let store = BlobStore::open(root).expect("blob store");
+	let error = collect_blobs_with(
+		&store,
+		std::slice::from_ref(&path),
+		BlobGcOptions::dry_run(no_grace()),
+		&GcCancellation::default(),
+	)
+	.expect_err("parent process owns a shared namespace writer lease");
+	assert!(matches!(
+		error,
+		GcError::Journal(omp_journal::JournalError::NamespaceLocked { .. })
+	));
+}
+
+/// A writer in another process excludes inventory and sweep as one boundary.
+#[test]
+fn collection_in_another_process_refuses_a_live_namespace_writer() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let path = directory.path().join("process-live-namespace.oms");
+	let mut journal = Journal::create(&path).expect("journal creates");
+	journal
+		.append(draft(KindName::Journal, None, None))
+		.expect("genesis appends");
+	let status = Command::new(env::current_exe().expect("journal test executable"))
+		.args(["--ignored", "--exact", "gc_namespace_lock_subprocess_helper"])
+		.env("OMP_JOURNAL_GC_NAMESPACE_TEST_PATH", &path)
+		.status()
+		.expect("run namespace GC contender");
+	assert!(status.success(), "subprocess GC must observe the held namespace lease");
 }
 
 /// GC coordinates with the writer lock: a session that has the journal open
@@ -385,4 +427,238 @@ fn blob_gc_cleans_abandoned_stages_without_crossing_project_namespaces() {
 	assert!(!temporary.exists(), "abandoned staging content is removed");
 	assert!(!first.has(&first_blob), "first namespace is swept");
 	assert!(second.has(&second_blob), "another project's namespace is untouched");
+}
+
+#[test]
+fn dry_run_and_apply_select_the_same_unreferenced_content() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let store = BlobStore::open(directory.path()).expect("blob store");
+	let retained = store.put(b"retained").expect("retained");
+	let orphan = store.put(b"orphan").expect("orphan");
+	let path = directory.path().join("session.oms");
+	let mut journal = Journal::create(&path).expect("journal");
+	let genesis = journal
+		.append(draft(KindName::Journal, None, None))
+		.expect("genesis");
+	journal
+		.append(draft_data(
+			KindName::Patch,
+			Some(genesis.id),
+			None,
+			Str::new(format!(
+				"{{\"legacy\":\"blob:sha256:{}\"}}",
+				retained.to_hex().as_str().to_ascii_uppercase()
+			)),
+		))
+		.expect("legacy imported root");
+	drop(journal);
+
+	let cancel = GcCancellation::default();
+	let preview = collect_blobs_with(
+		&store,
+		std::slice::from_ref(&path),
+		BlobGcOptions::dry_run(no_grace()),
+		&cancel,
+	)
+	.expect("dry run");
+	assert_eq!(preview.storage.blobs_eligible, 1);
+	assert_eq!(preview.storage.blobs_removed, 0);
+	assert!(store.has(&orphan), "dry run never removes an eligible blob");
+
+	let applied = collect_blobs_with(
+		&store,
+		std::slice::from_ref(&path),
+		BlobGcOptions::apply(no_grace()),
+		&cancel,
+	)
+	.expect("apply");
+	assert_eq!(applied.storage.blobs_eligible, preview.storage.blobs_eligible);
+	assert_eq!(applied.storage.blob_bytes_eligible, preview.storage.blob_bytes_eligible);
+	assert_eq!(applied.storage.blobs_removed, 1);
+	assert!(store.has(&retained));
+	assert!(!store.has(&orphan));
+}
+
+#[test]
+fn namespace_inventory_roots_jobs_checkpoints_and_in_progress_imports() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let store = BlobStore::open(directory.path()).expect("blob store");
+	let main_blob = store.put(b"main").expect("main");
+	let job_blob = store.put(b"job").expect("job");
+	let checkpoint_blob = store.put(b"checkpoint").expect("checkpoint");
+	let imported_blob = store.put(b"import").expect("import");
+	let orphan = store.put(b"orphan").expect("orphan");
+
+	for (name, reference, field) in [
+		("main.oms", main_blob, "attachment"),
+		("job-01.oms", job_blob, "artifact"),
+		("checkpoint.oms", checkpoint_blob, "checkpoint"),
+		(".foreign.importing.oms", imported_blob, "imported"),
+	] {
+		let path = directory.path().join(name);
+		let mut journal = Journal::create(path).expect("journal");
+		let genesis = journal
+			.append(draft(KindName::Journal, None, None))
+			.expect("genesis");
+		journal
+			.append(draft_data(
+				KindName::Patch,
+				Some(genesis.id),
+				None,
+				Str::new(format!("{{\"{field}\":\"{}\"}}", uri(reference))),
+			))
+			.expect("root entry");
+	}
+
+	let cancel = GcCancellation::default();
+	let report = collect_blobs_with(
+		&store,
+		&[directory.path().join("main.oms")],
+		BlobGcOptions::apply(no_grace()),
+		&cancel,
+	)
+	.expect("namespace collection");
+	assert_eq!(report.journals_scanned, 4);
+	assert_eq!(report.roots_retained, 4);
+	for retained in [main_blob, job_blob, checkpoint_blob, imported_blob] {
+		assert!(store.has(&retained), "every journal class roots its CAS content");
+	}
+	assert!(!store.has(&orphan));
+}
+
+#[test]
+fn hypothetical_branch_pruning_releases_only_abandoned_roots_in_dry_run() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let store = BlobStore::open(directory.path()).expect("blob store");
+	let live_blob = store.put(b"live").expect("live");
+	let branch_blob = store.put(b"branch").expect("branch");
+	let path = directory.path().join("branch.oms");
+	let mut journal = Journal::create(&path).expect("journal");
+	let genesis = journal
+		.append(draft(KindName::Journal, None, None))
+		.expect("genesis");
+	let live = journal
+		.append(draft_data(
+			KindName::Patch,
+			Some(genesis.id),
+			None,
+			Str::new(format!("{{\"live\":\"{}\"}}", uri(live_blob))),
+		))
+		.expect("live root");
+	journal
+		.append(draft_data(
+			KindName::Patch,
+			Some(live.id),
+			None,
+			Str::new(format!("{{\"branch\":\"{}\"}}", uri(branch_blob))),
+		))
+		.expect("branch root");
+	journal
+		.append(draft(KindName::Patch, Some(live.id), Some(live.id)))
+		.expect("rewind");
+	drop(journal);
+
+	let mut options = BlobGcOptions::dry_run(no_grace());
+	options.retain_abandoned = false;
+	let report = collect_blobs_with(
+		&store,
+		std::slice::from_ref(&path),
+		options,
+		&GcCancellation::default(),
+	)
+	.expect("preview branch collection");
+	assert_eq!(report.journals_with_abandoned, 1);
+	assert_eq!(report.abandoned_entries, 1);
+	assert_eq!(report.storage.blobs_eligible, 1);
+	assert!(store.has(&branch_blob), "preview leaves abandoned content intact");
+	assert!(store.has(&live_blob));
+}
+
+#[test]
+fn collection_refuses_an_active_put_before_journal_stage() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let store = BlobStore::open(directory.path()).expect("blob store");
+	let stage = store.begin_put().expect("active blob stage");
+	let error = collect_blobs_with(
+		&store,
+		&[],
+		BlobGcOptions::dry_run(no_grace()),
+		&GcCancellation::default(),
+	)
+	.expect_err("active put lease must exclude collection");
+	assert!(matches!(
+		error,
+		GcError::Blob(omp_journal::blob::Error::GcBusy)
+	));
+	drop(stage);
+	collect_blobs_with(
+		&store,
+		&[],
+		BlobGcOptions::dry_run(no_grace()),
+		&GcCancellation::default(),
+	)
+	.expect("collection resumes after the stage is dropped");
+}
+
+#[test]
+fn collection_refuses_live_writers_and_honors_cancellation_and_bounds() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let store = BlobStore::open(directory.path()).expect("blob store");
+	let orphan = store.put(b"bounded orphan").expect("orphan");
+	let path = directory.path().join("live.oms");
+	let mut journal = Journal::create(&path).expect("journal");
+	journal
+		.append(draft(KindName::Journal, None, None))
+		.expect("genesis");
+
+	let locked = collect_blobs_with(
+		&store,
+		std::slice::from_ref(&path),
+		BlobGcOptions::dry_run(no_grace()),
+		&GcCancellation::default(),
+	)
+	.expect_err("live namespace writer must exclude collection");
+	assert!(matches!(
+		locked,
+		GcError::Journal(omp_journal::JournalError::NamespaceLocked { .. })
+	));
+	drop(journal);
+
+	let cancelled = GcCancellation::default();
+	cancelled.cancel();
+	assert!(matches!(
+		collect_blobs_with(
+			&store,
+			std::slice::from_ref(&path),
+			BlobGcOptions::dry_run(no_grace()),
+			&cancelled,
+		),
+		Err(GcError::Cancelled)
+	));
+
+	let mut bounded = BlobGcOptions::dry_run(no_grace());
+	bounded.max_entries = 0;
+	assert!(matches!(
+		collect_blobs_with(
+			&store,
+			std::slice::from_ref(&path),
+			bounded,
+			&GcCancellation::default(),
+		),
+		Err(GcError::Limit { resource: "journal-entry-count", limit: 0 })
+	));
+	assert!(store.has(&orphan), "journal bound failure is fail-closed");
+
+	let mut bounded_cas = BlobGcOptions::dry_run(no_grace());
+	bounded_cas.max_blob_depth = 1;
+	assert!(matches!(
+		collect_blobs_with(
+			&store,
+			std::slice::from_ref(&path),
+			bounded_cas,
+			&GcCancellation::default(),
+		),
+		Err(GcError::Blob(omp_journal::blob::Error::GcDepthLimit { limit: 1 }))
+	));
+	assert!(store.has(&orphan), "CAS bound failure is fail-closed");
 }

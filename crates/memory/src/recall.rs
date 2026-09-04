@@ -115,7 +115,7 @@ impl Default for RecallBounds {
 }
 
 impl RecallBounds {
-	fn normalized(self) -> Self {
+	pub(crate) fn normalized(self) -> Self {
 		Self {
 			limit:        self.limit.clamp(1, 50),
 			token_budget: self.token_budget.clamp(1, 32 * 1024),
@@ -201,7 +201,14 @@ impl<'a> RecallEngine<'a> {
 					.map(|candidate| VoiceCandidate::new(candidate, broadened)),
 			);
 		}
-		voices.entry(RecallVoice::Graph).or_default().extend(
+		let graph = voices.entry(RecallVoice::Graph).or_default();
+		graph.extend(
+			store
+				.search_facts(query, limit)?
+				.into_iter()
+				.map(|candidate| VoiceCandidate::new(candidate, broadened)),
+		);
+		graph.extend(
 			store
 				.graph_candidates(terms, limit)?
 				.into_iter()
@@ -309,7 +316,7 @@ fn fuse(
 			result.score += contribution;
 			result.voice_scores.add(voice, contribution);
 			result.broadened &= candidate.broadened;
-			if candidate.native > native_proxy(result) {
+			if prefer_record(&candidate.record, &result.memory) {
 				result.memory = candidate.record.clone();
 			}
 		}
@@ -357,12 +364,11 @@ fn fuse(
 	selected
 }
 
-fn native_proxy(result: &RecallResult) -> f64 {
-	(result.voice_scores.vector
-		+ result.voice_scores.graph
-		+ result.voice_scores.episodic
-		+ result.voice_scores.working)
-		.min(1.0)
+fn prefer_record(left: &MemoryRecord, right: &MemoryRecord) -> bool {
+	left.importance > right.importance
+		|| (left.importance == right.importance
+			&& (left.timestamp > right.timestamp
+				|| (left.timestamp == right.timestamp && left.bank < right.bank)))
 }
 
 fn prefer(left: &RecallResult, right: &RecallResult) -> bool {

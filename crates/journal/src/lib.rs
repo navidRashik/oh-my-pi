@@ -40,13 +40,16 @@ pub const FILE_EXTENSION: &str = "oms";
 /// its whole lifetime, so two processes (or two owners in one process) can
 /// never append to divergent materializations of one `.oms`, and
 /// [`gc::prune_abandoned`] cannot replace a file another writer is
-/// appending to. Read-only consumers use [`Journal::scan`], which takes no
-/// lock and never truncates.
+/// appending to. It also holds a shared directory-namespace lease; collection
+/// takes that lease exclusively from journal inventory through CAS sweep, so
+/// a new writer cannot cross the mark boundary. Read-only consumers use
+/// [`Journal::scan`], which takes no lock and never truncates.
 #[derive(Debug)]
 pub struct Journal {
 	path:                 PathBuf,
 	file:                 File,
 	_lock:                WriterLock,
+	_namespace:           JournalNamespaceLock,
 	generator:            MonotonicUlid,
 	ids:                  FastHashSet<EntryId>,
 	entry_count:          usize,
@@ -70,6 +73,7 @@ impl Journal {
 		{
 			fs::create_dir_all(parent)?;
 		}
+		let namespace = JournalNamespaceLock::acquire_shared(&path)?;
 		let lock = WriterLock::acquire(&path)?;
 		let file = OpenOptions::new()
 			.create_new(true)
@@ -80,6 +84,7 @@ impl Journal {
 			path,
 			file,
 			_lock: lock,
+			_namespace: namespace,
 			generator: MonotonicUlid::default(),
 			ids: FastHashSet::default(),
 			entry_count: 0,
@@ -102,6 +107,7 @@ impl Journal {
 		// journal inode itself is insufficient: GC replaces that inode, and
 		// an opener that raced the rename could otherwise lock and append to
 		// the unlinked predecessor.
+		let namespace = JournalNamespaceLock::acquire_shared(&path)?;
 		let lock = WriterLock::acquire(&path)?;
 		let file = OpenOptions::new()
 			.append(true)
@@ -127,6 +133,7 @@ impl Journal {
 				path,
 				file,
 				_lock: lock,
+				_namespace: namespace,
 				generator: MonotonicUlid::seeded(floor),
 				ids,
 				entry_count: entries.len(),
@@ -193,9 +200,9 @@ impl Journal {
 
 	/// Closes the replaceable data inode while retaining the stable sidecar
 	/// lock. GC uses this immediately before its atomic rename.
-	pub(crate) fn close_for_replace(self) -> WriterLock {
-		let Self { _lock, .. } = self;
-		_lock
+	pub(crate) fn close_for_replace(self) -> ReplaceLock {
+		let Self { _lock, _namespace, .. } = self;
+		ReplaceLock { _writer: _lock, _namespace }
 	}
 }
 
@@ -270,6 +277,12 @@ pub enum JournalError {
 		/// Journal file path.
 		path: PathBuf,
 	},
+	/// Namespace collection excludes session writers while establishing roots.
+	#[error("journal namespace {} is locked for garbage collection", path.display())]
+	NamespaceLocked {
+		/// Namespace lock path.
+		path: PathBuf,
+	},
 	/// No larger ULID can be generated.
 	#[error(transparent)]
 	Ulid(#[from] UlidGenerationError),
@@ -300,6 +313,55 @@ fn decode_committed(bytes: &[u8]) -> Result<(Vec<Entry>, usize), JournalError> {
 #[derive(Debug)]
 pub(crate) struct WriterLock {
 	_file: File,
+}
+
+/// Shared session-writer or exclusive collector lease for one journal directory.
+#[derive(Debug)]
+pub(crate) struct JournalNamespaceLock {
+	_file: File,
+}
+
+impl JournalNamespaceLock {
+	fn path(journal: &Path) -> PathBuf {
+		journal
+			.parent()
+			.unwrap_or_else(|| Path::new("."))
+			.join(".journal-gc.lock")
+	}
+
+	fn acquire_shared(journal: &Path) -> Result<Self, JournalError> {
+		let path = Self::path(journal);
+		let file = OpenOptions::new()
+			.create(true)
+			.read(true)
+			.write(true)
+			.open(&path)?;
+		match File::try_lock_shared(&file) {
+			Ok(()) => Ok(Self { _file: file }),
+			Err(fs::TryLockError::WouldBlock) => Err(JournalError::NamespaceLocked { path }),
+			Err(fs::TryLockError::Error(source)) => Err(JournalError::Io(source)),
+		}
+	}
+
+	pub(crate) fn acquire_exclusive(root: &Path) -> Result<Self, JournalError> {
+		let path = root.join(".journal-gc.lock");
+		let file = OpenOptions::new()
+			.create(true)
+			.read(true)
+			.write(true)
+			.open(&path)?;
+		match file.try_lock() {
+			Ok(()) => Ok(Self { _file: file }),
+			Err(fs::TryLockError::WouldBlock) => Err(JournalError::NamespaceLocked { path }),
+			Err(fs::TryLockError::Error(source)) => Err(JournalError::Io(source)),
+		}
+	}
+}
+
+/// Locks retained across an atomic journal inode replacement.
+pub(crate) struct ReplaceLock {
+	_writer:    WriterLock,
+	_namespace: JournalNamespaceLock,
 }
 
 impl WriterLock {

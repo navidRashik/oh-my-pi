@@ -14,7 +14,9 @@
 //! Blob-producing transactions intentionally finish before the journal entry
 //! that makes them reachable. This put-before-journal ordering can leave an
 //! unreferenced blob after a crash, but never a journal reference to a missing
-//! blob.
+//! blob. A streaming put holds a shared retention lease from temporary-file
+//! creation through final placement; collection takes it exclusively before
+//! inventory, so an active writer cannot age into a sweep candidate.
 
 use std::{
 	fmt::{self, Display},
@@ -22,7 +24,7 @@ use std::{
 	io::{self, Read, Seek, SeekFrom, Write},
 	path::{Path, PathBuf},
 	process,
-	sync::atomic::{AtomicU64, Ordering},
+	sync::atomic::{AtomicBool, AtomicU64, Ordering},
 	time::{Duration, SystemTime},
 };
 
@@ -154,6 +156,24 @@ pub enum Error {
 	/// The referenced blob does not exist.
 	#[error("blob not found")]
 	NotFound,
+	/// Collection was cancelled at a filesystem-entry boundary.
+	#[error("blob collection was cancelled")]
+	GcCancelled,
+	/// Collection exceeded its traversal bound and stopped fail-closed.
+	#[error("blob collection exceeded its {limit}-entry traversal bound")]
+	GcTraversalLimit {
+		/// Configured maximum filesystem entries.
+		limit: usize,
+	},
+	/// An active blob writer holds the namespace retention lease.
+	#[error("blob namespace has an active writer")]
+	GcBusy,
+	/// Collection encountered a tree deeper than its configured safety bound.
+	#[error("blob collection exceeded its depth bound of {limit}")]
+	GcDepthLimit {
+		/// Configured maximum directory depth.
+		limit: usize,
+	},
 }
 
 /// Immutable wheel identity used for unpacked-store directory names.
@@ -237,10 +257,11 @@ impl BlobRange {
 	}
 }
 
-/// Safety window for a blob put that has completed but whose journal entry has
-/// not committed yet. Collection keeps younger files even when a concurrent
-/// journal scan cannot see their root.
-pub const DEFAULT_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Five-minute safety window for a blob put that has completed but whose
+/// journal entry has not committed yet. Collection keeps younger files even
+/// when a crashed producer released its active retention lease before the
+/// authoritative journal root became visible.
+pub const DEFAULT_GC_GRACE: Duration = Duration::from_secs(5 * 60);
 
 /// Policy for one mark-and-sweep pass over a blob namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,19 +278,89 @@ impl Default for GcPolicy {
 	}
 }
 
-/// Storage reclaimed by one blob collection pass.
+/// Storage selected and reclaimed by one blob collection pass.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcReport {
 	/// Final blob files inspected.
-	pub blobs_examined:            usize,
+	pub blobs_examined:             usize,
+	/// Unreferenced final blob files old enough to remove.
+	pub blobs_eligible:             usize,
+	/// Bytes held by eligible final blob files.
+	pub blob_bytes_eligible:        u64,
 	/// Unreferenced final blob files removed.
-	pub blobs_removed:             usize,
+	pub blobs_removed:              usize,
 	/// Bytes removed from final blob files.
-	pub blob_bytes_reclaimed:      u64,
+	pub blob_bytes_reclaimed:       u64,
+	/// Abandoned staging files or directories old enough to remove.
+	pub temporaries_eligible:       usize,
+	/// Bytes held by eligible abandoned staging content.
+	pub temporary_bytes_eligible:   u64,
 	/// Abandoned staging files or directories removed.
-	pub temporaries_removed:       usize,
+	pub temporaries_removed:        usize,
 	/// Bytes removed from abandoned staging files.
-	pub temporary_bytes_reclaimed: u64,
+	pub temporary_bytes_reclaimed:  u64,
+	/// Filesystem entries visited under the bounded traversal.
+	pub filesystem_entries_visited: usize,
+}
+
+/// Controls a bounded dry-run or applying blob sweep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GcSweep {
+	/// Age policy for final and staging content.
+	pub policy:      GcPolicy,
+	/// Whether eligible content is removed.
+	pub apply:       bool,
+	/// Maximum filesystem entries visited in one namespace.
+	pub max_entries: usize,
+	/// Maximum directory nesting below `blobs/` or `tmp/`.
+	pub max_depth:   usize,
+}
+
+impl GcSweep {
+	/// Production applying sweep with conservative traversal bounds.
+	#[must_use]
+	pub const fn apply(policy: GcPolicy) -> Self {
+		Self { policy, apply: true, max_entries: 1_000_000, max_depth: 64 }
+	}
+
+	/// Production dry-run sweep with the same selection semantics as apply.
+	#[must_use]
+	pub const fn dry_run(policy: GcPolicy) -> Self {
+		Self { policy, apply: false, max_entries: 1_000_000, max_depth: 64 }
+	}
+}
+
+struct GcWalk<'a> {
+	options: GcSweep,
+	cancel:  &'a AtomicBool,
+	visited: usize,
+}
+
+struct TemporaryCandidate {
+	path:      PathBuf,
+	directory: bool,
+	bytes:     u64,
+}
+
+impl GcWalk<'_> {
+	fn ensure_depth(&self, depth: usize) -> Result<(), Error> {
+		if self.cancel.load(Ordering::Relaxed) {
+			return Err(Error::GcCancelled);
+		}
+		if depth > self.options.max_depth {
+			return Err(Error::GcDepthLimit { limit: self.options.max_depth });
+		}
+		Ok(())
+	}
+
+	fn visit(&mut self, depth: usize) -> Result<(), Error> {
+		self.ensure_depth(depth)?;
+		self.visited = self.visited.saturating_add(1);
+		if self.visited > self.options.max_entries {
+			return Err(Error::GcTraversalLimit { limit: self.options.max_entries });
+		}
+		Ok(())
+	}
 }
 
 /// A filesystem-backed, content-addressed blob store.
@@ -324,17 +415,88 @@ impl BlobStore {
 		retained: &FastHashSet<Hash32>,
 		policy: GcPolicy,
 	) -> Result<GcReport, Error> {
+		let cancel = AtomicBool::new(false);
+		self.sweep_unreferenced(retained, GcSweep::apply(policy), &cancel)
+	}
+
+	/// Selects or removes old unreferenced content using a bounded traversal.
+	///
+	/// The namespace lock is held for the whole walk, including dry-run, so
+	/// candidate reporting and applying observe the same placement boundary.
+	/// `cancel` is checked before every filesystem entry and destructive
+	/// operation. A traversal-limit or cancellation error is fail-closed.
+	///
+	/// # Errors
+	///
+	/// Returns a typed error for cancellation, a configured traversal bound,
+	/// namespace locking, enumeration, inspection, or removal.
+	pub fn sweep_unreferenced(
+		&self,
+		retained: &FastHashSet<Hash32>,
+		options: GcSweep,
+		cancel: &AtomicBool,
+	) -> Result<GcReport, Error> {
+		let _retention = self.lock_gc_collector()?;
 		let _lock = self.lock_namespace()?;
 		let now = SystemTime::now();
 		let mut report = GcReport::default();
+		let mut blobs = Vec::new();
+		let mut temporaries = Vec::new();
+		let mut walk = GcWalk { options, cancel, visited: 0 };
 		self.collect_blob_files(
 			&self.blobs_dir(),
 			retained,
-			policy.unreferenced_grace,
+			options.policy.unreferenced_grace,
 			now,
+			0,
+			&mut walk,
 			&mut report,
+			&mut blobs,
 		)?;
-		self.collect_temporaries(policy.temporary_grace, now, &mut report)?;
+		self.collect_temporaries(
+			options.policy.temporary_grace,
+			now,
+			&mut walk,
+			&mut report,
+			&mut temporaries,
+		)?;
+		report.filesystem_entries_visited = walk.visited;
+		if options.apply {
+			for (path, bytes) in blobs {
+				if cancel.load(Ordering::Relaxed) {
+					return Err(Error::GcCancelled);
+				}
+				match fs::remove_file(path) {
+					Ok(()) => {
+						report.blobs_removed += 1;
+						report.blob_bytes_reclaimed =
+							report.blob_bytes_reclaimed.saturating_add(bytes);
+					},
+					Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+					Err(error) => return Err(error.into()),
+				}
+			}
+			for candidate in temporaries {
+				if cancel.load(Ordering::Relaxed) {
+					return Err(Error::GcCancelled);
+				}
+				let removed = if candidate.directory {
+					fs::remove_dir_all(candidate.path)
+				} else {
+					fs::remove_file(candidate.path)
+				};
+				match removed {
+					Ok(()) => {
+						report.temporaries_removed += 1;
+						report.temporary_bytes_reclaimed = report
+							.temporary_bytes_reclaimed
+							.saturating_add(candidate.bytes);
+					},
+					Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+					Err(error) => return Err(error.into()),
+				}
+			}
+		}
 		Ok(report)
 	}
 
@@ -430,10 +592,12 @@ impl BlobStore {
 	///
 	/// Returns [`Error::Io`] when a temporary staging file cannot be created.
 	pub fn begin_put(&self) -> Result<BlobStage, Error> {
+		let retention = self.lock_gc_writer()?;
 		let (file, temporary) = self.create_temp()?;
 		Ok(BlobStage {
 			store: self.clone(),
 			file: Some(file),
+			_retention: retention,
 			temporary,
 			hasher: Hash32::hasher(),
 			size: 0,
@@ -567,6 +731,7 @@ impl BlobStore {
 	/// Returns an error when `reference` is missing or corrupt, the wheel is
 	/// not a valid ZIP archive, or the filesystem cannot stage the directory.
 	pub fn unpack_wheel(&self, wheel: &WheelName, reference: &BlobRef) -> Result<PathBuf, Error> {
+		let _retention = self.lock_gc_writer()?;
 		let destination = self.unpacked_wheel_path(wheel, reference);
 		let complete = destination.join(".complete");
 		if complete.is_file() {
@@ -617,6 +782,33 @@ impl BlobStore {
 		self.root.join("tmp")
 	}
 
+	fn lock_gc_writer(&self) -> Result<GcLease, Error> {
+		// A retained `BlobStore` remains usable if its empty root was removed
+		// between operations (ephemeral sessions and cleanup rely on this).
+		// Recreate the namespace before minting the stable writer lease.
+		fs::create_dir_all(&self.root)?;
+		let file = OpenOptions::new()
+			.create(true)
+			.read(true)
+			.write(true)
+			.open(self.root.join(".blobs-gc.lock"))?;
+		File::lock_shared(&file)?;
+		Ok(GcLease { _file: file })
+	}
+
+	fn lock_gc_collector(&self) -> Result<GcLease, Error> {
+		let file = OpenOptions::new()
+			.create(true)
+			.read(true)
+			.write(true)
+			.open(self.root.join(".blobs-gc.lock"))?;
+		match file.try_lock() {
+			Ok(()) => Ok(GcLease { _file: file }),
+			Err(fs::TryLockError::WouldBlock) => Err(Error::GcBusy),
+			Err(fs::TryLockError::Error(source)) => Err(Error::Io(source)),
+		}
+	}
+
 	fn lock_namespace(&self) -> Result<NamespaceLock, Error> {
 		let file = OpenOptions::new()
 			.create(true)
@@ -633,71 +825,64 @@ impl BlobStore {
 		retained: &FastHashSet<Hash32>,
 		grace: Duration,
 		now: SystemTime,
+		depth: usize,
+		walk: &mut GcWalk<'_>,
 		report: &mut GcReport,
-	) -> Result<bool, Error> {
+		candidates: &mut Vec<(PathBuf, u64)>,
+	) -> Result<(), Error> {
+		walk.ensure_depth(depth)?;
 		let entries = match fs::read_dir(directory) {
 			Ok(entries) => entries,
-			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
 			Err(error) => return Err(error.into()),
 		};
-		let mut empty = true;
 		for entry in entries {
+			walk.visit(depth)?;
 			let entry = entry?;
 			let file_type = entry.file_type()?;
 			let path = entry.path();
 			if file_type.is_dir() {
-				if self.collect_blob_files(&path, retained, grace, now, report)?
-					&& path != self.blobs_dir()
-				{
-					match fs::remove_dir(&path) {
-						Ok(()) => {},
-						Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
-							empty = false;
-						},
-						Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-						Err(error) => return Err(error.into()),
-					}
-				} else {
-					empty = false;
-				}
+				self.collect_blob_files(
+					&path,
+					retained,
+					grace,
+					now,
+					depth.saturating_add(1),
+					walk,
+					report,
+					candidates,
+				)?;
 				continue;
 			}
 			if !file_type.is_file() {
-				empty = false;
 				continue;
 			}
 			report.blobs_examined += 1;
 			let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-				empty = false;
 				continue;
 			};
 			let Ok(hash) = parse_hash(name) else {
-				empty = false;
 				continue;
 			};
 			let metadata = entry.metadata()?;
 			if retained.contains(&hash) || !old_enough(&metadata, now, grace) {
-				empty = false;
 				continue;
 			}
 			let bytes = metadata.len();
-			match fs::remove_file(&path) {
-				Ok(()) => {
-					report.blobs_removed += 1;
-					report.blob_bytes_reclaimed = report.blob_bytes_reclaimed.saturating_add(bytes);
-				},
-				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-				Err(error) => return Err(error.into()),
-			}
+			report.blobs_eligible += 1;
+			report.blob_bytes_eligible = report.blob_bytes_eligible.saturating_add(bytes);
+			candidates.push((path, bytes));
 		}
-		Ok(empty)
+		Ok(())
 	}
 
 	fn collect_temporaries(
 		&self,
 		grace: Duration,
 		now: SystemTime,
+		walk: &mut GcWalk<'_>,
 		report: &mut GcReport,
+		candidates: &mut Vec<TemporaryCandidate>,
 	) -> Result<(), Error> {
 		let entries = match fs::read_dir(self.tmp_dir()) {
 			Ok(entries) => entries,
@@ -705,6 +890,7 @@ impl BlobStore {
 			Err(error) => return Err(error.into()),
 		};
 		for entry in entries {
+			walk.visit(0)?;
 			let entry = entry?;
 			let file_type = entry.file_type()?;
 			if !file_type.is_file() && !file_type.is_dir() {
@@ -718,22 +904,16 @@ impl BlobStore {
 			let bytes = if file_type.is_file() {
 				metadata.len()
 			} else {
-				directory_bytes(&path)?
+				directory_bytes(&path, 1, walk)?
 			};
-			let removed = if file_type.is_dir() {
-				fs::remove_dir_all(&path)
-			} else {
-				fs::remove_file(&path)
-			};
-			match removed {
-				Ok(()) => {
-					report.temporaries_removed += 1;
-					report.temporary_bytes_reclaimed =
-						report.temporary_bytes_reclaimed.saturating_add(bytes);
-				},
-				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-				Err(error) => return Err(error.into()),
-			}
+			report.temporaries_eligible += 1;
+			report.temporary_bytes_eligible =
+				report.temporary_bytes_eligible.saturating_add(bytes);
+			candidates.push(TemporaryCandidate {
+				path,
+				directory: file_type.is_dir(),
+				bytes,
+			});
 		}
 		Ok(())
 	}
@@ -795,12 +975,13 @@ impl BlobStore {
 /// byte length exactly once. The temporary content is removed unless
 /// [`Self::finish`] successfully adopts it.
 pub struct BlobStage {
-	store:     BlobStore,
-	file:      Option<File>,
-	temporary: TemporaryPath,
-	hasher:    Hasher,
-	size:      u64,
-	failed:    bool,
+	store:      BlobStore,
+	file:       Option<File>,
+	temporary:  TemporaryPath,
+	hasher:     Hasher,
+	size:       u64,
+	failed:     bool,
+	_retention: GcLease,
 }
 
 impl BlobStage {
@@ -893,6 +1074,10 @@ struct NamespaceLock {
 	_file: File,
 }
 
+struct GcLease {
+	_file: File,
+}
+
 struct TemporaryPath {
 	path: Option<PathBuf>,
 }
@@ -927,9 +1112,11 @@ fn old_enough(metadata: &fs::Metadata, now: SystemTime, grace: Duration) -> bool
 		.is_some_and(|age| age >= grace)
 }
 
-fn directory_bytes(path: &Path) -> Result<u64, Error> {
+fn directory_bytes(path: &Path, depth: usize, walk: &mut GcWalk<'_>) -> Result<u64, Error> {
+	walk.ensure_depth(depth)?;
 	let mut bytes = 0_u64;
 	for entry in fs::read_dir(path)? {
+		walk.visit(depth)?;
 		let entry = entry?;
 		let file_type = entry.file_type()?;
 		if !file_type.is_file() && !file_type.is_dir() {
@@ -937,7 +1124,7 @@ fn directory_bytes(path: &Path) -> Result<u64, Error> {
 		}
 		let metadata = entry.metadata()?;
 		bytes = bytes.saturating_add(if file_type.is_dir() {
-			directory_bytes(&entry.path())?
+			directory_bytes(&entry.path(), depth.saturating_add(1), walk)?
 		} else {
 			metadata.len()
 		});

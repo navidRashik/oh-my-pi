@@ -4,6 +4,10 @@ use std::{
 	fs::{self, File, OpenOptions},
 	io::{self, Write as _},
 	path::{Path, PathBuf},
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,8 +16,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-	EntryId, Journal, JournalError,
-	blob::{BlobRef, BlobStore, GcPolicy},
+	EntryId, Journal, JournalError, JournalNamespaceLock, WriterLock, decode_committed,
+	blob::{BlobRef, BlobStore, GcPolicy, GcSweep},
 	live_chain, sse,
 };
 
@@ -48,15 +52,83 @@ impl GcReport {
 /// namespace.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BlobGcReport {
-	/// Session journals whose committed histories were scanned.
+	/// Session, child-job, checkpoint, or imported journals scanned.
 	pub journals_scanned: usize,
+	/// Committed entries inspected across complete branch DAGs.
+	pub entries_scanned:         usize,
+	/// Journals containing abandoned branch history.
+	pub journals_with_abandoned: usize,
+	/// Abandoned entries that applying journal pruning would remove.
+	pub abandoned_entries:       usize,
+	/// Journal bytes that applying branch pruning would reclaim.
+	pub journal_bytes_eligible:  u64,
 	/// Distinct content digests retained by at least one journal history.
-	pub roots_retained:   usize,
-	/// Blob-store files inspected and reclaimed.
+	pub roots_retained:          usize,
+	/// Blob-store files inspected, selected, and possibly reclaimed.
 	pub storage:          crate::blob::GcReport,
 }
 
-/// Failure to open, encode, or atomically replace a journal.
+/// Hard bounds and mutation policy for one journal-rooted CAS pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobGcOptions {
+	/// Whether selected CAS content is removed.
+	pub apply:            bool,
+	/// Whether abandoned branch entries continue to root blobs.
+	pub retain_abandoned: bool,
+	/// Age policy protecting put-before-journal transactions and stages.
+	pub policy:           GcPolicy,
+	/// Maximum journals in one shared CAS namespace.
+	pub max_journals:     usize,
+	/// Maximum committed entries inspected across those journals.
+	pub max_entries:      usize,
+	/// Maximum filesystem entries traversed in the CAS.
+	pub max_blob_entries: usize,
+	/// Maximum directory depth traversed in the CAS.
+	pub max_blob_depth:   usize,
+}
+
+impl BlobGcOptions {
+	/// Conservative production bounds for an applying collection.
+	#[must_use]
+	pub const fn apply(policy: GcPolicy) -> Self {
+		Self {
+			apply: true,
+			retain_abandoned: true,
+			policy,
+			max_journals: 100_000,
+			max_entries: 10_000_000,
+			max_blob_entries: 1_000_000,
+			max_blob_depth: 64,
+		}
+	}
+
+	/// Conservative production bounds for a non-mutating collection preview.
+	#[must_use]
+	pub const fn dry_run(policy: GcPolicy) -> Self {
+		Self { apply: false, ..Self::apply(policy) }
+	}
+}
+
+/// Cloneable cancellation flag checked at journal, entry, and CAS boundaries.
+#[derive(Clone, Debug, Default)]
+pub struct GcCancellation {
+	cancelled: Arc<AtomicBool>,
+}
+
+impl GcCancellation {
+	/// Requests cancellation of an in-progress collection.
+	pub fn cancel(&self) {
+		self.cancelled.store(true, Ordering::Release);
+	}
+
+	/// Returns whether cancellation has been requested.
+	#[must_use]
+	pub fn is_cancelled(&self) -> bool {
+		self.cancelled.load(Ordering::Acquire)
+	}
+}
+
+/// Failure to inventory, collect, encode, or atomically replace journal storage.
 #[derive(Debug, Error)]
 pub enum GcError {
 	/// Existing journal validation or recovery failed.
@@ -86,6 +158,25 @@ pub enum GcError {
 	/// System time cannot be represented for a unique staging name.
 	#[error("system clock is before the Unix epoch")]
 	Clock(#[from] std::time::SystemTimeError),
+	/// Collection was cancelled at a safe journal, entry, or CAS boundary.
+	#[error("journal garbage collection was cancelled")]
+	Cancelled,
+	/// A supplied journal is not owned by the selected CAS namespace.
+	#[error("journal {} is outside blob namespace {}", path.display(), root.display())]
+	JournalOutsideNamespace {
+		/// Supplied journal path.
+		path: PathBuf,
+		/// Selected project/session CAS root.
+		root: PathBuf,
+	},
+	/// Journal discovery or entry scanning exceeded a configured hard bound.
+	#[error("journal garbage collection exceeded its {resource} bound of {limit}")]
+	Limit {
+		/// Bounded resource that was exhausted.
+		resource: &'static str,
+		/// Configured maximum.
+		limit:    usize,
+	},
 }
 
 /// Marks every blob referenced by every committed entry of every supplied
@@ -108,10 +199,173 @@ pub fn collect_blobs(
 	journals: &[PathBuf],
 	policy: GcPolicy,
 ) -> Result<BlobGcReport, GcError> {
-	let roots = journal_blob_roots(journals)?;
+	collect_blobs_with(
+		store,
+		journals,
+		BlobGcOptions::apply(policy),
+		&GcCancellation::default(),
+	)
+}
+
+/// Marks complete histories while holding every journal writer lease, then
+/// previews or applies one bounded CAS sweep.
+///
+/// Journal paths are sorted and deduplicated before leases are acquired. The
+/// leases remain held through the namespace-locked sweep, preventing a writer
+/// from committing a newly reachable old blob after the mark boundary. Blob
+/// producers that have not yet acquired a journal lease remain protected by
+/// the age grace. Any locked journal, malformed payload, cancellation, or
+/// traversal limit fails closed before unproven content can be removed.
+///
+/// # Errors
+///
+/// Returns a typed error without starting the CAS sweep when reachability is
+/// incomplete, or when the bounded sweep cannot finish safely.
+pub fn collect_blobs_with(
+	store: &BlobStore,
+	journals: &[PathBuf],
+	options: BlobGcOptions,
+	cancel: &GcCancellation,
+) -> Result<BlobGcReport, GcError> {
+	if cancel.is_cancelled() {
+		return Err(GcError::Cancelled);
+	}
+	if journals.len() > options.max_journals {
+		return Err(GcError::Limit { resource: "journal-count", limit: options.max_journals });
+	}
+	for path in journals {
+		if path.parent().unwrap_or_else(|| Path::new(".")) != store.root() {
+			return Err(GcError::JournalOutsideNamespace {
+				path: path.clone(),
+				root: store.root().to_path_buf(),
+			});
+		}
+	}
+	let _namespace = JournalNamespaceLock::acquire_exclusive(store.root())?;
+	let mut paths = journals.to_vec();
+	discover_namespace_journals(
+		store.root(),
+		options.max_blob_entries,
+		options.max_journals,
+		cancel,
+		&mut paths,
+	)?;
+	paths.sort();
+	paths.dedup();
+	if paths.len() > options.max_journals {
+		return Err(GcError::Limit { resource: "journal-count", limit: options.max_journals });
+	}
+
+	let mut leases = Vec::<WriterLock>::with_capacity(paths.len());
+	let mut roots = FastHashSet::default();
+	let mut entries_scanned = 0usize;
+	let mut journals_with_abandoned = 0usize;
+	let mut abandoned_entries = 0usize;
+	let mut journal_bytes_eligible = 0u64;
+	for path in &paths {
+		if cancel.is_cancelled() {
+			return Err(GcError::Cancelled);
+		}
+		let lock = WriterLock::acquire(path)?;
+		let bytes = fs::read(path)?;
+		let (entries, clean_len) = decode_committed(&bytes)?;
+		entries_scanned = entries_scanned.saturating_add(entries.len());
+		if entries_scanned > options.max_entries {
+			return Err(GcError::Limit { resource: "journal-entry-count", limit: options.max_entries });
+		}
+		let retained: Vec<_> = live_chain(&entries).collect();
+		let abandoned = entries.len().saturating_sub(retained.len());
+		abandoned_entries = abandoned_entries.saturating_add(abandoned);
+		if abandoned != 0 {
+			journals_with_abandoned += 1;
+			let mut encoded = Vec::new();
+			for entry in &retained {
+				sse::encode(entry, &mut encoded)?;
+			}
+			let retained_bytes =
+				u64::try_from(encoded.len()).map_err(|_| io::Error::other("journal is too large"))?;
+			let current_bytes = u64::try_from(clean_len).unwrap_or(u64::MAX);
+			journal_bytes_eligible = journal_bytes_eligible
+				.saturating_add(current_bytes.saturating_sub(retained_bytes));
+		}
+		if options.retain_abandoned {
+			for entry in &entries {
+				if cancel.is_cancelled() {
+					return Err(GcError::Cancelled);
+				}
+				collect_entry_roots(path, entry, &mut roots)?;
+			}
+		} else {
+			for entry in live_chain(&entries) {
+				if cancel.is_cancelled() {
+					return Err(GcError::Cancelled);
+				}
+				collect_entry_roots(path, entry, &mut roots)?;
+			}
+		}
+		leases.push(lock);
+	}
+
 	let roots_retained = roots.len();
-	let storage = store.collect_unreferenced(&roots, policy)?;
-	Ok(BlobGcReport { journals_scanned: journals.len(), roots_retained, storage })
+	let sweep = GcSweep {
+		policy: options.policy,
+		apply: options.apply,
+		max_entries: options.max_blob_entries,
+		max_depth: options.max_blob_depth,
+	};
+	let storage = match store.sweep_unreferenced(&roots, sweep, &cancel.cancelled) {
+		Ok(storage) => storage,
+		Err(crate::blob::Error::GcCancelled) => return Err(GcError::Cancelled),
+		Err(source) => return Err(GcError::Blob(source)),
+	};
+	drop(leases);
+	Ok(BlobGcReport {
+		journals_scanned: paths.len(),
+		entries_scanned,
+		journals_with_abandoned,
+		abandoned_entries,
+		journal_bytes_eligible,
+		roots_retained,
+		storage,
+	})
+}
+
+fn discover_namespace_journals(
+	root: &Path,
+	max_entries: usize,
+	max_journals: usize,
+	cancel: &GcCancellation,
+	output: &mut Vec<PathBuf>,
+) -> Result<(), GcError> {
+	let entries = match fs::read_dir(root) {
+		Ok(entries) => entries,
+		Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+		Err(error) => return Err(GcError::Io(error)),
+	};
+	for (visited, entry) in entries.enumerate() {
+		if cancel.is_cancelled() {
+			return Err(GcError::Cancelled);
+		}
+		if visited >= max_entries {
+			return Err(GcError::Limit {
+				resource: "journal-discovery-entry-count",
+				limit: max_entries,
+			});
+		}
+		let entry = entry?;
+		let file_type = entry.file_type()?;
+		let path = entry.path();
+		if file_type.is_file()
+			&& path.extension().and_then(|extension| extension.to_str())
+				== Some(crate::FILE_EXTENSION)
+		{
+			output.push(path);
+			if output.len() > max_journals {
+				return Err(GcError::Limit { resource: "journal-count", limit: max_journals });
+			}
+		}
+	}
+	Ok(())
 }
 
 /// Copies exactly the blobs named by every committed entry of `journals` from
@@ -199,22 +453,27 @@ fn collect_value_roots(value: &Value, roots: &mut FastHashSet<Hash32>) {
 }
 
 fn collect_uri_roots(text: &str, roots: &mut FastHashSet<Hash32>) {
-	const PREFIX: &str = "artifact://sha256/";
-	let mut rest = text;
-	while let Some(index) = rest.find(PREFIX) {
-		rest = &rest[index + PREFIX.len()..];
-		let Some(hex) = rest.get(..64) else {
-			break;
-		};
-		if let Some(hash) = parse_digest(hex) {
-			roots.insert(hash);
+	for prefix in ["artifact://sha256/", "blob:sha256:"] {
+		let mut rest = text;
+		while let Some(index) = rest.find(prefix) {
+			rest = &rest[index + prefix.len()..];
+			let Some(hex) = rest.get(..64) else {
+				break;
+			};
+			if let Some(hash) = parse_digest(hex) {
+				roots.insert(hash);
+			}
+			rest = &rest[64.min(rest.len())..];
 		}
-		rest = &rest[64.min(rest.len())..];
 	}
 }
 
 fn parse_digest(hex: &str) -> Option<Hash32> {
-	BlobRef::parse_hex(hex, 0)
+	let source: &[u8; 64] = hex.as_bytes().try_into().ok()?;
+	let mut normalized = *source;
+	normalized.make_ascii_lowercase();
+	let normalized = std::str::from_utf8(&normalized).ok()?;
+	BlobRef::parse_hex(normalized, 0)
 		.ok()
 		.map(|reference| reference.hash)
 }
