@@ -17,6 +17,7 @@ use omp_tool::{
 	InterruptWaitError, ParamError, Part, ProjectionAuthorizationError, ProjectionSpan, PromptCaps,
 	PromptProjection, Rev, Tool, ToolSpec, ToolTerminal, VisibilityReceipt,
 };
+use tokio_util::sync::CancellationToken;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
@@ -330,6 +331,19 @@ pub enum Fault {
 
 /// Zero-box workspace traversal boundary shared by `grep@1` and `glob@1`.
 pub trait WorkspaceSearch: Send + Sync + 'static {
+	/// Resolves the authored root list before search.
+	///
+	/// Environment owners use `unsplit` to preserve an existing literal path
+	/// containing semicolons. The default keeps the schema-level split for
+	/// host-free implementations.
+	fn prepare_roots(
+		&self,
+		roots: Vec<SearchRoot>,
+		_unsplit: Option<SearchRoot>,
+	) -> impl Future<Output = Result<Vec<SearchRoot>, Fault>> + Send + '_ {
+		future::ready(Ok(roots))
+	}
+
 	/// Execute a native regex search and return revision-pinned snapshot
 	/// candidates without authorizing any source lines.
 	fn search(
@@ -346,12 +360,14 @@ pub trait WorkspaceSearch: Send + Sync + 'static {
 	fn glob(
 		&self,
 		request: WalkRequest,
+		cancellation: CancellationToken,
 	) -> impl Future<Output = Result<WalkResult, GlobFault>> + Send + '_;
 	/// Attempts a resolver-backed glob such as `ssh://`; `None` keeps ordinary
 	/// workspace dispatch or reports an unsupported scheme.
 	fn glob_resource(
 		&self,
 		_request: WalkRequest,
+		_cancellation: CancellationToken,
 	) -> impl Future<Output = Option<Result<WalkResult, GlobFault>>> + Send + '_ {
 		future::ready(None)
 	}
@@ -462,16 +478,17 @@ impl<W: WorkspaceSearch> Tool for Grep<W> {
 					return;
 				},
 			};
-			let roots = match parse_roots(arguments.path.as_deref()) {
+			let (roots, unsplit) = match parse_roots(arguments.path.as_deref()) {
 				Ok(roots) => roots,
 				Err(fault) => {
 					yield done(Err(fault));
 					return;
 				},
 			};
-			let request =
-				build_request(arguments, &roots, self.context_before, self.context_after);
 			let operation = async {
+				let roots = self.workspace.prepare_roots(roots, unsplit).await?;
+				let request =
+					build_request(arguments, &roots, self.context_before, self.context_after);
 				let result = self.workspace.search(request).await?;
 				prepare_payload(result, &roots, skip, &self.workspace)
 			}.instrument(span.clone()).fuse();
@@ -593,14 +610,18 @@ fn normalize_skip(skip: Option<f64>) -> Result<u64, Fault> {
 	Ok(skip.floor() as u64)
 }
 
-fn parse_roots(path: Option<&str>) -> Result<Vec<SearchRoot>, Fault> {
+fn parse_roots(path: Option<&str>) -> Result<(Vec<SearchRoot>, Option<SearchRoot>), Fault> {
 	let entries = path.map(split_semicolon_targets).unwrap_or_default();
 	let entries = if entries.is_empty() {
 		vec![sf!(".")]
 	} else {
 		entries
 	};
-	entries.into_iter().map(parse_root).collect()
+	let roots = entries.into_iter().map(parse_root).collect::<Result<Vec<_>, _>>()?;
+	let unsplit = path
+		.filter(|path| path.contains(';'))
+		.and_then(|path| parse_root(Str::new(path)).ok());
+	Ok((roots, unsplit))
 }
 
 fn parse_root(original: Str) -> Result<SearchRoot, Fault> {
@@ -1102,7 +1123,8 @@ mod tests {
 
 	#[test]
 	fn semicolon_roots_preserve_order_and_parse_per_file_ranges() {
-		let roots = parse_roots(Some(" src ; tests/grep.rs:5-8,12-13 ")).unwrap();
+		let (roots, unsplit) =
+			parse_roots(Some(" src ; tests/grep.rs:5-8,12-13 ")).unwrap();
 		assert_eq!(roots.len(), 2);
 		assert_eq!(roots[0].path, "src");
 		assert!(roots[0].ranges.is_empty());
@@ -1111,11 +1133,18 @@ mod tests {
 			LineRange { start_line: 5, end_line: Some(8) },
 			LineRange { start_line: 12, end_line: Some(13) },
 		]);
+		let unsplit = unsplit.expect("literal-preserving candidate");
+		assert_eq!(unsplit.original, " src ; tests/grep.rs:5-8,12-13 ");
+		assert_eq!(unsplit.path, " src ; tests/grep.rs");
+		assert_eq!(unsplit.ranges.as_ref(), [
+			LineRange { start_line: 5, end_line: Some(8) },
+			LineRange { start_line: 12, end_line: Some(13) },
+		]);
 	}
 
 	#[test]
 	fn internal_roots_keep_ranges_and_ignore_display_only_modes() {
-		let roots = parse_roots(Some(
+		let (roots, _) = parse_roots(Some(
 			"artifact://7:raw:2-4; skill://prompt:conflicts; bundle.7z:docs/readme.txt",
 		))
 		.unwrap();
@@ -1138,7 +1167,7 @@ mod tests {
 
 	#[test]
 	fn request_applies_case_gitignore_and_cross_line_rules() {
-		let roots = parse_roots(Some("src; tests")).unwrap();
+		let (roots, _) = parse_roots(Some("src; tests")).unwrap();
 		let request = build_request(
 			Params {
 				pattern:   sf!(r"alpha\nbeta"),
@@ -1166,7 +1195,7 @@ mod tests {
 				gitignore: None,
 				skip:      None,
 			},
-			&parse_roots(None).unwrap(),
+			&parse_roots(None).unwrap().0,
 			0,
 			0,
 		);
@@ -1177,7 +1206,7 @@ mod tests {
 
 	#[test]
 	fn skip_paginates_matching_files_not_match_rows() {
-		let roots = parse_roots(Some(".")).unwrap();
+		let (roots, _) = parse_roots(Some(".")).unwrap();
 		let matches: Vec<_> = (0..22)
 			.map(|index| search_match(format!("src/file-{index:02}.rs"), 0))
 			.collect();

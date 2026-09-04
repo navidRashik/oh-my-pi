@@ -1,18 +1,27 @@
 //! `glob@1` schema, traversal, and model-facing output contracts.
 
-use std::{future, sync::Arc};
+use std::{
+	future,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+};
 
 use futures::{StreamExt, executor::block_on};
 use omp_core::{Str, sf};
-use omp_tool::{CapsBase, Ev, IncomingParams, ModelClass, Part, PromptCaps, Tool, ToolTerminal};
+use omp_tool::{
+	Abort, CapsBase, Ev, IncomingParams, Interrupt, ModelClass, Part, PromptCaps, Tool, ToolTerminal,
+};
 use omp_tools::{glob, grep};
 use parking_lot::Mutex;
 use serde_json::json;
 
 #[derive(Clone)]
 struct FakeWorkspace {
-	result: Result<glob::WalkResult, glob::Fault>,
-	seen:   Arc<Mutex<Vec<glob::WalkRequest>>>,
+	result:            Result<glob::WalkResult, glob::Fault>,
+	seen:              Arc<Mutex<Vec<glob::WalkRequest>>>,
+	stopped_on_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl grep::WorkspaceSearch for FakeWorkspace {
@@ -34,11 +43,18 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 	fn glob(
 		&self,
 		request: glob::WalkRequest,
+		cancellation: tokio_util::sync::CancellationToken,
 	) -> impl Future<Output = Result<glob::WalkResult, glob::Fault>> + Send + '_ {
 		let result = self.result.clone();
 		let seen = Arc::clone(&self.seen);
+		let stopped_on_cancel = self.stopped_on_cancel.clone();
 		async move {
 			seen.lock().push(request);
+			if let Some(stopped) = stopped_on_cancel {
+				cancellation.cancelled().await;
+				stopped.store(true, Ordering::Release);
+				return Err(glob::Fault::Cancelled { reason: sf!("cancelled by test") });
+			}
 			result
 		}
 	}
@@ -51,11 +67,19 @@ struct Invocation {
 }
 
 fn fake(result: glob::WalkResult) -> FakeWorkspace {
-	FakeWorkspace { result: Ok(result), seen: Arc::new(Mutex::new(Vec::new())) }
+	FakeWorkspace {
+		result:            Ok(result),
+		seen:              Arc::new(Mutex::new(Vec::new())),
+		stopped_on_cancel: None,
+	}
 }
 
 fn faulty(fault: glob::Fault) -> FakeWorkspace {
-	FakeWorkspace { result: Err(fault), seen: Arc::new(Mutex::new(Vec::new())) }
+	FakeWorkspace {
+		result:            Err(fault),
+		seen:              Arc::new(Mutex::new(Vec::new())),
+		stopped_on_cancel: None,
+	}
 }
 
 const fn walk(matches: Vec<glob::WalkMatch>) -> glob::WalkResult {
@@ -110,6 +134,9 @@ fn schema_and_defaults_are_exact() {
 	let tool = glob::tool(workspace.clone());
 	let actual: serde_json::Value =
 		serde_json::from_slice(&tool.spec().schema).expect("glob schema is JSON");
+	assert_eq!(tool.spec().name, "glob");
+	assert!(tool.spec().rev.family.is_empty());
+	assert_eq!(tool.spec().rev.n, 1);
 	assert_eq!(
 		tool.spec().schema.as_ref(),
 		omp_tool::schema::<glob::Params>().as_ref(),
@@ -144,7 +171,7 @@ fn schema_and_defaults_are_exact() {
 				},
 				"notrunc": {
 					"type": "boolean",
-					"description": "Return complete output inline without central truncation."
+					"description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."
 				}
 			}
 		})
@@ -214,6 +241,40 @@ fn root_search_is_rejected_before_workspace_traversal() {
 	assert_eq!(invocation.text, "Searching from root directory '/' is not allowed");
 	assert!(!invocation.useless);
 	assert!(seen.lock().is_empty());
+}
+
+#[test]
+fn interrupt_waits_until_the_workspace_traversal_has_stopped() {
+	let stopped = Arc::new(AtomicBool::new(false));
+	let workspace = FakeWorkspace {
+		result:            Ok(walk(Vec::new())),
+		seen:              Arc::default(),
+		stopped_on_cancel: Some(Arc::clone(&stopped)),
+	};
+	let started = Arc::clone(&workspace.seen);
+	let tool = glob::tool(workspace);
+	let (feed, params) = IncomingParams::channel();
+	feed
+		.args_committed(Str::new_static(r#"{"path":"**/*"}"#))
+		.expect("invocation consumer remains live");
+	let events = std::thread::scope(|scope| {
+		let execution = scope.spawn(|| block_on(tool.call(params).collect::<Vec<_>>()));
+		while started.lock().is_empty() {
+			std::thread::yield_now();
+		}
+		feed
+			.interrupt(Interrupt { class: sf!("user"), reason: sf!("stop glob") })
+			.expect("glob invocation accepts interruption");
+		execution.join().expect("glob execution thread")
+	});
+	assert!(
+		stopped.load(Ordering::Acquire),
+		"the tool must not report cancellation before its traversal has stopped"
+	);
+	assert!(matches!(
+		events.as_slice(),
+		[Ev::Aborted(Abort::Interrupted { reason })] if reason == "stop glob"
+	));
 }
 
 #[test]

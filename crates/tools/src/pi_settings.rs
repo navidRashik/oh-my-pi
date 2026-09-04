@@ -4,24 +4,28 @@ use omp_con::Kv;
 use omp_core::Str;
 
 omp_con::var! {
-	/// pi `tools.artifactTailBytes` (number, default: 20).
+	/// Bytes kept from an artifact-spilled tool output's tail.
 	pub static SV_TOOLS_ARTIFACT_TAIL_BYTES = sv_tools_artifact_tail_bytes: i64 {
-		default: 20,
+		default: 20 * 1024,
+		min: 1,
 		flags: archive,
 	};
-	/// pi `tools.artifactHeadBytes` (number, default: 20).
+	/// Bytes kept from an artifact-spilled tool output's head; zero selects tail-only projection.
 	pub static SV_TOOLS_ARTIFACT_HEAD_BYTES = sv_tools_artifact_head_bytes: i64 {
-		default: 20,
+		default: 20 * 1024,
+		min: 0,
 		flags: archive,
 	};
-	/// pi `tools.outputMaxColumns` (number, default: 768).
+	/// Per-line byte cap for model-visible tool output; zero disables the cap.
 	pub static SV_TOOLS_OUTPUT_MAX_COLUMNS = sv_tools_output_max_columns: i64 {
 		default: 768,
+		min: 0,
 		flags: archive,
 	};
-	/// pi `tools.artifactTailLines` (number, default: 500).
+	/// Maximum lines kept in each artifact-spilled output tail window.
 	pub static SV_TOOLS_ARTIFACT_TAIL_LINES = sv_tools_artifact_tail_lines: i64 {
 		default: 500,
+		min: 1,
 		flags: archive,
 	};
 	/// pi `images.blockImages` (boolean, default: false).
@@ -231,7 +235,7 @@ omp_con::var! {
 		default: false,
 		flags: archive,
 	};
-	/// pi `inspect_image.enabled` (boolean, default: false).
+	/// Legacy pi `inspect_image.enabled`, retained only for configuration migration.
 	pub static SV_INSPECT_IMAGE_ENABLED = sv_inspect_image_enabled: bool {
 		default: false,
 		flags: archive,
@@ -239,26 +243,6 @@ omp_con::var! {
 	/// pi `computer.enabled` (boolean, default: false).
 	pub static SV_COMPUTER_ENABLED = sv_computer_enabled: bool {
 		default: false,
-		flags: archive,
-	};
-	/// pi `computer.display` (string, default: "all").
-	pub static SV_COMPUTER_DISPLAY = sv_computer_display: Str {
-		default: Str::new_static("all"),
-		flags: archive,
-	};
-	/// pi `computer.maxWidth` (number, default: 3840).
-	pub static SV_COMPUTER_MAX_WIDTH = sv_computer_max_width: i64 {
-		default: 3840,
-		flags: archive,
-	};
-	/// pi `computer.maxHeight` (number, default: 2400).
-	pub static SV_COMPUTER_MAX_HEIGHT = sv_computer_max_height: i64 {
-		default: 2400,
-		flags: archive,
-	};
-	/// pi `inspect_image.timeoutMs` (number, default: 300_000).
-	pub static SV_INSPECT_IMAGE_TIMEOUT_MS = sv_inspect_image_timeout_ms: i64 {
-		default: 300000,
 		flags: archive,
 	};
 	/// pi `checkpoint.enabled` (boolean, default: false).
@@ -291,11 +275,6 @@ omp_con::var! {
 		default: 604800,
 		flags: archive,
 	};
-	/// pi `tools.abortOnFabricatedResult` (boolean, default: true).
-	pub static SV_TOOLS_ABORT_ON_FABRICATED_RESULT = sv_tools_abort_on_fabricated_result: bool {
-		default: true,
-		flags: archive,
-	};
 	/// pi `exa.enabled` (boolean, default: true).
 	pub static SV_EXA_ENABLED = sv_exa_enabled: bool {
 		default: true,
@@ -310,6 +289,7 @@ omp_con::var! {
 
 /// Exact pi setting keys and their command-stream convar names.
 pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
+	("tools.artifactSpillThreshold", "sv_tools_output_spill_bytes"),
 	("tools.artifactTailBytes", "sv_tools_artifact_tail_bytes"),
 	("tools.artifactHeadBytes", "sv_tools_artifact_head_bytes"),
 	("tools.outputMaxColumns", "sv_tools_output_max_columns"),
@@ -359,14 +339,12 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("computer.display", "sv_computer_display"),
 	("computer.maxWidth", "sv_computer_max_width"),
 	("computer.maxHeight", "sv_computer_max_height"),
-	("inspect_image.timeoutMs", "sv_inspect_image_timeout_ms"),
 	("checkpoint.enabled", "sv_checkpoint_enabled"),
 	("vault.enabled", "sv_vault_enabled"),
 	("github.enabled", "sv_github_enabled"),
 	("github.cache.enabled", "sv_github_cache_enabled"),
 	("github.cache.softTtlSec", "sv_github_cache_soft_ttl_sec"),
 	("github.cache.hardTtlSec", "sv_github_cache_hard_ttl_sec"),
-	("tools.abortOnFabricatedResult", "sv_tools_abort_on_fabricated_result"),
 	("exa.enabled", "sv_exa_enabled"),
 	("exa.searchDelayMs", "sv_exa_search_delay_ms"),
 ];

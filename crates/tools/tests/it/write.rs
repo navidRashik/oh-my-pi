@@ -189,7 +189,7 @@ fn generated_schema_definition_and_revision_are_exact() {
 				},
 				"notrunc": {
 					"type": "boolean",
-					"description": "Return complete output inline without central truncation."
+					"description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."
 				}
 			}
 		})

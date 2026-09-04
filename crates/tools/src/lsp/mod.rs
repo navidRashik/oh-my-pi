@@ -3,11 +3,13 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use async_stream::stream;
+use bytes::Bytes;
 use futures::Stream;
-use omp_core::{Str, sf};
+use omp_core::{FastHashSet, Str, sf};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DocEffects, Effects, Ev, IncomingParams,
-	ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, CallOutcome, CommitError, Constraint, DocEffects, Effects, Ev,
+	IncomingParams, LiftedCall, ParamError, Part, PromptCaps, RecordedCall, Rev, Tool, ToolSpec,
+	ToolTerminal,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -79,7 +81,7 @@ impl Action {
 	}
 }
 
-/// Arguments for `lsp@2`.
+/// Arguments for `lsp@3`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
@@ -91,21 +93,24 @@ pub struct Params {
 	/// One-based source line.
 	#[serde(default)]
 	pub line:     Option<u32>,
-	/// Identifier or `identifier#N` occurrence target.
+	/// Identifier or `identifier#N` one-based occurrence target. Required for
+	/// project-aware definition, references, and rename requests.
 	#[serde(default)]
 	pub symbol:   Option<Str>,
-	/// Workspace symbol query, code-action selector, or raw request method.
+	/// Workspace symbol query, zero-based code-action index/title substring,
+	/// or raw request method.
 	#[serde(default)]
 	pub query:    Option<Str>,
 	/// New identifier for rename, or destination path for `rename_file`.
 	#[serde(default)]
 	pub new_name: Option<Str>,
-	/// Apply a rename/code action; false requests a dry-run.
+	/// Apply a symbol/path rename or code action; false requests a dry-run.
 	#[serde(default)]
 	pub apply:    Option<bool>,
 	/// Wall-clock timeout in seconds, clamped to 5–300 and the configured
 	/// maximum.
 	#[serde(default)]
+	#[schemars(range(min = 5, max = 300))]
 	pub timeout:  Option<u64>,
 	/// Raw JSON parameters for `request`. When omitted, textDocument and
 	/// position are derived from `file`, `line`, and `symbol`.
@@ -227,13 +232,65 @@ pub fn aggregate_workspace_symbols(
 	if servers.is_empty() {
 		return Err(Fault::workspace_symbols(failures));
 	}
+	let query_folded = query.trim().to_ascii_lowercase();
+	if !query_folded.is_empty() {
+		symbols.retain(|symbol| {
+			[
+				symbol
+					.get("name")
+					.and_then(Value::as_str)
+					.unwrap_or_default(),
+				symbol
+					.get("containerName")
+					.and_then(Value::as_str)
+					.unwrap_or_default(),
+				symbol
+					.pointer("/location/uri")
+					.and_then(Value::as_str)
+					.unwrap_or_default(),
+			]
+			.iter()
+			.any(|field| field.to_ascii_lowercase().contains(query_folded.as_str()))
+		});
+	}
+	let mut seen = FastHashSet::default();
+	symbols.retain(|symbol| {
+		let identity = (
+			Str::from(
+				symbol
+					.get("name")
+					.and_then(Value::as_str)
+					.unwrap_or_default(),
+			),
+			Str::from(
+				symbol
+					.get("containerName")
+					.and_then(Value::as_str)
+					.unwrap_or_default(),
+			),
+			symbol.get("kind").and_then(Value::as_u64),
+			Str::from(
+				symbol
+					.pointer("/location/uri")
+					.and_then(Value::as_str)
+					.unwrap_or_default(),
+			),
+			symbol
+				.pointer("/location/range/start/line")
+				.and_then(Value::as_u64),
+			symbol
+				.pointer("/location/range/start/character")
+				.and_then(Value::as_u64),
+		);
+		seen.insert(identity)
+	});
+	let total = symbols.len();
 	let mut output = if symbols.is_empty() {
 		format!("No symbols matching \"{query}\"")
 	} else {
 		format!(
-			"Found {} symbol(s) matching \"{query}\":\n{}",
-			symbols.len(),
-			render::structured(&Value::Array(symbols.clone()), 200)
+			"Found {total} symbol(s) matching \"{query}\":\n{}",
+			render::structured(&Value::Array(symbols.clone()), symbols.len())
 		)
 	};
 	if !failures.is_empty() {
@@ -275,14 +332,18 @@ pub struct LspTool<C> {
 	spec:    ToolSpec,
 }
 
-/// Returns the host-free `lsp@2` specification.
+/// Returns the host-free `lsp@3` specification.
 pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("lsp"),
-		rev:             Rev { family: Str::default(), n: 2 },
+		rev:             Rev { family: Str::default(), n: 3 },
 		description:     sf!(
-			"Queries and transactionally applies project language-server diagnostics, navigation, \
-			 symbols, refactors, code actions, raw requests, status, and reloads."
+			"Symbol-aware language-server diagnostics, navigation, references, hover, symbols, \
+			 transactional symbol/path renames, code actions, raw requests, status, and reload. \
+			 Position requests use one-based line plus symbol (symbol#N selects an occurrence); \
+			 rename and rename_file apply by default, code_actions applies only with apply=true; \
+			 diagnostics accepts a path, glob, or * and symbols uses * plus query for workspace \
+			 search."
 		),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {
@@ -308,7 +369,7 @@ pub fn spec() -> ToolSpec {
 	}
 }
 
-/// Creates discoverable `lsp@2` with an environment-configured timeout ceiling.
+/// Creates discoverable `lsp@3` with an environment-configured timeout ceiling.
 pub fn tool<C: LspControl>(control: C, maximum: Duration) -> LspTool<C> {
 	LspTool {
 		control,
@@ -332,7 +393,7 @@ impl<C: LspControl> Tool for LspTool<C> {
 		mut incoming: IncomingParams<'c>,
 	) -> impl Stream<Item = Ev<Update, Payload, Fault>> + Send + 'c {
 		stream! {
-			let params = match incoming.whole::<Params>().await {
+			let params = match incoming.interruptable().whole::<Params>().await {
 				Ok(params) => params,
 				Err(error) => { yield param_event(error); return; },
 			};
@@ -346,14 +407,30 @@ impl<C: LspControl> Tool for LspTool<C> {
 			}
 			let timeout = Duration::from_secs(params.timeout.unwrap_or(20).clamp(5, 300)).min(self.maximum);
 			let cancel = CancellationToken::new();
-			match tokio::time::timeout(timeout, self.control.execute(params, timeout, cancel.clone())).await {
-				Ok(Ok(payload)) => {
-					let useless = matches!(payload.action, Action::Definition | Action::TypeDefinition | Action::Implementation | Action::References | Action::Symbols)
-						&& payload.data.as_array().is_some_and(Vec::is_empty);
-					yield done(Ok(payload), useless);
+			let execution = self.control.execute(params, timeout, cancel.clone());
+			let deadline = tokio::time::sleep(timeout);
+			tokio::pin!(execution, deadline);
+			tokio::select! {
+				result = &mut execution => match result {
+					Ok(payload) => {
+						let useless = matches!(payload.action, Action::Definition | Action::TypeDefinition | Action::Implementation | Action::References | Action::Symbols)
+							&& payload.data.as_array().is_some_and(Vec::is_empty);
+						yield done(Ok(payload), useless);
+					},
+					Err(fault) => yield done(Err(fault), true),
 				},
-				Ok(Err(fault)) => yield done(Err(fault), true),
-				Err(_) => { cancel.cancel(); yield done(Err(Fault::TimedOut), true); },
+				interrupt = incoming.next_interrupt() => {
+					cancel.cancel();
+					if let Ok(interrupt) = interrupt {
+						yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason });
+					} else {
+						yield Ev::Aborted(Abort::InputDropped);
+					}
+				},
+				() = &mut deadline => {
+					cancel.cancel();
+					yield done(Err(Fault::TimedOut), true);
+				},
 			}
 		}
 	}
@@ -365,6 +442,42 @@ impl<C: LspControl> Tool for LspTool<C> {
 		};
 		vec![Part::Text { text }]
 	}
+
+	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+		lift_legacy_call(from, call)
+	}
+}
+
+/// Lifts durable `lsp@1` and `lsp@2` calls onto `lsp@3` only when both the
+/// historical arguments and verdict satisfy the current typed contract.
+/// Revision three adds schema bounds and semantic navigation projection; old
+/// successful navigation verdicts are re-projected from their structured data.
+fn lift_legacy_call(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+	if !from.family.is_empty() || !matches!(from.n, 1 | 2) {
+		return None;
+	}
+	let mut raw_args = serde_json::from_slice::<Value>(call.raw_args).ok()?;
+	let object = raw_args.as_object_mut()?;
+	object.remove("i");
+	object.remove("notrunc");
+	let params = serde_json::from_value::<Params>(raw_args).ok()?;
+	if !valid(&params) {
+		return None;
+	}
+	let mut verdict = serde_json::from_slice::<CallOutcome<Payload, Fault>>(call.verdict).ok()?;
+	if let CallOutcome::Ok(payload) = &mut verdict {
+		payload.output = match payload.action {
+			Action::Definition => navigation::render_locations("definition", &payload.data),
+			Action::TypeDefinition => navigation::render_locations("type definition", &payload.data),
+			Action::Implementation => navigation::render_locations("implementation", &payload.data),
+			Action::References => navigation::render_references(&payload.data),
+			_ => payload.output.clone(),
+		};
+	}
+	Some(LiftedCall {
+		raw_args: Bytes::copy_from_slice(call.raw_args),
+		verdict:  Bytes::from(serde_json::to_vec(&verdict).ok()?),
+	})
 }
 
 fn valid(params: &Params) -> bool {
@@ -372,7 +485,8 @@ fn valid(params: &Params) -> bool {
 		return false;
 	}
 	match params.action {
-		Action::Diagnostics | Action::Status | Action::Capabilities | Action::Reload => true,
+		Action::Diagnostics => params.file.is_some(),
+		Action::Status | Action::Capabilities | Action::Reload => true,
 		Action::Request => params
 			.query
 			.as_ref()
@@ -399,6 +513,28 @@ mod tests {
 
 	#[derive(Clone, Default)]
 	struct RecordingControl(Arc<Mutex<Option<Params>>>);
+
+	#[derive(Clone, Default)]
+	struct CancellationControl(Arc<Mutex<Option<CancellationToken>>>);
+
+	impl LspControl for CancellationControl {
+		fn execute(
+			&self,
+			_: Params,
+			_: Duration,
+			cancel: CancellationToken,
+		) -> impl Future<Output = Result<Payload, Fault>> + Send + '_ {
+			self
+				.0
+				.lock()
+				.expect("cancellation control")
+				.replace(cancel.clone());
+			async move {
+				cancel.cancelled().await;
+				Err(Fault::Cancelled)
+			}
+		}
+	}
 
 	impl LspControl for RecordingControl {
 		fn execute(
@@ -455,12 +591,17 @@ mod tests {
 			.collect()
 		);
 		assert_eq!(schema["properties"]["payload"]["type"], serde_json::json!(["string", "null"]));
-		assert_eq!(
-			schema["properties"]["notrunc"],
-			serde_json::json!({
-				"type": "boolean",
-				"description": "Return complete output inline without central truncation."
-			})
+		assert_eq!(schema["properties"]["timeout"]["minimum"], 5);
+		assert_eq!(schema["properties"]["timeout"]["maximum"], 300);
+		// Current pi owns the fields above but has no `notrunc` parameter.
+		// `notrunc` is injected by omp-tool under ADR 0009, so this LSP
+		// conformance test verifies its protocol shape without duplicating the
+		// central owner's presentation prose.
+		assert_eq!(schema["properties"]["notrunc"]["type"], "boolean");
+		assert!(
+			schema["properties"]["notrunc"]["description"]
+				.as_str()
+				.is_some_and(|description| !description.is_empty())
 		);
 	}
 
@@ -480,6 +621,36 @@ mod tests {
 		assert_eq!(params.payload.as_deref(), Some(r#"{"x":1}"#));
 	}
 
+	#[tokio::test]
+	async fn caller_interrupt_cancels_the_in_flight_language_server_request() {
+		let control = CancellationControl::default();
+		let lsp = tool(control.clone(), Duration::from_secs(300));
+		let raw = r#"{"action":"status"}"#;
+		let (feed, incoming) = IncomingParams::channel();
+		feed.arg_text(raw.into()).expect("stream args");
+		feed.args_committed(raw.into()).expect("commit args");
+		feed
+			.interrupt(omp_tool::Interrupt {
+				class:  Str::new_static(omp_tool::Interrupt::ESCAPE),
+				reason: Str::new_static("user interrupted LSP"),
+			})
+			.expect("interrupt request");
+		let events = lsp.call(incoming).collect::<Vec<_>>().await;
+		assert!(matches!(
+			events.last(),
+			Some(Ev::Aborted(Abort::Interrupted { reason })) if reason == "user interrupted LSP"
+		));
+		assert!(
+			control
+				.0
+				.lock()
+				.expect("cancellation control")
+				.as_ref()
+				.is_some_and(CancellationToken::is_cancelled),
+			"host cancellation token must be raised before the tool settles",
+		);
+	}
+
 	#[test]
 	fn workspace_symbols_keep_results_and_server_failures() {
 		let payload = aggregate_workspace_symbols("Target", vec![
@@ -489,15 +660,58 @@ mod tests {
 			},
 			WorkspaceSymbolOutcome {
 				server: Str::new_static("healthy"),
-				result: Ok(serde_json::json!([{"name": "TargetSymbol"}])),
+				result: Ok(serde_json::json!([
+					{"name": "TargetSymbol", "kind": 12, "location": {"uri": "file:///src/a.rs", "range": {"start": {"line": 3, "character": 1}}}},
+					{"name": "TargetSymbol", "kind": 12, "location": {"uri": "file:///src/a.rs", "range": {"start": {"line": 3, "character": 1}}}},
+					{"name": "Unrelated", "kind": 12, "location": {"uri": "file:///src/b.rs", "range": {"start": {"line": 1, "character": 1}}}}
+				])),
 			},
 		])
 		.expect("one server responded");
 		assert_eq!(payload.servers, [Str::new_static("healthy")]);
-		assert_eq!(payload.data, serde_json::json!([{"name": "TargetSymbol"}]));
+		assert_eq!(
+			payload.data,
+			serde_json::json!([
+				{"name": "TargetSymbol", "kind": 12, "location": {"uri": "file:///src/a.rs", "range": {"start": {"line": 3, "character": 1}}}}
+			])
+		);
 		assert!(payload.output.contains("TargetSymbol"));
 		assert!(payload.output.contains("Server failures:"));
 		assert!(payload.output.contains("broken: server exited with code 7"));
+	}
+
+	#[test]
+	fn legacy_lift_is_shape_checked_and_semantically_reprojects_navigation() {
+		let lsp = tool(RecordingControl::default(), Duration::from_secs(300));
+		let args =
+			br#"{"i":"Finding references","action":"references","file":"src/lib.rs","line":4}"#;
+		let verdict = serde_json::to_vec(&CallOutcome::<Payload, Fault>::Ok(Payload {
+			action:  Action::References,
+			servers: vec![Str::new_static("rust-analyzer")],
+			output:  Str::new_static("No references found"),
+			data:    serde_json::json!([]),
+		}))
+		.expect("verdict JSON");
+		let lifted = lsp
+			.lift(&Rev { family: Str::default(), n: 2 }, RecordedCall {
+				raw_args: args,
+				verdict:  &verdict,
+			})
+			.expect("compatible legacy call");
+		assert_eq!(lifted.raw_args.as_ref(), args);
+		let outcome =
+			serde_json::from_slice::<CallOutcome<Payload, Fault>>(&lifted.verdict).expect("lifted");
+		let CallOutcome::Ok(payload) = outcome else {
+			panic!("successful historical verdict must remain successful");
+		};
+		assert_eq!(payload.output, "No references found");
+		assert!(
+			lsp.lift(&Rev { family: Str::default(), n: 1 }, RecordedCall {
+				raw_args: br#"{"action":"unknown"}"#,
+				verdict:  &verdict,
+			},)
+				.is_none()
+		);
 	}
 
 	#[test]

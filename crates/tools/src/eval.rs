@@ -20,6 +20,7 @@ use std::{
 };
 
 use async_stream::stream;
+use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{FutureExt, Stream, future::Either, pin_mut};
@@ -34,7 +35,9 @@ use omp_tool::{
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 use tokio::{runtime, sync::OnceCell};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
 	auto_background::{
@@ -83,7 +86,8 @@ __OMP_EVAL_AGENT_DAG__
 
 <critical>
 Prior top-level names survive into the next cell — reuse; NEVER re-import/re-declare. Re-read only if file changed since last read.
-</critical>"#;
+</critical>
+__OMP_EVAL_DEFINED_TOOLS__"#;
 const EVAL_AGENT_ISOLATION: &str = "Eval `agent()` children use independent kernels.";
 const EVAL_AGENT_HELPER: &str = r#"agent(prompt, agent?="task", name=None, outputSchema=None, schemaMode?="permissive", isolated=None, apply=None, merge=None, handle=False) → str | dict
     Run a subagent → final output. `agent` selects a discovered agent; omit it to use `task`. `outputSchema` overrides agent/session schemas; `schemaMode`/`schemaMode`: "permissive" | "strict". Effective schemas return parsed data. `isolated` requests a worktree; `apply`/`merge` control its changes. Background via `local://` files named in the prompt. `handle` → { text, output, handle: "agent://<id>", id, agent }, parsed `data` when structured."#;
@@ -95,6 +99,15 @@ Acyclic waves via `agent(…, handle=true)` + `pipeline`/`parallel`:
 - **Isolate failure.** Wrap risky nodes in try/except; a failure degrades only its subtree.
 - **Acyclic only.** No node waits on its own descendant.
 </dag>"#;
+const EVAL_DEFINED_TOOLS: &str = r#"<eval-defined-tools>
+Additional Python helpers:
+```
+@tool / tool(fn, name=None, description=None, rev=1)
+    Define a process-local tool from type hints. Pass its name in `workpool(tools=[…])`; calls execute in this retained kernel and are fenced across redefine/reset.
+workpool(agent=None, *, name=None, context=None, tools=None) → WorkPool
+    Queue independent items onto persistent children. `tools` exposes only named eval-defined handlers.
+```
+</eval-defined-tools>"#;
 
 /// One live discovered agent projected into eval task guidance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,6 +178,14 @@ pub fn task_description(snapshot: TaskDescriptionSnapshot<'_>) -> Str {
 			"__OMP_EVAL_AGENT_DAG__",
 			if subagents_available {
 				EVAL_AGENT_DAG
+			} else {
+				""
+			},
+		)
+		.replace(
+			"__OMP_EVAL_DEFINED_TOOLS__",
+			if subagents_available {
+				EVAL_DEFINED_TOOLS
 			} else {
 				""
 			},
@@ -532,12 +553,14 @@ pub struct Payload {
 }
 
 /// Typed eval resource or validation failure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fault {
 	/// The timeout was negative or not finite.
+	#[error("eval timeout must be finite and non-negative")]
 	InvalidTimeout,
 	/// The environment resource rejected or lost an operation.
+	#[error("eval resource operation `{operation}` failed: {message}")]
 	Resource {
 		/// Operation that failed.
 		operation: Str,
@@ -545,6 +568,7 @@ pub enum Fault {
 		message:   Str,
 	},
 	/// A worker ended without a terminal cell event.
+	#[error("eval session was lost: {message}")]
 	SessionLost {
 		/// Resource-owned diagnostic.
 		message: Str,
@@ -569,6 +593,90 @@ pub struct RuntimeSnapshot {
 	pub cwd:         Option<PathBuf>,
 	/// Sanitized managed-environment replacements and removals.
 	pub managed_env: BTreeMap<Str, Option<Str>>,
+}
+
+/// One authenticated, generation-fenced eval-defined tool registration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EvalToolRegistration {
+	/// Model-visible stable name.
+	pub name:        Str,
+	/// Model-facing purpose and usage guidance.
+	pub description: Str,
+	/// Closed JSON Schema inferred by the eval kernel.
+	pub parameters:  Value,
+	/// Author-declared semantic contract revision.
+	pub rev:         u16,
+	/// Opaque process-local handler identity.
+	pub handler:     Str,
+	/// Namespace roster generation at description time.
+	pub generation:  u64,
+	/// Owning eval-session reset epoch.
+	#[serde(default)]
+	pub epoch:       u64,
+}
+
+/// Complete immutable registration snapshot forwarded to one child.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EvalToolRoster {
+	/// Namespace roster generation shared by every registration.
+	pub generation: u64,
+	/// Registrations in the caller's requested order.
+	pub tools:      Vec<EvalToolRegistration>,
+	/// Requested names absent from the live namespace.
+	#[serde(default)]
+	pub missing:    Vec<Str>,
+}
+
+/// Terminal result of one eval-defined handler call.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EvalToolResult {
+	/// JSON-safe handler result or diagnostic.
+	pub value:    Value,
+	/// Whether the handler raised or the registration was rejected.
+	pub is_error: bool,
+}
+
+/// Typed eval-defined registry or invocation failure.
+#[derive(Debug, Error)]
+pub enum EvalToolControlError {
+	/// This environment connection cannot invoke retained eval kernels.
+	#[error("eval-defined tool forwarding is unavailable on this environment connection")]
+	Unavailable,
+	/// The owner has not started a persistent eval kernel.
+	#[error("eval kernel for owner `{owner}` is not running")]
+	OwnerUnavailable {
+		/// Authenticated invocation owner.
+		owner: Str,
+	},
+	/// The forwarded registration belongs to an older reset epoch.
+	#[error(
+		"eval tool `{name}` registration belongs to stale reset epoch {received}; current epoch is \
+		 {current}"
+	)]
+	StaleEpoch {
+		/// Tool name.
+		name:     Str,
+		/// Current owner epoch.
+		current:  u64,
+		/// Forwarded epoch.
+		received: u64,
+	},
+	/// The hidden request was cancelled at the kill boundary.
+	#[error("eval-defined tool request was cancelled")]
+	Cancelled,
+	/// The retained kernel returned no valid terminal envelope.
+	#[error("eval-defined tool kernel returned an invalid response")]
+	InvalidResponse,
+	/// JSON protocol encoding or decoding failed.
+	#[error("eval-defined tool protocol JSON is invalid")]
+	Json {
+		/// Serialization error.
+		#[source]
+		source: serde_json::Error,
+	},
+	/// The retained eval resource failed.
+	#[error(transparent)]
+	Eval(#[from] Fault),
 }
 
 /// Request to execute one cell in a persistent session.
@@ -697,7 +805,7 @@ fn format_display_json(outputs: &[DisplayOutput]) -> String {
 /// Python-only `eval@1` implementation retaining one lazy session per owner.
 pub struct EvalTool<E: EvalExec> {
 	exec: E,
-	sessions: DashMap<Str, Arc<OwnerSession>>,
+	sessions: Arc<DashMap<Str, Arc<OwnerSession>>>,
 	control: EvalSessionControl,
 	spec: ToolSpec,
 	next_background_name: AtomicU64,
@@ -709,6 +817,214 @@ struct OwnerSession {
 	reset_generation: AtomicU64,
 }
 
+#[async_trait]
+trait EvalDefinedToolHost: Send + Sync {
+	async fn describe(
+		&self,
+		owner: &str,
+		names: &[Str],
+		cancellation: CancellationToken,
+	) -> Result<EvalToolRoster, EvalToolControlError>;
+
+	async fn invoke(
+		&self,
+		owner: &str,
+		registration: &EvalToolRegistration,
+		args: Value,
+		cancellation: CancellationToken,
+	) -> Result<EvalToolResult, EvalToolControlError>;
+}
+
+struct UnavailableEvalDefinedToolHost;
+
+#[async_trait]
+impl EvalDefinedToolHost for UnavailableEvalDefinedToolHost {
+	async fn describe(
+		&self,
+		_owner: &str,
+		_names: &[Str],
+		_cancellation: CancellationToken,
+	) -> Result<EvalToolRoster, EvalToolControlError> {
+		Err(EvalToolControlError::Unavailable)
+	}
+
+	async fn invoke(
+		&self,
+		_owner: &str,
+		_registration: &EvalToolRegistration,
+		_args: Value,
+		_cancellation: CancellationToken,
+	) -> Result<EvalToolResult, EvalToolControlError> {
+		Err(EvalToolControlError::Unavailable)
+	}
+}
+
+struct LocalEvalDefinedToolHost<E: EvalExec> {
+	exec:             E,
+	sessions:         Arc<DashMap<Str, Arc<OwnerSession>>>,
+	reset_generation: Arc<AtomicU64>,
+}
+
+impl<E: EvalExec> LocalEvalDefinedToolHost<E> {
+	fn owner_session(&self, owner: &str) -> Result<(Str, Arc<OwnerSession>), EvalToolControlError> {
+		if let Some(entry) = self.sessions.get(owner) {
+			return Ok((entry.key().clone(), Arc::clone(entry.value())));
+		}
+		let mut found = None;
+		for entry in self.sessions.iter() {
+			let matches_parent = serde_json::from_str::<(Str, Str)>(entry.key().as_str())
+				.is_ok_and(|(session, agent)| session.as_str() == owner && !agent.is_empty());
+			if !matches_parent {
+				continue;
+			}
+			if found.is_some() {
+				return Err(EvalToolControlError::OwnerUnavailable { owner: Str::new(owner) });
+			}
+			found = Some((entry.key().clone(), Arc::clone(entry.value())));
+		}
+		found.ok_or_else(|| EvalToolControlError::OwnerUnavailable { owner: Str::new(owner) })
+	}
+
+	async fn request(
+		&self,
+		owner: &str,
+		request: Value,
+		cancellation: CancellationToken,
+	) -> Result<Value, EvalToolControlError> {
+		let (runtime_owner, owned) = self.owner_session(owner)?;
+		let session = owned
+			.session
+			.get()
+			.ok_or_else(|| EvalToolControlError::OwnerUnavailable { owner: Str::new(owner) })?
+			.clone();
+		let request =
+			serde_json::to_string(&request).map_err(|source| EvalToolControlError::Json { source })?;
+		let literal =
+			serde_json::to_string(&request).map_err(|source| EvalToolControlError::Json { source })?;
+		let runtime = self
+			.exec
+			.runtime_snapshot(runtime_owner.as_str(), &session)?;
+		let mut run = self
+			.exec
+			.run(&session, RunRequest {
+				code: sf!("__omp_eval_tool_request__(__import__('json').loads({literal}))"),
+				timeout: None,
+				reset: false,
+				runtime,
+			})
+			.await?;
+		loop {
+			tokio::select! {
+				biased;
+				() = cancellation.cancelled() => {
+					run.cancel().await?;
+					return Err(EvalToolControlError::Cancelled);
+				},
+				event = run.next_event() => match event? {
+					Some(RunEvent::Started { .. } | RunEvent::Output(_)) => {},
+					Some(RunEvent::Completed(completion)) => {
+						if completion.status.outcome != CellOutcome::Complete {
+							return Err(EvalToolControlError::InvalidResponse);
+						}
+						return completion
+							.result
+							.and_then(|result| result.json)
+							.ok_or(EvalToolControlError::InvalidResponse);
+					},
+					None => return Err(EvalToolControlError::InvalidResponse),
+				},
+			}
+		}
+	}
+}
+
+#[async_trait]
+impl<E: EvalExec> EvalDefinedToolHost for LocalEvalDefinedToolHost<E> {
+	async fn describe(
+		&self,
+		owner: &str,
+		names: &[Str],
+		cancellation: CancellationToken,
+	) -> Result<EvalToolRoster, EvalToolControlError> {
+		let value = self
+			.request(owner, serde_json::json!({ "op": "describe", "names": names }), cancellation)
+			.await?;
+		if value.get("ok").and_then(Value::as_bool) != Some(true) {
+			return Err(EvalToolControlError::InvalidResponse);
+		}
+		let mut roster = serde_json::from_value::<EvalToolRoster>(value)
+			.map_err(|source| EvalToolControlError::Json { source })?;
+		let epoch = self.reset_generation.load(Ordering::Acquire);
+		for tool in &mut roster.tools {
+			if tool.generation != roster.generation
+				|| tool.name.is_empty()
+				|| tool.rev == 0
+				|| tool.handler.is_empty()
+				|| !tool.parameters.is_object()
+			{
+				return Err(EvalToolControlError::InvalidResponse);
+			}
+			tool.epoch = epoch;
+		}
+		Ok(roster)
+	}
+
+	async fn invoke(
+		&self,
+		owner: &str,
+		registration: &EvalToolRegistration,
+		mut args: Value,
+		cancellation: CancellationToken,
+	) -> Result<EvalToolResult, EvalToolControlError> {
+		let current = self.reset_generation.load(Ordering::Acquire);
+		if registration.epoch != current {
+			return Err(EvalToolControlError::StaleEpoch {
+				name: registration.name.clone(),
+				current,
+				received: registration.epoch,
+			});
+		}
+		if let Some(object) = args.as_object_mut() {
+			let schema_declares_intent = registration
+				.parameters
+				.get("properties")
+				.and_then(Value::as_object)
+				.is_some_and(|properties| properties.contains_key("i"));
+			if !schema_declares_intent {
+				object.remove("i");
+			}
+		}
+		let value = self
+			.request(
+				owner,
+				serde_json::json!({
+					"op": "call",
+					"name": registration.name,
+					"rev": registration.rev,
+					"handler": registration.handler,
+					"generation": registration.generation,
+					"args": args,
+				}),
+				cancellation,
+			)
+			.await?;
+		match value.get("ok").and_then(Value::as_bool) {
+			Some(true) => Ok(EvalToolResult {
+				value:    value.get("value").cloned().unwrap_or(Value::Null),
+				is_error: false,
+			}),
+			Some(false) => Ok(EvalToolResult {
+				value:    value
+					.get("error")
+					.cloned()
+					.unwrap_or_else(|| Value::String("eval-defined tool failed".to_owned())),
+				is_error: true,
+			}),
+			None => Err(EvalToolControlError::InvalidResponse),
+		}
+	}
+}
+
 /// External reset and disposal trigger used when chat identity changes.
 #[derive(Clone)]
 pub struct EvalSessionControl {
@@ -716,16 +1032,24 @@ pub struct EvalSessionControl {
 }
 
 enum EvalSessionControlInner {
-	Local { reset_generation: AtomicU64, dispose_all: Arc<dyn Fn() + Send + Sync> },
-	Remote { client: EnvClient, runtime: runtime::Handle },
+	Local {
+		reset_generation: Arc<AtomicU64>,
+		dispose_all:      Arc<dyn Fn() + Send + Sync>,
+		tool_host:        Arc<dyn EvalDefinedToolHost>,
+	},
+	Remote {
+		client:  EnvClient,
+		runtime: runtime::Handle,
+	},
 }
 
 impl Default for EvalSessionControl {
 	fn default() -> Self {
 		Self {
 			inner: Arc::new(EvalSessionControlInner::Local {
-				reset_generation: AtomicU64::new(0),
+				reset_generation: Arc::new(AtomicU64::new(0)),
 				dispose_all:      Arc::new(|| {}),
+				tool_host:        Arc::new(UnavailableEvalDefinedToolHost),
 			}),
 		}
 	}
@@ -746,10 +1070,91 @@ impl EvalSessionControl {
 		}
 	}
 
+	/// Seals registrations carried by an authenticated eval bridge call.
+	///
+	/// The reset epoch is host-owned and cannot be supplied by Python. Namespace
+	/// generation and opaque handler identity remain child-owned and are checked
+	/// again inside the retained process on every call.
+	pub fn seal_registrations(
+		&self,
+		mut tools: Vec<EvalToolRegistration>,
+	) -> Result<EvalToolRoster, EvalToolControlError> {
+		let epoch = match self.inner.as_ref() {
+			EvalSessionControlInner::Local { reset_generation, .. } => {
+				reset_generation.load(Ordering::Acquire)
+			},
+			EvalSessionControlInner::Remote { .. } => return Err(EvalToolControlError::Unavailable),
+		};
+		let generation = tools.first().map_or(0, |tool| tool.generation);
+		let mut names = std::collections::BTreeSet::new();
+		for tool in &mut tools {
+			if generation == 0
+				|| tool.generation != generation
+				|| tool.name.is_empty()
+				|| tool.rev == 0
+				|| tool.handler.is_empty()
+				|| !tool.parameters.is_object()
+				|| !names.insert(tool.name.clone())
+			{
+				return Err(EvalToolControlError::InvalidResponse);
+			}
+			tool.epoch = epoch;
+		}
+		Ok(EvalToolRoster { generation, tools, missing: Vec::new() })
+	}
+
+	/// Resolves exact eval-defined registrations in requested order.
+	///
+	/// The returned epoch and handler identities are checked again on every
+	/// invocation, so a reset, redefine, or undefine can never retarget an
+	/// already-running child.
+	pub async fn describe_tools(
+		&self,
+		owner: &str,
+		names: &[Str],
+		cancellation: CancellationToken,
+	) -> Result<EvalToolRoster, EvalToolControlError> {
+		match self.inner.as_ref() {
+			EvalSessionControlInner::Local { tool_host, .. } => {
+				tool_host.describe(owner, names, cancellation).await
+			},
+			EvalSessionControlInner::Remote { .. } => Err(EvalToolControlError::Unavailable),
+		}
+	}
+
+	/// Calls one exact eval-defined handler registration.
+	///
+	/// Handler failures are returned as [`EvalToolResult::is_error`]; transport,
+	/// cancellation, and generation failures remain typed control errors.
+	pub async fn invoke_tool(
+		&self,
+		owner: &str,
+		registration: &EvalToolRegistration,
+		args: Value,
+		cancellation: CancellationToken,
+	) -> Result<EvalToolResult, EvalToolControlError> {
+		match self.inner.as_ref() {
+			EvalSessionControlInner::Local { reset_generation, tool_host, .. } => {
+				let current = reset_generation.load(Ordering::Acquire);
+				if registration.epoch != current {
+					return Err(EvalToolControlError::StaleEpoch {
+						name: registration.name.clone(),
+						current,
+						received: registration.epoch,
+					});
+				}
+				tool_host
+					.invoke(owner, registration, args, cancellation)
+					.await
+			},
+			EvalSessionControlInner::Remote { .. } => Err(EvalToolControlError::Unavailable),
+		}
+	}
+
 	/// Disposes every live process and makes each owner's next cell fresh.
 	pub fn request_reset(&self) {
 		match self.inner.as_ref() {
-			EvalSessionControlInner::Local { reset_generation, dispose_all } => {
+			EvalSessionControlInner::Local { reset_generation, dispose_all, .. } => {
 				reset_generation.fetch_add(1, Ordering::AcqRel);
 				dispose_all();
 			},
@@ -834,15 +1239,23 @@ fn eval_controlled_described<E: EvalExec>(
 	description: Str,
 ) -> (EvalTool<E>, EvalSessionControl) {
 	let disposer = exec.clone();
+	let sessions = Arc::new(DashMap::new());
+	let reset_generation = Arc::new(AtomicU64::new(0));
+	let tool_host: Arc<dyn EvalDefinedToolHost> = Arc::new(LocalEvalDefinedToolHost {
+		exec:             exec.clone(),
+		sessions:         Arc::clone(&sessions),
+		reset_generation: Arc::clone(&reset_generation),
+	});
 	let control = EvalSessionControl {
 		inner: Arc::new(EvalSessionControlInner::Local {
-			reset_generation: AtomicU64::new(0),
-			dispose_all:      Arc::new(move || disposer.dispose_all()),
+			reset_generation,
+			dispose_all: Arc::new(move || disposer.dispose_all()),
+			tool_host,
 		}),
 	};
 	let tool = EvalTool {
 		exec,
-		sessions: DashMap::new(),
+		sessions,
 		control: control.clone(),
 		next_background_name: AtomicU64::new(1),
 		auto_background_threshold: DEFAULT_AUTO_BACKGROUND_THRESHOLD,
@@ -1277,7 +1690,162 @@ mod cow_bytes {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::AtomicBool;
+
+	use parking_lot::Mutex;
+
 	use super::*;
+
+	#[derive(Clone)]
+	struct EvalToolProtocolExec {
+		last_code: Arc<Mutex<Str>>,
+		cancelled: Arc<AtomicBool>,
+	}
+
+	struct EvalToolProtocolRun {
+		event:     Option<RunEvent>,
+		pending:   bool,
+		cancelled: Arc<AtomicBool>,
+	}
+
+	impl EvalRun for EvalToolProtocolRun {
+		fn reset(&self) -> bool {
+			false
+		}
+
+		async fn next_event(&mut self) -> Result<Option<RunEvent>, Fault> {
+			if self.pending {
+				future::pending().await
+			} else {
+				Ok(self.event.take())
+			}
+		}
+
+		async fn cancel(&self) -> Result<(), Fault> {
+			self.cancelled.store(true, Ordering::Release);
+			Ok(())
+		}
+	}
+
+	impl EvalExec for EvalToolProtocolExec {
+		type Run = EvalToolProtocolRun;
+
+		async fn open_session(&self) -> Result<Session, Fault> {
+			Ok(Session { id: Bytes::from_static(b"eval-tools") })
+		}
+
+		async fn run<'a>(
+			&'a self,
+			_session: &'a Session,
+			request: RunRequest,
+		) -> Result<Self::Run, Fault> {
+			let pending = request.code.contains(r#"\"name\":\"hang\""#);
+			*self.last_code.lock() = request.code;
+			Ok(EvalToolProtocolRun {
+				event: Some(RunEvent::Completed(RunCompletion {
+					status:          CellStatus {
+						outcome:     CellOutcome::Complete,
+						exit_code:   Some(0),
+						duration_ms: 1,
+						exception:   None,
+					},
+					result:          Some(CellValue {
+						text: sf!("ok"),
+						json: Some(serde_json::json!({
+							"ok": true,
+							"value": { "score": 9 }
+						})),
+					}),
+					display_outputs: Vec::new(),
+				})),
+				pending,
+				cancelled: Arc::clone(&self.cancelled),
+			})
+		}
+	}
+
+	fn protocol_control() -> (EvalSessionControl, Arc<Mutex<Str>>, Arc<AtomicBool>) {
+		let last_code = Arc::new(Mutex::new(Str::default()));
+		let cancelled = Arc::new(AtomicBool::new(false));
+		let exec = EvalToolProtocolExec {
+			last_code: Arc::clone(&last_code),
+			cancelled: Arc::clone(&cancelled),
+		};
+		let sessions = Arc::new(DashMap::new());
+		let owned = Arc::new(OwnerSession {
+			session:          OnceCell::new(),
+			reset_generation: AtomicU64::new(0),
+		});
+		owned
+			.session
+			.set(Session { id: Bytes::from_static(b"eval-tools") })
+			.expect("install session");
+		sessions.insert(sf!("owner"), owned);
+		let reset_generation = Arc::new(AtomicU64::new(0));
+		let tool_host: Arc<dyn EvalDefinedToolHost> = Arc::new(LocalEvalDefinedToolHost {
+			exec,
+			sessions,
+			reset_generation: Arc::clone(&reset_generation),
+		});
+		(
+			EvalSessionControl {
+				inner: Arc::new(EvalSessionControlInner::Local {
+					reset_generation,
+					dispose_all: Arc::new(|| {}),
+					tool_host,
+				}),
+			},
+			last_code,
+			cancelled,
+		)
+	}
+
+	#[tokio::test]
+	async fn forwarded_handler_calls_return_json_strip_harness_intent_and_cancel() {
+		let (control, last_code, cancelled) = protocol_control();
+		let registration = control
+			.seal_registrations(vec![EvalToolRegistration {
+				name:        sf!("score"),
+				description: sf!("Score"),
+				parameters:  serde_json::json!({
+					"type": "object",
+					"properties": { "value": { "type": "integer" } }
+				}),
+				rev:         3,
+				handler:     sf!("handler"),
+				generation:  2,
+				epoch:       0,
+			}])
+			.expect("seal registration")
+			.tools
+			.remove(0);
+		let result = control
+			.invoke_tool(
+				"owner",
+				&registration,
+				serde_json::json!({ "i": "Scoring", "value": 4 }),
+				CancellationToken::new(),
+			)
+			.await
+			.expect("invoke handler");
+		assert_eq!(result, EvalToolResult {
+			value:    serde_json::json!({ "score": 9 }),
+			is_error: false,
+		});
+		assert!(!last_code.lock().contains(r#"\"i\""#));
+
+		let mut hanging = registration;
+		hanging.name = sf!("hang");
+		let stop = CancellationToken::new();
+		stop.cancel();
+		assert!(matches!(
+			control
+				.invoke_tool("owner", &hanging, serde_json::json!({}), stop)
+				.await,
+			Err(EvalToolControlError::Cancelled)
+		));
+		assert!(cancelled.load(Ordering::Acquire));
+	}
 
 	#[test]
 	fn standard_task_description_omits_empty_extension_helpers() {
@@ -1475,22 +2043,42 @@ mod tests {
 		assert!(tool.prompt(Ok(&payload), &caps).is_empty());
 	}
 
-	#[test]
-	fn local_control_increments_generation_and_disposes_synchronously() {
+	#[tokio::test]
+	async fn local_control_increments_generation_and_fences_forwarded_handlers() {
 		let disposals = Arc::new(AtomicU64::new(0));
 		let observed = Arc::clone(&disposals);
 		let control = EvalSessionControl {
 			inner: Arc::new(EvalSessionControlInner::Local {
-				reset_generation: AtomicU64::new(0),
+				reset_generation: Arc::new(AtomicU64::new(0)),
 				dispose_all:      Arc::new(move || {
 					observed.fetch_add(1, Ordering::AcqRel);
 				}),
+				tool_host:        Arc::new(UnavailableEvalDefinedToolHost),
 			}),
 		};
+
+		let roster = control
+			.seal_registrations(vec![EvalToolRegistration {
+				name:        sf!("score"),
+				description: sf!("Score one value"),
+				parameters:  serde_json::json!({"type":"object"}),
+				rev:         2,
+				handler:     sf!("handler-a"),
+				generation:  7,
+				epoch:       u64::MAX,
+			}])
+			.expect("registration seals");
+		assert_eq!(roster.tools[0].epoch, 0);
 
 		control.request_reset();
 		assert_eq!(control.reset_generation(), 1);
 		assert_eq!(disposals.load(Ordering::Acquire), 1);
+		assert!(matches!(
+			control
+				.invoke_tool("owner", &roster.tools[0], serde_json::json!({}), CancellationToken::new(),)
+				.await,
+			Err(EvalToolControlError::StaleEpoch { current: 1, received: 0, .. })
+		));
 	}
 
 	#[tokio::test]

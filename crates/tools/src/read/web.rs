@@ -147,8 +147,13 @@ pub async fn read_resource<C: HttpClient + Sync>(
 
 	let extension = extension_hint(&response.final_url, response.header("content-disposition"));
 	if is_image(&content_type, &extension)
-		&& let Some(processed) = image::process_image(response.body.clone())
-			.map_err(|error| WebError::render(error.to_string()))?
+		&& let Some(processed) = tokio::task::spawn_blocking({
+			let bytes = response.body.clone();
+			move || image::process_image(bytes)
+		})
+		.await
+		.map_err(|_| WebError::render("image processing task failed"))?
+		.map_err(|error| WebError::render(error.to_string()))?
 	{
 		let content = processed.description.clone();
 		return Ok(WebRead {

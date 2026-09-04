@@ -51,6 +51,7 @@ impl grep::WorkspaceSearch for FakeWorkspace {
 	fn glob(
 		&self,
 		_request: glob::WalkRequest,
+		_cancellation: tokio_util::sync::CancellationToken,
 	) -> impl Future<Output = Result<glob::WalkResult, glob::Fault>> + Send + '_ {
 		future::ready(Err(glob::Fault::Workspace { message: sf!("unused fake glob boundary") }))
 	}
@@ -186,7 +187,7 @@ fn schema_is_exactly_the_native_grep_schema() {
 				},
 				"notrunc": {
 					"type": "boolean",
-					"description": "Return complete output inline without central truncation."
+					"description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."
 				}
 			}
 		})

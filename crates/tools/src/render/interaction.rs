@@ -53,13 +53,21 @@ impl RenderFold for AskRenderer {
 			},
 			None => Some(render_ask(&state.questions, None).into()),
 			Some(CallOutcome::Ok(payload)) => {
-				Some(render_ask(&state.questions, Some(&payload.answers)).into())
+				let rendered = if state.questions.is_empty() {
+					render_durable_ask(&payload.answers)
+				} else {
+					render_ask(&state.questions, Some(&payload.answers))
+				};
+				Some(rendered.into())
 			},
 			Some(CallOutcome::Faulted(fault)) => {
 				let message = match fault {
-					AskFault::Invalid { message }
-					| AskFault::Presenter { message }
-					| AskFault::Cancelled { message } => message,
+					AskFault::Invalid { message } | AskFault::Presenter { message } => message.as_str(),
+					AskFault::Cancelled { message } => message.as_str(),
+					AskFault::RequiresInteractive => "Ask tool requires interactive mode",
+					AskFault::InvalidPresentation => {
+						"Ask presenter returned selections that do not match the questions"
+					},
 				};
 				Some(render_fault(message).into())
 			},
@@ -182,6 +190,32 @@ fn render_ask(questions: &[AskQuestion], answers: Option<&[AskAnswer]>) -> El {
 	}
 }
 
+fn render_durable_ask(answers: &[AskAnswer]) -> El {
+	view! {
+		<col gap=1>
+			for answer in answers {
+				<col gap=0>
+					<row sep=" · ">
+						<fact label="ID">{&answer.id}</fact>
+						<fact label="Options"><num value={answer.options.len()} compact/></fact>
+						if answer.multi { <fact label="Mode">{"multiple"}</fact> }
+					</row>
+					<text bold wrap="word">{&answer.question}</text>
+					for option in &answer.options {
+						<choice
+							multi={answer.multi}
+							selected={answer.selected.contains(option)}
+						>
+							{option}
+						</choice>
+					}
+					{render_written_answer(answer)}
+				</col>
+			}
+		</col>
+	}
+}
+
 fn render_question(question: &AskQuestion, answers: Option<&[AskAnswer]>) -> El {
 	let answer = answers.and_then(|items| items.iter().find(|item| item.id == question.id));
 	view! {
@@ -211,6 +245,23 @@ fn render_question(question: &AskQuestion, answers: Option<&[AskAnswer]>) -> El 
 						<choice multi={question.multi} selected>{selected}</choice>
 					}
 				}
+				{render_written_answer(answer)}
+			}
+		</col>
+	}
+}
+
+fn render_written_answer(answer: &AskAnswer) -> El {
+	view! {
+		<col gap=0>
+			if let Some(custom) = &answer.custom_input {
+				<fact label="Other">{custom}</fact>
+			}
+			if let Some(note) = &answer.note {
+				<fact label="Note">{note}</fact>
+			}
+			if answer.timed_out {
+				<text fg=muted>{"auto-selected after timeout — not a user choice"}</text>
 			}
 		</col>
 	}
@@ -284,7 +335,7 @@ pub(crate) fn gallery_fixtures(
 			streaming_args: r#"{"questions":[{"id":"db","question":"Which database should the new service use?","options":[{"label":"Postgres","description":"Relational, strong consistency, JSONB support"},{"label":"SQLite","description":"Embedded, zero-ops, great for single-node"},{"label":"MongoDB","description":"Document store, flexible schema"}],"recommended":0},{"id":"features","question":"Which auth flows should sh"#,
 			args: r#"{"questions":[{"id":"db","question":"Which database should the new service use?","options":[{"label":"Postgres","description":"Relational, strong consistency, JSONB support"},{"label":"SQLite","description":"Embedded, zero-ops, great for single-node"},{"label":"MongoDB","description":"Document store, flexible schema"}],"recommended":0},{"id":"features","question":"Which auth flows should ship in v1?","options":[{"label":"Email + password"},{"label":"OAuth (Google, GitHub)"},{"label":"Magic links"},{"label":"SAML SSO","description":"Enterprise; can be deferred"}],"multi":true}]}"#,
 			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"answers":[{"id":"db","selected":["Postgres"],"timed_out":false},{"id":"features","selected":["Email + password","OAuth (Google, GitHub)","Custom <flow>"],"timed_out":false}],"headless":false}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"answers":[{"id":"db","question":"Which database should the new service use?","options":["Postgres","SQLite","MongoDB"],"multi":false,"selected":["Postgres"],"timed_out":false},{"id":"features","question":"Which auth flows should ship in v1?","options":["Email + password","OAuth (Google, GitHub)","Magic links","SAML SSO"],"multi":true,"selected":["Email + password","OAuth (Google, GitHub)"],"customInput":"Custom <flow>","timed_out":false}]}}"#,
 			error_outcome: br#"{"kind":"faulted","value":{"kind":"presenter","message":"Prompt cancelled by user before any answer was given"}}"#,
 		},
 		RendererGalleryFixture {
@@ -343,7 +394,7 @@ mod tests {
 			.expect("ask success renders");
 		assert!(success.contains("<choice selected>Postgres</choice>"));
 		assert!(success.contains("<choice multi selected>Email + password</choice>"));
-		assert!(success.contains("<choice multi selected>Custom &lt;flow&gt;</choice>"));
+		assert!(success.contains("<fact label=Other>Custom &lt;flow&gt;</fact>"));
 		assert!(success.contains("Relational, strong consistency, JSONB support"));
 		assert!(!success.contains('●'));
 		assert!(!success.contains('○'));

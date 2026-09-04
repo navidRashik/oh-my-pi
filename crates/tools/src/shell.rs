@@ -1002,6 +1002,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 						}
 					}
 					push_transcript(&mut projection, &payload.transcript);
+					push_spilled_output(&mut projection, payload.status.spilled_output.as_ref());
 					if !caps.media {
 						push_attachment_fallbacks(&mut projection, attachments);
 					}
@@ -1014,6 +1015,7 @@ impl<E: ShellExec> Tool for ShellTool<E> {
 				);
 				if projection.push(&status) {
 					push_transcript(&mut projection, &payload.transcript);
+					push_spilled_output(&mut projection, payload.status.spilled_output.as_ref());
 					if !caps.media {
 						push_attachment_fallbacks(&mut projection, attachments);
 					}
@@ -1230,6 +1232,15 @@ fn push_attachment_fallbacks(projection: &mut TextProjection, attachments: &[Blo
 		)) {
 			break;
 		}
+	}
+}
+
+fn push_spilled_output(projection: &mut TextProjection, spilled: Option<&BlobRef>) {
+	if let Some(spilled) = spilled {
+		let _ = projection.push(&format!(
+			"[full output: artifact://sha256/{}; {} bytes]\n",
+			spilled.hash, spilled.byte_len
+		));
 	}
 }
 

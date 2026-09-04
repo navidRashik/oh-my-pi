@@ -3,7 +3,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use async_stream::stream;
-use futures::{FutureExt, Stream, pin_mut, select_biased};
+use futures::Stream;
 use omp_core::{Str, sf};
 use omp_tool::{
 	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, DocEffects, Effects, Ev, IncomingParams,
@@ -11,6 +11,7 @@ use omp_tool::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::{
@@ -286,33 +287,29 @@ impl<W: WorkspaceSearch> Tool for Glob<W> {
 			}
 			let resource_scheme = unsupported_scheme(&path);
 			let request = walk_request(path, arguments.hidden, arguments.gitignore, limit);
-			if let Some(scheme) = resource_scheme {
-				let resource = self.workspace.glob_resource(request.clone()).instrument(span.clone()).await;
-				match resource {
-					Some(Ok(result)) => {
-						yield done(Ok(payload(result, limit, DEFAULT_TIMEOUT_MS)));
-					},
-					Some(Err(fault)) => {
-						yield done(Err(fault));
-					},
-					None => {
-						yield done(Err(Fault::UnsupportedScheme { scheme }));
-					},
-				}
-				return;
-			}
+			let cancellation = CancellationToken::new();
 			let operation = async {
-				let result = self.workspace.glob(request).await?;
+				let result = if let Some(scheme) = resource_scheme {
+					match self.workspace.glob_resource(request, cancellation.clone()).await {
+						Some(result) => result,
+						None => Err(Fault::UnsupportedScheme { scheme }),
+					}
+				} else {
+					self.workspace.glob(request, cancellation.clone()).await
+				}?;
 				Ok(payload(result, limit, DEFAULT_TIMEOUT_MS))
-			}.instrument(span.clone()).fuse();
-			let interruption = params.next_interrupt().fuse();
-			pin_mut!(operation, interruption);
-			select_biased! {
-				result = operation => {
-					yield done(result);
-				},
-				interrupt = interruption => {
+			}
+			.instrument(span.clone());
+			tokio::pin!(operation);
+			tokio::select! {
+				biased;
+				interrupt = params.next_interrupt() => {
+					cancellation.cancel();
+					let _ = operation.await;
 					yield interrupt_event(interrupt, "glob traversal owner disappeared");
+				},
+				result = &mut operation => {
+					yield done(result);
 				},
 			}
 		}

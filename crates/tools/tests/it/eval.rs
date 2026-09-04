@@ -265,7 +265,7 @@ fn constructed_tool_spec_has_exact_python_only_schema() {
 							},
 							"notrunc": {
 								"type": "boolean",
-								"description": "Return complete output inline without central truncation."
+								"description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."
 							}}
 		})
 	);

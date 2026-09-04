@@ -8,9 +8,6 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum explicit file targets from one glob.
 pub const MAX_GLOB_TARGETS: usize = 20;
-/// Maximum rendered findings.
-pub const MAX_DIAGNOSTICS: usize = 50;
-
 /// Source-independent diagnostics result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DiagnosticResult {
@@ -23,15 +20,10 @@ pub struct DiagnosticResult {
 }
 
 impl DiagnosticResult {
-	/// Normalizes, sorts, and bounds findings.
+	/// Normalizes and sorts findings without applying a second tool-local
+	/// output bound. The runtime owns inline projection and artifact spill.
 	pub fn new(diagnostics: Vec<Diagnostic>, complete: bool) -> Self {
-		let diagnostics = normalize(diagnostics);
-		let omitted = diagnostics.len().saturating_sub(MAX_DIAGNOSTICS);
-		Self {
-			diagnostics: diagnostics.into_iter().take(MAX_DIAGNOSTICS).collect(),
-			omitted,
-			complete,
-		}
+		Self { diagnostics: normalize(diagnostics), omitted: 0, complete }
 	}
 }
 

@@ -207,16 +207,15 @@ fn render_ast_grep_payload(payload: &AstGrepPayload) -> El {
 }
 
 fn render_ast_edit_payload(payload: &AstEditPayload) -> El {
-	let replacements = payload
-		.files
-		.iter()
-		.map(|file| u64::from(file.replacements))
-		.sum::<u64>();
 	view! {
 		<col gap=1>
 			<row gap=1>
 				<text bold fg=accent>
-					{sf!("{replacements} replacements · {} files", payload.files.len())}
+					{sf!(
+						"{} replacements · {} files",
+						payload.total_replacements,
+						payload.files_touched
+					)}
 				</text>
 			</row>
 			for (file, (added, removed)) in payload
@@ -230,11 +229,12 @@ fn render_ast_edit_payload(payload: &AstEditPayload) -> El {
 					<diff max-rows=40 overflow="diff rows">{&file.diff}</diff>
 				</col>
 			}
-			if payload.pending_proposal.is_some() {
+			if let Some(proposal) = &payload.pending_proposal {
 				<row gap=1>
 					<state status="active"/>
 					<text bold>{"proposed"}</text>
-					<text fg=muted>{"resolve to apply or reject"}</text>
+					<fact label="Proposal">{proposal}</fact>
+					<text fg=muted>{"resolve or reject this exact id"}</text>
 				</row>
 			} else if let Some(recovery_root) = &payload.recovery_root {
 				<row gap=1>
@@ -245,6 +245,25 @@ fn render_ast_edit_payload(payload: &AstEditPayload) -> El {
 			}
 			for advisory in &payload.advisories {
 				<callout kind="warn">{&advisory.path}{": "}{&advisory.message}</callout>
+			}
+			if payload.advisories_total > payload.advisories.len() {
+				<callout kind="warn">
+					{sf!(
+						"{} additional advisories omitted",
+						payload.advisories_total - payload.advisories.len()
+					)}
+				</callout>
+			}
+			for error in &payload.parse_errors {
+				<callout kind="warn">{error}</callout>
+			}
+			if payload.parse_errors_total > payload.parse_errors.len() {
+				<callout kind="warn">
+					{sf!(
+						"{} additional parse issues omitted",
+						payload.parse_errors_total - payload.parse_errors.len()
+					)}
+				</callout>
 			}
 		</col>
 	}
@@ -288,7 +307,7 @@ pub(crate) fn gallery_fixtures(
 			streaming_args: r#"{"ops":[{"pat":"$A && $A.$B","out":"$A?."#,
 			args:           r#"{"ops":[{"pat":"$A && $A.$B","out":"$A?.$B"}],"paths":["packages/tui/src/**/*.ts"]}"#,
 			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"files":[{"path":"packages/tui/src/components/Message.ts","replacements":2,"before_hash":"a71c9d3b245e","after_hash":"9d21b8f4430a","diff":" 40|export function authorName(message: Message) {\n-41|  return message.author && message.author.name;\n+41|  return message.author?.name;\n 42|}\n-67|  const avatar = user && user.avatar;\n+67|  const avatar = user?.avatar;"},{"path":"packages/tui/src/runtime/session.ts","replacements":1,"before_hash":"52f6a77e8c03","after_hash":"e048bfc91d77","diff":" 88|  const active = sessions.get(id);\n-89|  return active && active.transport;\n+89|  return active?.transport;\n 90|}"}],"advisories":[],"recovery_root":null,"pending_proposal":"proposal-ast-edit-7"}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"files":[{"path":"packages/tui/src/components/Message.ts","replacements":2,"before_hash":"a71c9d3b245e","after_hash":"9d21b8f4430a","diff":" 40|export function authorName(message: Message) {\n-41|  return message.author && message.author.name;\n+41|  return message.author?.name;\n 42|}\n-67|  const avatar = user && user.avatar;\n+67|  const avatar = user?.avatar;"},{"path":"packages/tui/src/runtime/session.ts","replacements":1,"before_hash":"52f6a77e8c03","after_hash":"e048bfc91d77","diff":" 88|  const active = sessions.get(id);\n-89|  return active && active.transport;\n+89|  return active?.transport;\n 90|}"}],"advisories":[],"advisories_total":0,"parse_errors":[],"parse_errors_total":0,"files_searched":17,"files_touched":2,"total_replacements":3,"recovery_root":null,"pending_proposal":"proposal-ast-edit-7"}}"#,
 			error_outcome: br#"{"kind":"faulted","value":{"message":"operation 1 pattern parse error: unmatched `(`"}}"#,
 		},
 	]
@@ -385,13 +404,14 @@ mod tests {
 		assert!(view.contains("-41|"));
 		assert!(view.contains("+41|"));
 		assert!(view.contains("<state status=active/><text bold>proposed</text>"));
+		assert!(view.contains("<fact label=Proposal>proposal-ast-edit-7</fact>"));
 		assert!(!view.contains("⟨proposed⟩"));
 	}
 
 	#[test]
 	fn ast_edit_applied_state_preserves_recovery_and_advisory() {
 		let payload: AstEditPayload = serde_json::from_str(
-			r#"{"files":[{"path":"src/main.rs","replacements":1,"before_hash":"000000000000","after_hash":"111111111111","diff":"-1|old\n+1|new"}],"advisories":[{"path":"src/<skip>.rs","message":"unsupported <language> & encoding"}],"recovery_root":".omp/recovery/<snapshot>&","pending_proposal":null}"#,
+			r#"{"files":[{"path":"src/main.rs","replacements":1,"before_hash":"000000000000","after_hash":"111111111111","diff":"-1|old\n+1|new"}],"advisories":[{"path":"src/<skip>.rs","message":"unsupported <language> & encoding"}],"advisories_total":1,"parse_errors":["src/<broken>.rs: parse error & recovered"],"parse_errors_total":2,"files_searched":2,"files_touched":1,"total_replacements":1,"recovery_root":".omp/recovery/<snapshot>&","pending_proposal":null}"#,
 		)
 		.unwrap();
 		let view = render_ast_edit_payload(&payload).to_tml();
@@ -402,6 +422,10 @@ mod tests {
 			"<callout kind=warn>src/&lt;skip&gt;.rs: unsupported &lt;language&gt; &amp; \
 			 encoding</callout>"
 		));
+		assert!(view.contains(
+			"<callout kind=warn>src/&lt;broken&gt;.rs: parse error &amp; recovered</callout>"
+		));
+		assert!(view.contains("<callout kind=warn>1 additional parse issues omitted</callout>"));
 	}
 
 	#[test]

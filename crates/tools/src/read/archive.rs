@@ -128,6 +128,19 @@ pub struct ArchiveBinaryMember {
 	pub notice: String,
 }
 
+/// One selected binary member with its bounded materialized bytes.
+///
+/// Whole-archive search retains only [`ArchiveBinaryMember`] metadata; bytes
+/// are carried only for the exact member selected by `Read`, allowing image
+/// projection without keeping every binary entry resident.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveBinaryContent {
+	/// Binary member metadata and fallback notice.
+	pub member: ArchiveBinaryMember,
+	/// Exact uncompressed bytes of the selected member.
+	pub bytes:  Bytes,
+}
+
 /// The content selected from an archive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArchiveContent {
@@ -136,7 +149,7 @@ pub enum ArchiveContent {
 	/// A member accepted by the UTF-8 text classifier.
 	Text(ArchiveTextMember),
 	/// A binary or invalid-UTF-8 member.
-	Binary(ArchiveBinaryMember),
+	Binary(ArchiveBinaryContent),
 }
 
 /// An archive read with the member selector preserved for the standard text
@@ -482,9 +495,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
 			let (offset, limit) = selector.offset_limit();
 			ArchiveContent::Directory(self.read_directory_slice(member_path, offset, limit)?)
 		} else {
-			match self.read_text_member(member_path)? {
-				Ok(text) => ArchiveContent::Text(text),
-				Err(binary) => ArchiveContent::Binary(binary),
+			let member = self.read_member(member_path)?;
+			if let Some(text) = decode_utf8_text(&member.bytes) {
+				ArchiveContent::Text(ArchiveTextMember { node: member.node, text })
+			} else {
+				let notice = binary_member_notice(&member.node.path, member.node.size);
+				ArchiveContent::Binary(ArchiveBinaryContent {
+					member: ArchiveBinaryMember { node: member.node, notice },
+					bytes: member.bytes,
+				})
 			}
 		};
 		Ok(ArchiveRead { selector, content })

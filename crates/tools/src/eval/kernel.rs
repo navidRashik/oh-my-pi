@@ -2398,22 +2398,18 @@ print("right")"#
 		let original = env::current_dir().expect("current directory");
 		let first = tempfile::tempdir().expect("first runtime directory");
 		let second = tempfile::tempdir().expect("second runtime directory");
-		let snapshot = |cwd: &Path, session_file: Option<&str>| RuntimeSnapshot {
+		let snapshot = |cwd: &Path, local_roots: Option<&str>| RuntimeSnapshot {
 			cwd:         Some(cwd.to_path_buf()),
-			managed_env: [
-				(sf!("OMP_ARTIFACTS_DIR"), None),
-				(sf!("OMP_EVAL_LOCAL_ROOTS"), None),
-				(sf!("OMP_SESSION_FILE"), session_file.map(Str::new)),
-			]
-			.into_iter()
-			.collect(),
+			managed_env: [(sf!("OMP_EVAL_LOCAL_ROOTS"), local_roots.map(Str::new))]
+				.into_iter()
+				.collect(),
 		};
 		let mut first_run = runtime
 			.run(&session, RunRequest {
-				code:    sf!("import os\n(os.getcwd(), os.environ.get('OMP_SESSION_FILE'))"),
+				code:    sf!("import os\n(os.getcwd(), os.environ.get('OMP_EVAL_LOCAL_ROOTS'))"),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
-				runtime: snapshot(first.path(), Some("first")),
+				runtime: snapshot(first.path(), Some(r#"{"local":"first"}"#)),
 			})
 			.await
 			.expect("first runtime starts");
@@ -2426,13 +2422,15 @@ print("right")"#
 					.canonicalize()
 					.expect("canonical first")
 					.to_string_lossy(),
-				"first"
+				r#"{"local":"first"}"#
 			])),
 		);
 
 		let mut second_run = runtime
 			.run(&session, RunRequest {
-				code:    sf!("import os\n(os.getcwd(), os.environ.get('OMP_SESSION_FILE') is None)"),
+				code:    sf!(
+					"import os\n(os.getcwd(), os.environ.get('OMP_EVAL_LOCAL_ROOTS') is None)"
+				),
 				timeout: Some(StdDuration::from_secs(2)),
 				reset:   false,
 				runtime: snapshot(second.path(), None),

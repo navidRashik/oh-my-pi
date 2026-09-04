@@ -4,11 +4,10 @@ use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::Stream;
 use omp_core::{Str, sf};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, CallOutcome, CommitError, Constraint, Effects, Ev, ExecEffects,
+	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, ExecEffects,
 	IncomingParams, LiftedCall, ParamError, Part, PromptCaps, RecordedCall, Rev, Tool, ToolSpec,
 	ToolTerminal,
 };
@@ -168,13 +167,30 @@ impl Params {
 	}
 }
 
-/// Direct API response plus rate-limit receipt.
+/// Durable reference to complete output retained outside the inline projection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Artifact {
+	/// Canonical content-addressed URI.
+	pub uri:        Str,
+	/// Exact retained byte count.
+	pub size:       u64,
+	/// Media type of the retained bytes.
+	pub media_type: Str,
+}
+
+/// Direct API response plus a bounded human projection and rate-limit receipt.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Payload {
 	/// Completed operation.
 	pub op:                   Operation,
 	/// Structured operation result.
 	pub result:               Value,
+	/// Human-readable model and transcript projection.
+	pub output:               Str,
+	/// Complete output retained outside the inline projection, when applicable.
+	pub artifact:             Option<Artifact>,
+	/// Whether the operation produced no actionable result.
+	pub useless:              bool,
 	/// Remaining GitHub API requests, when reported.
 	pub rate_limit_remaining: Option<u64>,
 	/// Rate-limit reset Unix timestamp, when reported.
@@ -186,14 +202,40 @@ pub struct Payload {
 #[error("{message}")]
 pub struct Fault {
 	/// Stable failure category.
-	pub code:    Str,
+	pub code:                 Str,
 	/// Secret-free diagnostic.
-	pub message: Str,
+	pub message:              Str,
+	/// HTTP status, when the failure came from GitHub.
+	#[serde(default)]
+	pub status:               Option<u16>,
+	/// Remaining requests reported with an HTTP failure.
+	#[serde(default)]
+	pub rate_limit_remaining: Option<u64>,
+	/// Rate-limit reset Unix timestamp reported with an HTTP failure.
+	#[serde(default)]
+	pub rate_limit_reset:     Option<u64>,
+	/// Retry delay reported by GitHub, in seconds.
+	#[serde(default)]
+	pub retry_after_seconds:  Option<u64>,
 }
 
-/// GitHub operations currently settle as one bounded result.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum Update {}
+impl Fault {
+	/// Whether GitHub classified this failure as a primary or secondary rate limit.
+	pub fn is_rate_limited(&self) -> bool {
+		self.code == "github_rate_limited"
+	}
+}
+
+/// Ephemeral Actions-watch state.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Update {
+	/// Operation producing the update.
+	pub op:     Operation,
+	/// Current normalized watch snapshot.
+	pub result: Value,
+	/// Human-readable current state.
+	pub output: Str,
+}
 
 /// Harness-owned direct GitHub service.
 #[async_trait]
@@ -203,6 +245,7 @@ pub trait GithubHost: Send + Sync + 'static {
 		&self,
 		params: Params,
 		cancellation: CancellationToken,
+		updates: flume::Sender<Update>,
 	) -> Result<Payload, Fault>;
 }
 
@@ -212,13 +255,13 @@ pub struct Github {
 	spec: ToolSpec,
 }
 
-/// Creates `github@2`.
+/// Creates `github@3`.
 pub fn tool(host: Arc<dyn GithubHost>) -> Github {
 	Github {
 		host,
 		spec: ToolSpec {
 			name:            sf!("github"),
-			rev:             Rev { family: Str::default(), n: 2 },
+			rev:             Rev { family: Str::default(), n: 3 },
 			description:     sf!(
 				"Uses GitHub's direct API for repository, file, search, pull-request worktree, push, \
 				 and Actions operations. Repository identities are [host/]owner/repo; name the host \
@@ -266,56 +309,65 @@ impl Tool for Github {
 			let params = match incoming.whole::<Params>().await { Ok(params) => params, Err(error) => { yield param_event(error); return; } };
 			if let Err(error) = incoming.interruptable().committed().await { yield commit_event(error); return; }
 			let cancellation = CancellationToken::new();
-			let execution = self.host.execute(params, cancellation.clone());
+			let (update_tx, update_rx) = flume::bounded(1);
+			let execution = self.host.execute(params, cancellation.clone(), update_tx);
 			tokio::pin!(execution);
-			tokio::select! {
-				result = &mut execution => {
-					yield Ev::Done(ToolTerminal::Done { result, useless: false });
-				},
-				interrupt = incoming.next_interrupt() => {
-					cancellation.cancel();
-					if let Ok(interrupt) = interrupt {
-						yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason });
-					} else {
-						yield Ev::Aborted(Abort::InputDropped);
-					}
-				},
+			loop {
+				tokio::select! {
+					result = &mut execution => {
+						let useless = result.as_ref().is_ok_and(|payload| payload.useless);
+						yield Ev::Done(ToolTerminal::Done { result, useless });
+						break;
+					},
+					update = update_rx.recv_async() => {
+						if let Ok(update) = update {
+							yield Ev::Update(update);
+						}
+					},
+					interrupt = incoming.next_interrupt() => {
+						cancellation.cancel();
+						if let Ok(interrupt) = interrupt {
+							yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason });
+						} else {
+							yield Ev::Aborted(Abort::InputDropped);
+						}
+						break;
+					},
+				}
 			}
 		}
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, _: &PromptCaps) -> Vec<Part> {
-		vec![Part::Text {
-			text: match view {
-				Ok(payload) => {
-					Str::new(serde_json::to_string(payload).expect("GitHub payload serializes"))
-				},
-				Err(fault) => fault.message.clone(),
+		match view {
+			Ok(payload) => {
+				let mut parts = vec![Part::Text { text: payload.output.clone() }];
+				if let Some(artifact) = &payload.artifact
+					&& artifact.media_type.starts_with("image/")
+					&& let Some(hash) = artifact.uri.strip_prefix("artifact://sha256/")
+				{
+					parts.push(Part::Blob {
+						blob: omp_tool::BlobRef {
+							hash: Str::new(hash),
+							media_type: artifact.media_type.clone(),
+							byte_len: artifact.size,
+						},
+						alt: payload
+							.result
+							.get("path")
+							.and_then(Value::as_str)
+							.map(Str::new),
+					});
+				}
+				parts
 			},
-		}]
+			Err(fault) => vec![Part::Text { text: fault.message.clone() }],
+		}
 	}
 
-	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
-		lift_rev1(from, call)
+	fn lift(&self, _: &Rev, _: RecordedCall<'_>) -> Option<LiftedCall> {
+		None
 	}
-}
-
-/// Lifts `github@1` calls onto `github@2`. Revision two only adds optional
-/// arguments, so valid arguments and verdicts retain their exact bytes.
-fn lift_rev1(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
-	if !from.family.is_empty() || from.n != 1 {
-		return None;
-	}
-	let mut raw_args = serde_json::from_slice::<Value>(call.raw_args).ok()?;
-	let object = raw_args.as_object_mut()?;
-	object.remove("i");
-	object.remove("notrunc");
-	serde_json::from_value::<Params>(raw_args).ok()?;
-	serde_json::from_slice::<CallOutcome<Payload, Fault>>(call.verdict).ok()?;
-	Some(LiftedCall {
-		raw_args: Bytes::copy_from_slice(call.raw_args),
-		verdict:  Bytes::copy_from_slice(call.verdict),
-	})
 }
 
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {
@@ -348,15 +400,15 @@ fn protocol_issue(message: Str) -> ArgIssue {
 #[cfg(test)]
 mod tests {
 	use omp_core::Str;
-	use omp_tool::{CallOutcome, RecordedCall, Rev, Tool as _};
+	use omp_tool::{Rev, Tool as _};
 	use serde_json::json;
 
 	use super::{DateField, Params, Payload, PrSelector, tool};
 
 	#[test]
-	fn revision_two_schema_is_the_github_wire_contract() {
+	fn revision_three_schema_is_the_github_wire_contract() {
 		let tool = tool(std::sync::Arc::new(PanicHost));
-		assert_eq!(tool.spec().rev, Rev { family: Str::default(), n: 2 });
+		assert_eq!(tool.spec().rev, Rev { family: Str::default(), n: 3 });
 		let schema: serde_json::Value =
 			serde_json::from_slice(&tool.spec().schema).expect("GitHub schema is JSON");
 		let properties = schema["properties"].as_object().expect("object properties");
@@ -409,6 +461,7 @@ mod tests {
 			&self,
 			_: Params,
 			_: tokio_util::sync::CancellationToken,
+			_: flume::Sender<super::Update>,
 		) -> Result<Payload, super::Fault> {
 			panic!("schema test never executes the host")
 		}
@@ -460,32 +513,17 @@ mod tests {
 	}
 
 	#[test]
-	fn revision_one_calls_lift_without_rewriting_their_wire_bytes() {
+	fn older_revisions_do_not_lift_across_the_projection_change() {
 		let tool = tool(std::sync::Arc::new(PanicHost));
-		let raw_args =
-			br#"{"i":"Reading repository","notrunc":true,"op":"repo_view","repo":"owner/repo"}"#;
-		let verdict = br#"{"kind":"ok","value":{"op":"repo_view","result":{},"rate_limit_remaining":null,"rate_limit_reset":null}}"#;
-		let lifted = tool
-			.lift(&Rev { family: Str::default(), n: 1 }, RecordedCall { raw_args, verdict })
-			.expect("revision one lifts");
-		assert_eq!(lifted.raw_args.as_ref(), raw_args);
-		assert_eq!(lifted.verdict.as_ref(), verdict);
-		assert!(matches!(
-			serde_json::from_slice::<CallOutcome<Payload, super::Fault>>(&lifted.verdict)
-				.expect("lifted verdict"),
-			CallOutcome::Ok(_)
-		));
 		assert!(
 			tool
-				.lift(&Rev { family: Str::default(), n: 2 }, RecordedCall { raw_args, verdict })
-				.is_none()
-		);
-		assert!(
-			tool
-				.lift(&Rev { family: Str::default(), n: 1 }, RecordedCall {
-					raw_args: br#"{"op":"repo_view","unknown":true}"#,
-					verdict,
-				})
+				.lift(
+					&Rev { family: Str::default(), n: 2 },
+					omp_tool::RecordedCall {
+						raw_args: br#"{"op":"repo_view","repo":"owner/repo"}"#,
+						verdict: br#"{"kind":"ok","value":{"op":"repo_view","result":{}}}"#,
+					},
+				)
 				.is_none()
 		);
 	}

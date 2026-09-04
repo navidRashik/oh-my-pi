@@ -23,9 +23,10 @@ use crate::{
 
 #[derive(Default)]
 pub(super) struct GithubState {
-	op:    Option<GithubOperation>,
-	repo:  Option<Str>,
-	query: Option<Str>,
+	op:       Option<GithubOperation>,
+	repo:     Option<Str>,
+	query:    Option<Str>,
+	progress: Option<Str>,
 }
 
 pub(super) struct GithubRenderer;
@@ -35,8 +36,9 @@ impl RenderFold for GithubRenderer {
 	type State = GithubState;
 	type Update = GithubUpdate;
 
-	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
-		match update {}
+	fn fold(&self, state: &mut Self::State, update: Self::Update) {
+		state.op = Some(update.op);
+		state.progress = Some(update.output);
 	}
 
 	fn fold_args(&self, state: &mut Self::State, args: &omp_slopjson::Value, _complete: bool) {
@@ -76,6 +78,9 @@ fn render_github_live(state: &GithubState) -> El {
 			}
 			if let Some(query) = state.query.as_deref() {
 				<text fg=muted truncate>{query}</text>
+			}
+			if let Some(progress) = state.progress.as_deref() {
+				<text fg=muted truncate>{progress}</text>
 			}
 		</row>
 	}
@@ -692,6 +697,9 @@ mod tests {
 				}],
 				"total_count": 1
 			}),
+			output:               Str::new_static("1 result"),
+			artifact:             None,
+			useless:              false,
 			rate_limit_remaining: None,
 			rate_limit_reset:     None,
 		};
@@ -711,6 +719,9 @@ mod tests {
 		let file = GithubPayload {
 			op:                   GithubOperation::FileRead,
 			result:               serde_json::json!({"content": "first\nsecond <third>"}),
+			output:               Str::new_static("first\nsecond <third>"),
+			artifact:             None,
+			useless:              false,
 			rate_limit_remaining: Some(42),
 			rate_limit_reset:     None,
 		};
@@ -725,6 +736,9 @@ mod tests {
 		let repo = GithubPayload {
 			op:                   GithubOperation::RepoView,
 			result:               serde_json::json!({"full_name": "oh-my-pi/pi", "private": false}),
+			output:               Str::new_static("oh-my-pi/pi"),
+			artifact:             None,
+			useless:              false,
 			rate_limit_remaining: None,
 			rate_limit_reset:     None,
 		};

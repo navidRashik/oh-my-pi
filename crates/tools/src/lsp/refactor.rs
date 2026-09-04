@@ -100,7 +100,7 @@ fn validate_text_edits(
 pub fn preview(edit: &Value) -> Str {
 	let mut output = StrMut::new("");
 	if let Some(changes) = edit.get("changes").and_then(Value::as_object) {
-		for (uri, edits) in changes.iter().take(50) {
+		for (uri, edits) in changes {
 			output.push_str(uri);
 			output.push_str(": ");
 			output.push_str(edits.as_array().map_or(0, Vec::len).to_string().as_str());

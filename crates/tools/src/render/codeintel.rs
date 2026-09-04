@@ -75,8 +75,8 @@ impl RenderFold for LspRenderer {
 pub(super) struct DebugState {
 	action:  Option<Str>,
 	adapter: Option<Str>,
-	session: Option<Str>,
-	path:    Option<Str>,
+	program: Option<Str>,
+	file:    Option<Str>,
 }
 
 pub(super) struct DebugRenderer;
@@ -97,11 +97,11 @@ impl RenderFold for DebugRenderer {
 		if let Some(adapter) = args.get("adapter").and_then(omp_slopjson::Value::as_str) {
 			state.adapter = Some(Str::new(adapter));
 		}
-		if let Some(session) = args.get("session").and_then(omp_slopjson::Value::as_str) {
-			state.session = Some(Str::new(session));
+		if let Some(program) = args.get("program").and_then(omp_slopjson::Value::as_str) {
+			state.program = Some(Str::new(program));
 		}
-		if let Some(path) = args.get("path").and_then(omp_slopjson::Value::as_str) {
-			state.path = Some(Str::new(path));
+		if let Some(file) = args.get("file").and_then(omp_slopjson::Value::as_str) {
+			state.file = Some(Str::new(file));
 		}
 	}
 
@@ -261,8 +261,8 @@ fn render_debug_live(state: &DebugState) -> El {
 			<row sep=" · ">
 				if let Some(action) = state.action.as_deref() {
 					<text bold>{action}</text>
-					if let Some(session) = state.session.as_deref() {
-						<text fg=muted>{session}</text>
+					if let Some(target) = state.program.as_deref().or(state.file.as_deref()) {
+						<text fg=muted>{target}</text>
 					}
 				} else {
 					<text fg=muted>{"waiting for request"}</text>
@@ -273,7 +273,7 @@ fn render_debug_live(state: &DebugState) -> El {
 }
 
 fn render_debug_payload(state: &DebugState, payload: &DebugPayload) -> El {
-	let snapshot = payload.data.get("snapshot").unwrap_or(&payload.data);
+	let snapshot = payload.data.get("session").unwrap_or(&payload.data);
 	let first_frame = payload
 		.data
 		.get("stackFrames")
@@ -302,21 +302,38 @@ fn render_debug_payload(state: &DebugState, payload: &DebugPayload) -> El {
 			if let Some(status) = string_field(snapshot, "status", "state") {
 				<fact label="Status"><state status={status}/></fact>
 			}
-			if let Some(program) =
-				string_field(snapshot, "program", "program").or_else(|| state.path.as_deref())
+			if let Some(program) = snapshot
+				.get("program")
+				.and_then(Value::as_str)
+				.or_else(|| state.program.as_deref())
 			{
 				{fact("Program", program)}
 			}
-			if let Some(reason) = string_field(snapshot, "stopReason", "stop_reason")
-				.or_else(|| snapshot.get("reason").and_then(Value::as_str))
+			if let Some(pid) = snapshot
+				.get("pid")
+				.or_else(|| snapshot.get("processId"))
+				.and_then(Value::as_u64)
+			{
+				{integer_fact("Process", pid)}
+			}
+			if let Some(reason) = payload
+				.data
+				.get("reason")
+				.and_then(Value::as_str)
+				.or_else(|| snapshot.pointer("/stop/reason").and_then(Value::as_str))
 			{
 				{fact("Stop reason", reason)}
 			}
-			if let Some(frame) = string_field(snapshot, "frameName", "frame_name").or_else(|| {
-				first_frame
-					.and_then(|frame| frame.get("name"))
-					.and_then(Value::as_str)
-			}) {
+			if let Some(frame) = snapshot
+				.pointer("/frame/name")
+				.or_else(|| snapshot.pointer("/stop/frame/name"))
+				.and_then(Value::as_str)
+				.or_else(|| {
+					first_frame
+						.and_then(|frame| frame.get("name"))
+						.and_then(Value::as_str)
+				})
+			{
 				{fact("Frame", frame)}
 			}
 			if let Some(location) = render_debug_location(snapshot, first_frame) {
@@ -333,8 +350,11 @@ fn render_debug_payload(state: &DebugState, payload: &DebugPayload) -> El {
 }
 
 fn render_debug_location(snapshot: &Value, first_frame: Option<&Value>) -> Option<El> {
-	let source = snapshot
-		.get("source")
+	let stopped_frame = snapshot
+		.get("frame")
+		.or_else(|| snapshot.pointer("/stop/frame"));
+	let source = stopped_frame
+		.and_then(|frame| frame.get("source"))
 		.and_then(|source| source.get("path"))
 		.and_then(Value::as_str)
 		.or_else(|| {
@@ -343,12 +363,18 @@ fn render_debug_location(snapshot: &Value, first_frame: Option<&Value>) -> Optio
 				.and_then(|source| source.get("path"))
 				.and_then(Value::as_str)
 		});
-	let line = snapshot.get("line").and_then(Value::as_u64).or_else(|| {
+	let line = stopped_frame
+		.and_then(|frame| frame.get("line"))
+		.and_then(Value::as_u64)
+		.or_else(|| {
 		first_frame
 			.and_then(|frame| frame.get("line"))
 			.and_then(Value::as_u64)
 	});
-	let column = snapshot.get("column").and_then(Value::as_u64).or_else(|| {
+	let column = stopped_frame
+		.and_then(|frame| frame.get("column"))
+		.and_then(Value::as_u64)
+		.or_else(|| {
 		first_frame
 			.and_then(|frame| frame.get("column"))
 			.and_then(Value::as_u64)
@@ -454,10 +480,10 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: debug,
-			streaming_args: r#"{"action":"stack_trace","session":"dbg-"#,
-			args: r#"{"action":"stack_trace","session":"dbg-1","thread_id":1}"#,
+			streaming_args: r#"{"action":"launch","program":"./app/ser"#,
+			args: r#"{"action":"stack_trace","levels":20}"#,
 			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"action":"stack_trace","session":"dbg-1","revision":7,"output":"Stack trace","data":{"snapshot":{"id":"dbg-1","adapter":"debugpy","program":"./app/server.py","status":"stopped","stopReason":"breakpoint","frameName":"validate_token","source":{"name":"server.py","path":"app/server.py"},"line":42,"column":14},"stackFrames":[{"id":1000,"name":"validate_token","source":{"name":"server.py","path":"app/server.py"},"line":42,"column":14},{"id":1001,"name":"authenticate","source":{"name":"server.py","path":"app/server.py"},"line":88,"column":9},{"id":1002,"name":"handle_request","source":{"name":"router.py","path":"app/router.py"},"line":153,"column":20},{"id":1003,"name":"dispatch","source":{"name":"router.py","path":"app/router.py"},"line":97,"column":5},{"id":1004,"name":"<module>","source":{"name":"server.py","path":"app/server.py"},"line":212,"column":1}]}}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"action":"stack_trace","session":"dbg-1","revision":7,"output":"FRAME\tNAME\tSOURCE\tLINE:COLUMN","data":{"reason":"breakpoint","session":{"id":"dbg-1","adapter":"debugpy","program":"./app/server.py","status":"stopped","pid":3184,"frame":{"id":1000,"name":"validate_token","instructionPointerReference":"0x1000034a8","source":{"name":"server.py","path":"app/server.py"},"line":42,"column":14}},"stackFrames":[{"id":1000,"name":"validate_token","source":{"name":"server.py","path":"app/server.py"},"line":42,"column":14},{"id":1001,"name":"authenticate","source":{"name":"server.py","path":"app/server.py"},"line":88,"column":9},{"id":1002,"name":"handle_request","source":{"name":"router.py","path":"app/router.py"},"line":153,"column":20},{"id":1003,"name":"dispatch","source":{"name":"router.py","path":"app/router.py"},"line":97,"column":5},{"id":1004,"name":"<module>","source":{"name":"server.py","path":"app/server.py"},"line":212,"column":1}]}}}"#,
 			error_outcome: br#"{"kind":"faulted","value":{"kind":"unavailable"}}"#,
 		},
 	]
@@ -506,7 +532,7 @@ mod tests {
 			false,
 		);
 		let debug_live = DebugRenderer.view(&debug_state, None).unwrap();
-		assert!(debug_live.contains("dbg-"));
+		assert!(debug_live.contains("./app/ser"));
 		DebugRenderer.fold_args(
 			&mut debug_state,
 			&omp_slopjson::parse_streaming(fixtures[1].args),
@@ -519,6 +545,7 @@ mod tests {
 			.unwrap();
 		assert!(debug_view.contains("<fact label=Adapter>debugpy</fact>"));
 		assert!(debug_view.contains("<fact label=Status><state status=stopped/></fact>"));
+		assert!(debug_view.contains("<fact label=Process>3184</fact>"));
 		assert!(debug_view.contains("<fact label=Location>app/server.py:42:14</fact>"));
 		assert!(debug_view.contains("<pre max-rows=8 overflow=frames>"));
 		assert!(debug_view.contains("#1000 validate_token @ app/server.py:42:14"));

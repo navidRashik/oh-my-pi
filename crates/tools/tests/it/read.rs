@@ -490,7 +490,7 @@ fn generated_schema_exposes_optional_image_question_without_a_new_tool() {
 				},
 				"notrunc": {
 					"type": "boolean",
-					"description": "Return complete output inline without central truncation."
+					"description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."
 				},
 				"i": {
 					"type": "string",
@@ -1172,6 +1172,14 @@ fn encoded_zip(entries: &[(&str, &str)]) -> Bytes {
 	)
 }
 
+fn encoded_binary_zip(path: &str, contents: &[u8]) -> Bytes {
+	let mut writer = zip::Writer::new(Vec::new());
+	writer
+		.add_file(path, contents)
+		.expect("add binary ZIP fixture member");
+	Bytes::from(writer.finish().expect("finish binary ZIP fixture"))
+}
+
 fn asar_fixture() -> Bytes {
 	let json = br#"{"files":{"dir":{"files":{"member.txt":{"size":7,"offset":"0"}}},"root.txt":{"size":4,"offset":"7"}}}"#;
 	let payload_size = 4 + json.len() + 1;
@@ -1578,6 +1586,98 @@ async fn image_question_routes_question_and_blob_to_vision_or_reports_unavailabl
 		text(sources, r#"{"path":"notes.txt","question":"What is pictured?"}"#,).await,
 		"Image questions require a supported PNG, JPEG, GIF, WebP, or rasterized SVG/PDF image."
 	);
+}
+
+#[tokio::test]
+async fn image_question_materializes_archive_internal_and_url_images() {
+	let question = "What color is the pixel?";
+
+	let archive_sources = Sources::default();
+	archive_sources.file(
+		"images.zip",
+		encoded_binary_zip("nested/pixel.png", &png_fixture()),
+	);
+	let archive = payload(
+		archive_sources,
+		Blobs::default(),
+		r#"{"path":"images.zip:nested/pixel.png","question":"What color is the pixel?"}"#,
+	)
+	.await;
+	let [
+		read::PayloadPart::Text { text: archive_text },
+		read::PayloadPart::Blob {
+			vision: Some(read::VisionRequest { question: archive_question }),
+			..
+		},
+	] = archive.parts.as_slice()
+	else {
+		panic!("archive image remains a typed vision request: {:?}", archive.parts);
+	};
+	assert!(archive_text.contains("Archive image images.zip:nested/pixel.png"), "{archive_text}");
+	assert_eq!(archive_question, question);
+
+	let calls = Arc::new(AtomicU64::new(0));
+	let resolver = StaticResolver {
+		bytes: CowBytes::from_static(include_bytes!(
+			"../fixtures/special-sources/images/pixel.png"
+		)),
+		lines: Arc::new(LineOffsetCache::default()),
+		calls,
+	};
+	let mut builder = ResolverTable::builder();
+	builder
+		.register(
+			SchemeEntry::new(Scheme::Artifact, true, true, "Session and durable artifacts"),
+			resolver,
+		)
+		.expect("register artifact fixture");
+	let internal_tool =
+		read::tool_with_resolvers(Sources::default(), Blobs::default(), Arc::new(builder.build()));
+	let (feed, params) = IncomingParams::channel();
+	feed
+		.args_committed(sf!(
+			r#"{{"path":"artifact://7","question":"{question}"}}"#
+		))
+		.expect("internal image question remains live");
+	let events = internal_tool.call(params).collect::<Vec<_>>().await;
+	let [Ev::Done(ToolTerminal::Done { result: Ok(internal), .. })] = events.as_slice() else {
+		panic!("internal image question succeeds: {events:?}");
+	};
+	assert!(matches!(
+		internal.parts.as_slice(),
+		[
+			read::PayloadPart::Text { .. },
+			read::PayloadPart::Blob {
+				vision: Some(read::VisionRequest { question: internal_question }),
+				..
+			}
+		] if internal_question == question
+	));
+
+	let url_sources = Sources::default();
+	url_sources.responses.lock().push_back(Ok(HttpResponse {
+		final_url:    sf!("https://fixture.invalid/pixel"),
+		status:       200,
+		content_type: Some(sf!("image/jpeg")),
+		headers:      vec![(sf!("content-type"), sf!("image/jpeg"))].into(),
+		body:         png_fixture(),
+	}));
+	let url = payload(
+		url_sources,
+		Blobs::default(),
+		r#"{"path":"https://fixture.invalid/pixel","question":"What color is the pixel?"}"#,
+	)
+	.await;
+	assert!(matches!(
+		url.parts.as_slice(),
+		[
+			read::PayloadPart::Text { .. },
+			read::PayloadPart::Blob {
+				vision: Some(read::VisionRequest { question: url_question }),
+				..
+			}
+		] if url_question == question
+	));
 }
 
 #[tokio::test]

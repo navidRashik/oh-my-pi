@@ -925,6 +925,23 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 					});
 				};
 				let bytes = result?;
+				if !uri.selector.is_raw()
+					&& image::sniff_metadata(&bytes[..bytes.len().min(256 * 1024)]).is_some()
+					&& let Some(loaded) = Self::process_image_async(
+						bytes.clone().into_bytes(),
+						self.policy.auto_resize_images,
+					)
+					.await?
+				{
+					let blob = self
+						.blobs
+						.store(loaded.data, loaded.media_type.clone())
+						.await?;
+					return Ok(vec![
+						PayloadPart::Text { text: loaded.description.clone() },
+						PayloadPart::Blob { blob, alt: loaded.description, vision: None },
+					]);
+				}
 				let text = str::from_utf8(&bytes).map_err(|_| Fault::Invalid {
 					message: sf!("{}:// did not resolve to UTF-8 text", uri.raw_scheme),
 				})?;
@@ -957,11 +974,11 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				}
 				if !uri.selector.is_raw()
 					&& image::sniff_metadata(&bytes[..bytes.len().min(256 * 1024)]).is_some()
-					&& let Some(loaded) = image::process_image_with_policy(
+					&& let Some(loaded) = Self::process_image_async(
 						bytes.clone().into_bytes(),
 						self.policy.auto_resize_images,
 					)
-					.map_err(|error| Fault::Source { message: error.message() })?
+					.await?
 				{
 					let blob = self
 						.blobs
@@ -1057,7 +1074,12 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 						})?,
 				};
 				let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
-				let raster = pdf::rasterize_page(bytes, pdf.page)
+				let page = pdf.page;
+				let raster = task::spawn_blocking(move || pdf::rasterize_page(bytes, page))
+					.await
+					.map_err(|_| Fault::Source {
+						message: Str::new_static("PDF image raster task failed"),
+					})?
 					.map_err(|error| Fault::Source { message: Str::new(error.to_string()) })?;
 				let blob = self.blobs.store(raster.data, raster.media_type).await?;
 				return Ok(vec![
@@ -1428,8 +1450,38 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				Ok(parts)
 			},
 			archive::ArchiveContent::Binary(member_binary) => {
+				if image::sniff_metadata(
+					&member_binary.bytes[..member_binary.bytes.len().min(256 * 1024)],
+				)
+				.is_some()
+				{
+					let loaded = Self::process_image_async(
+						member_binary.bytes,
+						self.policy.auto_resize_images,
+					)
+					.await?
+					.expect("sniffed archive image remains supported");
+					let description = Str::new(format::prepend_suffix_resolution_notice(
+						&format!(
+							"Archive image {}:{}\n{}",
+							stat.display_path, member_binary.member.node.path, loaded.description
+						),
+						suffix_from.map(|from| format::SuffixResolution {
+							from,
+							to: &stat.display_path,
+						}),
+					));
+					let blob = self
+						.blobs
+						.store(loaded.data, loaded.media_type.clone())
+						.await?;
+					return Ok(vec![
+						PayloadPart::Text { text: description.clone() },
+						PayloadPart::Blob { blob, alt: description, vision: None },
+					]);
+				}
 				let text = format::prepend_suffix_resolution_notice(
-					&member_binary.notice,
+					&member_binary.member.notice,
 					suffix_from.map(|from| format::SuffixResolution { from, to: &stat.display_path }),
 				);
 				Ok(vec![PayloadPart::Text { text: Str::new(text) }])
@@ -1464,8 +1516,8 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 
 	async fn read_image(&self, stat: &SourceStat) -> Result<Option<Vec<PayloadPart>>, Fault> {
 		let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
-		let Some(loaded) = image::process_image_with_policy(bytes, self.policy.auto_resize_images)
-			.map_err(|error| Fault::Source { message: error.message() })?
+		let Some(loaded) =
+			Self::process_image_async(bytes, self.policy.auto_resize_images).await?
 		else {
 			return Ok(None);
 		};
@@ -1481,10 +1533,14 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 	}
 
 	async fn read_svg_image(&self, source: Bytes, gzip: bool) -> Result<Vec<PayloadPart>, Fault> {
-		let png = image::rasterize_svg(&source, gzip)
+		let png = task::spawn_blocking(move || image::rasterize_svg(&source, gzip))
+			.await
+			.map_err(|_| Fault::Source {
+				message: Str::new_static("SVG image raster task failed"),
+			})?
 			.map_err(|error| Fault::Source { message: Str::new(error.to_string()) })?;
-		let loaded = image::process_image_with_policy(png, false)
-			.map_err(|error| Fault::Source { message: error.message() })?
+		let loaded = Self::process_image_async(png, false)
+			.await?
 			.expect("SVG rasterizer always returns PNG bytes");
 		let blob = self
 			.blobs
@@ -1495,6 +1551,18 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			alt: loaded.description,
 			vision: None,
 		}])
+	}
+
+	async fn process_image_async(
+		bytes: Bytes,
+		auto_resize: bool,
+	) -> Result<Option<image::ProcessedImage>, Fault> {
+		task::spawn_blocking(move || image::process_image_with_policy(bytes, auto_resize))
+			.await
+			.map_err(|_| Fault::Source {
+				message: Str::new_static("Image processing task failed"),
+			})?
+			.map_err(|error| Fault::Source { message: error.message() })
 	}
 
 	fn structural_parts(
