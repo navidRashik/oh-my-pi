@@ -59,7 +59,7 @@ fn generated_schema_is_compact_inlined_and_model_facing() {
 				},
 				"notrunc": {
 					"type": "boolean",
-					"description": "Return complete output inline without central truncation."
+					"description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."
 				}
 			},
 			"required": ["i", "required"],
@@ -128,7 +128,7 @@ fn arbitrary_schema_injection_normalizes_protocol_fields() {
 	.expect("valid object schema");
 	assert_eq!(
 		injected.as_ref(),
-		br#"{"type":"object","properties":{"path":{"type":"string"},"i":{"type":"string","description":"Short present-participle intent for this call."},"notrunc":{"type":"boolean","description":"Return complete output inline without central truncation."}},"required":["i","path"]}"#
+		br#"{"type":"object","properties":{"path":{"type":"string"},"i":{"type":"string","description":"Short present-participle intent for this call."},"notrunc":{"type":"boolean","description":"Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."}},"required":["i","path"]}"#
 	);
 	assert_eq!(
 		inject_protocol_schema(&injected).expect("protocol injection is idempotent"),

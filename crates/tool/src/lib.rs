@@ -1189,6 +1189,14 @@ pub trait Tool: Send + Sync + 'static {
 	/// Returns this implementation's immutable specification.
 	fn spec(&self) -> &ToolSpec;
 
+	/// Returns the batch scheduling constraint for this tool.
+	///
+	/// Interactive tools use [`ExecutionMode::Sequential`] so concurrent
+	/// calls cannot compete for one host-owned presentation surface.
+	fn execution_mode(&self) -> ExecutionMode {
+		ExecutionMode::Parallel
+	}
+
 	/// Returns model-facing examples for this exact revision.
 	///
 	/// Examples are optional metadata; the registry never invents examples for

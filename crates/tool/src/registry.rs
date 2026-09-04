@@ -124,6 +124,9 @@ pub struct HostToolSpec {
 	pub description: Str,
 	/// JSON Schema for the tool argument object.
 	pub parameters:  Value,
+	/// Exact semantic revision when the host contract declares one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rev:         Option<Rev>,
 }
 
 /// One correlated invocation delivered to an attached RPC host.
@@ -1843,10 +1846,16 @@ impl Registry {
 		}
 		let mut names = BTreeSet::new();
 		for spec in &specs {
-			if spec.name.trim().is_empty() || !spec.parameters.is_object() {
+			if spec.name.trim().is_empty()
+				|| !spec.parameters.is_object()
+				|| spec.rev.as_ref().is_some_and(|rev| rev.n == 0)
+			{
 				return Err(RegistryError::InvalidHostToolSpec {
 					name:    spec.name.clone(),
-					message: sf!("name must be non-empty and parameters must be a JSON Schema object"),
+					message: sf!(
+						"name must be non-empty, parameters must be a JSON Schema object, and an \
+						 explicit revision must be nonzero"
+					),
 				});
 			}
 			let owner = if !names.insert(spec.name.clone()) {
@@ -1873,7 +1882,9 @@ impl Registry {
 		let mut entries = BTreeMap::new();
 		for (index, declared) in specs.into_iter().enumerate() {
 			let schema = serde_json::to_vec(&declared.parameters)?;
-			let rev = Rev { family: family.clone(), n: 1 };
+			let rev = declared
+				.rev
+				.unwrap_or_else(|| Rev { family: family.clone(), n: 1 });
 			let value = serde_json::from_slice(&schema).map_err(|source| {
 				RegistryError::InvalidSchema { name: declared.name.clone(), rev: rev.clone(), source }
 			})?;
@@ -1953,6 +1964,7 @@ impl Registry {
 					name:        spec.name.clone(),
 					description: spec.description.clone(),
 					parameters:  serde_json::from_slice(&spec.schema).ok()?,
+					rev:         Some(spec.rev.clone()),
 				})
 			})
 			.collect()
@@ -2154,6 +2166,7 @@ impl Registry {
 		claims: Claims,
 		locus: ToolLocus,
 	) -> Result<(), RegistryError> {
+		let execution = tool.execution_mode();
 		let spec = tool.spec();
 		let name = spec.name.clone();
 		let rev = spec.rev.clone();
@@ -2171,7 +2184,7 @@ impl Registry {
 			}),
 			presentation,
 			claims,
-			execution: ExecutionMode::Parallel,
+			execution,
 			locus,
 		};
 		self.insert(name, rev, entry)
@@ -2411,11 +2424,23 @@ impl Registry {
 		Ok(entry.tool.spec().effects.clone())
 	}
 
-	/// Iterates winning identities in deterministic name order.
+	/// Iterates winning native identities in deterministic name order.
 	pub fn live_identities(
 		&self,
 	) -> impl DoubleEndedIterator<Item = (&Str, &Rev)> + ExactSizeIterator + '_ {
 		self.live.iter().map(|(name, claim)| (name, &claim.rev))
+	}
+
+	/// Snapshots every live stable name, including replaceable host tools.
+	///
+	/// Unlike [`Self::live_identities`], this is the complete allow-list needed
+	/// when a composition projects the registry without silently dropping
+	/// dynamic host declarations.
+	#[must_use]
+	pub fn live_names(&self) -> Vec<Str> {
+		let mut names = self.live.keys().cloned().collect::<BTreeSet<_>>();
+		names.extend(self.host_tools.read().live.keys().cloned());
+		names.into_iter().collect()
 	}
 
 	/// Borrows the resolved claim and its shadow provenance.
@@ -3861,6 +3886,41 @@ mod tests {
 	}
 
 	#[test]
+	fn child_local_host_roster_does_not_mutate_parent_and_keeps_declared_revision() {
+		let mut parent = Registry::new();
+		parent
+			.register(tool(1), Presentation::Slot, Claims {
+				precedence: Precedence::DEFAULT,
+				claimant:   sf!("test/native"),
+				replaces:   None,
+			})
+			.expect("native tool registers");
+		let names = parent.live_names();
+		let child = parent.restrict(names.iter().map(Str::as_str));
+		child
+			.replace_host_tools(
+				sf!("eval/owner/generation/handler"),
+				1,
+				vec![HostToolSpec {
+					name:        sf!("score"),
+					description: sf!("Score a candidate"),
+					parameters:  serde_json::json!({"type":"object"}),
+					rev:         Some(Rev { family: Str::default(), n: 9 }),
+				}],
+				Arc::new(HostExecutor),
+			)
+			.expect("child roster installs");
+		assert!(parent.resolved_identity("score").is_none());
+		assert_eq!(
+			child
+				.resolved_identity("score")
+				.map(|identity| identity.rev.n),
+			Some(9)
+		);
+		assert_eq!(child.live_names(), vec![sf!("lift"), sf!("score")]);
+	}
+
+	#[test]
 	fn host_roster_replacement_is_atomic_revisioned_and_preserves_native_tools() {
 		let mut registry = Registry::new();
 		registry
@@ -3879,12 +3939,19 @@ mod tests {
 					name:        sf!("alpha"),
 					description: sf!("alpha host tool"),
 					parameters:  serde_json::json!({"type": "object"}),
+					rev:         Some(Rev { family: Str::default(), n: 7 }),
 				}],
 				Arc::clone(&executor),
 			)
 			.expect("first host roster installs");
 		assert!(registry.resolved_identity("lift").is_some());
-		assert!(registry.resolved_identity("alpha").is_some());
+		assert_eq!(
+			registry
+				.resolved_identity("alpha")
+				.map(|identity| identity.rev.n),
+			Some(7)
+		);
+		assert_eq!(registry.live_names(), vec![sf!("alpha"), sf!("lift")]);
 		registry
 			.replace_host_tools(
 				sf!("rpc/client"),
@@ -3893,12 +3960,14 @@ mod tests {
 					name:        sf!("beta"),
 					description: sf!("beta host tool"),
 					parameters:  serde_json::json!({"type": "object"}),
+					rev:         None,
 				}],
 				executor,
 			)
 			.expect("replacement host roster installs");
 		assert!(registry.resolved_identity("alpha").is_none());
 		assert!(registry.resolved_identity("beta").is_some());
+		assert_eq!(registry.live_names(), vec![sf!("beta"), sf!("lift")]);
 		assert_eq!(registry.locus("beta").expect("host locus resolves"), ToolLocus::Session);
 		assert!(matches!(
 			registry.replace_host_tools(sf!("rpc/client"), 2, Vec::new(), Arc::new(HostExecutor),),
@@ -3936,11 +4005,13 @@ mod tests {
 						name:        sf!("alpha"),
 						description: sf!("alpha host tool"),
 						parameters:  serde_json::json!({"type": "object"}),
+						rev:         None,
 					},
 					HostToolSpec {
 						name:        sf!("beta"),
 						description: sf!("beta host tool"),
 						parameters:  serde_json::json!({"type": "object"}),
+						rev:         None,
 					},
 				],
 				Arc::new(HostExecutor),
