@@ -269,6 +269,7 @@ impl CompactionDirector {
 			tokens_before: Some(context_tokens),
 			tokens_after:  Some(tokens_after),
 			warning:       warning.clone(),
+			frames:        Vec::new(),
 		})?;
 		if let Some(hooks) = cx.hooks {
 			hooks.notify(

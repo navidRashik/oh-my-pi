@@ -9,12 +9,15 @@ use omp_agent::{
 };
 use omp_con::Ctx;
 use omp_core::{Str, sf};
-use omp_dom::{KnownTag, PropId, PropKey, Tag};
+use omp_dom::{KnownTag, PropId, PropKey, Tag, Value};
 use omp_inference::{
 	ChatEvent, ChatRequest, ChatStream, ContentPart, Error, ErrorDetail, ErrorKind,
 	ExecutionReceipt, Role,
 };
-use omp_journal::blob::BlobStore;
+use omp_journal::{
+	blob::BlobStore,
+	data::{AdvisorMessage, AdvisorSeverity},
+};
 use omp_session::{ComponentRegistry, Session};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -247,11 +250,34 @@ async fn blocker_review_continues_and_reaches_the_main_model() {
 			.expect("notice selector"),
 		1
 	);
+	let notice = session
+		.dom()
+		.select("body turn notice[kind=advisor]")
+		.expect("notice selector")
+		.into_iter()
+		.next()
+		.and_then(|handle| session.dom().get(handle))
+		.expect("advisor notice");
+	let Some(Value::Json(data)) = notice.prop(&PropId::Data.into()) else {
+		panic!("real advisor producer must journal typed notes");
+	};
+	let message: AdvisorMessage = serde_json::from_str(data.get()).expect("typed advisor payload");
+	assert_eq!(message.notes, [omp_journal::data::AdvisorNote {
+		advisor:  Str::new_static("default"),
+		severity: AdvisorSeverity::Blocker,
+		note:     Str::new_static("Verify the failing edge."),
+	}]);
 	let (_, node) = find_director(session.dom(), advisor::FAMILY).expect("advisor frame");
 	assert_eq!(state_str(node, "status").as_deref(), Some("running"));
 	assert!(state_bool(node, "yielded").unwrap_or(false));
 	assert_eq!(state_int(node, "completed_turns"), Some(2));
 	assert_eq!(state_int(node, "immune_start"), Some(2), "cooldown starts on the next turn");
+
+	let live = session.dom().snapshot();
+	drop(session);
+	let restored = Session::open(root.path().join("advisor.oms"), ComponentRegistry::standard())
+		.expect("advisor session replays");
+	assert_eq!(restored.dom().snapshot(), live, "typed advisor notes survive replay exactly");
 }
 
 #[tokio::test]

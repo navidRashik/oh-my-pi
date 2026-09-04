@@ -21,7 +21,7 @@ use std::{
 use flume::{Receiver, r#async::RecvStream};
 use futures::{Stream, StreamExt as _};
 use omp_core::{FastHashMap, Hash32, Str, sf};
-use omp_dom::{Handle, KnownTag, PropId, Sid, Tag};
+use omp_dom::{Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Sid, Tag, Txn, Value};
 use omp_journal::{
 	EntryId,
 	blob::{BlobRef, BlobStage, BlobStore},
@@ -84,6 +84,12 @@ pub struct DispatchPolicy {
 	pub max_complete_output_bytes: usize,
 	/// Maximum bytes retained from one output line.
 	pub max_line_bytes:            usize,
+	/// Maximum bytes retained from the beginning of artifact-spilled output.
+	pub artifact_head_bytes:       usize,
+	/// Maximum bytes retained from the end of artifact-spilled output.
+	pub artifact_tail_bytes:       usize,
+	/// Maximum lines retained in each artifact-spilled output head/tail window.
+	pub artifact_tail_lines:       usize,
 	/// Maximum time a call may block the turn.
 	pub blocking_limit:            Duration,
 	/// Bounded wait after a stop request before a call that has not settled
@@ -109,6 +115,9 @@ impl DispatchPolicy {
 			max_output_bytes: Self::DEFAULT_MAX_OUTPUT_BYTES,
 			max_complete_output_bytes: Self::MAX_COMPLETE_OUTPUT_BYTES,
 			max_line_bytes: 512,
+			artifact_head_bytes: Self::DEFAULT_MAX_OUTPUT_BYTES,
+			artifact_tail_bytes: 0,
+			artifact_tail_lines: usize::MAX,
 			blocking_limit: Duration::from_secs(30),
 			interrupt_grace: Duration::from_secs(1),
 			spill,
@@ -132,7 +141,25 @@ impl DispatchPolicy {
 	) -> Self {
 		self.max_output_bytes = max_output_bytes;
 		self.max_line_bytes = max_line_bytes;
+		self.artifact_head_bytes = max_output_bytes;
+		self.artifact_tail_bytes = 0;
+		self.artifact_tail_lines = usize::MAX;
 		self.blocking_limit = blocking_limit;
+		self
+	}
+
+	/// Selects the inline head/tail projection used after complete output is
+	/// saved to the artifact store.
+	#[must_use]
+	pub const fn with_artifact_projection(
+		mut self,
+		head_bytes: usize,
+		tail_bytes: usize,
+		tail_lines: usize,
+	) -> Self {
+		self.artifact_head_bytes = head_bytes;
+		self.artifact_tail_bytes = tail_bytes;
+		self.artifact_tail_lines = tail_lines;
 		self
 	}
 }
@@ -188,6 +215,10 @@ pub struct ExternalDispatchRequest {
 	pub identity:       ToolIdentity,
 	/// Stable durable session identity owning this call.
 	pub session_id:     Str,
+	/// Content-addressed store owned by the session currently dispatching the
+	/// call. Session switches and relocation therefore cannot leave the
+	/// external executor writing into its launch-time namespace.
+	pub blobs:          BlobStore,
 	/// Stable provider call identity.
 	pub call_id:        Str,
 	/// Canonical committed argument object.
@@ -287,6 +318,9 @@ pub enum Received {
 	PauseChanged,
 	/// The turn or session was cancelled.
 	Cancelled,
+	/// One or more identified tool calls were interrupted without cancelling
+	/// unrelated siblings.
+	ToolScopedAbort(crate::ToolScopedAbortReason),
 	/// A journaled approval prompt was decided; a call waiting on it
 	/// starts or settles denied.
 	Approved(crate::ApprovalTicket),
@@ -389,6 +423,7 @@ impl CallControl {
 				crate::set_paused(session, active)?;
 				Ok(Received::PauseChanged)
 			},
+			Up::AbortTools(reason) => Ok(Received::ToolScopedAbort(reason)),
 			Up::Interrupt => {
 				self.turn.cancel_turn();
 				Ok(Received::Cancelled)
@@ -460,18 +495,42 @@ pub(crate) fn journal_env_event(
 			steering::append_notice(
 				session,
 				turn,
-				Str::new(format!(
-					"Staged proposal {proposal_id} from {source_tool} awaits `dyn resolve` or dyn \
-					 reject."
-				)),
+				sf!(
+					"Staged proposal {proposal_id} from {source_tool} awaits `dyn resolve \
+					 \"{proposal_id}\" \"<one-sentence reason>\"` or `dyn reject \"{proposal_id}\" \
+					 \"<one-sentence reason>\"`."
+				),
 			)?;
 			Ok(None)
 		},
-		crate::EnvEvent::CheckpointControl { operation, payload } => {
-			checkpoint_control(session, operation.as_str(), payload.as_str())
+		crate::EnvEvent::CheckpointOpened { token, goal, started_at, workspace } => {
+			checkpoint_open(session, token, goal, started_at, workspace)?;
+			Ok(None)
+		},
+		crate::EnvEvent::CheckpointRewind { token, report, receipt, workspace, rewound_at } => {
+			checkpoint_rewind(session, &token, report, receipt, &workspace, rewound_at)
 		},
 		crate::EnvEvent::IrcTraffic { payload } => {
 			crate::append_irc_traffic(session, turn, &payload)?;
+			Ok(None)
+		},
+		crate::EnvEvent::LateDiagnostics(diagnostics) => {
+			let Some(diagnostics) = diagnostics.non_empty() else {
+				return Ok(None);
+			};
+			session.patch(Txn {
+				cause: session.head().ok_or(SessionError::NoActiveTurn)?,
+				label: Some(Str::new_static("diagnostics.late")),
+				ops:   vec![Op::Ins {
+					parent: turn,
+					after:  session.dom().children(turn).last().copied(),
+					node:   diagnostics.into_node()?,
+				}],
+			})?;
+			Ok(None)
+		},
+		crate::EnvEvent::CustomMessage(message) => {
+			steering::append_custom_message(session, turn, message)?;
 			Ok(None)
 		},
 		crate::EnvEvent::Notice { kind, name, body } => {
@@ -481,58 +540,162 @@ pub(crate) fn journal_env_event(
 	}
 }
 
-fn checkpoint_control(
+fn checkpoint_open(
 	session: &mut Session,
-	operation: &str,
-	payload: &str,
-) -> Result<Option<omp_session::LifecycleWork>, SessionError> {
-	let value: serde_json::Value = serde_json::from_str(payload)?;
-	let Some(token) = value.get("token").and_then(serde_json::Value::as_str) else {
-		return Ok(None);
-	};
-	if operation == "checkpoint" {
-		let cause = session.head().ok_or(SessionError::NoActiveTurn)?;
-		session.patch(omp_dom::Txn {
-			cause,
-			label: Some(Str::new_static("checkpoint.open")),
-			ops: vec![omp_dom::Op::Ins {
-				parent: session.dom().meta(),
-				after:  session.dom().children(session.dom().meta()).last().copied(),
-				node:   omp_dom::NodeSpec::new(omp_dom::Tag::Custom(Str::new_static(
-					"rewind-checkpoint",
-				)))
+	token: Str,
+	goal: Str,
+	started_at: u64,
+	workspace: omp_proto::env::v1::WorkspaceSnapshot,
+) -> Result<(), SessionError> {
+	let cause = session.head().ok_or(SessionError::NoActiveTurn)?;
+	session.patch(Txn {
+		cause,
+		label: Some(Str::new_static("checkpoint.open")),
+		ops: vec![Op::Ins {
+			parent: session.dom().meta(),
+			after:  session.dom().children(session.dom().meta()).last().copied(),
+			node:   NodeSpec::new(omp_dom::Tag::Custom(Str::new_static("rewind-checkpoint")))
+				.with_prop(PropKey::Custom(Str::new_static("token")), Value::Str(token))
 				.with_prop(
-					omp_dom::PropKey::Custom(Str::new_static("token")),
-					omp_dom::Value::Str(Str::new(token)),
+					PropKey::Custom(Str::new_static("target")),
+					Value::Str(Str::new(cause.to_string())),
+				)
+				.with_prop(PropKey::Custom(Str::new_static("goal")), Value::Str(goal))
+				.with_prop(
+					PropKey::Custom(Str::new_static("started-at")),
+					Value::Int(i64::try_from(started_at).unwrap_or(i64::MAX)),
 				)
 				.with_prop(
-					omp_dom::PropKey::Custom(Str::new_static("target")),
-					omp_dom::Value::Str(Str::new(cause.to_string())),
+					PropKey::Custom(Str::new_static("workspace-snapshot")),
+					Value::Str(Str::new(workspace.snapshot_id)),
+				)
+				.with_prop(
+					PropKey::Custom(Str::new_static("workspace-root")),
+					Value::Str(Str::new(workspace.root_uri)),
+				)
+				.with_prop(
+					PropKey::Custom(Str::new_static("workspace-generation")),
+					Value::Int(i64::try_from(workspace.generation).unwrap_or(i64::MAX)),
+				)
+				.with_prop(
+					PropKey::Custom(Str::new_static("workspace-tree")),
+					Value::Str(Str::new(workspace.tree_hash)),
+				)
+				.with_prop(
+					PropKey::Custom(Str::new_static("workspace-files")),
+					Value::Int(i64::try_from(workspace.files).unwrap_or(i64::MAX)),
+				)
+				.with_prop(
+					PropKey::Custom(Str::new_static("workspace-bytes")),
+					Value::Int(i64::try_from(workspace.bytes).unwrap_or(i64::MAX)),
 				),
-			}],
-		})?;
+		}],
+	})?;
+	Ok(())
+}
+
+fn checkpoint_rewind(
+	session: &mut Session,
+	token: &str,
+	report: Str,
+	receipt: Str,
+	workspace: &omp_proto::env::v1::WorkspaceRestored,
+	rewound_at: u64,
+) -> Result<Option<omp_session::LifecycleWork>, SessionError> {
+	if workspace.partial || !workspace.conflicts.is_empty() {
 		return Ok(None);
 	}
-	if operation != "schedule_rewind" {
-		return Ok(None);
-	}
-	let target = session.dom().handles().find_map(|handle| {
+	let checkpoint = session.dom().handles().find_map(|handle| {
 		let node = session.dom().get(handle)?;
 		if node.tag != omp_dom::Tag::Custom(Str::new_static("rewind-checkpoint"))
 			|| node
-				.prop(&omp_dom::PropKey::Custom(Str::new_static("token")))
-				.and_then(omp_dom::Value::as_str)
+				.prop(&PropKey::Custom(Str::new_static("token")))
+				.and_then(Value::as_str)
 				!= Some(token)
+			|| node
+				.prop(&PropKey::Custom(Str::new_static("workspace-snapshot")))
+				.and_then(Value::as_str)
+				!= Some(workspace.snapshot_id.as_str())
 		{
 			return None;
 		}
-		node
-			.prop(&omp_dom::PropKey::Custom(Str::new_static("target")))
-			.and_then(omp_dom::Value::as_str)?
+		let target = node
+			.prop(&PropKey::Custom(Str::new_static("target")))
+			.and_then(Value::as_str)?
 			.parse::<EntryId>()
-			.ok()
+			.ok()?;
+		let started_at = match node.prop(&PropKey::Custom(Str::new_static("started-at")))? {
+			Value::Int(value) => u64::try_from(*value).ok()?,
+			_ => return None,
+		};
+		Some((target, started_at))
 	});
-	target.map(|target| session.rewind(target)).transpose()
+	let Some((target, started_at)) = checkpoint else {
+		return Ok(None);
+	};
+	let work = session.rewind(target)?;
+	let turn = session
+		.dom()
+		.children(session.dom().body())
+		.last()
+		.copied()
+		.ok_or(SessionError::NoActiveTurn)?;
+	let cause = session.head().ok_or(SessionError::NoActiveTurn)?;
+	let report_body = sf!(
+		"<system-notice>\nExploration checkpoint rewound.\nReport:\n{}\n</system-notice>",
+		report
+	);
+	let status = sf!(
+		"Workspace restored to checkpoint: {} written, {} deleted, {} unchanged.",
+		workspace.written,
+		workspace.deleted,
+		workspace.unchanged
+	);
+	session.patch(Txn {
+		cause,
+		label: Some(Str::new_static("checkpoint.rewound")),
+		ops: vec![
+			Op::Ins {
+				parent: turn,
+				after:  session.dom().children(turn).last().copied(),
+				node:   NodeSpec::new(KnownTag::Developer)
+					.with_prop(
+						PropKey::Custom(Str::new_static("checkpoint-token")),
+						Value::Str(Str::new(token)),
+					)
+					.with_prop(
+						PropKey::Custom(Str::new_static("workspace-snapshot")),
+						Value::Str(Str::new(&workspace.snapshot_id)),
+					)
+					.with_prop(
+						PropKey::Custom(Str::new_static("workspace-undo-snapshot")),
+						Value::Str(Str::new(&workspace.undo_snapshot_id)),
+					)
+					.with_prop(
+						PropKey::Custom(Str::new_static("started-at")),
+						Value::Int(i64::try_from(started_at).unwrap_or(i64::MAX)),
+					)
+					.with_prop(
+						PropKey::Custom(Str::new_static("rewound-at")),
+						Value::Int(i64::try_from(rewound_at).unwrap_or(i64::MAX)),
+					)
+					.with_prop(PropKey::Custom(Str::new_static("receipt")), Value::Str(receipt))
+					.with_content(report_body),
+			},
+			Op::Ins {
+				parent: turn,
+				after:  session.dom().children(turn).last().copied(),
+				node:   NodeSpec::new(KnownTag::Notice)
+					.with_prop(PropId::Kind, Value::Str(Str::new_static("info")))
+					.with_prop(
+						PropKey::Custom(Str::new_static("name")),
+						Value::Str(Str::new_static("checkpoint")),
+					)
+					.with_content(status),
+			},
+		],
+	})?;
+	Ok(Some(work))
 }
 
 /// Runtime context available only to a session-owned tool.
@@ -949,6 +1112,8 @@ pub struct PreparedCall {
 	report:       Option<DispatchReport>,
 	/// Approval prompt this call waits on while `AwaitingApproval`.
 	ticket:       Option<Str>,
+	/// Call-specific stop label supplied by a scoped abort.
+	abort_reason: Option<Str>,
 }
 
 impl PreparedCall {
@@ -1105,6 +1270,15 @@ impl Dispatcher {
 		&self.committer.registry
 	}
 
+	/// Replaces the runtime registry between turns.
+	///
+	/// Composition owners use this for child-only contracts whose advertised
+	/// schema depends on the next queued unit of work. Callers must never swap
+	/// the registry while a turn has prepared calls.
+	pub fn replace_registry(&mut self, registry: Arc<Registry>) {
+		self.committer.registry = registry;
+	}
+
 	/// Borrows the central dispatch policy.
 	#[must_use]
 	pub const fn policy(&self) -> &DispatchPolicy {
@@ -1152,6 +1326,7 @@ impl Dispatcher {
 				closed: true,
 				report: None,
 				ticket: None,
+				abort_reason: None,
 			});
 		}
 		let route = self.committer.registry.route(name.as_str())?;
@@ -1198,6 +1373,7 @@ impl Dispatcher {
 			closed: false,
 			report: None,
 			ticket: None,
+			abort_reason: None,
 		})
 	}
 
@@ -1246,6 +1422,7 @@ impl Dispatcher {
 		mut calls: Vec<PreparedCall>,
 		control: Option<&CallControl>,
 	) -> Result<Vec<DispatchReport>, DispatchError> {
+		self.jobs.set_artifact_store(session.blobs().clone());
 		for call in &calls {
 			if !call.is_committed() {
 				return Err(DispatchError::Uncommitted { call_id: call.call_id.clone() });
@@ -1330,6 +1507,14 @@ impl Dispatcher {
 							}
 							self.jobs.apply_lifecycle(session, &work).await;
 						},
+						Received::ToolScopedAbort(reason) => {
+							for call in calls.iter_mut().filter(|call| {
+								reason.contains(call.call_id.as_str()) && call.phase != Phase::Settled
+							}) {
+								call.abort_reason = Some(reason.message_for(call.call_id.as_str()).clone());
+								call.interrupt.cancel();
+							}
+						},
 						Received::Approved(ticket) => {
 							let approved = ticket
 								.decision
@@ -1359,7 +1544,7 @@ impl Dispatcher {
 						Received::None | Received::PauseChanged | Received::Cancelled => {},
 					}
 					// A cancellation while a prompt is open withdraws the
-					// prompt and settles the call as interrupted.
+					// prompt and settles the never-started call as skipped.
 					for call in calls.iter_mut().filter(|call| {
 						call.phase == Phase::AwaitingApproval && call.interrupt.is_cancelled()
 					}) {
@@ -1367,12 +1552,13 @@ impl Dispatcher {
 							let _ = crate::ApprovalBook::new().withdraw(session, ticket.as_str());
 						}
 						let mut output = std::mem::take(call.output(&self.committer.policy));
+						let reason = call.abort_reason.take().unwrap_or_else(|| {
+							Str::new_static("tool execution cancelled while awaiting approval")
+						});
 						let report = self.committer.commit_abort(
 							session,
 							call,
-							Abort::Interrupted {
-								reason: Str::new_static("tool execution cancelled while awaiting approval"),
-							},
+							Abort::Skipped { reason },
 							&mut output,
 						)?;
 						call.phase = Phase::Settled;
@@ -1386,8 +1572,10 @@ impl Dispatcher {
 					call.grace_until = Some(Instant::now() + policy.interrupt_grace);
 					if let Unit::Native { feed } = &call.unit {
 						let _ = feed.interrupt(Interrupt {
-							class:  Str::new_static(Interrupt::ESCAPE),
-							reason: Str::new_static("tool execution cancelled"),
+							class: Str::new_static(Interrupt::ESCAPE),
+							reason: call.abort_reason.clone().unwrap_or_else(|| {
+								Str::new_static("tool execution cancelled")
+							}),
 						});
 					}
 				},
@@ -1403,15 +1591,16 @@ impl Dispatcher {
 								let _ = task.await;
 							}
 							let mut output = std::mem::take(call.output(&policy));
+							let reason = call.abort_reason.take().unwrap_or_else(|| {
+								Str::new_static(
+									"tool execution cancelled; the call did not settle within the \
+									 interrupt grace and was terminated",
+								)
+							});
 							let report = self.committer.commit_abort(
 								session,
 								call,
-								Abort::EffectsUnknown {
-									reason: Str::new_static(
-										"tool execution cancelled; the call did not settle within the \
-										 interrupt grace and was terminated",
-									),
-								},
+								Abort::EffectsUnknown { reason },
 								&mut output,
 							)?;
 							call.phase = Phase::Settled;
@@ -1485,10 +1674,13 @@ impl Dispatcher {
 			if call.interrupt.is_cancelled() {
 				// A stop already requested never starts new work.
 				let mut output = std::mem::take(call.output(&self.committer.policy));
+				let reason = call.abort_reason.take().unwrap_or_else(|| {
+					Str::new_static("tool execution cancelled before it started")
+				});
 				let report = self.committer.commit_abort(
 					session,
 					call,
-					Abort::Interrupted { reason: Str::new_static("tool execution cancelled") },
+					Abort::Skipped { reason },
 					&mut output,
 				)?;
 				call.phase = Phase::Settled;
@@ -1569,6 +1761,10 @@ impl Dispatcher {
 					},
 				}
 			}
+			// Journal the execution boundary before releasing committed
+			// arguments or spawning the host unit. A cancellation observed
+			// above remains a never-started placeholder on replay.
+			session.call_started(call.call)?;
 			call.started = Some(Instant::now());
 			match &mut call.unit {
 				Unit::Native { feed } => {
@@ -1587,6 +1783,7 @@ impl Dispatcher {
 								Hash32::sum(session.journal_path().as_os_str().as_encoded_bytes()).to_hex();
 							Str::new(digest.as_str())
 						},
+						blobs: session.blobs().clone(),
 						call_id: call.call_id.clone(),
 						args,
 						route: route.clone(),
@@ -1911,6 +2108,7 @@ impl crate::jobs::DetachedCall {
 			closed:       false,
 			report:       None,
 			ticket:       None,
+			abort_reason: None,
 		};
 		while let Ok(event) = self.events.try_recv() {
 			// A detached settlement lands from the job board's synchronous
@@ -2121,6 +2319,16 @@ impl Committer {
 				)?)))
 			},
 			DispatchEvent::External(ExternalDispatchEvent::Aborted(abort)) => {
+				// External cancellation tokens cannot carry a reason. Preserve
+				// the scoped label selected by the controller when the unit
+				// reports a cooperative interruption; owner-reported
+				// effects-unknown/skipped detail remains authoritative.
+				let abort = match (abort, &call.abort_reason) {
+					(Abort::Interrupted { .. }, Some(reason)) => {
+						Abort::Interrupted { reason: reason.clone() }
+					},
+					(abort, _) => abort,
+				};
 				Ok(Some(Settled::Report(self.commit_abort(session, call, abort, output)?)))
 			},
 		}
@@ -2283,9 +2491,11 @@ impl Committer {
 					.then(|| source_artifact.clone())
 					.flatten()
 			});
-		let bounded = bound_parts(&parts, visibility, call.options, &self.policy, transport_spill)?;
+		let spill = session.blobs().clone();
+		let bounded =
+			bound_parts(&parts, visibility, call.options, &self.policy, &spill, transport_spill)?;
 		let stream_inline_bytes = u64::try_from(output.shown).unwrap_or(u64::MAX);
-		let stream_spill = output.close(session, call.call, &self.policy.spill)?;
+		let stream_spill = output.close(session, call.call, &spill)?;
 		let stream_was_spilled = stream_spill.is_some();
 		let spilled = bounded.spilled.or(stream_spill);
 		let transport_source_bytes = transport_projection
@@ -2446,7 +2656,8 @@ impl Committer {
 		}
 		let update = match OutputStream::frame(&value) {
 			Some((sequence, bytes)) => {
-				output.push(session, call.call, &self.policy.spill, value, sequence, &bytes)?
+				let spill = session.blobs().clone();
+				output.push(session, call.call, &spill, value, sequence, &bytes)?
 			},
 			None => update,
 		};
@@ -2468,7 +2679,8 @@ impl Committer {
 		source_artifact: Option<BlobRef>,
 		output: &mut OutputStream,
 	) -> Result<(), DispatchError> {
-		output.close(session, call.call, &self.policy.spill)?;
+		let spill = session.blobs().clone();
+		output.close(session, call.call, &spill)?;
 		// The raw outcome is published on the element and travels in every
 		// snapshot and patch: bound it under the same policy as the prompt
 		// projection so an actor never receives an unbounded payload (ADR
@@ -2492,8 +2704,7 @@ impl Committer {
 				{
 					artifact
 				},
-				Some(_) => session.blobs().put(outcome_bytes)?,
-				None => self.policy.spill.put(outcome_bytes)?,
+				_ => session.blobs().put(outcome_bytes)?,
 			};
 			serde_json::value::to_raw_value(&CallOutcomeDetails::Spilled {
 				blob:     ToolBlobRef {
@@ -2613,6 +2824,7 @@ fn bound_parts(
 	visibility: &[ProjectionSpan],
 	options: DispatchOptions,
 	policy: &DispatchPolicy,
+	spill: &BlobStore,
 	transport_spill: Option<BlobRef>,
 ) -> Result<BoundedParts, DispatchError> {
 	const CONTINUATION_BYTES: usize = "artifact://sha256/".len() + 64;
@@ -2657,20 +2869,24 @@ fn bound_parts(
 	};
 	let mut output = Vec::with_capacity(parts.len().saturating_add(1));
 	let mut full = String::new();
+	let mut projected = String::new();
 	let mut shown_bytes = 0;
 	let mut lines_clamped = 0;
 	let mut changed = false;
+	let mut byte_truncated = false;
 	let mut visible_spans = Vec::new();
 	for (part_index, part) in parts.iter().enumerate() {
 		match part {
 			Part::Text { text } => {
 				full.push_str(text.as_str());
 				let bounded = clamp_text(text.as_str(), line_limit);
+				projected.push_str(&bounded.text);
 				lines_clamped += bounded.lines_clamped;
 				changed |= bounded.lines_clamped != 0;
 				let available = text_limit.saturating_sub(shown_bytes);
 				let visible = utf8_prefix(&bounded.text, available);
 				shown_bytes += visible.len();
+				byte_truncated |= visible.len() != bounded.text.len();
 				changed |= visible.len() != bounded.text.len();
 				visible_spans.extend(visibility.iter().filter(|span| {
 					span.part == part_index
@@ -2683,11 +2899,13 @@ fn bound_parts(
 					.map_err(|source| DispatchError::ProjectionUtf8 { source })?;
 				full.push_str(text);
 				let bounded = clamp_text(text, line_limit);
+				projected.push_str(&bounded.text);
 				lines_clamped += bounded.lines_clamped;
 				changed |= bounded.lines_clamped != 0;
 				let available = text_limit.saturating_sub(shown_bytes);
 				let visible = utf8_prefix(&bounded.text, available);
 				shown_bytes += visible.len();
+				byte_truncated |= visible.len() != bounded.text.len();
 				changed |= visible.len() != bounded.text.len();
 				visible_spans.extend(visibility.iter().filter(|span| {
 					span.part == part_index
@@ -2703,9 +2921,24 @@ fn bound_parts(
 			},
 		}
 	}
+	if byte_truncated && !options.notrunc && policy.artifact_tail_bytes != 0 {
+		let tail_bytes = policy.artifact_tail_bytes.min(text_limit);
+		let head_bytes = policy
+			.artifact_head_bytes
+			.min(text_limit.saturating_sub(tail_bytes));
+		let text =
+			artifact_projection(&projected, head_bytes, tail_bytes, policy.artifact_tail_lines);
+		shown_bytes = text.len();
+		output.retain(|part| matches!(part, Part::Blob { .. }));
+		output.push(Part::Text { text: Str::new(text) });
+		// Head/tail elision can expose complete source lines at both ends. A
+		// later projection-aware implementation may retain those receipts;
+		// conservatively authorizing none is safe today.
+		visible_spans.clear();
+	}
 	let spilled = match transport_spill {
 		Some(artifact) => Some(artifact),
-		None if changed => Some(policy.spill.put(full.as_bytes())?),
+		None if changed => Some(spill.put(full.as_bytes())?),
 		None => None,
 	};
 	if let Some(artifact) = spilled {
@@ -2724,6 +2957,63 @@ fn bound_parts(
 		lines_clamped,
 		visibility: visibility_receipt(visible_spans),
 	})
+}
+
+/// Builds the model-visible head/tail view of output that has already been
+/// preserved in the artifact store.
+fn artifact_projection(
+	text: &str,
+	head_bytes: usize,
+	tail_bytes: usize,
+	max_lines: usize,
+) -> String {
+	let head_line_end = if max_lines == usize::MAX {
+		text.len()
+	} else {
+		text
+			.match_indices('\n')
+			.nth(max_lines.saturating_sub(1))
+			.map_or(text.len(), |(index, _)| index + 1)
+	};
+	let head = utf8_prefix(text, head_bytes.min(head_line_end));
+
+	let mut tail_line_start = 0;
+	if max_lines != usize::MAX {
+		let mut remaining = max_lines.max(1);
+		for (index, _) in text.match_indices('\n').rev() {
+			if index + 1 == text.len() {
+				continue;
+			}
+			if remaining == 1 {
+				tail_line_start = index + 1;
+				break;
+			}
+			remaining -= 1;
+		}
+	}
+	let mut tail_byte_start = text.len().saturating_sub(tail_bytes);
+	while !text.is_char_boundary(tail_byte_start) {
+		tail_byte_start += 1;
+	}
+	let tail_start = tail_byte_start.max(tail_line_start);
+	if head.len() >= tail_start {
+		return text.to_owned();
+	}
+
+	let tail = &text[tail_start..];
+	let mut output = String::with_capacity(head.len().saturating_add(tail.len()).saturating_add(5));
+	if !head.is_empty() {
+		output.push_str(head);
+		if !head.ends_with('\n') {
+			output.push('\n');
+		}
+	}
+	output.push('…');
+	if !tail.is_empty() {
+		output.push('\n');
+		output.push_str(tail);
+	}
+	output
 }
 
 fn visibility_receipt<'a>(
@@ -2865,30 +3155,76 @@ pub(crate) fn utf8_prefix(text: &str, maximum: usize) -> &str {
 
 #[cfg(test)]
 mod checkpoint_tests {
-	use omp_core::Str;
+	use omp_core::sf;
+	use omp_dom::{KnownTag, PropKey, Tag, Value};
+	use omp_proto::env::v1::{WorkspaceRestored, WorkspaceSnapshot};
 	use omp_session::{ComponentRegistry, Session};
 
 	use super::journal_env_event;
 
+	fn snapshot(id: &str) -> WorkspaceSnapshot {
+		WorkspaceSnapshot {
+			snapshot_id: id.to_owned(),
+			root_uri: "file:///workspace".to_owned(),
+			generation: 7,
+			tree_hash: "tree".to_owned(),
+			files: 2,
+			bytes: 12,
+			wire_revision: omp_proto::SCHEMA_REV,
+			..Default::default()
+		}
+	}
+
+	fn restored(id: &str) -> WorkspaceRestored {
+		WorkspaceRestored {
+			snapshot_id: id.to_owned(),
+			undo_snapshot_id: "undo".to_owned(),
+			from_generation: 8,
+			to_generation: 9,
+			written: 1,
+			deleted: 1,
+			unchanged: 0,
+			wire_revision: omp_proto::SCHEMA_REV,
+			..Default::default()
+		}
+	}
+
 	#[test]
-	fn checkpoint_control_rewinds_to_the_journaled_token_target() {
+	fn checkpoint_control_rewinds_to_the_journaled_workspace_and_retains_report() {
 		let temp = tempfile::tempdir().expect("tempdir");
-		let mut session =
-			Session::create(temp.path().join("checkpoint.oms"), ComponentRegistry::standard())
-				.expect("session");
+		let path = temp.path().join("checkpoint.oms");
+		let mut session = Session::create(&path, ComponentRegistry::standard()).expect("session");
 		session.begin_turn().expect("turn");
 		session.user("before", Vec::new()).expect("before");
-		journal_env_event(&mut session, crate::EnvEvent::CheckpointControl {
-			operation: Str::new_static("checkpoint"),
-			payload:   Str::new_static(r#"{"token":"checkpoint-1"}"#),
+		journal_env_event(&mut session, crate::EnvEvent::CheckpointOpened {
+			token:      sf!("checkpoint-1"),
+			goal:       sf!("inspect"),
+			started_at: 42,
+			workspace:  snapshot("snapshot-1"),
 		})
 		.expect("checkpoint");
+		let checkpoint = session
+			.dom()
+			.select("rewind-checkpoint")
+			.expect("selector")
+			.next()
+			.expect("checkpoint element");
+		assert_eq!(
+			session
+				.dom()
+				.get(checkpoint)
+				.and_then(|node| node.prop(&PropKey::Custom(sf!("workspace-snapshot"))))
+				.and_then(Value::as_str),
+			Some("snapshot-1")
+		);
+
 		session.user("after", Vec::new()).expect("after");
-		let work = journal_env_event(&mut session, crate::EnvEvent::CheckpointControl {
-			operation: Str::new_static("schedule_rewind"),
-			payload:   Str::new_static(
-				r#"{"token":"checkpoint-1","report":"done","receipt":"rewind-1"}"#,
-			),
+		let work = journal_env_event(&mut session, crate::EnvEvent::CheckpointRewind {
+			token:      sf!("checkpoint-1"),
+			report:     sf!("kept finding"),
+			receipt:    sf!("rewind-1"),
+			workspace:  restored("snapshot-1"),
+			rewound_at: 84,
 		})
 		.expect("schedule")
 		.expect("rewind work");
@@ -2901,6 +3237,97 @@ mod checkpoint_tests {
 			.collect::<Vec<_>>();
 		assert_eq!(texts, ["before"]);
 		assert_eq!(session.dom().count("rewind-checkpoint").expect("selector"), 0);
+		let report = session
+			.dom()
+			.select("body turn developer")
+			.expect("selector")
+			.filter_map(|handle| session.dom().get(handle)?.content.as_deref())
+			.next()
+			.expect("retained report");
+		assert!(report.contains("kept finding"));
+		let status = session
+			.dom()
+			.select("body turn notice")
+			.expect("selector")
+			.filter_map(|handle| session.dom().get(handle)?.content.as_deref())
+			.next()
+			.expect("restoration status");
+		assert!(status.contains("1 written, 1 deleted, 0 unchanged"));
+
+		let live = session.dom().snapshot();
+		drop(session);
+		let replayed = Session::open(path, ComponentRegistry::standard()).expect("replay");
+		assert_eq!(replayed.dom().snapshot(), live);
+	}
+
+	#[test]
+	fn mismatched_workspace_snapshot_never_selects_the_branch() {
+		let temp = tempfile::tempdir().expect("tempdir");
+		let mut session =
+			Session::create(temp.path().join("checkpoint.oms"), ComponentRegistry::standard())
+				.expect("session");
+		session.begin_turn().expect("turn");
+		session.user("before", Vec::new()).expect("before");
+		journal_env_event(&mut session, crate::EnvEvent::CheckpointOpened {
+			token:      sf!("checkpoint-1"),
+			goal:       sf!("inspect"),
+			started_at: 42,
+			workspace:  snapshot("snapshot-1"),
+		})
+		.expect("checkpoint");
+		session.user("after", Vec::new()).expect("after");
+		assert!(
+			journal_env_event(&mut session, crate::EnvEvent::CheckpointRewind {
+				token:      sf!("checkpoint-1"),
+				report:     sf!("wrong workspace"),
+				receipt:    sf!("rewind-1"),
+				workspace:  restored("snapshot-from-another-project"),
+				rewound_at: 84,
+			})
+			.expect("mismatch is ignored")
+			.is_none()
+		);
+		assert_eq!(session.dom().count("body turn user").expect("selector"), 2);
+	}
+
+	#[test]
+	fn late_diagnostics_event_materializes_typed_files_and_replays() {
+		use omp_session::late_diagnostics::{LateDiagnostics, LateDiagnosticsFile};
+
+		let temp = tempfile::tempdir().expect("tempdir");
+		let path = temp.path().join("late-diagnostics.oms");
+		let mut session = Session::create(&path, ComponentRegistry::standard()).expect("session");
+		session.begin_turn().expect("turn");
+		let expected = LateDiagnostics {
+			files: vec![LateDiagnosticsFile {
+				path:     sf!("src/lib.rs"),
+				summary:  sf!("1 error(s)"),
+				errored:  true,
+				messages: vec![sf!("src/lib.rs:2:1 [error] [rustc] mismatched types (E0308)")],
+			}],
+		};
+		journal_env_event(&mut session, crate::EnvEvent::LateDiagnostics(expected.clone()))
+			.expect("late diagnostics journal");
+		let notice = session
+			.dom()
+			.select("body turn developer[kind=diagnostics]")
+			.expect("selector")
+			.next()
+			.and_then(|handle| session.dom().get(handle))
+			.expect("typed diagnostics notice");
+		assert_eq!(notice.tag, Tag::Known(KnownTag::Developer));
+		assert_eq!(
+			notice
+				.prop(&PropKey::from(omp_dom::PropId::Kind))
+				.and_then(Value::as_str),
+			Some("diagnostics")
+		);
+		assert_eq!(LateDiagnostics::from_node(notice), Some(expected));
+
+		let live = session.dom().snapshot();
+		drop(session);
+		let replayed = Session::open(path, ComponentRegistry::standard()).expect("replay");
+		assert_eq!(replayed.dom().snapshot(), live);
 	}
 }
 

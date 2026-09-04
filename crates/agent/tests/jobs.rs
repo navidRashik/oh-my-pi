@@ -232,6 +232,7 @@ async fn process_settlement_journals_one_atomic_replayable_completion() {
 	let completion: LaunchCompletion = serde_json::from_str(data.get()).expect("completion decodes");
 	assert_eq!(completion.daemons[0].name, "web");
 	assert_eq!(completion.daemons[0].duration_ms, 2_500);
+	drop(restored);
 
 	let (_, entries) = omp_journal::Journal::open(&path).expect("journal opens");
 	let settlement = entries
@@ -240,8 +241,8 @@ async fn process_settlement_journals_one_atomic_replayable_completion() {
 		.collect::<Vec<_>>();
 	assert_eq!(settlement.len(), 1, "settlement is one journal entry");
 	let patch: Patch = serde_json::from_str(settlement[0].data.as_str()).expect("patch payload");
-	assert!(patch.ops.get().contains("\"launch_completion\""));
-	assert!(patch.ops.get().contains("\"delivered\""));
+	assert!(patch.ops.get().contains("\"custom:launch_completion\""));
+	assert!(patch.ops.get().contains("\"custom:delivered\""));
 }
 
 /// ADR 0009: a settlement larger than the central inline bound never lands
@@ -392,6 +393,7 @@ async fn jobs_restart_adopts_terminal_artifact_and_settles_exactly_once() {
 	assert_eq!(resolved.get(), full.get());
 
 	board.poll(&mut session).expect("idempotent reconcile");
+	drop(session);
 	let (_, entries) = omp_journal::Journal::open(&path).expect("journal");
 	assert_eq!(
 		entries

@@ -10,7 +10,8 @@ use omp_core::Str;
 use omp_dom::{PropId, PropKey, Value};
 use omp_inference::{
 	BlockKind, ChatEvent, ChatRequest, ChatStream, Error, ErrorDetail, ErrorKind, ErrorPhase,
-	ExecutionReceipt, ProviderId, ReasonId, RequestId, ResponseMeta, RetryAction, RouteId,
+	ExecutionReceipt, ProviderId, ReasonId, RecoveryKind, RecoveryRecord, RequestId, ResponseMeta,
+	RetryAction, RouteId,
 };
 use omp_journal::blob::BlobStore;
 use omp_session::{ComponentRegistry, Session};
@@ -76,6 +77,48 @@ impl Inference for MidStreamFailure {
 				)
 				.committed(true)
 				.detail(ErrorDetail::protocol(ReasonId::new_static("http-response-body"))),
+			),
+		];
+		std::future::ready(Ok(ChatStream::ordinary(Box::pin(futures::stream::iter(events)))))
+	}
+}
+
+/// Opens an assistant, then surfaces an exhausted Harmony retry carrying
+/// typed recovery evidence.
+struct HarmonyFailure;
+
+impl Inference for HarmonyFailure {
+	fn chat(
+		&mut self,
+		_request: ChatRequest,
+	) -> impl Future<Output = Result<ChatStream, Error>> + Send {
+		let receipt = ExecutionReceipt {
+			recoveries: vec![RecoveryRecord {
+				attempt:     2,
+				kind:        RecoveryKind::HarmonyLeakDetection,
+				rule:        ReasonId::new_static("harmony/codex/shadow-routing-signal"),
+				input_bytes: 64,
+				steps:       0,
+			}],
+			..ExecutionReceipt::default()
+		};
+		let events = vec![
+			Ok(ChatEvent::Started(ResponseMeta {
+				request_id:          RequestId::from("harmony-request"),
+				provider:            ProviderId::from("openai-codex"),
+				route:               RouteId::from("openai-codex/responses"),
+				model:               None,
+				provider_request_id: None,
+				created_at:          std::time::SystemTime::UNIX_EPOCH,
+			})),
+			Err(
+				Error::new(
+					ErrorKind::MalformedModelOutput,
+					ErrorPhase::Recovery,
+					RetryAction::Never,
+					receipt,
+				)
+				.detail(ErrorDetail::protocol(ReasonId::new_static("harmony.provable-leak"))),
 			),
 		];
 		std::future::ready(Ok(ChatStream::ordinary(Box::pin(futures::stream::iter(events)))))
@@ -192,6 +235,43 @@ async fn mid_stream_failure_closes_the_assistant_with_error_and_journals_the_cau
 	drop(session);
 	let entries = journal_entries(&journal_path);
 	assert_all_entries_caused(&entries);
+	let reopened = Session::open(&journal_path, ComponentRegistry::default()).expect("replays");
+	assert_eq!(reopened.dom().snapshot(), live);
+}
+
+#[tokio::test]
+async fn exhausted_harmony_retry_journals_typed_evidence_and_replays_identically() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("harmony.oms");
+	let mut kernel = kernel(HarmonyFailure, directory.path());
+	let mut session = fresh_session(&journal_path);
+
+	kernel
+		.run_turn(&mut session, input("hi"), RunControl::default())
+		.await
+		.expect_err("exhausted Harmony leak surfaces");
+
+	let usage = session
+		.dom()
+		.select("body turn usage")
+		.expect("selector")
+		.next()
+		.expect("failure receipt");
+	let recovery = session
+		.dom()
+		.get(usage)
+		.and_then(|node| node.prop(&PropKey::Custom(Str::new_static("recoveries"))));
+	let json = match recovery {
+		Some(Value::Json(raw)) => {
+			serde_json::from_str::<serde_json::Value>(raw.get()).expect("recovery evidence JSON")
+		},
+		other => panic!("unexpected recovery evidence: {other:?}"),
+	};
+	assert_eq!(json[0]["kind"], "harmony_leak_detection");
+	assert_eq!(json[0]["attempt"], 2);
+
+	let live = session.dom().snapshot();
+	drop(session);
 	let reopened = Session::open(&journal_path, ComponentRegistry::default()).expect("replays");
 	assert_eq!(reopened.dom().snapshot(), live);
 }

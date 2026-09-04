@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use omp_core::Str;
 use omp_dom::{Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
-use omp_journal::data::{Attachment, IrcTraffic};
+use omp_journal::data::{Attachment, Compaction, IrcTraffic};
 use omp_session::{Session, SessionError};
 
 use crate::SteeringMode;
@@ -22,6 +22,57 @@ const EMPTY_OUTPUT_CAP_NOTICE: &str =
 
 /// A live DOM subscription handed back through [`Up::Subscribe`].
 pub type DomSubscription = (omp_dom::Snapshot, flume::Receiver<omp_dom::Event>);
+
+/// A turn stop caused by one or more identified tool calls.
+///
+/// Completed sibling calls need neutral placeholder results when the abort
+/// happens during inference, while a call already executing is interrupted
+/// without cancelling unrelated execution units.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolScopedAbortReason {
+	/// Human-facing reason for the turn-level interruption.
+	pub message:                   Str,
+	/// Per-call labels for calls that caused the interruption.
+	pub tool_call_messages:        Arc<[(Str, Str)]>,
+	/// Neutral label for other calls in the same assistant batch.
+	pub default_tool_call_message: Str,
+}
+
+impl ToolScopedAbortReason {
+	/// Creates a reason for one offending call and its unaffected siblings.
+	#[must_use]
+	pub fn one(
+		call_id: impl Into<Str>,
+		message: impl Into<Str>,
+		default_tool_call_message: impl Into<Str>,
+	) -> Self {
+		let message = message.into();
+		Self {
+			message: message.clone(),
+			tool_call_messages: Arc::from([(call_id.into(), message)]),
+			default_tool_call_message: default_tool_call_message.into(),
+		}
+	}
+
+	/// Returns the call-specific label or the neutral sibling label.
+	#[must_use]
+	pub fn message_for(&self, call_id: &str) -> &Str {
+		self
+			.tool_call_messages
+			.iter()
+			.find_map(|(id, message)| (id.as_str() == call_id).then_some(message))
+			.unwrap_or(&self.default_tool_call_message)
+	}
+
+	/// Reports whether this call caused the interruption.
+	#[must_use]
+	pub fn contains(&self, call_id: &str) -> bool {
+		self
+			.tool_call_messages
+			.iter()
+			.any(|(id, _)| id.as_str() == call_id)
+	}
+}
 
 /// Control sent to a running kernel turn.
 #[derive(Clone, Debug)]
@@ -73,6 +124,12 @@ pub enum Up {
 		/// `true` holds runtime work; `false` releases it.
 		active: bool,
 	},
+	/// Interrupts identified tool calls without cancelling their siblings.
+	///
+	/// During inference this ends the request and settles each materialized
+	/// call without admitting execution. During execution only matching scopes
+	/// receive the stop request.
+	AbortTools(ToolScopedAbortReason),
 	/// Interrupts the current inference/tool turn while preserving mutations.
 	Interrupt,
 	/// Cancels the whole session and every execution scope.
@@ -403,6 +460,28 @@ pub(crate) fn append_error_notice(
 	append_notice_with_kind(session, turn, text, Str::new_static("error"))
 }
 
+/// Appends a durable custom message as model-visible developer context.
+///
+/// Visible legacy `handoff` messages are normalized at this producer boundary
+/// into the ordinary compaction journal kind. That keeps new journals free of
+/// the obsolete custom-message shape while the fold retains replay support for
+/// journals that already contain it.
+pub(crate) fn append_custom_message(
+	session: &mut Session,
+	turn: Handle,
+	message: omp_session::custom_message::CustomMessage,
+) -> Result<(), SessionError> {
+	if let Some(document) = message.legacy_handoff_document() {
+		let boundary = session.head().ok_or(SessionError::NoActiveTurn)?;
+		let summary = session.blobs().put(document.as_bytes())?;
+		let mut compaction = Compaction::new(summary, boundary);
+		compaction.method = Some(Str::new_static("handoff"));
+		session.compaction(compaction)?;
+		return Ok(());
+	}
+	append_turn_child(session, turn, message.into_node(), Str::new_static("kernel.custom-message"))
+}
+
 /// Appends a producer-named notice (`<notice kind=hook name=…>`).
 pub(crate) fn append_named_notice(
 	session: &mut Session,
@@ -528,6 +607,54 @@ mod tests {
 				.flatten()
 			})
 			.collect()
+	}
+
+	#[test]
+	fn runtime_legacy_handoff_journals_an_ordinary_compaction() {
+		let directory = tempfile::tempdir().expect("temporary session directory");
+		let path = directory.path().join("handoff.oms");
+		let (mut session, turn) = session_with_turn(&path);
+		append_custom_message(
+			&mut session,
+			turn,
+			omp_session::custom_message::CustomMessage::new(
+				"handoff",
+				"before<handoff-context>\n# State\nContinue.\n</handoff-context>after",
+			),
+		)
+		.expect("handoff journals");
+
+		let head = session.head().expect("journal head");
+		assert_eq!(
+			session.entry(head).expect("head entry").kind.name.as_str(),
+			"compaction",
+			"new runtime handoffs use compaction@1 rather than a compatibility patch"
+		);
+		let handle = session
+			.dom()
+			.select("meta compaction[method=handoff]")
+			.expect("selector")
+			.next()
+			.expect("handoff compaction");
+		let node = session.dom().get(handle).expect("compaction node");
+		assert_eq!(
+			node.prop(&PropId::Summary.into()).and_then(Value::as_str),
+			Some("# State\nContinue.")
+		);
+		assert!(
+			session
+				.dom()
+				.select("body turn developer[name=handoff]")
+				.expect("selector")
+				.next()
+				.is_none()
+		);
+		let live = session.dom().snapshot();
+		drop(session);
+
+		let restored =
+			Session::open(&path, ComponentRegistry::default()).expect("handoff compaction replays");
+		assert_eq!(restored.dom().snapshot(), live);
 	}
 
 	#[test]

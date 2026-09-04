@@ -5,6 +5,7 @@ use std::{fmt::Write as _, sync::Arc};
 use omp_core::{Str, StrMut};
 use omp_dom::{Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Value};
 use omp_journal::data::{IrcTraffic, LaunchCompletion, LaunchDaemonCompletion};
+use omp_proto::env::v1::{WorkspaceRestored, WorkspaceSnapshot};
 use omp_session::{Session, SessionError};
 
 /// Builds the atomic journal operations for a supervised-process settlement.
@@ -96,12 +97,30 @@ pub enum EnvEvent {
 		/// Canonical JSON projection of the available devices.
 		payload: Str,
 	},
-	/// A checkpoint or rewind request crossed the environment boundary.
-	CheckpointControl {
-		/// Stable operation name (`checkpoint` or `schedule_rewind`).
-		operation: Str,
-		/// Canonical JSON operation arguments, including the host-issued receipt.
-		payload:   Str,
+	/// A workspace generation was captured before speculative exploration.
+	CheckpointOpened {
+		/// Opaque token scoped to the bound session controller.
+		token:      Str,
+		/// Human-readable exploration goal.
+		goal:       Str,
+		/// Checkpoint creation time in epoch milliseconds.
+		started_at: u64,
+		/// Typed environment-owned workspace generation.
+		workspace:  WorkspaceSnapshot,
+	},
+	/// Workspace restoration completed and the matching journal branch may be
+	/// selected.
+	CheckpointRewind {
+		/// Opaque token scoped to the bound session controller.
+		token:      Str,
+		/// Findings retained on the selected branch.
+		report:     Str,
+		/// Stable environment-issued operation receipt.
+		receipt:    Str,
+		/// Restoration result, including its durable undo generation.
+		workspace:  WorkspaceRestored,
+		/// Completion time in epoch milliseconds.
+		rewound_at: u64,
 	},
 	/// A staged mutation requires a host-side resolution director.
 	StagedPreview {
@@ -116,9 +135,15 @@ pub enum EnvEvent {
 		/// fan-out without cloning its message body or attribution strings.
 		payload: Arc<IrcTraffic>,
 	},
-	/// A hook or extension message journaled as `<notice kind=… name=…>` under
-	/// the current turn at the next mailbox drain (pi `hookMessage` /
-	/// `custom_message`).
+	/// Revision-fenced diagnostics that settled after a mutation tool returned.
+	LateDiagnostics(omp_session::late_diagnostics::LateDiagnostics),
+	/// A durable extension message projected into inference and the transcript.
+	///
+	/// Renderer output is optional presentation metadata: its semantic Markdown
+	/// body remains authoritative for replay, copy, and fallback rendering.
+	CustomMessage(omp_session::custom_message::CustomMessage),
+	/// A hook or extension notice journaled as `<notice kind=… name=…>` under
+	/// the current turn at the next mailbox drain.
 	Notice {
 		/// Notice kind (`hook`, `custom`, …).
 		kind: Str,

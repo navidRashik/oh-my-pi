@@ -1,14 +1,74 @@
 //! Goal-mode Director.
 
+use std::fmt::Write as _;
+
 use omp_core::Str;
 use omp_dom::{Dom, Node};
 
 use crate::director::{
 	BindValue, Director, DirectorCx, DirectorEffect, Slot, StateUpdate, TurnView, Verdict,
-	state_bool, state_int, state_str, turn_call_inputs, turn_tokens,
+	director_status, find_director, state_bool, state_int, state_str, turn_call_inputs, turn_tokens,
 };
 
 const CLAIMS: &[Slot] = &[Slot::Mode, Slot::Loop];
+const ACTIVE: &str = "active";
+
+/// Whether the selected branch has an active Goal eligible for idle
+/// continuation.
+#[must_use]
+pub fn continuation_is_active(dom: &Dom) -> bool {
+	find_director(dom, "goal").is_some_and(|(_, node)| director_status(node) == Some(ACTIVE))
+}
+
+/// Builds the hidden prompt for the next idle-boundary continuation.
+///
+/// An active Goal yields after a prose-only model response. The interactive
+/// controller may submit this prompt as a new turn after pi's 800 ms idle
+/// window; paused and queued engagements deliberately produce no prompt.
+#[must_use]
+pub fn continuation_prompt(dom: &Dom) -> Option<Str> {
+	let (_, node) = find_director(dom, "goal")?;
+	if director_status(node) != Some(ACTIVE) {
+		return None;
+	}
+	let objective = state_str(node, "objective")?;
+	let tokens_used = state_int(node, "tokens_used")
+		.and_then(|value| u64::try_from(value).ok())
+		.unwrap_or(0);
+	let token_budget = state_int(node, "token_budget").and_then(|value| u64::try_from(value).ok());
+	let (budget, remaining) = token_budget.map_or_else(
+		|| (Str::new_static("none"), Str::new_static("unbounded")),
+		|budget| {
+			(Str::new(budget.to_string()), Str::new(budget.saturating_sub(tokens_used).to_string()))
+		},
+	);
+	let mut prompt = String::with_capacity(objective.len().saturating_add(640));
+	prompt.push_str("Continue active goal.\n\n<objective>\n");
+	push_xml_text(&mut prompt, objective.as_str());
+	write!(
+		&mut prompt,
+		"\n</objective>\n\nBudget:\n- Tokens used: {tokens_used}\n- Token budget: {budget}\n- \
+		 Tokens remaining: {remaining}\n\nAutonomous continuation; objective persists across turns. \
+		 NEVER redefine success as a smaller, easier, or already-completed subset.\n\nBefore \
+		 `goal({{op:\"complete\"}})`, audit the current repo state and verify every objective \
+		 deliverable with direct current-state evidence. Uncertainty means the goal is unfinished. \
+		 Budget exhaustion is not completion. If unfinished, keep working without narrating \
+		 continuation."
+	)
+	.expect("formatting a String is infallible");
+	Some(Str::new(prompt))
+}
+
+fn push_xml_text(out: &mut String, text: &str) {
+	for character in text.chars() {
+		match character {
+			'&' => out.push_str("&amp;"),
+			'<' => out.push_str("&lt;"),
+			'>' => out.push_str("&gt;"),
+			_ => out.push(character),
+		}
+	}
+}
 
 /// Keeps the loop occupied until a goal completes, drops, or exhausts its token
 /// budget.
@@ -105,7 +165,7 @@ impl Director for Goal {
 		updates
 	}
 
-	fn evaluate(&self, _dom: &Dom, _cx: &DirectorCx<'_>, _turn: &TurnView) -> DirectorEffect {
+	fn evaluate(&self, _dom: &Dom, _cx: &DirectorCx<'_>, turn: &TurnView) -> DirectorEffect {
 		if self.done || self.dropped {
 			return DirectorEffect::new(Verdict::Done);
 		}
@@ -116,8 +176,9 @@ impl Director for Goal {
 			return DirectorEffect::new(Verdict::Done)
 				.with_aside("Goal token budget exhausted; returning control to the user.");
 		}
-		DirectorEffect::new(Verdict::Continue {
-			reminder: Some(Str::new(format!("Continue toward the active goal: {}", self.objective))),
-		})
+		if !turn.had_tool_calls {
+			return DirectorEffect::new(Verdict::Yield);
+		}
+		DirectorEffect::new(Verdict::Continue { reminder: None })
 	}
 }

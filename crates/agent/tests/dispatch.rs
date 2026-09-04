@@ -1,6 +1,6 @@
 //! Central dispatch, projection, and cancellation contracts.
 
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use omp_agent::{
 	CancelTree, DispatchOptions, DispatchPolicy, DispatchRequest, Dispatcher, ExternalDispatchEvent,
@@ -19,8 +19,8 @@ use parking_lot::Mutex;
 
 mod support;
 use support::{
-	Fault, Payload, assert_journal_cause, call, registry, request, result_text, session, spec,
-	tool_spec,
+	Fault, Payload, assert_journal_cause, call, journal_entries, registry, request, result_text,
+	session, spec, tool_spec,
 };
 
 struct SessionEcho(ToolSpec);
@@ -75,11 +75,15 @@ async fn central_truncation_spills_and_notrunc_explicitly_opts_out() {
 	let directory = tempfile::tempdir().expect("temporary directory");
 	let tools = registry([spec("echo", 1, "abcdefghij")]);
 	let identity = tools.resolved_identity("echo").expect("identity");
-	let policy = DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store"))
-		.with_limits(5, usize::MAX, Duration::from_secs(5));
+	let policy = DispatchPolicy::new(
+		BlobStore::open(directory.path().join("launch")).expect("launch blob store"),
+	)
+	.with_limits(5, usize::MAX, Duration::from_secs(5));
 	let dispatcher = Dispatcher::new(Arc::clone(&tools), policy);
 	let tree = CancelTree::new();
-	let mut bounded = session(&directory.path().join("bounded.oms"));
+	let active = directory.path().join("active");
+	std::fs::create_dir_all(&active).expect("active session directory");
+	let mut bounded = session(&active.join("bounded.oms"));
 	let (entry, args) = call(&mut bounded, &identity, "bounded");
 	let report = dispatcher
 		.dispatch(
@@ -96,20 +100,23 @@ async fn central_truncation_spills_and_notrunc_explicitly_opts_out() {
 		.expect("bounded dispatch");
 	let spilled = report.spilled.expect("full output spills");
 	assert_eq!(
-		dispatcher
-			.policy()
-			.spill
+		bounded
+			.blobs()
 			.get(&spilled)
-			.expect("artifact reads")
+			.expect("artifact reads from active session CAS")
 			.as_ref(),
 		b"abcdefghij"
+	);
+	assert!(
+		!dispatcher.policy().spill.has(&spilled),
+		"the launch-session CAS is never a fallback after navigation"
 	);
 	let parts = result_text(&bounded, "bounded");
 	assert_eq!(parts[0], "abcde");
 	assert!(parts[1].starts_with("artifact://sha256/"));
 	assert_journal_cause(&bounded, entry);
 
-	let mut unlimited = session(&directory.path().join("unlimited.oms"));
+	let mut unlimited = session(&active.join("unlimited.oms"));
 	let (entry, args) = call(&mut unlimited, &identity, "unlimited");
 	let report = dispatcher
 		.dispatch(
@@ -126,6 +133,45 @@ async fn central_truncation_spills_and_notrunc_explicitly_opts_out() {
 		.expect("unbounded dispatch");
 	assert!(report.spilled.is_none());
 	assert_eq!(result_text(&unlimited, "unlimited"), ["abcdefghij"]);
+}
+
+#[tokio::test]
+async fn artifact_projection_keeps_configured_head_and_tail() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let tools = registry([spec("echo", 1, "aa\nbb\ncc\ndd")]);
+	let identity = tools.resolved_identity("echo").expect("identity");
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store"))
+			.with_limits(8, usize::MAX, Duration::from_secs(5))
+			.with_artifact_projection(3, 3, 1),
+	);
+	let mut active = session(&directory.path().join("head-tail.oms"));
+	let (entry, args) = call(&mut active, &identity, "head-tail");
+	let report = dispatcher
+		.dispatch(
+			&mut active,
+			request(
+				entry,
+				identity,
+				args,
+				ToolCancellation::ReadOnly(CancelTree::new().begin_turn().read_only_tool()),
+				false,
+			),
+		)
+		.await
+		.expect("bounded dispatch");
+
+	assert_eq!(result_text(&active, "head-tail")[0], "aa\n…\ndd");
+	let artifact = report.spilled.expect("complete output is artifact-backed");
+	assert_eq!(
+		active
+			.blobs()
+			.get(&artifact)
+			.expect("artifact reads")
+			.as_ref(),
+		b"aa\nbb\ncc\ndd"
+	);
 }
 
 #[tokio::test]
@@ -440,6 +486,7 @@ async fn notrunc_disables_the_per_line_clamp() {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExternalObserved {
 	session_id: Str,
+	blobs:      PathBuf,
 	call_id:    Str,
 	args:       Str,
 	route:      ToolRoute,
@@ -453,6 +500,7 @@ impl ExternalToolExecutor for ScriptedExternal {
 	fn invoke(&self, request: ExternalDispatchRequest) -> ExternalDispatchStream {
 		self.observed.lock().push(ExternalObserved {
 			session_id: request.session_id,
+			blobs:      request.blobs.root().to_path_buf(),
 			call_id:    request.call_id,
 			args:       Str::new(request.args.get()),
 			route:      request.route,
@@ -502,6 +550,32 @@ impl ExternalToolExecutor for StuckExternal {
 	}
 }
 
+/// A two-call worker batch whose selected call ignores its stop request while
+/// the sibling settles normally.
+struct ScopedAbortExternal {
+	started: Arc<tokio::sync::Barrier>,
+}
+
+impl ExternalToolExecutor for ScopedAbortExternal {
+	fn invoke(&self, request: ExternalDispatchRequest) -> ExternalDispatchStream {
+		let started = Arc::clone(&self.started);
+		Box::pin(async_stream::stream! {
+			started.wait().await;
+			if request.call_id == "abort-me" {
+				request.cancellation.cancelled().await;
+				std::future::pending::<()>().await;
+			} else {
+				yield ExternalDispatchEvent::Done {
+					outcome: CallOutcome::Ok(serde_json::json!({"text": "sibling result"})),
+					parts: vec![Part::Text { text: Str::new_static("sibling result") }],
+					is_error: false,
+					source_artifact: None,
+				};
+			}
+		})
+	}
+}
+
 fn worker_registry() -> Arc<omp_tool::Registry> {
 	let mut tools = omp_tool::Registry::new();
 	tools
@@ -512,6 +586,133 @@ fn worker_registry() -> Arc<omp_tool::Registry> {
 		})
 		.expect("worker registers");
 	Arc::new(tools)
+}
+
+#[tokio::test]
+async fn tool_scoped_abort_forces_only_the_selected_sibling_and_replays() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("scoped-abort.oms");
+	let tools = worker_registry();
+	let identity = tools.resolved_identity("worker").expect("worker identity");
+	let started = Arc::new(tokio::sync::Barrier::new(3));
+	let dispatcher = Dispatcher::new(
+		Arc::clone(&tools),
+		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store"))
+			.with_interrupt_grace(Duration::from_millis(25)),
+	)
+	.with_external_executor(Arc::new(ScopedAbortExternal {
+		started: Arc::clone(&started),
+	}));
+	let mut session = session(&journal_path);
+	let (aborted_entry, aborted_args) = call(&mut session, &identity, "abort-me");
+	let (sibling_entry, sibling_args) = call(&mut session, &identity, "sibling");
+	let tree = CancelTree::new();
+	let turn = tree.begin_turn();
+	let aborted_scope = turn.read_only_tool();
+	let mut aborted = dispatcher
+		.prepare(
+			identity.clone(),
+			Str::new_static("abort-me"),
+			aborted_entry,
+			ToolCancellation::ReadOnly(aborted_scope.clone()),
+		)
+		.expect("aborted call prepares");
+	aborted.commit(aborted_args);
+	let mut sibling = dispatcher
+		.prepare(
+			identity,
+			Str::new_static("sibling"),
+			sibling_entry,
+			ToolCancellation::ReadOnly(turn.read_only_tool()),
+		)
+		.expect("sibling call prepares");
+	sibling.commit(sibling_args);
+
+	let reports = {
+		let drive = dispatcher.drive(&mut session, vec![aborted, sibling], None);
+		tokio::pin!(drive);
+		tokio::select! {
+			_ = started.wait() => {},
+			result = &mut drive => panic!("batch settled before both calls started: {result:?}"),
+		}
+		aborted_scope.cancel_tool();
+		tokio::time::timeout(Duration::from_millis(250), &mut drive)
+			.await
+			.expect("forced cleanup is bounded")
+			.expect("batch journals both terminals")
+	};
+	assert!(reports[0].is_error);
+	assert!(!reports[1].is_error);
+	assert!(!turn.is_turn_cancelled(), "tool abort must not become a turn interrupt");
+	assert!(!tree.is_session_cancelled(), "tool abort must not become session cancellation");
+	assert!(
+		result_text(&session, "abort-me")[0].contains("effects unknown"),
+		"started call that ignored cancellation records uncertainty"
+	);
+	assert_eq!(result_text(&session, "sibling"), ["sibling result"]);
+
+	let entries = journal_entries(&journal_path);
+	for call in [aborted_entry, sibling_entry] {
+		let started_at = entries
+			.iter()
+			.position(|entry| {
+				entry.kind.name.as_str() == omp_journal::kind::TOOL_UPDATE
+					&& entry.by == Some(call)
+					&& entry.data.as_str().contains(r#""kernel":"started""#)
+			})
+			.expect("execution start journals");
+		let settled_at = entries
+			.iter()
+			.position(|entry| {
+				entry.kind.name.as_str() == omp_journal::kind::TOOL_RESULT
+					&& entry.by == Some(call)
+			})
+			.expect("terminal journals");
+		assert!(started_at < settled_at, "start must precede settlement");
+	}
+
+	let started_key = omp_dom::PropKey::Custom(Str::new_static("execution-started"));
+	for selector in ["body turn worker[id=abort-me]", "body turn worker[id=sibling]"] {
+		let call = session
+			.dom()
+			.select(selector)
+			.expect("selector parses")
+			.next()
+			.expect("call materializes");
+		assert_eq!(
+			session.dom().get(call).and_then(|node| node.prop(&started_key)),
+			Some(&omp_dom::Value::Bool(true)),
+			"execution start boundary is durable"
+		);
+	}
+	let abort_diag = session
+		.dom()
+		.select("body turn worker[id=abort-me] diag")
+		.expect("selector parses")
+		.next()
+		.expect("aborted card diagnostic materializes");
+	assert!(
+		session
+			.dom()
+			.get(abort_diag)
+			.and_then(|node| node.prop(&omp_dom::PropKey::from(omp_dom::PropId::Text)))
+			.and_then(omp_dom::Value::as_str)
+			.is_some_and(|text| text.contains("effects unknown")),
+		"card projection preserves uncertainty"
+	);
+	let live = session.dom().snapshot();
+	drop(session);
+	let replayed = omp_session::Session::open(
+		&journal_path,
+		omp_session::ComponentRegistry::default(),
+	)
+	.expect("journal replays");
+	assert_eq!(replayed.dom().snapshot(), live);
+	assert!(
+		result_text(&replayed, "abort-me")[0].contains("effects unknown"),
+		"replayed model/card projection preserves the abort"
+	);
+	assert_eq!(result_text(&replayed, "sibling"), ["sibling result"]);
 }
 
 #[tokio::test]
@@ -692,12 +893,19 @@ async fn worker_routed_tools_use_the_injected_external_executor() {
 	let tools = Arc::new(tools);
 	let identity = tools.resolved_identity("worker").expect("worker identity");
 	let observed = Arc::new(Mutex::new(Vec::new()));
-	let dispatcher = Dispatcher::new(
-		Arc::clone(&tools),
-		DispatchPolicy::new(BlobStore::open(directory.path()).expect("blob store")),
-	)
-	.with_external_executor(Arc::new(ScriptedExternal { observed: Arc::clone(&observed) }));
-	let mut session = session(&directory.path().join("worker.oms"));
+	let launch_store =
+		BlobStore::open(directory.path().join("launch")).expect("launch-time blob store");
+	let launch_root = launch_store.root().to_path_buf();
+	let dispatcher = Dispatcher::new(Arc::clone(&tools), DispatchPolicy::new(launch_store))
+		.with_external_executor(Arc::new(ScriptedExternal { observed: Arc::clone(&observed) }));
+	let active = directory.path().join("active");
+	std::fs::create_dir_all(&active).expect("active session directory");
+	let mut session = session(&active.join("worker.oms"));
+	assert_ne!(
+		session.blobs().root(),
+		launch_root.as_path(),
+		"fixture separates launch and active CAS"
+	);
 	let (entry, args) = call(&mut session, &identity, "worker-1");
 	let cancellation = CancelTree::new().begin_turn();
 
@@ -717,10 +925,11 @@ async fn worker_routed_tools_use_the_injected_external_executor() {
 	assert_eq!(result_text(&session, "worker-1"), ["external result"]);
 	assert_eq!(observed.lock().as_slice(), [ExternalObserved {
 		session_id: {
-			let path = directory.path().join("worker.oms");
+			let path = active.join("worker.oms");
 			let digest = omp_core::Hash32::sum(path.as_os_str().as_encoded_bytes()).to_hex();
 			Str::new(digest.as_str())
 		},
+		blobs:      session.blobs().root().to_path_buf(),
 		call_id:    Str::new_static("worker-1"),
 		args:       Str::new_static("{}"),
 		route:      ToolRoute::Worker {

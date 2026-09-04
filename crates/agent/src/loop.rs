@@ -9,19 +9,19 @@ use std::{
 };
 
 use futures::StreamExt as _;
-use omp_core::{FastHashMap, Str};
+use omp_core::{FastHashMap, Hash32, Str, sf};
 use omp_dom::{Handle, KnownTag, NodeSpec, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_inference::{
 	ArtifactBody, BlockKind, ChatEvent, ChatRequest, ChatStream, Client, Completion, FinishReason,
-	Message as InferenceMessage, NegotiationPolicy, Planner, SafetySetting, Sampling, Setting,
-	Usage,
+	Message as InferenceMessage, NegotiationPolicy, Planner, RecoveryKind, RecoveryRecord,
+	SafetySetting, Sampling, Setting, Usage,
 };
 use omp_journal::{
 	EntryId,
 	blob::BlobStore,
 	data::{
-		AsyncJobDelivery, AsyncJobStatus, AsyncResult, Attachment, FileMentions, MentionedFile,
-		MentionedFileState, SkillPrompt, TurnReceipt,
+		AsyncJobDelivery, AsyncJobStatus, AsyncResult, Attachment, FileMentions, InferenceRecovery,
+		InferenceRecoveryKind, MentionedFile, MentionedFileState, SkillPrompt, TurnReceipt,
 	},
 };
 use omp_proto::{
@@ -44,11 +44,16 @@ use crate::{
 	directors::compaction::CompactionDirector,
 	parse_file_mentions,
 	steering::{
-		EMPTY_OUTPUT_RETRY_CAP, append_empty_output_cap_notice, append_empty_output_retry,
-		append_error_notice, append_interrupt_notice, append_named_notice, append_notice,
-		consume_steering, steering_pending,
+		EMPTY_OUTPUT_RETRY_CAP, append_custom_message, append_empty_output_cap_notice,
+		append_empty_output_retry, append_error_notice, append_interrupt_notice, append_named_notice,
+		append_notice, consume_steering, steering_pending,
 	},
 };
+
+/// Maximum consecutive provider-declared non-terminal completions without a
+/// tool call. Mirrors pi's `MAX_PAUSED_TURN_CONTINUATIONS`.
+const PAUSED_TURN_CONTINUATION_CAP: u8 = 8;
+const PAUSED_TURN_KIND: &str = "pause_turn";
 
 struct TurnActivity(Arc<AtomicBool>);
 
@@ -118,6 +123,13 @@ pub trait Inference: Send {
 	/// no-op.
 	fn set_debug_session(&mut self, session: Option<Str>) {
 		let _ = session;
+	}
+
+	/// Re-derives disposable host-side indexes from the selected session DOM.
+	/// Inference stacks without environment-owned session tools keep the
+	/// default no-op.
+	fn select_session(&self, dom: &omp_dom::Dom) {
+		let _ = dom;
 	}
 
 	/// Installs the observer that receives same-route retry notices for
@@ -291,6 +303,19 @@ pub enum KernelError {
 	/// Blob persistence failed.
 	#[error(transparent)]
 	Blob(#[from] omp_journal::blob::Error),
+	/// Provider artifact metadata disagreed with the bytes pinned in the
+	/// session CAS.
+	#[error("provider artifact size differs from its pinned bytes")]
+	ArtifactSizeMismatch {
+		/// Size declared by the provider.
+		declared: u64,
+		/// Size stored in the session CAS.
+		actual:   u64,
+	},
+	/// A provider returned a stored artifact without the size needed to
+	/// address it in the session CAS.
+	#[error("stored provider artifact omitted its byte length")]
+	StoredArtifactSizeMissing,
 	/// Tool dispatch failed.
 	#[error(transparent)]
 	Dispatch(#[from] DispatchError),
@@ -481,7 +506,11 @@ impl<C> Kernel<C> {
 
 	/// Rehydrates disposable host state and Director layers from the current
 	/// DOM.
-	pub fn resync_session_state(&self, session: &Session) {
+	pub fn resync_session_state(&self, session: &Session)
+	where
+		C: Inference,
+	{
+		self.client.select_session(session.dom());
 		for bridge in &self.state_bridges {
 			bridge.resync(session.dom());
 		}
@@ -561,6 +590,16 @@ impl<C> Kernel<C> {
 	#[must_use]
 	pub fn tool_registry(&self) -> &Arc<Registry> {
 		self.dispatcher.registry()
+	}
+
+	/// Replaces the runtime tool registry between turns.
+	///
+	/// This is intentionally a mutable, host-only operation: workpool workers
+	/// install the strict yield schema for their next batch before inference
+	/// sees the roster. Ordinary sessions retain their composed registry.
+	pub fn replace_tool_registry(&mut self, registry: Arc<Registry>) {
+		debug_assert!(!self.turn_active.load(Ordering::Acquire));
+		self.dispatcher.replace_registry(registry);
 	}
 
 	/// Borrows the runtime job board supervising detached tools, subagents,
@@ -784,7 +823,7 @@ impl<C: Inference> Kernel<C> {
 		control: RunControl,
 	) -> Result<TurnOutcome, KernelError> {
 		self
-			.run_explicit_turn(session, input, None, None, control)
+			.run_explicit_turn(session, input, None, None, None, control)
 			.await
 	}
 
@@ -802,7 +841,7 @@ impl<C: Inference> Kernel<C> {
 		control: RunControl,
 	) -> Result<TurnOutcome, KernelError> {
 		self
-			.run_explicit_turn(session, input, Some(author), None, control)
+			.run_explicit_turn(session, input, Some(author), None, None, control)
 			.await
 	}
 
@@ -815,7 +854,20 @@ impl<C: Inference> Kernel<C> {
 	) -> Result<TurnOutcome, KernelError> {
 		let input = TurnInput { text: prompt.prompt_body.clone(), attachments: Vec::new() };
 		self
-			.run_explicit_turn(session, input, None, Some(prompt), control)
+			.run_explicit_turn(session, input, None, Some(prompt), None, control)
+			.await
+	}
+
+	/// Runs one extension-authored message as model-visible developer context.
+	pub async fn run_custom_turn(
+		&mut self,
+		session: &mut Session,
+		message: omp_session::custom_message::CustomMessage,
+		control: RunControl,
+	) -> Result<TurnOutcome, KernelError> {
+		let input = TurnInput { text: message.body.clone(), attachments: Vec::new() };
+		self
+			.run_explicit_turn(session, input, None, None, Some(message), control)
 			.await
 	}
 
@@ -825,6 +877,7 @@ impl<C: Inference> Kernel<C> {
 		mut input: TurnInput,
 		author: Option<Str>,
 		mut skill_prompt: Option<SkillPrompt>,
+		mut custom_message: Option<omp_session::custom_message::CustomMessage>,
 		control: RunControl,
 	) -> Result<TurnOutcome, KernelError> {
 		if control.is_expired() || self.cancel.is_session_cancelled() {
@@ -855,6 +908,9 @@ impl<C: Inference> Kernel<C> {
 				if let Some(prompt) = &mut skill_prompt {
 					prompt.prompt_body = input.text.clone();
 				}
+				if let Some(message) = &mut custom_message {
+					message.body = input.text.clone();
+				}
 			}
 			hooks.notify(
 				HookEventId::HookEventAgentStart,
@@ -868,11 +924,15 @@ impl<C: Inference> Kernel<C> {
 		let turn_cancel = self.cancel.begin_turn();
 		session.begin_turn()?;
 		self.apply_live_components(session)?;
-		match skill_prompt {
-			Some(prompt) => {
+		match (skill_prompt, custom_message) {
+			(Some(prompt), None) => {
 				session.skill_prompt(prompt)?;
 			},
-			None => {
+			(None, Some(message)) => {
+				let turn = current_turn(session)?;
+				append_custom_message(session, turn, message)?;
+			},
+			(None, None) => {
 				let mention_paths = parse_file_mentions(&input.text);
 				if let Some(author) = author {
 					session.user_authored(input.text, input.attachments, author)?;
@@ -881,6 +941,7 @@ impl<C: Inference> Kernel<C> {
 				}
 				self.append_file_mentions(session, mention_paths).await?;
 			},
+			(Some(_), Some(_)) => unreachable!("one explicit turn source"),
 		}
 		self.apply_live_components(session)?;
 		let turn = current_turn(session)?;
@@ -1119,6 +1180,15 @@ impl<C: Inference> Kernel<C> {
 				turn_cancel.cancel_turn();
 				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
 			}
+			// Admission consumes already-queued control before checking the
+			// journal-derived pause gate. Otherwise an immediately-ready
+			// preflight/provider future can win both biased selects and start a
+			// request ahead of a pause or session cancellation accepted earlier.
+			let admission_cancelled = self.drain_admission_control(session, turn_cancel)?;
+			if admission_cancelled {
+				self.notify_interrupt(session, turn, "admission");
+				return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
+			}
 			if self
 				.hold_while_paused(session, turn_cancel, control)
 				.await?
@@ -1293,6 +1363,7 @@ impl<C: Inference> Kernel<C> {
 					},
 					PreflightSignal::Control(message) => {
 						match preflight_control.handle(session, message)? {
+							Received::ToolScopedAbort(_) => {},
 							Received::Cancelled => {
 								self.notify_interrupt(session, turn, "immediate");
 								return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
@@ -1346,6 +1417,7 @@ impl<C: Inference> Kernel<C> {
 							},
 							message = opening_control.recv() => {
 								match opening_control.handle(session, message)? {
+									Received::ToolScopedAbort(_) => {},
 									Received::Cancelled => {
 										notify_interrupt(hooks.as_ref(), turn, "immediate");
 										return Ok(outcome(
@@ -1472,6 +1544,7 @@ impl<C: Inference> Kernel<C> {
 				assistant_text: driven.text,
 				stop_reason: driven.stop_reason,
 			};
+			let terminal_tool_yield = turn_has_terminal_incremental_yield(session.dom(), turn);
 			directors.observe_turn(session, &director_cx, &turn_view)?;
 			self.apply_live_components(session)?;
 			if let Some(hooks) = &self.lifecycle_hooks {
@@ -1497,10 +1570,61 @@ impl<C: Inference> Kernel<C> {
 				self.resync_session_state(session);
 				self.apply_live_components(session)?;
 			}
-			if turn_view.had_tool_calls || steering_received {
+			if (turn_view.had_tool_calls && !terminal_tool_yield) || steering_received {
 				continue;
 			}
-			if turn_view.assistant_text.is_empty() {
+			if !terminal_tool_yield && turn_view.stop_reason == PAUSED_TURN_KIND {
+				// A canonical `pause_turn` is a provider-declared scheduling
+				// pause, not a candidate yield. Re-sample only after the safe
+				// mailbox boundary above: steering/cancellation wins, global
+				// pause has been released, and a queued follow-up prevents this
+				// turn from claiming another request. The count is re-derived
+				// from durable assistant evidence, never kept as shadow state.
+				let paused_turn_continuations =
+					paused_turn_continuation_count(session.dom(), turn);
+				if queued_follow_up(session.dom()) {
+					record_paused_turn_decision(
+						session,
+						turn,
+						paused_turn_continuations,
+						"pending-input",
+					)?;
+					self.apply_live_components(session)?;
+					// The queued prompt is a user-owned next turn, not a
+					// candidate yield for Directors or stop hooks to consume.
+					return Ok(outcome(
+						if was_steered {
+							TurnStop::Steered
+						} else {
+							TurnStop::Completed
+						},
+						total_text,
+						tokens_in,
+						tokens_out,
+					));
+				} else if paused_turn_continuations < PAUSED_TURN_CONTINUATION_CAP {
+					let attempt = paused_turn_continuations.saturating_add(1);
+					record_paused_turn_decision(session, turn, attempt, "scheduled")?;
+					self.apply_live_components(session)?;
+					// Scripted/local providers may resolve synchronously. Yield
+					// once so even those continuations cannot monopolize the
+					// controller between mailbox safe points.
+					tokio::task::yield_now().await;
+					continue;
+				} else {
+					record_paused_turn_decision(
+						session,
+						turn,
+						paused_turn_continuations,
+						"capped",
+					)?;
+					self.apply_live_components(session)?;
+				}
+			}
+			if turn_view.assistant_text.is_empty()
+				&& !terminal_tool_yield
+				&& turn_view.stop_reason != PAUSED_TURN_KIND
+			{
 				if empty_output_retries < EMPTY_OUTPUT_RETRY_CAP {
 					empty_output_retries = empty_output_retries.saturating_add(1);
 					append_empty_output_retry(session, turn, empty_output_retries)?;
@@ -1510,7 +1634,8 @@ impl<C: Inference> Kernel<C> {
 				append_empty_output_cap_notice(session, turn)?;
 				self.apply_live_components(session)?;
 			}
-			if self.runtime_flags.autolearn_enabled
+			if !terminal_tool_yield
+				&& self.runtime_flags.autolearn_enabled
 				&& should_schedule_autolearn(
 					session.dom(),
 					turn,
@@ -1592,6 +1717,7 @@ impl<C: Inference> Kernel<C> {
 					return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
 				},
 				PreflightSignal::Control(message) => match yield_control.handle(session, message)? {
+					Received::ToolScopedAbort(_) => {},
 					Received::Cancelled => {
 						self.notify_interrupt(session, turn, "idle");
 						return Ok(outcome(TurnStop::Cancelled, total_text, tokens_in, tokens_out));
@@ -1750,6 +1876,7 @@ impl<C: Inference> Kernel<C> {
 				},
 				AwaitSignal::Finished => return Ok(Awaited::Settled),
 				AwaitSignal::Control(message) => match call_control.handle(session, message)? {
+					Received::ToolScopedAbort(_) => {},
 					Received::Cancelled => return Ok(Awaited::Cancelled),
 					Received::Rewound(work) => {
 						self.dispatcher.jobs().apply_lifecycle(session, &work).await;
@@ -2007,7 +2134,7 @@ impl<C: Inference> Kernel<C> {
 		let mut assistant = None;
 		let mut content_streams = FastHashMap::<u32, u32>::default();
 		let mut pending = FastHashMap::<u32, StreamingCall>::default();
-		let mut ready = Vec::new();
+		let mut ready = Vec::<IndexedPreparedCall>::new();
 		let mut text = String::new();
 		let mut usage = Usage::default();
 		let mut stop_reason = Str::new_static("stop");
@@ -2039,6 +2166,10 @@ impl<C: Inference> Kernel<C> {
 					StreamSignal::Control(Some(message)) => {
 						match call_control.handle(session, message)? {
 							Received::Cancelled => return Ok(Fold::Cancelled),
+							Received::ToolScopedAbort(reason) => {
+								turn_cancel.cancel_turn();
+								return Ok(Fold::ToolScopedAbort(reason));
+							},
 							Received::Rewound(work) => {
 								self.dispatcher.jobs().apply_lifecycle(session, &work).await;
 								turn_cancel.cancel_turn();
@@ -2204,8 +2335,15 @@ impl<C: Inference> Kernel<C> {
 							&call.raw_args,
 						);
 						if abort_invalid_edit {
+							let reason = crate::ToolScopedAbortReason::one(
+								call.call_id.clone(),
+								Str::new_static(
+									"streamed edit arguments became irrecoverably invalid before commit",
+								),
+								Str::new_static("another tool call interrupted the inference request"),
+							);
 							turn_cancel.cancel_turn();
-							return Ok(Fold::InvalidEditArguments);
+							return Ok(Fold::ToolScopedAbort(reason));
 						}
 					},
 					ChatEvent::ToolCallReady { index, call } => {
@@ -2305,7 +2443,7 @@ impl<C: Inference> Kernel<C> {
 							call_id: call_id.clone(),
 							name:    identity.name.clone(),
 						});
-						ready.push(prepared);
+						ready.push(IndexedPreparedCall { index, call: prepared });
 					},
 					ChatEvent::Usage(update) => {
 						usage = update.usage;
@@ -2350,7 +2488,7 @@ impl<C: Inference> Kernel<C> {
 									.prepare(identity, call_id.clone(), entry, cancellation)?;
 							prepared.arg_delta(args.get());
 							prepared.commit(args);
-							ready.push(prepared);
+							ready.push(IndexedPreparedCall { index: u32::MAX, call: prepared });
 							had_tool_calls = true;
 							self
 								.events
@@ -2382,6 +2520,7 @@ impl<C: Inference> Kernel<C> {
 							cost_nano_usd(&completion),
 							request_started,
 							first_token,
+							&completion.receipt.recoveries,
 						))?;
 						self.apply_live_components(session)?;
 						completed = true;
@@ -2389,9 +2528,9 @@ impl<C: Inference> Kernel<C> {
 					},
 					ChatEvent::Artifact { index, artifact } => {
 						let media_type = artifact.media_type.clone();
-						let size = artifact.size;
 						let blobs = session.blobs().clone();
-						let uri = Self::artifact_uri(&blobs, artifact).await?;
+						let blob = Self::artifact_blob(&blobs, artifact).await?;
+						let uri = Str::new(format!("artifact://sha256/{}", blob.to_hex()));
 						let assistant = assistant.ok_or(KernelError::MissingResponseStart)?;
 						let kind = if media_type.starts_with("image/") {
 							"image"
@@ -2410,12 +2549,10 @@ impl<C: Inference> Kernel<C> {
 								PropKey::Custom(Str::new_static(omp_session::PROVIDER_BLOCK_INDEX_PROP)),
 								Value::Int(i64::from(index)),
 							);
-						if let Some(size) = size {
-							node = node.with_prop(
-								PropKey::Custom(Str::new_static("size")),
-								Value::Int(i64::try_from(size).unwrap_or(i64::MAX)),
-							);
-						}
+						node = node.with_prop(
+							PropKey::Custom(Str::new_static("size")),
+							Value::Int(i64::try_from(blob.size).unwrap_or(i64::MAX)),
+						);
 						session.patch(Txn {
 							cause: session.head().ok_or(SessionError::NoActiveTurn)?,
 							label: Some(Str::new_static("assistant.artifact")),
@@ -2471,35 +2608,51 @@ impl<C: Inference> Kernel<C> {
 		.await;
 		match fold {
 			Ok(Fold::Ended) => {},
-			Ok(state @ (Fold::Cancelled | Fold::InvalidEditArguments)) => {
-				let invalid_edit = matches!(state, Fold::InvalidEditArguments);
+			Ok(state @ (Fold::Cancelled | Fold::ToolScopedAbort(_))) => {
+				let scoped = match &state {
+					Fold::ToolScopedAbort(reason) => Some(reason),
+					Fold::Cancelled | Fold::Ended => None,
+				};
 				close_streams(session, &mut content_streams)?;
-				for (_, streaming) in pending.drain() {
+				// pi `buildToolCallAbortMessages`: placeholder results follow
+				// provider call order even when some calls completed argument
+				// streaming and others did not. They are never marked as
+				// executed: no execution unit was admitted
+				// before this inference fold ended.
+				let mut aborted = Vec::with_capacity(pending.len() + ready.len());
+				for (index, streaming) in pending.drain() {
 					let _ = session.stream_close(streaming.sid);
-					self.dispatcher.abort_prepared(
-						session,
-						streaming.prepared,
-						if invalid_edit {
-							Abort::Skipped {
-								reason: Str::new_static(
-									"streamed edit arguments became irrecoverably invalid before commit",
-								),
-							}
-						} else {
-							Abort::Interrupted {
-								reason: Str::new_static(
+					aborted.push((index, false, streaming.prepared));
+				}
+				aborted.extend(
+					ready
+						.drain(..)
+						.map(|prepared| (prepared.index, true, prepared.call)),
+				);
+				aborted.sort_unstable_by_key(|(index, _, _)| *index);
+				for (_, authorized, prepared) in aborted {
+					let reason = scoped.map_or_else(
+						|| {
+							if authorized {
+								Str::new_static("inference cancelled before tool execution")
+							} else {
+								Str::new_static(
 									"inference cancelled before tool arguments settled",
-								),
+								)
 							}
 						},
+						|reason| {
+							sf!(
+								"Tool execution was aborted: {}",
+								reason.message_for(prepared.call_id())
+							)
+						},
+					);
+					self.dispatcher.abort_prepared(
+						session,
+						prepared,
+						Abort::Skipped { reason },
 					)?;
-				}
-				for prepared in ready.drain(..) {
-					self
-						.dispatcher
-						.abort_prepared(session, prepared, Abort::Interrupted {
-							reason: Str::new_static("inference cancelled before tool execution"),
-						})?;
 				}
 				return Ok(DrivenInference::cancelled(text, usage));
 			},
@@ -2512,6 +2665,42 @@ impl<C: Inference> Kernel<C> {
 					self
 						.dispatcher
 						.abort_prepared(session, streaming.prepared, Abort::InputDropped)?;
+				}
+				let harmony_failure = match &error {
+					KernelError::Inference(inference)
+						if inference.receipt().recoveries.iter().any(|record| {
+							matches!(
+								record.kind,
+								RecoveryKind::HarmonyLeakDetection | RecoveryKind::HarmonyLeakRepair
+							)
+						}) =>
+					{
+						Some((
+							inference.receipt().usage,
+							inference.receipt().cost.micro_usd,
+							inference.receipt().recoveries.clone(),
+						))
+					},
+					_ => None,
+				};
+				if let Some((failure_usage, micro_usd, recoveries)) = harmony_failure
+					&& assistant.is_some()
+				{
+					session.assistant_end("error")?;
+					self.apply_live_components(session)?;
+					let cost_nano_usd = micro_usd
+						.max(0)
+						.saturating_mul(1_000)
+						.try_into()
+						.unwrap_or(u64::MAX);
+					session.receipt(receipt_facts(
+						&failure_usage,
+						cost_nano_usd,
+						request_started,
+						first_token,
+						&recoveries,
+					))?;
+					self.apply_live_components(session)?;
 				}
 				if ready.is_empty() {
 					return Err(error);
@@ -2534,14 +2723,14 @@ impl<C: Inference> Kernel<C> {
 			self.apply_live_components(session)?;
 			session.assistant_end("stream_closed")?;
 			self.apply_live_components(session)?;
-			session.receipt(receipt_facts(&usage, 0, request_started, first_token))?;
+			session.receipt(receipt_facts(&usage, 0, request_started, first_token, &[]))?;
 			self.apply_live_components(session)?;
 		}
 		Ok(DrivenInference {
 			text: Str::new(text),
 			usage,
 			stop_reason,
-			calls: ready,
+			calls: ready.into_iter().map(|prepared| prepared.call).collect(),
 			had_tool_calls,
 			cancelled: false,
 		})
@@ -2617,27 +2806,41 @@ impl<C: Inference> Kernel<C> {
 		}
 	}
 
-	async fn artifact_uri(
+	async fn artifact_blob(
 		blobs: &BlobStore,
 		artifact: omp_inference::Artifact,
-	) -> Result<Str, KernelError> {
-		match artifact.body {
-			ArtifactBody::Bytes(bytes) => {
-				let blob = blobs.put(&bytes)?;
-				Ok(Str::new(format!("artifact://sha256/{}", blob.to_hex())))
-			},
+	) -> Result<omp_journal::blob::BlobRef, KernelError> {
+		let declared = artifact.size;
+		let blob = match artifact.body {
+			ArtifactBody::Bytes(bytes) => blobs.put(&bytes)?,
 			ArtifactBody::Stored(reference) => {
-				Ok(Str::new(format!("artifact://{}/{}", reference.store, reference.id)))
+				let size = declared.ok_or(KernelError::StoredArtifactSizeMissing)?;
+				let blob = omp_journal::blob::BlobRef::parse_hex(reference.id.as_str(), size)?;
+				if !blobs.verify(&blob)? {
+					return Err(
+						omp_journal::blob::Error::DigestMismatch {
+							expected: blob.hash,
+							actual:   Hash32::sum(&blobs.get(&blob)?),
+						}
+						.into(),
+					);
+				}
+				blob
 			},
 			ArtifactBody::Stream(mut stream) => {
 				let mut bytes = Vec::new();
 				while let Some(chunk) = stream.next().await {
 					bytes.extend_from_slice(&chunk?);
 				}
-				let blob = blobs.put(&bytes)?;
-				Ok(Str::new(format!("artifact://sha256/{}", blob.to_hex())))
+				blobs.put(&bytes)?
 			},
+		};
+		if let Some(declared) = declared
+			&& declared != blob.size
+		{
+			return Err(KernelError::ArtifactSizeMismatch { declared, actual: blob.size });
 		}
+		Ok(blob)
 	}
 
 	/// Executes one provider workflow action as a journaled tool call and
@@ -2792,6 +2995,7 @@ impl<C: Inference> Kernel<C> {
 					return Ok(true);
 				},
 				message = control.recv() => match control.handle(session, message)? {
+					Received::ToolScopedAbort(_) => {},
 					Received::Cancelled => return Ok(true),
 					Received::Rewound(work) => {
 						self.dispatcher.jobs().apply_lifecycle(session, &work).await;
@@ -2807,6 +3011,46 @@ impl<C: Inference> Kernel<C> {
 			}
 		}
 		Ok(false)
+	}
+
+	/// Applies only admission-preempting control already accepted by the
+	/// mailbox, leaving prompts, follow-ups, steering, approvals, and
+	/// observations for their ordinary owner.
+	///
+	/// The bounded snapshot scan lets a pause behind unrelated work win
+	/// provider admission without draining that work into the wrong turn.
+	fn drain_admission_control(
+		&self,
+		session: &mut Session,
+		turn: &crate::TurnCancellation,
+	) -> Result<bool, SessionError> {
+		let pending = self.mailbox_rx.len();
+		if pending == 0 {
+			return Ok(false);
+		}
+		let mut deferred = Vec::new();
+		let mut cancelled = false;
+		for _ in 0..pending {
+			let Ok(message) = self.mailbox_rx.try_recv() else {
+				break;
+			};
+			match message {
+				Up::Pause { active } => {
+					crate::set_paused(session, active)?;
+				},
+				Up::Cancel => {
+					self.cancel.cancel_session();
+					turn.cancel_turn();
+					cancelled = true;
+					break;
+				},
+				other => deferred.push(other),
+			}
+		}
+		for message in deferred {
+			let _ = self.mailbox_tx.send(message);
+		}
+		Ok(cancelled)
 	}
 
 	/// Drains every queued mailbox message at a safe point. A rewind that
@@ -2827,6 +3071,7 @@ impl<C: Inference> Kernel<C> {
 		);
 		while let Ok(message) = self.mailbox_rx.try_recv() {
 			match control.handle(session, message)? {
+				Received::ToolScopedAbort(_) => {},
 				Received::Steering => drained.received = true,
 				Received::Cancelled => drained.cancelled = true,
 				Received::Approved(_) => {},
@@ -2963,6 +3208,11 @@ struct StreamingCall {
 	call_id:  Str,
 	prepared: PreparedCall,
 	raw_args: String,
+}
+
+struct IndexedPreparedCall {
+	index: u32,
+	call:  PreparedCall,
 }
 
 pub(crate) struct ReadyCall {
@@ -3307,8 +3557,9 @@ enum Fold {
 	Ended,
 	/// Caller control ended the stream before completion.
 	Cancelled,
-	/// Strict streamed edit validation proved the argument prefix invalid.
-	InvalidEditArguments,
+	/// One identified tool call aborted the request; siblings receive neutral
+	/// placeholders rather than being blamed for the trigger.
+	ToolScopedAbort(crate::ToolScopedAbortReason),
 }
 
 /// Renders an error with its full `source()` chain, one cause per line.
@@ -3538,6 +3789,41 @@ fn extract_inline_sloppy_edits(text: &str) -> Option<(String, String, usize)> {
 	Some((remaining, payloads.join("\n"), regions))
 }
 
+fn turn_has_terminal_incremental_yield(dom: &omp_dom::Dom, turn: Handle) -> bool {
+	dom.children(turn).iter().copied().any(|handle| {
+		let Some(call) = dom.get(handle) else {
+			return false;
+		};
+		if !matches!(&call.tag, Tag::Custom(name) if name == "yield")
+			|| call
+				.prop(&PropKey::from(PropId::Status))
+				.and_then(Value::as_str)
+				!= Some("ok")
+		{
+			return false;
+		}
+		dom.children(handle).iter().copied().any(|child| {
+			let Some(result) = dom.get(child) else {
+				return false;
+			};
+			if result.tag != Tag::Known(KnownTag::Result) {
+				return false;
+			}
+			let Some(Value::Json(raw)) = result.prop(&PropKey::from(PropId::Outcome)) else {
+				return false;
+			};
+			let Ok(outcome) = serde_json::from_str::<serde_json::Value>(raw.get()) else {
+				return false;
+			};
+			let Some(payload) = outcome.get("value") else {
+				return false;
+			};
+			payload.get("complete").and_then(serde_json::Value::as_bool) == Some(true)
+				|| payload.get("failed").and_then(serde_json::Value::as_bool) == Some(true)
+		})
+	})
+}
+
 fn should_schedule_autolearn(dom: &omp_dom::Dom, turn: Handle, minimum: usize) -> bool {
 	let mut settled = 0_usize;
 	for handle in dom.children(turn) {
@@ -3579,6 +3865,104 @@ fn finish_reason(reason: &FinishReason) -> Str {
 	}
 }
 
+/// Whether a user follow-up already owns the next explicit turn.
+///
+/// This is read from the journal-derived queues subtree after the mailbox
+/// drain, so replay and a live run make the same eligibility decision.
+fn queued_follow_up(dom: &omp_dom::Dom) -> bool {
+	dom.children(dom.queues()).iter().any(|queue| {
+		dom.get(*queue)
+			.is_some_and(|node| node.tag == Tag::Known(KnownTag::Prompts))
+			&& dom.children(*queue).iter().any(|prompt| {
+				dom.get(*prompt).is_some_and(|node| {
+					node.tag == Tag::Known(KnownTag::Prompt)
+						&& node.prop(&PropId::Kind.into()).and_then(Value::as_str) == Some("queued")
+						&& node.prop(&PropId::Status.into()).and_then(Value::as_str)
+							== Some("pending")
+				})
+			})
+	})
+}
+
+/// Counts consecutive pause continuations since the latest tool element.
+///
+/// The current pause assistant has not been marked yet and is ignored. A tool
+/// element carries `rev`; encountering one re-arms the budget exactly as pi's
+/// completed-tool-call branch does. Reading the DOM makes crash replay retain
+/// the same remaining budget.
+fn paused_turn_continuation_count(dom: &omp_dom::Dom, turn: Handle) -> u8 {
+	let count = dom
+		.children(turn)
+		.iter()
+		.rev()
+		.take_while(|handle| {
+			dom.get(**handle)
+				.is_none_or(|node| node.prop(&PropId::Rev.into()).is_none())
+		})
+		.filter(|handle| {
+			dom.get(**handle).is_some_and(|node| {
+				node.tag == Tag::Known(KnownTag::Assistant)
+					&& node
+						.prop(&PropKey::Custom(Str::new_static("continuation-decision")))
+						.and_then(Value::as_str)
+						== Some("scheduled")
+			})
+		})
+		.count();
+	u8::try_from(count).unwrap_or(u8::MAX)
+}
+
+/// Persists the eligibility decision on the assistant completion that caused
+/// it. These props are audit-only: projection still replays the original
+/// assistant content and stop reason byte-for-byte.
+fn record_paused_turn_decision(
+	session: &mut Session,
+	turn: Handle,
+	attempt: u8,
+	decision: &'static str,
+) -> Result<(), SessionError> {
+	let assistant = session
+		.dom()
+		.children(turn)
+		.iter()
+		.rev()
+		.copied()
+		.find(|handle| {
+			session
+				.dom()
+				.get(*handle)
+				.is_some_and(|node| node.tag == Tag::Known(KnownTag::Assistant))
+		})
+		.ok_or(SessionError::NoActiveAssistant)?;
+	session.patch(Txn {
+		cause: session.head().ok_or(SessionError::NoActiveTurn)?,
+		label: Some(Str::new_static("kernel.pause-turn")),
+		ops:   vec![
+			Op::Set {
+				h:     assistant,
+				prop:  PropKey::Custom(Str::new_static("continuation")),
+				value: Value::Str(Str::new_static(PAUSED_TURN_KIND)),
+			},
+			Op::Set {
+				h:     assistant,
+				prop:  PropKey::Custom(Str::new_static("continuation-attempt")),
+				value: Value::Int(i64::from(attempt)),
+			},
+			Op::Set {
+				h:     assistant,
+				prop:  PropKey::Custom(Str::new_static("continuation-cap")),
+				value: Value::Int(i64::from(PAUSED_TURN_CONTINUATION_CAP)),
+			},
+			Op::Set {
+				h:     assistant,
+				prop:  PropKey::Custom(Str::new_static("continuation-decision")),
+				value: Value::Str(Str::new_static(decision)),
+			},
+		],
+	})?;
+	Ok(())
+}
+
 /// The `turn.receipt@1` payload for one completed inference: provider usage
 /// plus the kernel-clock timings pi's usage row shows (TTFT, duration →
 /// tok/s).
@@ -3587,6 +3971,7 @@ fn receipt_facts(
 	cost_nano_usd: u64,
 	request_started: Instant,
 	first_token: Option<Instant>,
+	recoveries: &[RecoveryRecord],
 ) -> TurnReceipt {
 	let millis =
 		|elapsed: std::time::Duration| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
@@ -3600,6 +3985,32 @@ fn receipt_facts(
 		duration_ms: Some(millis(request_started.elapsed())),
 		premium_requests_millionths: usage.premium_requests_millionths,
 		identity: None,
+		recoveries: recoveries.iter().map(journal_recovery).collect(),
+	}
+}
+
+pub(crate) fn journal_recovery(recovery: &RecoveryRecord) -> InferenceRecovery {
+	let kind = match recovery.kind {
+		RecoveryKind::JsonRepair => InferenceRecoveryKind::JsonRepair,
+		RecoveryKind::DialectNormalization => InferenceRecoveryKind::DialectNormalization,
+		RecoveryKind::ToolAssembly => InferenceRecoveryKind::ToolAssembly,
+		RecoveryKind::ThinkingClassification => InferenceRecoveryKind::ThinkingClassification,
+		RecoveryKind::HarmonyLeakRepair => InferenceRecoveryKind::HarmonyLeakRepair,
+		RecoveryKind::HarmonyLeakDetection => InferenceRecoveryKind::HarmonyLeakDetection,
+		RecoveryKind::ReasoningStall => InferenceRecoveryKind::ReasoningStall,
+		RecoveryKind::WithinAttemptRepetition => InferenceRecoveryKind::WithinAttemptRepetition,
+		RecoveryKind::CrossTurnToolLoop => InferenceRecoveryKind::CrossTurnToolLoop,
+		RecoveryKind::ToolResultRepair => InferenceRecoveryKind::ToolResultRepair,
+		RecoveryKind::FabricatedResultRejection => InferenceRecoveryKind::FabricatedResultRejection,
+		RecoveryKind::SessionReseed => InferenceRecoveryKind::SessionReseed,
+		RecoveryKind::EmptyOutput => InferenceRecoveryKind::EmptyOutput,
+	};
+	InferenceRecovery {
+		attempt: recovery.attempt,
+		kind,
+		rule: recovery.rule.0.clone(),
+		input_bytes: recovery.input_bytes,
+		steps: recovery.steps,
 	}
 }
 
@@ -3629,7 +4040,9 @@ mod streaming_edit_tests {
 	use omp_core::Str;
 	use omp_session::{ComponentRegistry, Session};
 
-	use super::{should_schedule_autolearn, streamed_edit_must_abort};
+	use super::{
+		should_schedule_autolearn, streamed_edit_must_abort, turn_has_terminal_incremental_yield,
+	};
 
 	fn context(enabled: bool) -> Ctx {
 		let ctx = Ctx::new();
@@ -3645,6 +4058,53 @@ mod streaming_edit_tests {
 		ctx.set("sv_tools_edit_streaming_abort", Value::Bool(enabled), Origin::Session)
 			.expect("setting writes");
 		ctx
+	}
+
+	#[test]
+	fn terminal_incremental_yield_is_detected_from_the_durable_payload() {
+		for field in ["complete", "failed"] {
+			let temp = tempfile::tempdir().expect("tempdir");
+			let mut session =
+				Session::create(temp.path().join("yield.oms"), ComponentRegistry::standard())
+					.expect("session");
+			session.begin_turn().expect("turn");
+			session.user("batch", Vec::new()).expect("prompt");
+			let turn = *session
+				.dom()
+				.children(session.dom().body())
+				.last()
+				.expect("turn");
+			let call = session
+				.call(
+					"yield",
+					2,
+					"yield-1",
+					None,
+					Some(
+						serde_json::value::to_raw_value(&serde_json::json!({"key": 1, "data": "done"}))
+							.expect("args"),
+					),
+					None,
+				)
+				.expect("call");
+			let mut payload = serde_json::json!({
+				"incremental": true,
+				"use_last_turn": false,
+				"validation": null
+			});
+			payload[field] = serde_json::Value::Bool(true);
+			session
+				.settle(
+					call,
+					serde_json::value::to_raw_value(&serde_json::json!({
+						"kind": "ok",
+						"value": payload
+					}))
+					.expect("outcome"),
+				)
+				.expect("settle");
+			assert!(turn_has_terminal_incremental_yield(session.dom(), turn));
+		}
 	}
 
 	#[test]

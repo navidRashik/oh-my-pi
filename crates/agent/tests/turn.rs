@@ -11,14 +11,14 @@ use std::{
 };
 
 use omp_agent::{
-	DispatchPolicy, Inference, Kernel, KernelEvent, RunControl, StaticPrompt, TurnInput, TurnStop,
-	Up,
+	DispatchPolicy, Inference, Kernel, KernelEvent, RunControl, StaticPrompt, ToolScopedAbortReason,
+	TurnInput, TurnStop, Up,
 };
 use omp_core::Str;
 use omp_dom::{PropId, PropKey};
 use omp_inference::{
-	BlockKind, ChatEvent, ChatRequest, ChatStream, ContentPart, ProviderId, RequestId, ResponseMeta,
-	Role, RouteId, ToolCall, ToolCallId, call::OpaqueJson,
+	BlockKind, ChatEvent, ChatRequest, ChatStream, ContentPart, FinishReason, ProviderId, RequestId,
+	ResponseMeta, Role, RouteId, ToolCall, ToolCallId, call::OpaqueJson,
 };
 use omp_journal::{blob::BlobStore, kind};
 
@@ -54,8 +54,57 @@ impl Inference for PendingCallInference {
 	}
 }
 
+struct ScopedAbortInference {
+	ready: Arc<tokio::sync::Notify>,
+}
+
+impl Inference for ScopedAbortInference {
+	fn chat(
+		&mut self,
+		_: ChatRequest,
+	) -> impl Future<Output = Result<ChatStream, omp_inference::Error>> + Send {
+		let calls_ready = Arc::clone(&self.ready);
+		ready(Ok(ChatStream::ordinary(Box::pin(async_stream::stream! {
+			yield Ok(ChatEvent::Started(ResponseMeta {
+				request_id: RequestId::from("scoped-abort"),
+				provider: ProviderId::from("scripted"),
+				route: RouteId::from("scripted/test"),
+				model: None,
+				provider_request_id: None,
+				created_at: SystemTime::UNIX_EPOCH,
+			}));
+			yield Ok(ChatEvent::ToolCallReady {
+				index: 0,
+				call: ToolCall {
+					id: ToolCallId::from("innocent-read"),
+					name: Str::new_static("read"),
+					arguments: OpaqueJson::new(serde_json::json!({})),
+				},
+			});
+			yield Ok(ChatEvent::ToolCallReady {
+				index: 1,
+				call: ToolCall {
+					id: ToolCallId::from("invalid-edit"),
+					name: Str::new_static("edit"),
+					arguments: OpaqueJson::new(serde_json::json!({})),
+				},
+			});
+			calls_ready.notify_one();
+			std::future::pending::<()>().await;
+		}))))
+	}
+}
+
 fn input(text: &str) -> TurnInput {
 	TurnInput { text: Str::new(text), attachments: Vec::new() }
+}
+
+fn pause_script(text: &str) -> Vec<ChatEvent> {
+	vec![
+		ChatEvent::BlockStarted { index: 0, kind: BlockKind::Text },
+		ChatEvent::TextDelta { index: 0, text: Str::new(text) },
+		completed(FinishReason::Other(Str::new_static("pause_turn")), 1),
+	]
 }
 
 fn policy(path: &std::path::Path) -> DispatchPolicy {
@@ -150,6 +199,240 @@ async fn user_turn_journals_assistant_text_in_the_explicit_turn() {
 }
 
 #[tokio::test]
+async fn paused_completion_resamples_and_replays_durable_evidence() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("paused.oms");
+	let (inference, requests) =
+		ScriptedInference::new([pause_script("Scanning first."), text_script("All done.")]);
+	let mut kernel = Kernel::new(
+		inference,
+		registry(std::iter::empty()),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	);
+	let mut session = fresh_session(&journal_path);
+
+	let outcome = kernel
+		.run_turn(&mut session, input("inspect"), RunControl::default())
+		.await
+		.expect("paused completion continues");
+	assert_eq!(outcome.stop, TurnStop::Completed);
+	let requests = requests.lock();
+	assert_eq!(requests.len(), 2);
+	assert!(requests[1].messages.iter().any(|message| {
+		message.role == Role::Assistant
+			&& message.content.iter().any(
+				|part| matches!(part, ContentPart::Text { text, .. } if text.as_str() == "Scanning first."),
+			)
+	}));
+	drop(requests);
+	let paused = session
+		.dom()
+		.select("body turn assistant[stop-reason=pause_turn]")
+		.expect("selector")
+		.next()
+		.expect("paused assistant");
+	let paused = session.dom().get(paused).expect("assistant materializes");
+	assert_eq!(
+		paused
+			.prop(&PropKey::Custom(Str::new_static("continuation-decision")))
+			.and_then(omp_dom::Value::as_str),
+		Some("scheduled")
+	);
+	assert!(matches!(
+		paused.prop(&PropKey::Custom(Str::new_static("continuation-attempt"))),
+		Some(omp_dom::Value::Int(1))
+	));
+
+	let live = session.dom().snapshot();
+	drop(session);
+	let replayed =
+		omp_session::Session::open(&journal_path, omp_session::ComponentRegistry::default())
+			.expect("journal replays");
+	assert_eq!(replayed.dom().snapshot().as_bytes(), live.as_bytes());
+	let paused = replayed
+		.dom()
+		.select("body turn assistant[stop-reason=pause_turn]")
+		.expect("selector")
+		.next()
+		.expect("paused assistant replays");
+	let paused = replayed.dom().get(paused).expect("replayed assistant");
+	assert_eq!(
+		paused
+			.prop(&PropKey::Custom(Str::new_static("continuation-decision")))
+			.and_then(omp_dom::Value::as_str),
+		Some("scheduled")
+	);
+}
+
+#[tokio::test]
+async fn paused_completion_caps_consecutive_resamples_without_spinning() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("paused-cap.oms");
+	let scripts = (0..9).map(|_| pause_script(""));
+	let (inference, requests) = ScriptedInference::new(scripts);
+	let mut kernel = Kernel::new(
+		inference,
+		registry(std::iter::empty()),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	);
+	let mut session = fresh_session(&journal_path);
+
+	let outcome = kernel
+		.run_turn(&mut session, input("inspect"), RunControl::default())
+		.await
+		.expect("cap yields cleanly");
+	assert_eq!(outcome.stop, TurnStop::Completed);
+	assert_eq!(requests.lock().len(), 9, "initial sample plus eight continuations");
+	assert_eq!(
+		session
+			.dom()
+			.count("body turn assistant[stop-reason=pause_turn]")
+			.expect("selector"),
+		9
+	);
+	let last = session
+		.dom()
+		.select("body turn assistant[stop-reason=pause_turn]")
+		.expect("selector")
+		.last()
+		.expect("last paused assistant");
+	let last = session.dom().get(last).expect("assistant materializes");
+	assert_eq!(
+		last
+			.prop(&PropKey::Custom(Str::new_static("continuation-decision")))
+			.and_then(omp_dom::Value::as_str),
+		Some("capped")
+	);
+	assert!(matches!(
+		last.prop(&PropKey::Custom(Str::new_static("continuation-attempt"))),
+		Some(omp_dom::Value::Int(8))
+	));
+}
+
+#[tokio::test]
+async fn tool_progress_rearms_paused_completion_cap() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("paused-rearm.oms");
+	let mut scripts = (0..8).map(|_| pause_script("phase one")).collect::<Vec<_>>();
+	scripts.push(tool_script("echo-1", "echo", serde_json::json!({})));
+	scripts.extend((0..8).map(|_| pause_script("phase two")));
+	scripts.push(text_script("done"));
+	let (inference, requests) = ScriptedInference::new(scripts);
+	let mut kernel = Kernel::new(
+		inference,
+		registry([spec("echo", 1, "progress")]),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	);
+	let mut session = fresh_session(&journal_path);
+
+	let outcome = kernel
+		.run_turn(&mut session, input("inspect"), RunControl::default())
+		.await
+		.expect("tool progress rearms continuation cap");
+	assert_eq!(outcome.stop, TurnStop::Completed);
+	assert_eq!(requests.lock().len(), 18);
+	let attempts = session
+		.dom()
+		.select("body turn assistant[stop-reason=pause_turn]")
+		.expect("selector")
+		.map(|handle| {
+			match session
+				.dom()
+				.get(handle)
+				.and_then(|node| {
+					node.prop(&PropKey::Custom(Str::new_static("continuation-attempt")))
+				}) {
+				Some(omp_dom::Value::Int(attempt)) => *attempt,
+				_ => panic!("paused completion carries an attempt"),
+			}
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(attempts, [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
+#[tokio::test]
+async fn queued_follow_up_blocks_paused_completion_resample() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("paused-pending.oms");
+	let (inference, requests) = ScriptedInference::new([pause_script("waiting")]);
+	let mut kernel = Kernel::new(
+		inference,
+		registry(std::iter::empty()),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	);
+	kernel
+		.mailbox()
+		.send(Up::Queue {
+			text:        Str::new_static("next user turn"),
+			attachments: Vec::new(),
+		})
+		.expect("follow-up queues");
+	let mut session = fresh_session(&journal_path);
+
+	let outcome = kernel
+		.run_turn(&mut session, input("inspect"), RunControl::default())
+		.await
+		.expect("pending input yields");
+	assert_eq!(outcome.stop, TurnStop::Completed);
+	assert_eq!(requests.lock().len(), 1);
+	let paused = session
+		.dom()
+		.select("body turn assistant[stop-reason=pause_turn]")
+		.expect("selector")
+		.next()
+		.expect("paused assistant");
+	assert_eq!(
+		session
+			.dom()
+			.get(paused)
+			.and_then(|node| {
+				node
+					.prop(&PropKey::Custom(Str::new_static("continuation-decision")))
+					.and_then(omp_dom::Value::as_str)
+			}),
+		Some("pending-input")
+	);
+}
+
+#[tokio::test]
+async fn runtime_pause_blocks_paused_completion_provider_admission() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("paused-runtime.oms");
+	let (inference, requests) =
+		ScriptedInference::new([pause_script("waiting"), text_script("done")]);
+	let mut kernel = Kernel::new(
+		inference,
+		registry(std::iter::empty()),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	);
+	let up = kernel.mailbox();
+	up.send(Up::Pause { active: true }).expect("pause queues");
+	let mut session = fresh_session(&journal_path);
+	let run = kernel.run_turn(&mut session, input("inspect"), RunControl::default());
+	tokio::pin!(run);
+
+	assert!(
+		tokio::time::timeout(Duration::from_millis(25), &mut run)
+			.await
+			.is_err(),
+		"paused runtime must hold the turn"
+	);
+	assert!(requests.lock().is_empty(), "pause prevents provider admission");
+	up.send(Up::Pause { active: false }).expect("resume queues");
+	let outcome = tokio::time::timeout(Duration::from_secs(2), &mut run)
+		.await
+		.expect("resumed turn settles")
+		.expect("resumed turn succeeds");
+	assert_eq!(outcome.stop, TurnStop::Completed);
+	assert_eq!(requests.lock().len(), 2);
+}
+
+#[tokio::test]
 async fn tool_call_round_settles_in_the_dom_then_runs_second_inference() {
 	let directory = tempfile::tempdir().expect("temporary directory");
 	let journal_path = directory.path().join("tool.oms");
@@ -240,6 +523,112 @@ async fn tool_call_round_settles_in_the_dom_then_runs_second_inference() {
 		.find(|entry| entry.kind.name.as_str() == kind::TOOL_RESULT)
 		.expect("tool result journals");
 	assert_eq!(result.by, Some(call.id));
+}
+
+#[tokio::test]
+async fn scoped_stream_abort_labels_siblings_in_call_order_and_replays() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let journal_path = directory.path().join("scoped-stream-abort.oms");
+	let ready = Arc::new(tokio::sync::Notify::new());
+	let mut kernel = Kernel::new(
+		ScopedAbortInference { ready: Arc::clone(&ready) },
+		registry([spec("read", 1, "unused"), spec("edit", 1, "unused")]),
+		policy(&directory.path().join("blobs")),
+		StaticPrompt(Str::new_static("test system")),
+	);
+	let up = kernel.mailbox();
+	let mut session = fresh_session(&journal_path);
+
+	let outcome = {
+		let run = kernel.run_turn(&mut session, input("stream two calls"), RunControl::default());
+		tokio::pin!(run);
+		tokio::select! {
+			() = ready.notified() => {},
+			result = &mut run => panic!("turn ended before both calls were authorized: {result:?}"),
+		}
+		up.send(Up::AbortTools(ToolScopedAbortReason::one(
+			"invalid-edit",
+			"TTSR matched rule: no-unwrap",
+			"TTSR interrupt on another tool call",
+		)))
+		.expect("scoped abort queues");
+		(&mut run)
+			.await
+			.expect("scoped abort is a terminal turn outcome")
+	};
+	assert_eq!(outcome.stop, TurnStop::Cancelled);
+	let innocent_text = support::result_text(&session, "innocent-read");
+	assert!(
+		innocent_text[0].contains("TTSR interrupt on another tool call"),
+		"innocent sibling receives the neutral label"
+	);
+	assert!(
+		!innocent_text[0].contains("TTSR matched rule"),
+		"innocent sibling is not blamed for the matching call"
+	);
+	assert!(
+		support::result_text(&session, "invalid-edit")[0].contains("TTSR matched rule: no-unwrap"),
+		"matching call receives its own abort reason"
+	);
+
+	let entries = journal_entries(&journal_path);
+	let calls = entries
+		.iter()
+		.filter(|entry| entry.kind.name.as_str() == kind::TOOL_CALL)
+		.map(|entry| entry.id)
+		.collect::<Vec<_>>();
+	let results = entries
+		.iter()
+		.filter(|entry| entry.kind.name.as_str() == kind::TOOL_RESULT)
+		.map(|entry| entry.by.expect("result is caused by its call"))
+		.collect::<Vec<_>>();
+	assert_eq!(results, calls, "placeholder settlement follows provider call order");
+	let execution_started = PropKey::Custom(Str::new_static("execution-started"));
+	for selector in [
+		"body turn read[id=innocent-read]",
+		"body turn edit[id=invalid-edit]",
+	] {
+		let call = session
+			.dom()
+			.select(selector)
+			.expect("selector parses")
+			.next()
+			.expect("call materializes");
+		let node = session.dom().get(call).expect("call remains materialized");
+		assert_eq!(
+			node.prop(&execution_started),
+			None,
+			"inference placeholders must not claim execution started"
+		);
+		assert_eq!(
+			node.prop(&PropKey::from(PropId::Status))
+				.and_then(omp_dom::Value::as_str),
+			Some("error")
+		);
+	}
+	assert!(
+		!entries
+			.iter()
+			.any(|entry| entry.kind.name.as_str() == kind::TURN_RECEIPT),
+		"an aborted inference is never recorded as a completed request"
+	);
+
+	let live = session.dom().snapshot();
+	drop(session);
+	let replayed = omp_session::Session::open(
+		&journal_path,
+		omp_session::ComponentRegistry::default(),
+	)
+	.expect("journal replays");
+	assert_eq!(replayed.dom().snapshot(), live);
+	assert!(
+		support::result_text(&replayed, "innocent-read")[0]
+			.contains("TTSR interrupt on another tool call")
+	);
+	assert!(
+		support::result_text(&replayed, "invalid-edit")[0]
+			.contains("TTSR matched rule: no-unwrap")
+	);
 }
 
 #[tokio::test]

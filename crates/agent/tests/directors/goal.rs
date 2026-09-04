@@ -1,6 +1,9 @@
 use omp_agent::{
 	LoopDecision,
-	directors::{goal::Goal, loop_mode::LoopMode},
+	directors::{
+		goal::{Goal, continuation_prompt},
+		loop_mode::LoopMode,
+	},
 };
 
 use crate::harness::{Call, Harness};
@@ -42,6 +45,20 @@ fn test_goal_holds_instead_of_looping_on_prose_only_turn() {
 	world.engage(Goal::new("do not self-prompt on prose", None));
 	assert_eq!(world.turn("I need user guidance", &[], 13), LoopDecision::Yield);
 	assert!(world.active().iter().any(|&id| id == "goal"));
+}
+
+#[test]
+fn continuation_prompt_requires_an_active_goal_and_escapes_the_objective() {
+	let mut world = Harness::new();
+	world.engage(Goal::new("ship <safe> & sound", Some(20)));
+	let prompt = continuation_prompt(world.session.dom()).expect("active goal continues");
+	assert!(prompt.contains("<objective>\nship &lt;safe&gt; &amp; sound\n</objective>"));
+	assert!(prompt.contains("- Token budget: 20"));
+	world
+		.stack
+		.pause(&mut world.session, "goal")
+		.expect("goal pauses");
+	assert!(continuation_prompt(world.session.dom()).is_none());
 }
 
 #[test]

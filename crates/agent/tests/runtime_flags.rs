@@ -198,7 +198,7 @@ async fn disabled_goal_is_removed_before_inference_while_enabled_goal_remains() 
 		DirectorStack::from_dom(session.dom(), &directors)
 			.engage(&mut session, Box::new(Goal::new("finish", None)))
 			.expect("goal engages");
-		let (inference, _) = ScriptedInference::new([text_script("candidate")]);
+		let (inference, requests) = ScriptedInference::new([text_script("candidate")]);
 		let mut kernel = Kernel::new(
 			inference,
 			registry(std::iter::empty()),
@@ -222,5 +222,6 @@ async fn disabled_goal_is_removed_before_inference_while_enabled_goal_remains() 
 				.expect("selector"),
 			expected
 		);
+		assert_eq!(requests.lock().len(), 1, "one provider request per prose-only turn");
 	}
 }

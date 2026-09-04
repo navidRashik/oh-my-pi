@@ -527,6 +527,9 @@ pub enum DirectorError {
 	/// Projecting hidden history into inference messages failed.
 	#[error(transparent)]
 	ThreadProjection(#[from] omp_inference::ThreadProjectionError),
+	/// A typed Director payload could not be encoded for the session DOM.
+	#[error(transparent)]
+	Json(#[from] serde_json::Error),
 	/// The canonical `<directors>` component is absent.
 	#[error("session tree has no directors component")]
 	MissingDirectors,

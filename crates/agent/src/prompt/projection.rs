@@ -48,9 +48,10 @@ pub fn template_props(dom: &Dom) -> Props {
 /// Projects canonical conversation items and resolves journaled blob parts
 /// against `blobs` at the projection boundary (no process-local attachment
 /// index): every user attachment (pi `ImageContent`) must be present, so a
-/// missing one fails the request; a tool-result blob absent from the
-/// session store stays a reference. Each blob is read once into a shared
-/// buffer the inference request then borrows.
+/// missing one fails the request. A missing snapcompact frame is omitted
+/// while its summary text remains usable; a tool-result blob absent from the
+/// session store stays a reference. Each present blob is read once into a
+/// shared buffer the inference request then borrows.
 ///
 /// # Errors
 /// A user attachment is missing or corrupt in `blobs`.
@@ -62,13 +63,19 @@ pub fn project_thread_with_attachments(
 	for item in &mut items {
 		match item.kind.as_mut() {
 			Some(item::Kind::Message(message)) => {
-				for part in &mut message.parts {
-					inline_blob(part, blobs, true)?;
+				let required = message.synthetic != Some(true);
+				let source = std::mem::take(&mut message.parts);
+				let mut retained = Vec::with_capacity(source.len());
+				for mut part in source {
+					if inline_blob(&mut part, blobs, required)? {
+						retained.push(part);
+					}
 				}
+				message.parts = retained;
 			},
 			Some(item::Kind::ToolResult(result)) => {
 				for part in &mut result.parts {
-					inline_blob(part, blobs, false)?;
+					let _ = inline_blob(part, blobs, false)?;
 				}
 			},
 			_ => {},
@@ -81,22 +88,25 @@ fn inline_blob(
 	part: &mut Part,
 	blobs: &BlobStore,
 	required: bool,
-) -> Result<(), omp_journal::blob::Error> {
+) -> Result<bool, omp_journal::blob::Error> {
 	let Some(part::Kind::Blob(blob)) = part.kind.as_mut() else {
-		return Ok(());
+		return Ok(true);
 	};
 	if !blob.inline.is_empty() {
-		return Ok(());
+		return Ok(true);
 	}
 	let Ok(hash) = <[u8; 32]>::try_from(blob.hash.as_ref()) else {
-		return Ok(());
+		return Ok(required);
 	};
 	let reference = BlobRef { hash: Hash32::new(hash), size: blob.size };
-	if !required && !blobs.has(&reference) {
-		return Ok(());
+	match blobs.get(&reference) {
+		Ok(bytes) => {
+			blob.inline = bytes;
+			Ok(true)
+		},
+		Err(source) if required => Err(source),
+		Err(_) => Ok(false),
 	}
-	blob.inline = blobs.get(&reference)?;
-	Ok(())
 }
 
 /// Reads one journaled boolean convar directly from the authoritative DOM.

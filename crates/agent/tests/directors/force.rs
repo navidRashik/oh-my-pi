@@ -55,7 +55,7 @@ fn test_forced_call_is_semantic_intent_for_inference_to_lower() {
 	assert_eq!(req.messages.len(), 0, "Directors do not author provider-strategy prompts");
 	assert_eq!(
 		req.forced_call,
-		Some(omp_inference::ForcedCall { non_compliant_turns: 0, escalations_left: 0 })
+		Some(omp_inference::ForcedCall { non_compliant_turns: 0, escalations_left: 2 })
 	);
 	assert!(matches!(world.turn("provider response", &[], 0), LoopDecision::Continue { .. }));
 	assert!(

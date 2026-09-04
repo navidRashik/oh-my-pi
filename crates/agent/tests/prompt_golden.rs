@@ -71,8 +71,8 @@ fn snapshot(session: &Session) -> Vec<GoldenItem> {
 		.collect()
 }
 
-const TOOL_NAMES: [&str; 9] =
-	["ast_edit", "bash", "edit", "glob", "grep", "inspect_image", "read", "task", "write"];
+const TOOL_NAMES: [&str; 8] =
+	["ast_edit", "bash", "edit", "glob", "grep", "read", "task", "write"];
 
 fn inventory(full: bool) -> String {
 	let mut out = String::new();
@@ -407,6 +407,97 @@ fn attachment_blob_refs_are_resolved_only_at_thread_projection() {
 	assert_eq!(projected.size, blob.size);
 	assert_eq!(projected.mime, "image/png");
 	assert_eq!(projected.inline.as_ref(), b"image");
+}
+
+#[test]
+fn retained_snapcompact_frame_is_inlined_after_the_summary() {
+	let (_, mut session) = session_with_facts(serde_json::json!({}));
+	session.begin_turn().expect("turn");
+	let boundary = session.user("old context", Vec::new()).expect("user");
+	let summary = session
+		.blobs()
+		.put(b"archive summary")
+		.expect("summary stores");
+	let frame = session
+		.store_attachment("image/png", b"snapcompact png")
+		.expect("frame stores");
+	session
+		.compaction(omp_journal::data::Compaction {
+			summary,
+			boundary,
+			method: Some(Str::new_static("snapcompact")),
+			tokens_before: Some(100_000),
+			tokens_after: Some(8_000),
+			warning: None,
+			frames: vec![frame],
+		})
+		.expect("compaction");
+
+	let items = omp_agent::project_thread_with_attachments(session.dom(), session.blobs())
+		.expect("frame resolves");
+	let message = items
+		.first()
+		.and_then(|item| match item.kind.as_ref()? {
+			item::Kind::Message(message) => Some(message),
+			_ => None,
+		})
+		.expect("summary message");
+	assert_eq!(message.parts.len(), 2);
+	let frame = message.parts[1]
+		.kind
+		.as_ref()
+		.and_then(|part| match part {
+			part::Kind::Blob(blob) => Some(blob),
+			_ => None,
+		})
+		.expect("frame blob");
+	assert_eq!(frame.mime, "image/png");
+	assert_eq!(frame.inline.as_ref(), b"snapcompact png");
+}
+
+#[test]
+fn missing_snapcompact_frame_drops_only_the_frame_and_keeps_summary_text() {
+	let (directory, mut session) = session_with_facts(serde_json::json!({}));
+	session.begin_turn().expect("turn");
+	let boundary = session.user("old context", Vec::new()).expect("user");
+	let summary = session
+		.blobs()
+		.put(b"archive summary")
+		.expect("summary stores");
+	let missing =
+		omp_journal::blob::BlobRef { hash: Hash32::sum(b"missing snapcompact frame"), size: 25 };
+	session
+		.compaction(omp_journal::data::Compaction {
+			summary,
+			boundary,
+			method: Some(Str::new_static("snapcompact")),
+			tokens_before: Some(100_000),
+			tokens_after: Some(8_000),
+			warning: None,
+			frames: vec![omp_journal::data::Attachment {
+				blob: missing,
+				mime: Str::new_static("image/png"),
+			}],
+		})
+		.expect("missing frame references remain replayable");
+	drop(session);
+	let session = Session::open(directory.path().join("prompt.oms"), ComponentRegistry::standard())
+		.expect("missing frame does not prevent replay");
+
+	let items = omp_agent::project_thread_with_attachments(session.dom(), session.blobs())
+		.expect("missing archive frame has a text fallback");
+	let message = items
+		.first()
+		.and_then(|item| match item.kind.as_ref()? {
+			item::Kind::Message(message) => Some(message),
+			_ => None,
+		})
+		.expect("summary message");
+	assert_eq!(message.parts.len(), 1, "only the unavailable frame is omitted");
+	assert_eq!(
+		message.parts[0].kind.as_ref(),
+		Some(&part::Kind::Text("archive summary".to_owned()))
+	);
 }
 
 #[test]

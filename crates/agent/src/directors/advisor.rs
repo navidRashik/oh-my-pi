@@ -33,14 +33,15 @@ use std::{fmt::Write as _, sync::Arc};
 
 use futures::StreamExt;
 use omp_con::Ctx;
-use omp_core::{FastHashMap, FastHashSet, Str};
+use omp_core::{FastHashMap, FastHashSet, Str, sf};
 use omp_dom::{Dom, Handle, KnownTag, Node, NodeSpec, Op, PropId, PropKey, Tag, Value};
 use omp_inference::{
 	ChatEvent, ChatRequest, Completion, ContentPart, ErrorKind, Message, OpaqueJson, Role, Setting,
 	ToolChoice, ToolDefinition, ToolInputConstraint, ToolResultContent,
 	pi_settings::{AI_ADVISOR_ENABLED, AI_ADVISOR_IMMUNE_TURNS, AI_ADVISOR_SYNC_BACKLOG},
 };
-use omp_journal::data::{ReceiptIdentity, ReceiptRole, TurnReceipt};
+use omp_journal::data::{AdvisorMessage, ReceiptIdentity, ReceiptRole, TurnReceipt};
+pub use omp_journal::data::{AdvisorNote as Note, AdvisorSeverity as Severity};
 use omp_session::{Session, projection::project_thread};
 use strum::{Display, EnumString};
 
@@ -154,27 +155,6 @@ pub enum Status {
 	NoModel,
 }
 
-/// Advice severity (pi `AdvisorSeverity`); ordered by rank.
-#[derive(Clone, Copy, Debug, Default, Display, EnumString, Eq, Ord, PartialEq, PartialOrd)]
-#[strum(serialize_all = "lowercase")]
-pub enum Severity {
-	/// Non-urgent; folds at the next step boundary.
-	#[default]
-	Nit,
-	/// The agent may be heading wrong; it decides.
-	Concern,
-	/// Stop and reconsider.
-	Blocker,
-}
-
-impl Severity {
-	/// pi `isInterruptingSeverity`.
-	#[must_use]
-	pub const fn interrupting(self) -> bool {
-		!matches!(self, Self::Nit)
-	}
-}
-
 /// How one accepted note reaches the primary (pi `AdvisorDeliveryChannel`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Channel {
@@ -240,20 +220,17 @@ pub fn normalize_note(note: &str) -> Str {
 
 /// pi `formatAdvisorBatchContent` for one note: the agent-facing bytes.
 #[must_use]
-pub fn advisory_text(note: &str, severity: Severity) -> Str {
+pub fn advisory_text(note: &Note) -> Str {
+	let advisor = if note.advisor == "default" {
+		Str::default()
+	} else {
+		sf!(" advisor=\"{}\"", escape_xml_attribute(note.advisor.as_str()))
+	};
 	Str::new(format!(
-		"<advisory severity=\"{severity}\" guidance=\"{GUIDANCE}\">\n{}\n</advisory>",
-		escape_xml_text(note)
+		"<advisory{advisor} severity=\"{}\" guidance=\"{GUIDANCE}\">\n{}\n</advisory>",
+		note.severity,
+		escape_xml_text(note.note.as_str())
 	))
-}
-
-/// One note the advisor emitted through `advise`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Note {
-	/// Trimmed note text.
-	pub note:     Str,
-	/// Requested severity; an omitted one is a `nit`.
-	pub severity: Severity,
 }
 
 /// The advisor watchdog engagement.
@@ -403,12 +380,8 @@ impl Advisor {
 						plan_mode: plan_engaged(dom),
 					};
 					let channel = delivery_channel(note.severity, facts);
-					ops.push(notice_op(dom, cx.turn, &note));
-					ops.push(developer_op(
-						dom,
-						cx.turn,
-						advisory_text(note.note.as_str(), note.severity),
-					));
+					ops.push(notice_op(dom, cx.turn, std::slice::from_ref(&note))?);
+					ops.push(developer_op(dom, cx.turn, advisory_text(&note)));
 					if channel == Channel::Steer {
 						// pi `#recordAdvisorInterruptDelivered`: arm the immune
 						// window only when a turn is actually steered.
@@ -629,13 +602,19 @@ fn earlier_notes(dom: &Dom) -> Vec<Note> {
 			{
 				continue;
 			}
+			if let Some(Value::Json(data)) = node.prop(&PropKey::from(PropId::Data))
+				&& let Ok(message) = serde_json::from_str::<AdvisorMessage>(data.get())
+			{
+				notes.extend(message.notes);
+				continue;
+			}
 			let Some(note) = node.content.clone() else {
 				continue;
 			};
 			let severity = prop_str(node, PropId::Severity)
 				.and_then(|severity| severity.parse().ok())
 				.unwrap_or_default();
-			notes.push(Note { note, severity });
+			notes.push(Note { advisor: Str::new_static("default"), note, severity });
 		}
 	}
 	notes
@@ -645,15 +624,23 @@ fn prop_str(node: &Node, prop: PropId) -> Option<&str> {
 	node.prop(&PropKey::from(prop)).and_then(Value::as_str)
 }
 
-fn notice_op(dom: &Dom, turn: Handle, note: &Note) -> Op {
-	Op::Ins {
+fn notice_op(dom: &Dom, turn: Handle, notes: &[Note]) -> Result<Op, serde_json::Error> {
+	let data = serde_json::value::to_raw_value(&AdvisorMessage { notes: notes.to_vec() })?;
+	let mut content = String::new();
+	for note in notes {
+		if !content.is_empty() {
+			content.push('\n');
+		}
+		content.push_str(note.note.as_str());
+	}
+	Ok(Op::Ins {
 		parent: turn,
 		after:  dom.children(turn).last().copied(),
 		node:   NodeSpec::new(KnownTag::Notice)
 			.with_prop(PropId::Kind, Value::Str(Str::new_static(FAMILY)))
-			.with_prop(PropId::Severity, Value::Str(Str::new(note.severity.to_string())))
-			.with_content(note.note.clone()),
-	}
+			.with_prop(PropId::Data, Value::Json(data))
+			.with_content(Str::new(content)),
+	})
 }
 
 /// The model-facing aside; anchored on the turn tail *after* the notice
@@ -767,7 +754,11 @@ async fn collect_notes(
 					.and_then(serde_json::Value::as_str)
 					.and_then(|severity| severity.parse().ok())
 					.unwrap_or_default();
-				notes.push(Note { note: Str::new(note), severity });
+				notes.push(Note {
+					advisor: Str::new_static("default"),
+					note: Str::new(note),
+					severity,
+				});
 			},
 			ChatEvent::Completed(completion) => receipt = advisor_receipt(&completion),
 			_ => {},
@@ -830,6 +821,12 @@ fn advisor_receipt(completion: &Completion) -> Option<TurnReceipt> {
 			provider: Str::new(provider),
 			model:    Str::new(model),
 		}),
+		recoveries:                  completion
+			.receipt
+			.recoveries
+			.iter()
+			.map(crate::loop_::journal_recovery)
+			.collect(),
 	})
 }
 
@@ -1203,6 +1200,20 @@ fn bounded_fenced(text: &str, language: &str) -> String {
 	format!("{fence}{language}\n{bounded}\n{fence}")
 }
 
+fn escape_xml_attribute(text: &str) -> String {
+	let mut out = String::with_capacity(text.len());
+	for character in text.chars() {
+		match character {
+			'&' => out.push_str("&amp;"),
+			'<' => out.push_str("&lt;"),
+			'>' => out.push_str("&gt;"),
+			'"' => out.push_str("&quot;"),
+			other => out.push(other),
+		}
+	}
+	out
+}
+
 fn escape_xml_text(text: &str) -> String {
 	let mut out = String::with_capacity(text.len());
 	for character in text.chars() {
@@ -1302,9 +1313,24 @@ mod tests {
 	#[test]
 	fn advisory_bytes_match_pi_batch_content() {
 		assert_eq!(
-			advisory_text("a < b", Severity::Blocker).as_str(),
+			advisory_text(&Note {
+				advisor:  Str::new_static("default"),
+				severity: Severity::Blocker,
+				note:     Str::new_static("a < b"),
+			})
+			.as_str(),
 			"<advisory severity=\"blocker\" guidance=\"weigh, don't blindly obey\">\na &lt; \
 			 b\n</advisory>"
+		);
+		assert_eq!(
+			advisory_text(&Note {
+				advisor:  Str::new_static("security & \"safety\""),
+				severity: Severity::Concern,
+				note:     Str::new_static("check it"),
+			})
+			.as_str(),
+			"<advisory advisor=\"security &amp; &quot;safety&quot;\" severity=\"concern\" \
+			 guidance=\"weigh, don't blindly obey\">\ncheck it\n</advisory>"
 		);
 	}
 

@@ -1,4 +1,4 @@
-//! Image-input policy (pi `/vision`, `inspect_image.mode`): the journaled
+//! Image-input policy for attachments and `Read.question`: the journaled
 //! `ai_vision` convar decides whether image parts reach the model. `auto`
 //! follows the route's image capability; `off` always replaces images by a
 //! text placeholder; `on` always sends them. Read from the session tree's
