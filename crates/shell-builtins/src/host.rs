@@ -85,8 +85,8 @@ pub struct DynSchema {
 
 /// A successful dynamic operation result.
 ///
-/// The builtin writes every variant to stdout: text verbatim, JSON compact,
-/// image blobs as terminal graphics passthrough
+/// The builtin writes every variant to stdout: plain and Markdown text
+/// verbatim, JSON compact, image blobs as terminal graphics passthrough
 /// ([`crate::graphics::encode_image_passthrough`]) and other blobs as raw
 /// bytes, so `dyn tts … > speech.mp3` and `dyn image_gen …` both compose with
 /// redirection.
@@ -94,6 +94,9 @@ pub struct DynSchema {
 pub enum DynOutput {
 	/// Plain text written directly to stdout.
 	Text(Str),
+	/// Markdown text. Shell composition writes the source bytes unchanged;
+	/// direct presentation consumers may render the semantic form.
+	Markdown(Str),
 	/// Structured output serialized as JSON on stdout.
 	Json(Value),
 	/// Binary media with its MIME type.

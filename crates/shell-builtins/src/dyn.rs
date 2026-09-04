@@ -212,11 +212,13 @@ fn write_message(mut output: impl io::Write, message: &str) -> io::Result<()> {
 	Ok(())
 }
 
-/// Writes one device result to stdout: text verbatim, JSON compact, images as
-/// terminal graphics passthrough, other media as raw bytes.
+/// Writes one device result to stdout: plain and Markdown text verbatim, JSON
+/// compact, images as terminal graphics passthrough, other media as raw bytes.
 fn write_output(stdout: &mut dyn io::Write, output: &DynOutput) -> io::Result<()> {
 	match output {
-		DynOutput::Text(text) => write_message(&mut *stdout, text.as_str()),
+		DynOutput::Text(text) | DynOutput::Markdown(text) => {
+			write_message(&mut *stdout, text.as_str())
+		},
 		DynOutput::Json(value) => write_message(&mut *stdout, &value.to_string()),
 		DynOutput::Blob { mime, bytes } => {
 			if mime.starts_with("image/") {
@@ -1227,7 +1229,7 @@ mod tests {
 				},
 				"notrunc": {
 					"type": "boolean",
-					"description": "Return complete output inline without central truncation."
+					"description": "Prefer complete output inline up to the host security ceiling; overflow or transport backpressure remains available through its artifact."
 				},
 				"session_id": { "type": "string", "description": "Session filing the report." },
 				"device": { "type": "string", "description": "Device whose result was inconsistent." },
@@ -1291,7 +1293,7 @@ mod tests {
 	fn positionals_bind_required_scalars_in_declaration_order() {
 		let parsed = parse(
 			&report_issue_schema(),
-			&["sess-1", "read", "3", "--verdict", r#"{"summary":"mismatch"}"#],
+			&["sess-1", "read", "3", "--verdict.summary", "mismatch"],
 			"",
 		)
 		.expect("positionals bind");
@@ -1310,8 +1312,12 @@ mod tests {
 				"read",
 				"--rev",
 				"1",
-				"--verdict",
-				r#"{"summary":"mismatch","observed":"x","expected":"y"}"#,
+				"--verdict.summary",
+				"mismatch",
+				"--verdict.observed",
+				"x",
+				"--verdict.expected",
+				"y",
 			],
 			"",
 		)
@@ -1534,18 +1540,13 @@ mod tests {
 	fn file_and_stdin_are_valid_flag_and_raw_json_values_and_flags_win() {
 		let root = tempfile::tempdir().expect("tempdir");
 		std::fs::write(
-			root.path().join("verdict.json"),
-			r#"{"summary":"mismatch","observed":"bad"}"#,
-		)
-		.expect("write verdict");
-		std::fs::write(
 			root.path().join("args.json"),
-			r#"{"session_id":"file-session","device":"read","rev":"1","verdict":{"summary":"mismatch"}}"#,
+			r#"{"session_id":"file-session","device":"read","rev":"1","verdict":{"summary":"mismatch","observed":"bad"}}"#,
 		)
 		.expect("write args");
 		let parsed = parse_in(
 			&report_issue_schema(),
-			&["--device", "bash", "--json", "@args.json", "--verdict", "@verdict.json"],
+			&["--json", "@args.json", "--device", "bash"],
 			root.path(),
 		)
 		.expect("file-backed flag values bind");
@@ -1561,8 +1562,8 @@ mod tests {
 
 		let parsed = parse(
 			&report_issue_schema(),
-			&["session", "read", "1", "--verdict", "-"],
-			r#"{"summary":"mismatch","expected":"complete"}"#,
+			&["--json", "-"],
+			r#"{"session_id":"session","device":"read","rev":"1","verdict":{"summary":"mismatch","expected":"complete"}}"#,
 		)
 		.expect("stdin flag value binds");
 		assert_eq!(
@@ -1601,5 +1602,13 @@ mod tests {
 		})
 		.expect("write audio");
 		assert_eq!(stdout, b"\xff\xfbID3");
+
+		let mut stdout = Vec::new();
+		write_output(
+			&mut stdout,
+			&DynOutput::Markdown(Str::new_static("**render me**")),
+		)
+		.expect("write Markdown");
+		assert_eq!(stdout, b"**render me**\n");
 	}
 }
