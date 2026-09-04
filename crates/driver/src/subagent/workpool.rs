@@ -11,9 +11,10 @@ use std::{
 
 use omp_agent::{EnvEvent, SessionAuthority, SessionEndpoint, SessionRole, Up};
 use omp_core::{FastHashMap, FastHashSet, Str, Ulid, sf};
-use omp_journal::data::{IrcTraffic, WorkpoolMode, WorkpoolObservation};
+use omp_journal::data::{IrcDirection, IrcTraffic, WorkpoolMode, WorkpoolObservation};
 use parking_lot::Mutex;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 /// Receipt proving that a preceding transition came from this producer.
 ///
@@ -51,10 +52,11 @@ pub struct StagedWorkpoolObservation {
 
 #[derive(Default)]
 struct ProducerState {
-	last_timestamp_ms: u64,
-	delivered:         FastHashSet<Str>,
-	results:           FastHashSet<Str>,
-	terminal:          Option<WorkpoolMode>,
+	last_timestamp_ms:   u64,
+	delivered:           FastHashSet<Str>,
+	result_observations: FastHashSet<Str>,
+	results:             FastHashSet<Str>,
+	terminal:            Option<WorkpoolMode>,
 }
 
 /// Process-local registry of uniquely named producer bindings.
@@ -302,13 +304,16 @@ impl WorkpoolProducer {
 	/// Delivers one worker's ordinary batch result to the pool owner.
 	///
 	/// The authenticated worker remains the ordinary sender and the producer
-	/// receipt becomes `reply_to`. The receipt is also the exactly-once key:
-	/// retries after a successful send return without another model input.
-	pub fn deliver_result_once(
+	/// receipt becomes `reply_to`. The receipt is also the exactly-once key.
+	/// Both mailbox writes honor backpressure asynchronously; the observation
+	/// phase is remembered separately so cancellation between the two writes
+	/// can never duplicate the card when delivery resumes.
+	pub async fn deliver_result_once(
 		&self,
 		worker: &str,
 		body: Str,
 		reply_to: &WorkpoolReceipt,
+		cancel: &CancellationToken,
 	) -> Result<(), WorkpoolProducerError> {
 		let owner = self.ensure_live_owner()?;
 		if reply_to.producer != self.producer {
@@ -319,28 +324,89 @@ impl WorkpoolProducer {
 			.lookup(worker)
 			.ok_or_else(|| WorkpoolProducerError::TargetUnavailable { id: Str::new(worker) })?;
 		self.authenticate_target(WorkpoolMode::Batch, &target)?;
-		let mut state = self.state.lock();
-		if state.results.contains(&reply_to.id) {
-			return Ok(());
+		let (already_observed, timestamp_ms) = {
+			let state = self.state.lock();
+			if state.results.contains(&reply_to.id) {
+				return Ok(());
+			}
+			if let Some(mode) = state.terminal {
+				return Err(WorkpoolProducerError::Closed { pool: self.pool.clone(), mode });
+			}
+			let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+			let now = u64::try_from(now).unwrap_or(u64::MAX);
+			let next = state
+				.last_timestamp_ms
+				.checked_add(1)
+				.ok_or_else(|| WorkpoolProducerError::TimestampExhausted {
+					pool: self.pool.clone(),
+				})?;
+			(state.result_observations.contains(&reply_to.id), now.max(next))
+		};
+		if !already_observed {
+			let incoming = IrcTraffic {
+				direction: IrcDirection::Incoming,
+				from: Some(target.name.clone()),
+				to: Some(owner.name.clone()),
+				body: body.clone(),
+				reply_to: Some(reply_to.id.clone()),
+				pool: None,
+				mode: None,
+				timestamp_ms,
+			};
+			tokio::select! {
+				biased;
+				() = cancel.cancelled() => {
+					return Err(WorkpoolProducerError::DeliveryCancelled { pool: self.pool.clone() });
+				},
+				result = owner.up.send_async(Up::Env(EnvEvent::IrcTraffic {
+					payload: Arc::new(incoming),
+				})) => {
+					result.map_err(|_| WorkpoolProducerError::OwnerDisconnected {
+						owner: owner.id.clone(),
+					})?;
+				},
+			}
+			let mut state = self.state.lock();
+			state.last_timestamp_ms = timestamp_ms;
+			state.result_observations.insert(reply_to.id.clone());
 		}
-		if let Some(mode) = state.terminal {
-			return Err(WorkpoolProducerError::Closed { pool: self.pool.clone(), mode });
+		tokio::select! {
+			biased;
+			() = cancel.cancelled() => {
+				return Err(WorkpoolProducerError::DeliveryCancelled { pool: self.pool.clone() });
+			},
+			result = owner.up.send_async(Up::Peer(body.clone())) => {
+				result.map_err(|_| WorkpoolProducerError::OwnerDisconnected {
+					owner: owner.id.clone(),
+				})?;
+			},
 		}
-		let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-		let timestamp_ms = u64::try_from(timestamp_ms).unwrap_or(u64::MAX);
-		if !crate::subagent::hub::deliver_authenticated_peer(
-			self.authority.as_ref(),
-			&owner,
-			&target,
-			body,
-			Some(reply_to.id.clone()),
-			timestamp_ms,
-			false,
-		) {
-			return Err(WorkpoolProducerError::OwnerDisconnected { owner: owner.id });
+		self.state.lock().results.insert(reply_to.id.clone());
+		if let Some(main) = self.authority.relay_target(&target, &owner) {
+			let relay = IrcTraffic {
+				direction: IrcDirection::Relay,
+				from: Some(target.name),
+				to: Some(owner.name),
+				body,
+				reply_to: Some(reply_to.id.clone()),
+				pool: None,
+				mode: None,
+				timestamp_ms,
+			};
+			let _ = main
+				.up
+				.try_send(Up::Env(EnvEvent::IrcTraffic { payload: Arc::new(relay) }));
 		}
-		state.results.insert(reply_to.id.clone());
 		Ok(())
+	}
+
+	/// Seals the terminal cancellation transition for retryable delivery.
+	pub(crate) fn cancelled(
+		&self,
+		body: Str,
+		reply_to: Option<&WorkpoolReceipt>,
+	) -> Result<StagedWorkpoolObservation, WorkpoolProducerError> {
+		self.stage(WorkpoolMode::Cancelled, self.owner.id.as_str(), body, reply_to)
 	}
 
 	/// Publishes the terminal cancellation transition, then permanently fences
@@ -350,7 +416,7 @@ impl WorkpoolProducer {
 		body: Str,
 		reply_to: Option<&WorkpoolReceipt>,
 	) -> Result<WorkpoolReceipt, WorkpoolProducerError> {
-		let staged = self.stage(WorkpoolMode::Cancelled, self.owner.id.as_str(), body, reply_to)?;
+		let staged = self.cancelled(body, reply_to)?;
 		self.try_deliver(&staged)
 	}
 
@@ -482,6 +548,12 @@ pub enum WorkpoolProducerError {
 	MailboxFull {
 		/// Stable owner identity.
 		owner: Str,
+	},
+	/// Batch-result delivery was cancelled while waiting for mailbox capacity.
+	#[error("workpool `{pool}` result delivery was cancelled")]
+	DeliveryCancelled {
+		/// Pool whose delivery stopped.
+		pool: Str,
 	},
 	/// Owner mailbox disconnected before the transition could be observed.
 	#[error("workpool owner `{owner}` mailbox is disconnected")]

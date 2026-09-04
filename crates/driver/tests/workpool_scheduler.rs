@@ -17,10 +17,12 @@ use omp_driver::{
 		workpool::WorkpoolRegistry,
 		workpool_scheduler::{
 			SchedulerRegistry, WorkerBatch, WorkerEvent, WorkerHandle, WorkerSpawn, WorkpoolCreate,
-			WorkpoolLauncher, WorkpoolPolicy, WorkpoolSchedulerError,
+			SessionMutator, WorkpoolLauncher, WorkpoolParentHost, WorkpoolPolicy,
+			WorkpoolSchedulerError, WorkpoolSessionHost,
 		},
 	},
 };
+use omp_envd::eval::ParentSessionHost as _;
 use omp_session::{ComponentRegistry, Session};
 use parking_lot::RwLock;
 use serde_json::json;
@@ -80,10 +82,11 @@ impl WorkpoolLauncher for Launcher {
 		});
 		let id = request.id.clone();
 		let child_cancel = cancel.clone();
+		let (finished_tx, finished) = flume::bounded(1);
 		let active = Arc::clone(&self.active);
 		let maximum = Arc::clone(&self.maximum);
 		let die_once = Arc::clone(&self.die_once);
-		tokio::spawn(async move {
+		let task = tokio::spawn(async move {
 			let _mailbox_rx = mailbox_rx;
 			loop {
 				let batch = tokio::select! {
@@ -136,18 +139,37 @@ impl WorkpoolLauncher for Launcher {
 					})
 					.await;
 			}
+			let _ = finished_tx.send(());
 		});
-		Ok(WorkerHandle { id: request.id, batches, cancel })
+		let abort = task.abort_handle();
+		Ok(WorkerHandle { id: request.id, batches, cancel, finished, abort })
 	}
 }
 
 struct Harness {
-	registry:     SchedulerRegistry,
-	parent:       Arc<Mutex<Session>>,
-	jobs:         Arc<JobBoard>,
-	launcher:     Arc<Launcher>,
-	producers:    Arc<WorkpoolRegistry>,
-	_owner_inbox: flume::Receiver<Up>,
+	registry:    Arc<SchedulerRegistry>,
+	parent:      Arc<Mutex<Session>>,
+	jobs:        Arc<JobBoard>,
+	launcher:    Arc<Launcher>,
+	producers:   Arc<WorkpoolRegistry>,
+	owner_actor: tokio::task::JoinHandle<()>,
+}
+
+impl Harness {
+	/// Closes every owner mailbox and joins the sole session actor before replay.
+	async fn release_session_owner(self) -> std::path::PathBuf {
+		let Self { registry, parent, jobs, launcher, producers, owner_actor } = self;
+		registry.release_owner();
+		launcher.sessions.remove(&SessionId::new(sf!("owner")));
+		drop(registry);
+		drop(jobs);
+		drop(producers);
+		drop(launcher);
+		let path = parent.lock().await.journal_path().to_path_buf();
+		drop(parent);
+		owner_actor.await.expect("owner actor stops after its mailbox closes");
+		path
+	}
 }
 
 fn harness(limit: usize, fresh: bool, die_once: bool) -> Harness {
@@ -161,7 +183,7 @@ fn harness(limit: usize, fresh: bool, die_once: bool) -> Harness {
 	sessions.register(sf!("owner"), KernelHandle {
 		id:        SessionId::new(sf!("owner")),
 		name:      sf!("owner"),
-		up:        mailbox,
+		up:        mailbox.clone(),
 		snapshot:  Arc::clone(&snapshot),
 		topology:  SessionTopology::main(sf!("owner")),
 		relay:     IrcRelayPolicy::fixed(true),
@@ -180,18 +202,26 @@ fn harness(limit: usize, fresh: bool, die_once: bool) -> Harness {
 		forwarded: Arc::new(RwLock::new(None)),
 	});
 	let parent = Arc::new(Mutex::new(parent));
+	let actor_parent = Arc::clone(&parent);
+	let owner_actor = tokio::spawn(async move {
+		while let Ok(message) = owner_inbox.recv_async().await {
+			if let Up::SessionMutation(request) = message {
+				request.apply(&mut *actor_parent.lock().await);
+			}
+		}
+	});
 	let jobs = Arc::new(JobBoard::new());
-	let registry = SchedulerRegistry::new(
+	let registry = Arc::new(SchedulerRegistry::new(
 		sf!("owner"),
-		Arc::clone(&parent),
+		SessionMutator::new(mailbox),
 		Arc::clone(&jobs),
 		spill,
 		Arc::clone(&producers),
 		launcher.clone(),
 		Arc::new(Policy { limit, fresh }),
 		omp_tools::eval::EvalSessionControl::default(),
-	);
-	Harness { registry, parent, jobs, launcher, producers, _owner_inbox: owner_inbox }
+	));
+	Harness { registry, parent, jobs, launcher, producers, owner_actor }
 }
 
 async fn wait_pending(pool: &omp_driver::subagent::workpool_scheduler::Workpool, expected: usize) {
@@ -202,6 +232,62 @@ async fn wait_pending(pool: &omp_driver::subagent::workpool_scheduler::Workpool,
 		tokio::time::sleep(Duration::from_millis(5)).await;
 	}
 	panic!("pool did not reach pending={expected}");
+}
+
+async fn wait_closed(pool: &omp_driver::subagent::workpool_scheduler::Workpool) {
+	for _ in 0..200 {
+		if pool.status().closed {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	panic!("pool did not close after draining");
+}
+
+async fn wait_finished(jobs: &JobBoard, id: &str) {
+	for _ in 0..200 {
+		if jobs.has_finished(id) {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	panic!("aggregate execution did not finish");
+}
+
+#[tokio::test]
+async fn eval_parent_host_routes_workpool_mutations_through_the_kernel_actor() {
+	let harness = harness(1, false, false);
+	let host = WorkpoolParentHost::new(
+		WorkpoolSessionHost::new(std::path::PathBuf::from("/project")),
+		Arc::clone(&harness.registry),
+	);
+	let progress = omp_envd::eval::NoopBridgeProgress;
+	let created = host
+		.workpool(
+			json!({"op":"create","name":"eval-live","agent":"task"}),
+			&progress,
+		)
+		.await
+		.expect("eval parent create");
+	assert_eq!(created["name"], "eval-live");
+	let pushed = host
+		.workpool(
+			json!({"op":"push","name":"eval-live","items":["one"]}),
+			&progress,
+		)
+		.await
+		.expect("eval parent push");
+	assert_eq!(pushed["ids"], json!(["eval-live#1"]));
+	let pool = harness.registry.get("eval-live").expect("live routed pool");
+	wait_closed(&pool).await;
+	assert!(
+		omp_driver::subagent::workpool_scheduler::replayed_state(
+			&*harness.parent.lock().await,
+			"eval-live",
+		)
+		.is_some(),
+		"kernel actor committed durable workpool state"
+	);
 }
 
 #[tokio::test]
@@ -285,7 +371,8 @@ async fn persistent_workers_batch_queue_and_aggregate_delivery_stays_atomic() {
 	assert_eq!(status.batches, 2);
 	assert_eq!(status.items.completed, 3);
 	assert!(undelivered(harness.parent.lock().await.dom()).is_empty());
-	assert!(pool.close().await.expect("close").is_empty());
+	wait_closed(&pool).await;
+	wait_finished(&harness.jobs, "audit").await;
 	let mut parent = harness.parent.lock().await;
 	let settled = harness
 		.jobs
@@ -295,6 +382,12 @@ async fn persistent_workers_batch_queue_and_aggregate_delivery_stays_atomic() {
 		.expect("aggregate job");
 	drop(parent);
 	assert_eq!(settled.status, "completed");
+	assert!(pool.status().closed, "the aggregate closes itself when the queue drains");
+	assert!(matches!(
+		pool.push(vec![sf!("late")]).await,
+		Err(WorkpoolSchedulerError::Closed { .. })
+	));
+	assert!(pool.close().await.expect("idempotent close").is_empty());
 	let aggregate: serde_json::Value =
 		serde_json::from_str(settled.output.as_deref().expect("aggregate output").get())
 			.expect("aggregate JSON");
@@ -311,7 +404,69 @@ async fn persistent_workers_batch_queue_and_aggregate_delivery_stays_atomic() {
 	assert_eq!(pending.len(), 1);
 	assert_eq!(pending[0].id, "audit");
 	let _ = pool.peek();
-	assert_eq!(undelivered(harness.parent.lock().await.dom()).len(), 1);
+	let path = {
+		let parent = harness.parent.lock().await;
+		assert_eq!(undelivered(parent.dom()).len(), 1);
+		let durable = omp_driver::subagent::workpool_scheduler::replayed_state(&parent, "audit")
+			.expect("durable pool state")
+			.get()
+			.to_owned();
+		assert!(durable.contains(r#""closed":true"#), "{durable}");
+		assert!(durable.contains(r#""status":"completed""#), "{durable}");
+		parent.journal_path().to_path_buf()
+	};
+	drop(pool);
+	let released_path = harness.release_session_owner().await;
+	assert_eq!(released_path, path);
+	let replayed = Session::open(path, ComponentRegistry::standard()).expect("replay pool state");
+	let durable = omp_driver::subagent::workpool_scheduler::replayed_state(&replayed, "audit")
+		.expect("replayed pool state")
+		.get();
+	assert!(durable.contains(r#""closed":true"#), "{durable}");
+	assert!(durable.contains(r#""audit#3""#), "{durable}");
+}
+
+#[tokio::test]
+async fn restart_adopts_durable_drained_pool_before_settlement_patch() {
+	let harness = harness(1, false, false);
+	let pool = harness
+		.registry
+		.create(WorkpoolCreate {
+			name: sf!("adopt"),
+			agent: sf!("task"),
+			context: None,
+		})
+		.expect("create pool");
+	pool.push(vec![sf!("one")]).await.expect("push");
+	wait_closed(&pool).await;
+	wait_finished(&harness.jobs, "adopt").await;
+	let path = harness.parent.lock().await.journal_path().to_path_buf();
+	assert_eq!(
+		harness
+			.jobs
+			.list()
+			.into_iter()
+			.find(|record| record.id == "adopt")
+			.expect("live aggregate")
+			.status,
+		"running",
+		"simulate a crash before JobBoard poll commits settlement"
+	);
+	drop(pool);
+	let released_path = harness.release_session_owner().await;
+	assert_eq!(released_path, path);
+
+	let mut replayed = Session::open(path, ComponentRegistry::standard()).expect("restart parent");
+	let board = JobBoard::new();
+	board.rebuild(&replayed);
+	let adopted = board
+		.wait(&mut replayed, Some(&[sf!("adopt")]))
+		.await
+		.expect("adopt settlement")
+		.expect("durable pool remains addressable");
+	assert_eq!(adopted.status, "completed");
+	let output = adopted.output.as_deref().expect("adopted aggregate output");
+	assert!(output.get().contains("Pool `adopt` completed"), "{}", output.get());
 }
 
 #[tokio::test]
@@ -360,9 +515,21 @@ async fn fresh_policy_honors_concurrency_and_uses_one_worker_per_item() {
 		.await
 		.expect("push");
 	wait_pending(&pool, 0).await;
+	wait_closed(&pool).await;
+	wait_finished(&harness.jobs, "fresh").await;
 	assert_eq!(harness.launcher.spawned.load(Ordering::Relaxed), 4);
 	assert!(harness.launcher.maximum.load(Ordering::Relaxed) <= 2);
-	assert_eq!(pool.status().items.completed, 4);
+	let status = pool.status();
+	assert_eq!(status.items.completed, 4);
+	assert!(status.agents.is_empty(), "fresh workers retire after exactly one item");
+	let mut parent = harness.parent.lock().await;
+	let settled = harness
+		.jobs
+		.wait(&mut parent, Some(&[sf!("fresh")]))
+		.await
+		.expect("wait fresh aggregate")
+		.expect("fresh aggregate");
+	assert_eq!(settled.status, "completed");
 }
 
 #[tokio::test]
@@ -381,6 +548,7 @@ async fn owner_release_cancels_pool_and_revokes_its_authenticated_producer() {
 	}
 	assert!(!pool.peek().batches.is_empty(), "active batch was dispatched");
 	harness.registry.release_owner();
+	wait_finished(&harness.jobs, "reset").await;
 	let mut parent = harness.parent.lock().await;
 	let settled = harness
 		.jobs

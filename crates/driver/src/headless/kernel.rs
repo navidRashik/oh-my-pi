@@ -222,6 +222,7 @@ pub struct ProductionInference {
 	_stack:             ProductionStack,
 	con:                Arc<omp_con::Ctx>,
 	_python_components: Vec<omp_envd::exthost::PyComponent>,
+	_eval_parent:       Option<omp_envd::eval::ParentBindingLease>,
 	_ephemeral_journal: Option<EphemeralJournal>,
 }
 
@@ -1326,6 +1327,8 @@ pub enum ComposedInference {
 		_agent_control:     Mutex<Option<omp_envd::AgentControlBinding>>,
 		/// Live Python Component reducers retained for the controller lifetime.
 		_python_components: Vec<omp_envd::exthost::PyComponent>,
+		/// Authenticated eval-parent binding retained for this kernel.
+		_eval_parent:       Option<omp_envd::eval::ParentBindingLease>,
 		/// No-session journal cleanup owner.
 		_ephemeral_journal: Option<EphemeralJournal>,
 	},
@@ -1336,6 +1339,13 @@ impl ComposedInference {
 		match self {
 			Self::Production(inference) => inference._ephemeral_journal = Some(journal),
 			Self::Gateway { _ephemeral_journal, .. } => *_ephemeral_journal = Some(journal),
+		}
+	}
+
+	fn retain_eval_parent(&mut self, lease: omp_envd::eval::ParentBindingLease) {
+		match self {
+			Self::Production(inference) => inference._eval_parent = Some(lease),
+			Self::Gateway { _eval_parent, .. } => *_eval_parent = Some(lease),
 		}
 	}
 
@@ -1531,6 +1541,39 @@ fn install_yield_contract(
 	Ok(Arc::new(registry))
 }
 
+#[derive(Clone, Copy)]
+struct GoalDeclaration;
+
+impl omp_tools::goal::GoalControl for GoalDeclaration {
+	fn apply(
+		&self,
+		_params: omp_tools::goal::Params,
+	) -> impl Future<Output = Result<Option<omp_tools::goal::Goal>, omp_tools::goal::Fault>> + Send + '_ {
+		async { Err(omp_tools::goal::Fault::Unavailable) }
+	}
+}
+
+/// Installs the stable Goal declaration. Live execution is intercepted by the
+/// session-owned reducer so no goal state exists outside the session DOM.
+fn install_goal_contract(registry: Arc<Registry>) -> Result<Arc<Registry>, HeadlessError> {
+	let retained = registry
+		.live_names()
+		.into_iter()
+		.filter(|name| name.as_str() != "goal")
+		.collect::<Vec<_>>();
+	let mut registry = registry.restrict(retained.iter().map(Str::as_str));
+	registry.register(
+		omp_tools::goal::tool(GoalDeclaration),
+		Presentation::Hidden,
+		Claims {
+			precedence: Precedence::CORE,
+			claimant:   Str::new_static("omp/core"),
+			replaces:   None,
+		},
+	)?;
+	Ok(Arc::new(registry))
+}
+
 /// Replaces generic `yield` with one strict batch-local workpool contract.
 pub(crate) fn install_workpool_yield_contract(
 	registry: &Registry,
@@ -1651,9 +1694,14 @@ pub async fn compose_kernel(
 			active_repository:  crate::discovery::active_repo::resolve(&project_root),
 		}
 	};
+	let inference_bridge =
+		tools_enabled.then(|| Arc::new(crate::bridges::InferenceBridge::default()));
 	let bridges = if tools_enabled {
 		omp_envd::RegistryBridges {
 			command_credentials: Some(Arc::new(crate::bridges::CommandCredentials)),
+			search: inference_bridge
+				.clone()
+				.map(|bridge| bridge as Arc<dyn omp_envd::SearchInference>),
 			telemetry_upload: Some(Arc::new(crate::bridges::TelemetryDelivery)),
 			url_resolvers: vec![skills.resolver(), rules.resolver()],
 			content: omp_envd::ActiveContentInputs {
@@ -1734,6 +1782,11 @@ pub async fn compose_kernel(
 		.tool_registry
 		.clone()
 		.unwrap_or_else(|| environment.registry());
+	let complete_registry = if tools_enabled {
+		install_goal_contract(complete_registry)?
+	} else {
+		complete_registry
+	};
 	let registry = if options.no_tools {
 		if options.tools.is_some() {
 			return Err(
@@ -1750,6 +1803,11 @@ pub async fn compose_kernel(
 		Arc::new(complete_registry.restrict(names.iter().map(Str::as_str)))
 	} else {
 		complete_registry
+	};
+	let registry = if tools_enabled {
+		install_goal_contract(registry)?
+	} else {
+		registry
 	};
 	let registry =
 		install_yield_contract(registry, options.output_schema.as_ref(), options.schema_mode)?;
@@ -1774,11 +1832,15 @@ pub async fn compose_kernel(
 	};
 
 	let mut inference = if let Some(channel) = options.gateway {
+		if let Some(bridge) = &inference_bridge {
+			bridge.bind_remote(channel.clone())?;
+		}
 		ComposedInference::Gateway {
 			inference:          GatewayInference::new(channel, model.as_str()),
 			_environment:       environment,
 			_agent_control:     Mutex::new(None),
 			_python_components: python_components,
+			_eval_parent: None,
 			_ephemeral_journal: None,
 		}
 	} else {
@@ -1794,6 +1856,9 @@ pub async fn compose_kernel(
 			},
 		)
 		.await?;
+		if let Some(bridge) = &inference_bridge {
+			bridge.bind(stack.rpc.clone())?;
+		}
 		let planner = Router::new(stack.registry.clone(), Duration::from_secs(30));
 		let target = match options.provider {
 			Some(provider) => Target::Provider { provider, model: model_key },
@@ -1824,6 +1889,7 @@ pub async fn compose_kernel(
 			_stack: stack,
 			con: Arc::clone(&ctx),
 			_python_components: python_components,
+			_eval_parent: None,
 			_ephemeral_journal: None,
 		})
 	};
@@ -1996,6 +2062,7 @@ pub async fn compose_kernel(
 		crate::subagent::settings::CL_IRC_RELAY_TO_MAIN.get(&relay_ctx)
 	});
 	let up = kernel.mailbox();
+	let session_mutator = crate::subagent::workpool_scheduler::SessionMutator::new(up.clone());
 	kernel
 		.inference()
 		.refresh_agent_control(up.clone(), session.dom());
@@ -2009,29 +2076,77 @@ pub async fn compose_kernel(
 		session.blobs().clone(),
 	);
 	live_sessions.register(name.clone(), crate::sessions::KernelHandle {
-		id: crate::sessions::SessionId::new(id),
+		id: crate::sessions::SessionId::new(id.clone()),
 		name: name.clone(),
-		up,
+		up: up.clone(),
 		snapshot: Arc::new(RwLock::new(session.dom().snapshot())),
 		topology,
 		relay,
 		autoreply,
 	});
 	if tools_enabled {
-		// ADR 0013: `subagent.cfg` and `<agent>.cfg` resolve through the same
-		// user (`~/.o2`) and project cfg roots every other `exec` uses.
 		let cfg: Arc<dyn omp_con::CfgLoader> =
 			Arc::new(crate::cfg::CfgFiles::new(Some(&project_root))?);
+		let jobs = Arc::clone(kernel.jobs());
+		let eval = kernel.inference().environment().eval_control();
+		let authority: Arc<dyn omp_agent::SessionAuthority> = live_sessions.clone();
+		let producers = Arc::new(crate::subagent::workpool::WorkpoolRegistry::new(authority));
+		let launcher = Arc::new(
+			crate::subagent::workpool_scheduler::KernelWorkpoolLauncher::new(
+				data_dir.to_path_buf(),
+				sessions_dir.clone(),
+				Arc::clone(&live_sessions),
+				session_mutator.clone(),
+				Arc::clone(&jobs),
+				hub_environment.clone(),
+				Arc::clone(&ctx),
+				Arc::clone(&cfg),
+				model.clone(),
+				Arc::clone(kernel.tool_registry()),
+				eval.clone(),
+			),
+		);
+		let scheduler = Arc::new(
+			crate::subagent::workpool_scheduler::SchedulerRegistry::new(
+				id.clone(),
+				session_mutator,
+				jobs,
+				session.blobs().clone(),
+				producers,
+				launcher,
+				Arc::new(crate::subagent::workpool_scheduler::ConWorkpoolPolicy::new(
+					Arc::clone(&ctx),
+				)),
+				eval,
+			),
+		);
+		let parent = Arc::new(crate::subagent::workpool_scheduler::WorkpoolParentHost::new(
+			crate::subagent::workpool_scheduler::WorkpoolSessionHost::new(project_root.clone()),
+			scheduler,
+		));
+		let lease = kernel
+			.inference()
+			.environment()
+			.bind_eval_sdk_parent(id, parent)?;
+		kernel.inference_mut().retain_eval_parent(lease);
+
+		kernel = kernel.with_session_tool(Arc::new(super::goal::GoalSessionTool::new()));
+		// `todo` is a session reducer: every invocation starts from the
+		// journal-derived `<meta><todo>` projection, including after resume,
+		// rewind, or an observer-authored todo patch.
+		kernel = kernel.with_session_tool(Arc::new(super::todo::TodoSessionTool::new()));
+		// ADR 0013: `subagent.cfg` and `<agent>.cfg` resolve through the same
+		// user (`~/.o2`) and project cfg roots every other `exec` uses.
 		// pi `atMaxDepth`: a child at the recursion ceiling never sees `task`,
 		// so it cannot plan a delegation the spawner would refuse.
 		if !crate::subagent::settings::task_withheld(&ctx) {
 			kernel = kernel.with_session_tool(Arc::new(crate::subagent::spawn::TaskSessionTool::new(
 				data_dir.to_path_buf(),
 				project_root.clone(),
-				sessions_dir,
+				sessions_dir.clone(),
 				Arc::clone(&live_sessions),
 				Arc::clone(&ctx),
-				cfg,
+				Arc::clone(&cfg),
 				hub_environment.clone(),
 				name.clone(),
 				model,

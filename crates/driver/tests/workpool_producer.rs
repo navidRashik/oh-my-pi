@@ -38,8 +38,8 @@ fn receive_workpool(rx: &flume::Receiver<Up>) -> Arc<IrcTraffic> {
 	payload
 }
 
-#[test]
-fn workpool_producer_authenticates_topology_retries_once_and_replays() {
+#[tokio::test]
+async fn workpool_producer_authenticates_topology_retries_once_and_replays() {
 	let temp = tempfile::tempdir().expect("temporary directory");
 	let path = temp.path().join("workpool.oms");
 	let mut session = Session::create(&path, ComponentRegistry::standard()).expect("owner session");
@@ -174,8 +174,35 @@ fn workpool_producer_authenticates_topology_retries_once_and_replays() {
 		Err(WorkpoolProducerError::ForeignReply { .. })
 	));
 
-	pool
-		.deliver_result_once("worker-a", Str::new_static("ordinary aggregate result"), &prior)
+	let cancel = tokio_util::sync::CancellationToken::new();
+	owner_up
+		.send(Up::Peer(Str::new_static("pressure-1")))
+		.expect("fill owner mailbox");
+	owner_up
+		.send(Up::Peer(Str::new_static("pressure-2")))
+		.expect("fill owner mailbox");
+	let delivery = tokio::spawn({
+		let pool = Arc::clone(&pool);
+		let prior = prior.clone();
+		let cancel = cancel.clone();
+		async move {
+			pool
+				.deliver_result_once(
+					"worker-a",
+					Str::new_static("ordinary aggregate result"),
+					&prior,
+					&cancel,
+				)
+				.await
+		}
+	});
+	tokio::task::yield_now().await;
+	assert!(!delivery.is_finished(), "full owner mailbox backpressures result delivery");
+	assert!(matches!(owner_inbox.recv().expect("first pressure row"), Up::Peer(_)));
+	assert!(matches!(owner_inbox.recv().expect("second pressure row"), Up::Peer(_)));
+	delivery
+		.await
+		.expect("delivery task")
 		.expect("ordinary result delivery");
 	let Up::Env(EnvEvent::IrcTraffic { payload: incoming }) =
 		owner_inbox.recv().expect("ordinary result observation")
@@ -190,7 +217,13 @@ fn workpool_producer_authenticates_topology_retries_once_and_replays() {
 	));
 	assert!(owner_inbox.try_recv().is_err(), "ordinary result delivers exactly once");
 	pool
-		.deliver_result_once("worker-a", Str::new_static("ordinary aggregate result"), &prior)
+		.deliver_result_once(
+			"worker-a",
+			Str::new_static("ordinary aggregate result"),
+			&prior,
+			&cancel,
+		)
+		.await
 		.expect("successful result retry is idempotent");
 	assert!(owner_inbox.try_recv().is_err(), "result retry must not duplicate input");
 

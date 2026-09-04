@@ -3,7 +3,9 @@
 pub mod ask;
 mod file_mentions;
 pub mod gateway;
+mod goal;
 pub mod kernel;
+mod todo;
 
 pub use ask::{AskReply, AskRoute};
 pub use kernel::{KernelOptions, compose_kernel};
@@ -33,6 +35,12 @@ pub enum HeadlessError {
 	/// Catalog, inference, or credential composition failed.
 	#[error("production inference composition failed")]
 	Registry(#[from] crate::registry::RegistryError),
+	/// The environment tool bridge already had a different inference owner.
+	#[error("environment inference binding failed")]
+	InferenceBridge(#[from] crate::bridges::InferenceBridgeError),
+	/// The authenticated eval parent could not be bound.
+	#[error("eval parent binding failed")]
+	EvalParent(#[from] omp_envd::eval::BridgeHostError),
 	/// A child-specific yield schema could not be compiled.
 	#[error("child yield schema composition failed")]
 	YieldSchema(#[from] omp_tools::yield_tool::SchemaContractError),

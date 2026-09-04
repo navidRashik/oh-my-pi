@@ -13,7 +13,7 @@
 use std::{
 	path::{Path, PathBuf},
 	sync::Arc,
-	time::Duration,
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use omp_agent::{
@@ -135,7 +135,10 @@ pub fn revive_child(parent: &mut Session, request: ReviveRequest<'_>) -> Result<
 		.map(Str::new)
 		.ok_or(ReviveError::ParentIdentity)?;
 	let cause = parent.head().ok_or(SpawnError::MissingParentHead)?;
-	parent.patch(jobs::set_status(cause, handle, "running"))?;
+	let started = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+	parent.patch(jobs::restart(cause, handle, Str::new(started.to_string())))?;
 	let child = Revived {
 		data_dir: request.data_dir.to_path_buf(),
 		sessions_dir: request.sessions_dir.to_path_buf(),
@@ -444,6 +447,9 @@ async fn idle(
 							return Idle::Prompt(text, attachments);
 						}
 					}
+				},
+				Ok(Up::SessionMutation(request)) => {
+					request.apply(session);
 				},
 				Ok(Up::Subscribe(reply)) => {
 					let _ = reply.send(session.subscribe());

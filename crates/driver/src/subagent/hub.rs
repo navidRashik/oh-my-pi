@@ -34,6 +34,8 @@ use omp_tool::{CallOutcome, ToolSpec};
 use omp_tools::hub::{Fault, HubBackend, Op as HubOp, Params, Request, Response, RestartPolicy};
 use tokio_util::sync::CancellationToken;
 
+const PROCESS_WAIT_BUFFER_BYTES: usize = 64 * 1024;
+
 /// Declaration-only backend; kernel session routing intercepts every call.
 pub struct HubDeclarationBackend;
 
@@ -693,15 +695,21 @@ async fn process_start(
 	let started = env.start_process(&cwd, start).await.map_err(|error| {
 		omp_agent::SessionToolError::Rejected { message: Str::new(error.to_string()) }
 	})?;
+	let process = find_process(env, name).await?;
+	if process.generation != started.generation {
+		return Err(omp_agent::SessionToolError::Rejected {
+			message: Str::new_static("started process generation was not observable"),
+		});
+	}
 	attach_process_job(session, jobs, env, owner, name)?;
 	Ok(Response {
 		text:    Str::new(
 			serde_json::json!({
-				"name": started.name,
-				"generation": started.generation,
-				"pid": started.identity.map(|identity| identity.pid),
-				"endpoint": started.endpoint,
-				"status": "ready",
+				"name": process.name,
+				"generation": process.generation,
+				"pid": process.identity.as_ref().map(|identity| identity.pid),
+				"endpoint": process.endpoint,
+				"status": process.state().as_str_name().to_ascii_lowercase(),
 			})
 			.to_string(),
 		),
@@ -1079,18 +1087,74 @@ async fn process_stop(
 	let name = required_name(params)?;
 	let process = find_process(env, name).await?;
 	let grace_ms = params.timeout.map_or(5_000, seconds_millis);
-	env.stop_process(StopProcess {
-		name: name.to_owned(),
-		grace_ms,
-		generation: process.generation,
-		props: None,
-	})
-	.await
-	.map_err(env_error)?;
-	set_job_status(session, name, "stopped")?;
-	jobs.rebuild(session);
+	let settled = if terminal_process(&process) {
+		process
+	} else {
+		let mut attachment = env
+			.attach_output(AttachOutput {
+				name:             name.to_owned(),
+				after_sequence:   process.log_end_offset,
+				generation:       process.generation,
+				max_bytes:        1,
+				terminal_text:    false,
+				terminal_columns: 1,
+				terminal_rows:    1,
+				props:            None,
+			})
+			.await
+			.map_err(env_error)?;
+		env.stop_process(StopProcess {
+			name: name.to_owned(),
+			grace_ms,
+			generation: process.generation,
+			props: None,
+		})
+		.await
+		.map_err(env_error)?;
+		let deadline = tokio::time::Instant::now()
+			+ Duration::from_millis(grace_ms)
+			+ Duration::from_secs(2);
+		loop {
+			let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+			if remaining.is_zero() {
+				return Err(omp_agent::SessionToolError::Rejected {
+					message: sf!(
+						"process `{name}` generation {} did not stop after bounded cleanup",
+						process.generation
+					),
+				});
+			}
+			let event = tokio::time::timeout(remaining, attachment.next_event())
+				.await
+				.map_err(|_| omp_agent::SessionToolError::Rejected {
+					message: sf!(
+						"process `{name}` generation {} did not stop after bounded cleanup",
+						process.generation
+					),
+				})?
+				.map_err(env_error)?;
+			let Some(event) = event else {
+				break find_process(env, name).await?;
+			};
+			if let ProcessAttachmentEvent::State(state) = event
+				&& let Some(info) = state.process
+				&& terminal_process(&info)
+			{
+				break info;
+			}
+		}
+	};
+	sync_process_statuses(session, jobs, std::slice::from_ref(&settled))?;
 	Ok(Response {
-		text:    Str::new(serde_json::json!({ "name": name, "status": "stopped" }).to_string()),
+		text: Str::new(
+			serde_json::json!({
+				"name": name,
+				"generation": settled.generation,
+				"status": settled.state().as_str_name().to_ascii_lowercase(),
+				"process": process_json(&settled),
+			})
+			.to_string(),
+		),
 		useless: false,
 	})
 }
@@ -1170,20 +1234,31 @@ async fn process_logs(
 	let timeout = params
 		.timeout
 		.map_or(Duration::from_secs(30), Duration::from_secs_f64);
+	let deadline = params.follow.then(|| tokio::time::Instant::now() + timeout);
 	let mut bytes = Vec::new();
 	let mut cursor = params.cursor.unwrap_or(0);
+	let mut observed_output = false;
+	let mut current_process = process.clone();
 	loop {
-		let next = tokio::time::timeout(
-			if params.follow {
-				timeout
-			} else if bytes.is_empty() {
-				Duration::from_secs(1)
+		let now = tokio::time::Instant::now();
+		if deadline.is_some_and(|deadline| now >= deadline) {
+			break;
+		}
+		let quiet = if params.follow {
+			let remaining = deadline
+				.map(|deadline| deadline.saturating_duration_since(now))
+				.unwrap_or(timeout);
+			if observed_output {
+				remaining.min(Duration::from_millis(50))
 			} else {
-				Duration::from_millis(50)
-			},
-			attachment.next_event(),
-		)
-		.await;
+				remaining
+			}
+		} else if bytes.is_empty() {
+			Duration::from_secs(1)
+		} else {
+			Duration::from_millis(50)
+		};
+		let next = tokio::time::timeout(quiet, attachment.next_event()).await;
 		let event = match next {
 			Ok(Ok(Some(event))) => event,
 			Ok(Ok(None)) | Err(_) => break,
@@ -1191,18 +1266,23 @@ async fn process_logs(
 		};
 		match event {
 			ProcessAttachmentEvent::Output(output) => {
+				observed_output = true;
 				cursor = cursor.max(output.sequence);
 				if bytes.len() < 1024 * 1024 {
 					let remaining = 1024 * 1024 - bytes.len();
 					bytes.extend_from_slice(&output.data[..output.data.len().min(remaining)]);
 				}
 			},
-			ProcessAttachmentEvent::State(state)
-				if state.process.as_ref().is_some_and(terminal_process) =>
-			{
-				break;
+			ProcessAttachmentEvent::State(state) => {
+				if let Some(next) = state.process {
+					let terminal = terminal_process(&next);
+					current_process = next;
+					if terminal {
+						break;
+					}
+				}
 			},
-			ProcessAttachmentEvent::Attached(_) | ProcessAttachmentEvent::State(_) => {},
+			ProcessAttachmentEvent::Attached(_) => {},
 		}
 		if !params.follow && !bytes.is_empty() {
 			continue;
@@ -1225,8 +1305,10 @@ async fn process_logs(
 		text:    Str::new(
 			serde_json::json!({
 				"name": name,
-				"generation": process.generation,
+				"generation": current_process.generation,
+				"state": current_process.state().as_str_name().to_ascii_lowercase(),
 				"cursor": cursor,
+				"timedOut": params.follow && !observed_output,
 				"logs": lines,
 			})
 			.to_string(),
@@ -1244,12 +1326,6 @@ async fn process_wait(
 	let name = required_name(params)?;
 	let process = find_process(env, name).await?;
 	let lifecycle = params.wait_for.as_deref().unwrap_or("exit");
-	if process_matches_wait(&process, lifecycle) {
-		return Ok(Response {
-			text:    Str::new(serde_json::json!({ "process": process_json(&process) }).to_string()),
-			useless: false,
-		});
-	}
 	let pattern = params
 		.pattern
 		.as_deref()
@@ -1258,10 +1334,32 @@ async fn process_wait(
 		.map_err(|error| omp_agent::SessionToolError::Rejected {
 			message: Str::new(error.to_string()),
 		})?;
+	if pattern.is_none() && process_matches_wait(&process, lifecycle) {
+		return Ok(Response {
+			text:    Str::new(serde_json::json!({ "process": process_json(&process) }).to_string()),
+			useless: false,
+		});
+	}
+	if pattern.is_none() && lifecycle == "ready" && terminal_process(&process) {
+		return Ok(Response {
+			text: Str::new(
+				serde_json::json!({
+					"timeout": true,
+					"process": process_json(&process),
+				})
+				.to_string(),
+			),
+			useless: true,
+		});
+	}
 	let mut attachment = env
 		.attach_output(AttachOutput {
 			name:             name.to_owned(),
-			after_sequence:   process.log_end_offset,
+			after_sequence:   if pattern.is_some() {
+				process.log_start_offset
+			} else {
+				process.log_end_offset
+			},
 			generation:       process.generation,
 			max_bytes:        1024 * 1024,
 			terminal_text:    false,
@@ -1274,6 +1372,9 @@ async fn process_wait(
 	let timeout = params.timeout.map_or(30.0, |seconds| seconds);
 	let deadline =
 		(timeout != 0.0).then(|| tokio::time::Instant::now() + Duration::from_secs_f64(timeout));
+	let mut generation_checks = tokio::time::interval(Duration::from_millis(50));
+	generation_checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	let mut pattern_buffer = Vec::new();
 	loop {
 		let next = attachment.next_event();
 		tokio::pin!(next);
@@ -1295,19 +1396,45 @@ async fn process_wait(
 					}
 					None
 				},
+				_ = generation_checks.tick(), if pattern.is_some() => None,
 				() = sleep => {
-					return Ok(Response { text: Str::new_static(r#"{"timeout":true}"#), useless: true });
+					return Ok(Response {
+						text: Str::new(
+							serde_json::json!({
+								"timeout": true,
+								"process": process_json(&process),
+							})
+							.to_string(),
+						),
+						useless: true,
+					});
 				},
 			}
 		} else {
 			tokio::select! {
 				event = &mut next => Some(event.map_err(env_error)?),
+				_ = generation_checks.tick(), if pattern.is_some() => None,
 				() = sleep => {
-					return Ok(Response { text: Str::new_static(r#"{"timeout":true}"#), useless: true });
+					return Ok(Response {
+						text: Str::new(
+							serde_json::json!({
+								"timeout": true,
+								"process": process_json(&process),
+							})
+							.to_string(),
+						),
+						useless: true,
+					});
 				},
 			}
 		};
 		let Some(event) = event.flatten() else {
+			if pattern.is_some() {
+				match find_process(env, name).await {
+					Ok(current) if current.generation == process.generation => {},
+					Ok(_) | Err(_) => return Err(replaced_process_wait(name, process.generation)),
+				}
+			}
 			if let Some(message) = pop_inbox_message(session)? {
 				return Ok(Response {
 					text:    Str::new(serde_json::json!({ "messages": [message] }).to_string()),
@@ -1317,38 +1444,38 @@ async fn process_wait(
 			continue;
 		};
 		match event {
-			ProcessAttachmentEvent::Output(output)
-				if pattern
+			ProcessAttachmentEvent::Output(output) if pattern.is_some() => {
+				pattern_buffer.extend_from_slice(&output.data);
+				if pattern_buffer.len() > PROCESS_WAIT_BUFFER_BYTES {
+					let discard = pattern_buffer.len() - PROCESS_WAIT_BUFFER_BYTES;
+					pattern_buffer.drain(..discard);
+				}
+				let text = String::from_utf8_lossy(&pattern_buffer);
+				let matched = pattern
 					.as_ref()
-					.is_some_and(|pattern| pattern.is_match(&String::from_utf8_lossy(&output.data))) =>
-			{
-				return Ok(Response {
-					text:    Str::new(
-						serde_json::json!({
-							"name": name,
-							"generation": output.generation,
-							"matched": String::from_utf8_lossy(&output.data),
-							"cursor": output.sequence,
-						})
-						.to_string(),
-					),
-					useless: false,
-				});
-			},
-			ProcessAttachmentEvent::State(state) => {
-				let Some(info) = state.process else { continue };
-				if info.generation != process.generation {
+					.and_then(|pattern| pattern.find(&text))
+					.map(|matched| matched.as_str().chars().take(500).collect::<String>());
+				if let Some(matched) = matched {
 					return Ok(Response {
 						text:    Str::new(
 							serde_json::json!({
 								"name": name,
-								"generation": process.generation,
-								"status": "replaced",
+								"generation": output.generation,
+								"matched": matched,
+								"cursor": output.sequence,
 							})
 							.to_string(),
 						),
 						useless: false,
 					});
+				}
+			},
+			ProcessAttachmentEvent::State(state) => {
+				let Some(info) = state.process else { continue };
+				if info.generation != process.generation
+					|| info.restart_count > process.restart_count
+				{
+					return Err(replaced_process_wait(name, process.generation));
 				}
 				if pattern.is_none() && process_matches_wait(&info, lifecycle) {
 					return Ok(Response {
@@ -1356,6 +1483,18 @@ async fn process_wait(
 							serde_json::json!({ "process": process_json(&info) }).to_string(),
 						),
 						useless: false,
+					});
+				}
+				if pattern.is_none() && lifecycle == "ready" && terminal_process(&info) {
+					return Ok(Response {
+						text: Str::new(
+							serde_json::json!({
+								"timeout": true,
+								"process": process_json(&info),
+							})
+							.to_string(),
+						),
+						useless: true,
 					});
 				}
 			},
@@ -1393,6 +1532,17 @@ fn process_json(process: &ProcessInfo) -> serde_json::Value {
 		"name": process.name,
 		"generation": process.generation,
 		"state": process.state().as_str_name().to_ascii_lowercase(),
+		"outcome": process.status.as_ref().map(|status| {
+			ExecOutcome::try_from(status.outcome)
+				.unwrap_or(ExecOutcome::Unspecified)
+				.as_str_name()
+				.strip_prefix("EXEC_OUTCOME_")
+				.unwrap_or("UNSPECIFIED")
+				.to_ascii_lowercase()
+		}),
+		"exitCode": process.status.as_ref().and_then(|status| status.exit_code),
+		"signal": process.status.as_ref().map(|status| status.signal.as_str()),
+		"durationMs": process.status.as_ref().map(|status| status.wall_clock_ms),
 		"pid": process.identity.as_ref().map(|identity| identity.pid),
 		"logStart": process.log_start_offset,
 		"logEnd": process.log_end_offset,
@@ -1401,7 +1551,62 @@ fn process_json(process: &ProcessInfo) -> serde_json::Value {
 		"restartCount": process.restart_count,
 		"consecutiveFailures": process.consecutive_failures,
 		"endpoint": process.endpoint,
+		"spec": process.spec.as_ref().map(process_spec_json),
+		"ready": process.ready.iter().map(ready_probe_json).collect::<Vec<_>>(),
 	})
+}
+
+fn process_spec_json(spec: &ProcessSpec) -> serde_json::Value {
+	let restart = spec.restart.as_ref().map(|restart| {
+		WireRestartPolicy::try_from(restart.policy)
+			.unwrap_or(WireRestartPolicy::Unspecified)
+			.as_str_name()
+			.strip_prefix("RESTART_POLICY_")
+			.unwrap_or("UNSPECIFIED")
+			.to_ascii_lowercase()
+			.replace('_', "-")
+	});
+	serde_json::json!({
+		"command": spec.source.as_ref().map(|source| source.text.as_str()),
+		"cwd": spec.cwd_uri,
+		"envKeys": spec
+			.env_delta
+			.as_ref()
+			.map(|delta| delta.set.keys().collect::<Vec<_>>()),
+		"pty": spec.pty.is_some(),
+		"restart": restart,
+		"persist": spec.persist,
+		"detached": spec.detached,
+		"timeoutMs": spec.timeout_ms,
+	})
+}
+
+fn ready_probe_json(probe: &ReadyProbe) -> serde_json::Value {
+	match probe.probe.as_ref() {
+		Some(ready_probe::Probe::Log(log)) => serde_json::json!({
+			"log": log.pattern,
+			"timeoutMs": probe.timeout_ms,
+		}),
+		Some(ready_probe::Probe::Tcp(tcp)) => serde_json::json!({
+			"host": tcp.host,
+			"port": tcp.port,
+			"timeoutMs": probe.timeout_ms,
+		}),
+		Some(ready_probe::Probe::Ping(ping)) => serde_json::json!({
+			"ping": ping.nonce,
+			"timeoutMs": probe.timeout_ms,
+		}),
+		None => serde_json::json!({"timeoutMs": probe.timeout_ms}),
+	}
+}
+
+fn replaced_process_wait(name: &str, generation: u64) -> omp_agent::SessionToolError {
+	omp_agent::SessionToolError::Rejected {
+		message: sf!(
+			"process `{name}` generation {generation} ended before the wait completed; \
+			 refusing to continue against a replacement generation"
+		),
+	}
 }
 
 fn terminal_process(process: &ProcessInfo) -> bool {
@@ -1410,7 +1615,7 @@ fn terminal_process(process: &ProcessInfo) -> bool {
 
 fn process_matches_wait(process: &ProcessInfo, lifecycle: &str) -> bool {
 	match lifecycle {
-		"ready" => process.state() == ProcessState::Ready,
+		"ready" => matches!(process.state(), ProcessState::Ready | ProcessState::Running),
 		"exit" => terminal_process(process),
 		_ => false,
 	}
@@ -1542,6 +1747,16 @@ mod tests {
 		let start = process_start_request("worker", "printf", &params);
 		assert_eq!(start.ready.len(), 2);
 		assert!(start.ready.iter().all(|probe| probe.timeout_ms == 2_500));
+		let rendered = process_json(&ProcessInfo {
+			name: String::from("worker"),
+			spec: start.spec.clone(),
+			ready: start.ready.clone(),
+			..ProcessInfo::default()
+		});
+		assert_eq!(rendered["spec"]["detached"], true);
+		assert_eq!(rendered["spec"]["persist"], true);
+		assert_eq!(rendered["spec"]["restart"], "on-failure");
+		assert_eq!(rendered["ready"].as_array().map(Vec::len), Some(2));
 		let spec = start.spec.expect("process spec");
 		assert!(spec.pty.is_none());
 		assert!(spec.persist);
@@ -1554,6 +1769,10 @@ mod tests {
 	fn process_wait_classifies_ready_and_every_terminal_state() {
 		let process = |state| ProcessInfo { state: state as i32, ..ProcessInfo::default() };
 		assert!(process_matches_wait(&process(ProcessState::Ready), "ready"));
+		assert!(
+			process_matches_wait(&process(ProcessState::Running), "ready"),
+			"a process without explicit probes is ready once it is running"
+		);
 		for state in [ProcessState::Exited, ProcessState::Stopped, ProcessState::Failed] {
 			assert!(process_matches_wait(&process(state), "exit"));
 		}

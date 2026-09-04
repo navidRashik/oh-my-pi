@@ -6,24 +6,23 @@ use async_trait::async_trait;
 use omp_agent::{JobBoard, JobSettlement, RunControl, TurnInput, TurnStop};
 use omp_core::{Str, sf};
 use omp_dom::{Op, PropKey, Txn, Value};
-use omp_session::{Session, components::jobs};
+use omp_session::components::jobs;
 use omp_tool::{
 	HostToolExecutor, HostToolInvocation, HostToolResult, HostToolSpec, HostToolUpdateSink,
 	Registry, Rev,
 };
 use omp_tools::eval::{EvalSessionControl, EvalToolRegistration, EvalToolRoster};
 use serde_json::Value as Json;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use super::{
 	settings::{SV_TASK_RECURSION_DEPTH, TaskSettings, child_ctx},
 	spawn::{
 		SpawnError, child_session_path, configure_child_route, create_isolation, discard_isolation,
-		finish_isolation,
+		engage_workpool_yield_ladder, finish_isolation,
 	},
 	workpool_scheduler::{
-		WorkerBatch, WorkerEvent, WorkerHandle, WorkerSpawn, WorkpoolLauncher,
+		SessionMutator, WorkerBatch, WorkerEvent, WorkerHandle, WorkerSpawn, WorkpoolLauncher,
 		WorkpoolSchedulerError, job_handle, now_ms,
 	},
 	yield_assembly,
@@ -35,7 +34,7 @@ pub struct KernelWorkpoolLauncher {
 	data_dir:     PathBuf,
 	sessions_dir: PathBuf,
 	sessions:     Arc<crate::sessions::SessionRegistry>,
-	parent:       Arc<AsyncMutex<Session>>,
+	parent:       SessionMutator,
 	jobs:         Arc<JobBoard>,
 	env:          omp_env::EnvClient,
 	ctx:          Arc<omp_con::Ctx>,
@@ -52,7 +51,7 @@ impl KernelWorkpoolLauncher {
 		data_dir: PathBuf,
 		sessions_dir: PathBuf,
 		sessions: Arc<crate::sessions::SessionRegistry>,
-		parent: Arc<AsyncMutex<Session>>,
+		parent: SessionMutator,
 		jobs: Arc<JobBoard>,
 		env: omp_env::EnvClient,
 		ctx: Arc<omp_con::Ctx>,
@@ -218,53 +217,71 @@ impl WorkpoolLauncher for KernelWorkpoolLauncher {
 			cancel: cancel.clone(),
 			ready: ready_tx,
 		};
-		let task = tokio::spawn(run_kernel_worker(run));
-		{
-			let mut parent = self.parent.lock().await;
-			if job_handle(&parent, request.id.as_str()).is_some() {
-				cancel.cancel();
-				return Err(WorkpoolSchedulerError::JobCollision { id: request.id });
-			}
-			let cause = parent
-				.head()
-				.ok_or(WorkpoolSchedulerError::MissingParentHead)?;
-			let txn = jobs::insert(parent.dom(), cause, jobs::JobSpec {
-				id:      request.id.clone(),
-				kind:    Str::new_static("subagent"),
-				owner:   request.owner,
-				started: Str::new(now_ms().to_string()),
-				agent:   Some(request.agent),
+		let (finished_tx, finished) = flume::bounded(1);
+		let task = tokio::spawn(async move {
+			let settlement = run_kernel_worker(run).await;
+			let _ = finished_tx.send(());
+			settlement
+		});
+		let abort = task.abort_handle();
+		let worker_id = request.id.clone();
+		let mutation_id = request.id.clone();
+		let owner = request.owner;
+		let agent = request.agent;
+		let jobs = Arc::clone(&self.jobs);
+		let execution_cancel = cancel.clone();
+		let request_cancel = cancel.clone();
+		self
+			.parent
+			.mutate(&cancel, move |parent| {
+				if request_cancel.is_cancelled() {
+					return Err(WorkpoolSchedulerError::MutationCancelled);
+				}
+				if job_handle(parent, mutation_id.as_str()).is_some() {
+					return Err(WorkpoolSchedulerError::JobCollision { id: mutation_id });
+				}
+				let cause = parent
+					.head()
+					.ok_or(WorkpoolSchedulerError::MissingParentHead)?;
+				let txn = jobs::insert(parent.dom(), cause, jobs::JobSpec {
+					id: mutation_id.clone(),
+					kind: Str::new_static("subagent"),
+					owner,
+					started: Str::new(now_ms().to_string()),
+					agent: Some(agent),
+				})
+				.ok_or(WorkpoolSchedulerError::MissingJobs)?;
+				parent.patch(txn)?;
+				let handle = job_handle(parent, mutation_id.as_str())
+					.ok_or(WorkpoolSchedulerError::MissingJobs)?;
+				let delivered_cause = parent
+					.head()
+					.ok_or(WorkpoolSchedulerError::MissingParentHead)?;
+				parent.patch(Txn {
+					cause: delivered_cause,
+					label: Some(Str::new_static("workpool.worker.internal")),
+					ops: vec![Op::Set {
+						h: handle,
+						prop: PropKey::Custom(Str::new_static(omp_agent::jobs::DELIVERED)),
+						value: Value::Bool(true),
+					}],
+				})?;
+				if !jobs.attach_task(parent.dom(), handle, execution_cancel, task) {
+					return Err(WorkpoolSchedulerError::MissingJobs);
+				}
+				Ok(())
 			})
-			.ok_or(WorkpoolSchedulerError::MissingJobs)?;
-			parent.patch(txn)?;
-			let handle =
-				job_handle(&parent, request.id.as_str()).ok_or(WorkpoolSchedulerError::MissingJobs)?;
-			let delivered_cause = parent
-				.head()
-				.ok_or(WorkpoolSchedulerError::MissingParentHead)?;
-			parent.patch(Txn {
-				cause: delivered_cause,
-				label: Some(Str::new_static("workpool.worker.internal")),
-				ops:   vec![Op::Set {
-					h:     handle,
-					prop:  PropKey::Custom(Str::new_static(omp_agent::jobs::DELIVERED)),
-					value: Value::Bool(true),
-				}],
-			})?;
-			if !self
-				.jobs
-				.attach_task(parent.dom(), handle, cancel.clone(), task)
-			{
-				return Err(WorkpoolSchedulerError::MissingJobs);
-			}
-		}
+			.await?;
 		match ready_rx.recv_async().await {
 			Ok(Ok(())) => {
 				cancel_guard.0 = None;
-				Ok(WorkerHandle { id: request.id, batches, cancel })
+				Ok(WorkerHandle { id: worker_id, batches, cancel, finished, abort })
 			},
-			Ok(Err(source)) => Err(WorkpoolSchedulerError::WorkerSpawn { id: request.id, source }),
-			Err(_) => Err(WorkpoolSchedulerError::WorkerExited { id: request.id }),
+			Ok(Err(source)) => Err(WorkpoolSchedulerError::WorkerSpawn {
+				id: worker_id,
+				source,
+			}),
+			Err(_) => Err(WorkpoolSchedulerError::WorkerExited { id: worker_id }),
 		}
 	}
 }
@@ -415,6 +432,7 @@ async fn run_kernel_worker_inner(
 			yield_items.clone(),
 		)?;
 		kernel.replace_tool_registry(registry);
+		engage_workpool_yield_ladder(&mut session)?;
 		let prompt = batch_prompt(&run.request.pool, &batch);
 		let deadline = (settings.max_runtime_ms != 0).then(|| {
 			std::time::Instant::now() + std::time::Duration::from_millis(settings.max_runtime_ms)
@@ -440,7 +458,10 @@ async fn run_kernel_worker_inner(
 		last = outcome.assistant_text.clone();
 		tokens_in = tokens_in.saturating_add(outcome.tokens_in);
 		tokens_out = tokens_out.saturating_add(outcome.tokens_out);
-		let alive = outcome.stop != TurnStop::Cancelled;
+		// Only a normally completed batch leaves a clean batch-local yield
+		// Director/registry generation that may be reused. Steering and
+		// cancellation retire this worker before another assignment.
+		let alive = outcome.stop == TurnStop::Completed;
 		let assembled = (outcome.stop == TurnStop::Completed)
 			.then(|| yield_assembly::assemble_workpool_batch(&session, &yield_items))
 			.transpose();
@@ -466,7 +487,7 @@ async fn run_kernel_worker_inner(
 		};
 		let _ = run.events.send_async(event).await;
 		if !alive {
-			cancelled = true;
+			cancelled = outcome.stop == TurnStop::Cancelled;
 			break;
 		}
 	}

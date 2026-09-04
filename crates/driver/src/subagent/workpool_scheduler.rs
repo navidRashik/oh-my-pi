@@ -13,8 +13,9 @@ use std::{
 
 use async_trait::async_trait;
 use omp_agent::{JobBoard, JobSettlement};
+pub use omp_agent::jobs::WORKPOOL_STATE;
 use omp_core::{FastHashMap, Str, sf};
-use omp_dom::{Handle, KnownTag, PropId, PropKey, Tag, Value};
+use omp_dom::{Handle, KnownTag, Op, PropId, PropKey, Tag, Txn, Value};
 use omp_journal::blob::BlobStore;
 use omp_session::{Session, components::jobs};
 use omp_tools::eval::{
@@ -22,9 +23,9 @@ use omp_tools::eval::{
 };
 use parking_lot::Mutex;
 use serde::Serialize;
-use serde_json::{Value as Json, json};
+use serde_json::{Value as Json, json, value::RawValue};
 use thiserror::Error;
-use tokio::{sync::Mutex as AsyncMutex, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub use super::workpool_runtime::KernelWorkpoolLauncher;
@@ -32,6 +33,68 @@ use super::{
 	spawn::SpawnError,
 	workpool::{WorkpoolProducer, WorkpoolProducerError, WorkpoolReceipt, WorkpoolRegistry},
 };
+
+/// Reads the latest durable pool snapshot from a live or replayed session.
+///
+/// The payload is intentionally self-describing JSON so status, cards, and
+/// recovery diagnostics never depend on the disposable scheduler actor.
+/// Oversized snapshots are a bounded envelope naming their full session-CAS
+/// artifact.
+#[must_use]
+pub fn replayed_state<'a>(session: &'a Session, id: &str) -> Option<&'a RawValue> {
+	let handle = job_handle(session, id)?;
+	let node = session.dom().get(handle)?;
+	match node.prop(&PropKey::Custom(Str::new_static(WORKPOOL_STATE))) {
+		Some(Value::Json(raw)) => Some(raw),
+		_ => None,
+	}
+}
+
+/// Typed request route into the kernel actor that exclusively owns the
+/// authoritative session writer.
+#[derive(Clone)]
+pub struct SessionMutator {
+	up: flume::Sender<omp_agent::Up>,
+}
+
+impl SessionMutator {
+	/// Binds mutations to one exact kernel mailbox generation.
+	#[must_use]
+	pub fn new(up: flume::Sender<omp_agent::Up>) -> Self {
+		Self { up }
+	}
+
+	pub(super) async fn mutate<R, F>(
+		&self,
+		cancel: &CancellationToken,
+		apply: F,
+	) -> Result<R, WorkpoolSchedulerError>
+	where
+		R: Send + 'static,
+		F: FnOnce(&mut Session) -> Result<R, WorkpoolSchedulerError> + Send + 'static,
+	{
+		let (reply, receive) = flume::bounded(1);
+		let request = omp_agent::SessionMutation::new(move |session| {
+			let _ = reply.send(apply(session));
+		});
+		tokio::select! {
+			biased;
+			() = cancel.cancelled() => {
+				return Err(WorkpoolSchedulerError::MutationCancelled);
+			},
+			result = self.up.send_async(omp_agent::Up::SessionMutation(request)) => {
+				result.map_err(|_| WorkpoolSchedulerError::MutationDisconnected)?;
+			},
+		}
+		tokio::select! {
+			biased;
+			() = cancel.cancelled() => Err(WorkpoolSchedulerError::MutationCancelled),
+			result = receive.recv_async() => {
+				result.map_err(|_| WorkpoolSchedulerError::MutationDisconnected)?
+			},
+		}
+	}
+}
 
 /// Live scheduling policy. Reading the limit at each dispatch lets convar
 /// changes take effect without replacing a pool.
@@ -89,7 +152,12 @@ pub struct WorkerHandle {
 	/// Batch input for the persistent kernel.
 	pub batches: flume::Sender<WorkerBatch>,
 	/// Kill boundary for the worker execution unit.
-	pub cancel:  CancellationToken,
+	pub cancel:   CancellationToken,
+	/// Closes only after the worker's ordinary [`JobSettlement`] has been
+	/// handed to the shared [`JobBoard`].
+	pub finished: flume::Receiver<()>,
+	/// Force boundary paired with the same task owned by [`JobBoard`].
+	pub abort:    tokio::task::AbortHandle,
 }
 
 /// Terminal event for one worker turn or execution unit.
@@ -288,8 +356,10 @@ struct Batch {
 }
 
 struct Snapshot {
-	closed:       bool,
-	items:        Vec<Item>,
+	started:         bool,
+	closed:          bool,
+	terminal_status: Option<Str>,
+	items:           Vec<Item>,
 	workers:      Vec<Worker>,
 	batches:      Vec<Batch>,
 	next_seq:     u64,
@@ -301,8 +371,10 @@ struct Snapshot {
 impl Default for Snapshot {
 	fn default() -> Self {
 		Self {
-			closed:       false,
-			items:        Vec::new(),
+			started:         false,
+			closed:          false,
+			terminal_status: None,
+			items:           Vec::new(),
 			workers:      Vec::new(),
 			batches:      Vec::new(),
 			next_seq:     1,
@@ -328,7 +400,7 @@ pub struct Workpool {
 	state:        Arc<Mutex<Snapshot>>,
 	commands:     flume::Sender<Command>,
 	cancel:       CancellationToken,
-	parent:       Arc<AsyncMutex<Session>>,
+	parent:       SessionMutator,
 	jobs:         Arc<JobBoard>,
 	task:         Mutex<Option<JoinHandle<JobSettlement>>>,
 }
@@ -336,6 +408,9 @@ pub struct Workpool {
 impl Workpool {
 	/// Queues items and returns stable ids in input order.
 	pub async fn push(&self, items: Vec<Str>) -> Result<Vec<Str>, WorkpoolSchedulerError> {
+		if self.state.lock().closed {
+			return Err(WorkpoolSchedulerError::Closed { pool: self.name.clone() });
+		}
 		if items.is_empty() {
 			return Ok(Vec::new());
 		}
@@ -423,6 +498,9 @@ impl Workpool {
 
 	/// Stops accepting work, drops queued items, and lets active turns settle.
 	pub async fn close(&self) -> Result<Vec<Str>, WorkpoolSchedulerError> {
+		if self.state.lock().closed {
+			return Ok(Vec::new());
+		}
 		let (tx, rx) = flume::bounded(1);
 		self
 			.commands
@@ -442,47 +520,54 @@ impl Workpool {
 	}
 
 	async fn ensure_aggregate_job(&self) -> Result<(), WorkpoolSchedulerError> {
-		let mut parent = self.parent.lock().await;
-		if self.task.lock().is_none() {
+		let Some(task) = self.task.lock().take() else {
 			return Ok(());
-		}
-		if job_handle(&parent, self.name.as_str()).is_some() {
-			return Err(WorkpoolSchedulerError::JobCollision { id: self.name.clone() });
-		}
-		let cause = parent
-			.head()
-			.ok_or(WorkpoolSchedulerError::MissingParentHead)?;
-		let txn = jobs::insert(parent.dom(), cause, jobs::JobSpec {
-			id:      self.name.clone(),
-			kind:    Str::new_static("tool"),
-			owner:   self.owner.clone(),
-			started: Str::new(now_ms().to_string()),
-			agent:   None,
-		})
-		.ok_or(WorkpoolSchedulerError::MissingJobs)?;
-		parent.patch(txn)?;
-		let handle =
-			job_handle(&parent, self.name.as_str()).ok_or(WorkpoolSchedulerError::MissingJobs)?;
-		let task = self
-			.task
-			.lock()
-			.take()
-			.ok_or(WorkpoolSchedulerError::MissingJobs)?;
-		if !self
-			.jobs
-			.attach_task(parent.dom(), handle, self.cancel.clone(), task)
-		{
+		};
+		let id = self.name.clone();
+		let owner = self.owner.clone();
+		let jobs = Arc::clone(&self.jobs);
+		let execution_cancel = self.cancel.clone();
+		let request_cancel = self.cancel.clone();
+		let result = self
+			.parent
+			.mutate(&self.cancel, move |parent| {
+				if request_cancel.is_cancelled() {
+					return Err(WorkpoolSchedulerError::MutationCancelled);
+				}
+				if job_handle(parent, id.as_str()).is_some() {
+					return Err(WorkpoolSchedulerError::JobCollision { id });
+				}
+				let cause = parent
+					.head()
+					.ok_or(WorkpoolSchedulerError::MissingParentHead)?;
+				let txn = jobs::insert(parent.dom(), cause, jobs::JobSpec {
+					id: id.clone(),
+					kind: Str::new_static("tool"),
+					owner,
+					started: Str::new(now_ms().to_string()),
+					agent: None,
+				})
+				.ok_or(WorkpoolSchedulerError::MissingJobs)?;
+				parent.patch(txn)?;
+				let handle =
+					job_handle(parent, id.as_str()).ok_or(WorkpoolSchedulerError::MissingJobs)?;
+				if !jobs.attach_task(parent.dom(), handle, execution_cancel, task) {
+					return Err(WorkpoolSchedulerError::MissingJobs);
+				}
+				Ok(())
+			})
+			.await;
+		if result.is_err() {
 			self.cancel.cancel();
-			return Err(WorkpoolSchedulerError::MissingJobs);
 		}
-		Ok(())
+		result
 	}
 }
 
 /// Owner-scoped scheduler registry used by the authenticated eval bridge.
 pub struct SchedulerRegistry {
 	owner:     Str,
-	parent:    Arc<AsyncMutex<Session>>,
+	parent:    SessionMutator,
 	jobs:      Arc<JobBoard>,
 	spill:     BlobStore,
 	producers: Arc<WorkpoolRegistry>,
@@ -497,7 +582,7 @@ impl SchedulerRegistry {
 	#[must_use]
 	pub fn new(
 		owner: Str,
-		parent: Arc<AsyncMutex<Session>>,
+		parent: SessionMutator,
 		jobs: Arc<JobBoard>,
 		spill: BlobStore,
 		producers: Arc<WorkpoolRegistry>,
@@ -540,7 +625,9 @@ impl SchedulerRegistry {
 		let producer = self.producers.create(self.owner.as_str(), name.clone())?;
 		let fresh_agents = self.policy.fresh_agents();
 		let state = Arc::new(Mutex::new(Snapshot::default()));
-		let (commands, command_rx) = flume::unbounded();
+		// Concurrent eval callers backpressure at the actor boundary instead of
+		// building an unbounded second work queue beside the durable item list.
+		let (commands, command_rx) = flume::bounded(64);
 		let cancel = CancellationToken::new();
 		let actor = PoolActor {
 			owner: self.owner.clone(),
@@ -557,6 +644,8 @@ impl SchedulerRegistry {
 			commands: command_rx,
 			events: flume::unbounded(),
 			cancel: cancel.clone(),
+			retired: Vec::new(),
+			parent: self.parent.clone(),
 		};
 		let task = tokio::spawn(actor.run());
 		let pool = Arc::new(Workpool {
@@ -568,7 +657,7 @@ impl SchedulerRegistry {
 			state,
 			commands,
 			cancel,
-			parent: Arc::clone(&self.parent),
+			parent: self.parent.clone(),
 			jobs: Arc::clone(&self.jobs),
 			task: Mutex::new(Some(task)),
 		});
@@ -720,6 +809,84 @@ impl Drop for SchedulerRegistry {
 	}
 }
 
+/// Minimal parent capability owner used by production compositions whose
+/// completion/agent helpers are not installed. Workpool is layered over this
+/// host without granting a second session authority.
+pub struct WorkpoolSessionHost {
+	cwd: std::path::PathBuf,
+}
+
+impl WorkpoolSessionHost {
+	/// Captures the environment-authorized project directory.
+	#[must_use]
+	pub fn new(cwd: std::path::PathBuf) -> Self {
+		Self { cwd }
+	}
+}
+
+#[async_trait]
+impl omp_envd::eval::ParentSessionHost for WorkpoolSessionHost {
+	fn eval_session_config(
+		&self,
+	) -> Result<omp_envd::eval::EvalSessionConfig, omp_envd::eval::BridgeHostError> {
+		Ok(omp_envd::eval::EvalSessionConfig {
+			cwd: self.cwd.clone(),
+			local_roots_json: None,
+		})
+	}
+
+	fn completion_available(&self) -> bool {
+		false
+	}
+
+	async fn completion(
+		&self,
+		_args: Json,
+		_progress: &dyn omp_envd::eval::BridgeProgressSink,
+	) -> Result<Json, omp_envd::eval::BridgeHostError> {
+		Err(omp_envd::eval::BridgeHostError::message(
+			"eval completion is unavailable for this parent session",
+		))
+	}
+
+	fn agent_available(&self) -> bool {
+		false
+	}
+
+	async fn agent(
+		&self,
+		_args: Json,
+		_progress: &dyn omp_envd::eval::BridgeProgressSink,
+	) -> Result<Json, omp_envd::eval::BridgeHostError> {
+		Err(omp_envd::eval::BridgeHostError::message(
+			"eval agent is unavailable for this parent session",
+		))
+	}
+
+	fn concurrency_available(&self) -> bool {
+		false
+	}
+
+	async fn concurrency(
+		&self,
+		_args: Json,
+	) -> Result<Json, omp_envd::eval::BridgeHostError> {
+		Err(omp_envd::eval::BridgeHostError::message(
+			"eval concurrency is unavailable for this parent session",
+		))
+	}
+
+	fn budget_available(&self) -> bool {
+		false
+	}
+
+	async fn budget(&self, _args: Json) -> Result<Json, omp_envd::eval::BridgeHostError> {
+		Err(omp_envd::eval::BridgeHostError::message(
+			"eval budget is unavailable for this parent session",
+		))
+	}
+}
+
 /// Parent-session bridge decorator that installs exactly one authenticated
 /// `__workpool__` route while delegating the existing completion/agent/control
 /// operations to the original host.
@@ -752,12 +919,20 @@ where
 		self.inner.release_eval_owner();
 	}
 
+	fn completion_available(&self) -> bool {
+		self.inner.completion_available()
+	}
+
 	async fn completion(
 		&self,
 		args: Json,
 		progress: &dyn omp_envd::eval::BridgeProgressSink,
 	) -> Result<Json, omp_envd::eval::BridgeHostError> {
 		self.inner.completion(args, progress).await
+	}
+
+	fn agent_available(&self) -> bool {
+		self.inner.agent_available()
 	}
 
 	async fn agent(
@@ -780,8 +955,16 @@ where
 		self.scheduler.bridge_host_call(args, progress).await
 	}
 
+	fn concurrency_available(&self) -> bool {
+		self.inner.concurrency_available()
+	}
+
 	async fn concurrency(&self, args: Json) -> Result<Json, omp_envd::eval::BridgeHostError> {
 		self.inner.concurrency(args).await
+	}
+
+	fn budget_available(&self) -> bool {
+		self.inner.budget_available()
 	}
 
 	async fn budget(&self, args: Json) -> Result<Json, omp_envd::eval::BridgeHostError> {
@@ -804,23 +987,128 @@ struct PoolActor {
 	commands:     flume::Receiver<Command>,
 	events:       (flume::Sender<WorkerEvent>, flume::Receiver<WorkerEvent>),
 	cancel:       CancellationToken,
+	retired:      Vec<(flume::Receiver<()>, tokio::task::AbortHandle)>,
+	parent:       SessionMutator,
 }
 
 impl PoolActor {
+	fn durable_state(&self) -> Json {
+		let state = self.state.lock();
+		let summary = state.closed.then(|| aggregate(&self.name, &state));
+		json!({
+			"version": 1,
+			"name": self.name,
+			"agent": self.agent,
+			"fresh_agents": self.fresh_agents,
+			"started": state.started,
+			"closed": state.closed,
+			"terminal_status": state.terminal_status,
+			"summary": summary,
+			"next_seq": state.next_seq,
+			"next_worker": state.next_worker,
+			"rr_cursor": state.rr_cursor,
+			"items": state.items.iter().map(|item| {
+				let status: &'static str = item.state.into();
+				json!({
+					"id": item.id,
+					"text": item.text,
+					"status": status,
+					"output": item.output,
+				})
+			}).collect::<Vec<_>>(),
+			"workers": state.workers.iter().map(|worker| json!({
+				"id": worker.handle.id,
+				"queued": worker.queue.iter().map(|index| &state.items[*index].id).collect::<Vec<_>>(),
+				"active": worker.active,
+				"turns": worker.turns,
+				"context_tokens": worker.context_tokens,
+				"context_window": worker.context_window,
+			})).collect::<Vec<_>>(),
+			"batches": state.batches.iter().map(|batch| json!({
+				"id": batch.id,
+				"worker": batch.worker,
+				"items": batch.items.iter().map(|index| &state.items[*index].id).collect::<Vec<_>>(),
+				"status": batch.status,
+				"output": batch.output,
+			})).collect::<Vec<_>>(),
+		})
+	}
+
+	async fn persist(&self, label: &'static str) -> Result<(), WorkpoolSchedulerError> {
+		self.persist_with(label, &self.cancel).await
+	}
+
+	async fn persist_with(
+		&self,
+		label: &'static str,
+		cancel: &CancellationToken,
+	) -> Result<(), WorkpoolSchedulerError> {
+		let state = self.durable_state();
+		let mut data = serde_json::value::to_raw_value(&state)?;
+		if data.get().len() > omp_agent::DispatchPolicy::DEFAULT_MAX_OUTPUT_BYTES {
+			let byte_len = data.get().len();
+			let artifact = self.spill.put(data.get().as_bytes())?;
+			data = serde_json::value::to_raw_value(&json!({
+				"version": 1,
+				"closed": state.get("closed"),
+				"terminal_status": state.get("terminal_status"),
+				"summary": state.get("summary"),
+				"artifact": sf!("artifact://sha256/{}", artifact.to_hex()),
+				"byte_len": byte_len,
+			}))?;
+		}
+		let id = self.name.clone();
+		let request_cancel = cancel.clone();
+		self
+			.parent
+			.mutate(cancel, move |parent| {
+				if request_cancel.is_cancelled() {
+					return Err(WorkpoolSchedulerError::MutationCancelled);
+				}
+				let handle =
+					job_handle(parent, id.as_str()).ok_or(WorkpoolSchedulerError::MissingJobs)?;
+				let cause = parent
+					.head()
+					.ok_or(WorkpoolSchedulerError::MissingParentHead)?;
+				parent.patch(Txn {
+					cause,
+					label: Some(Str::new_static(label)),
+					ops: vec![Op::Set {
+						h: handle,
+						prop: PropKey::Custom(Str::new_static(WORKPOOL_STATE)),
+						value: Value::Json(data),
+					}],
+				})?;
+				Ok(())
+			})
+			.await
+	}
+
 	async fn run(mut self) -> JobSettlement {
 		loop {
-			if self.drained() && self.state.lock().closed {
+			let should_finish = {
+				let state = self.state.lock();
+				state.started
+					&& !state
+						.items
+						.iter()
+						.any(|item| matches!(item.state, ItemState::Queued | ItemState::Running))
+			};
+			if should_finish {
 				return self.finish(false).await;
 			}
 			tokio::select! {
 				biased;
 				() = self.cancel.cancelled() => return self.finish(true).await,
-				command = self.commands.recv_async() => match command {
-					Ok(command) => self.command(command).await,
-					Err(_) => return self.finish(true).await,
-				},
+				// Settlement frees a worker and is finite; process it before
+				// accepting more pushes so a hot producer cannot starve the
+				// existing queue or its result delivery.
 				event = self.events.1.recv_async() => match event {
 					Ok(event) => self.worker_event(event).await,
+					Err(_) => return self.finish(true).await,
+				},
+				command = self.commands.recv_async() => match command {
+					Ok(command) => self.command(command).await,
 					Err(_) => return self.finish(true).await,
 				},
 			}
@@ -836,6 +1124,7 @@ impl PoolActor {
 				}
 				let (ids, indices) = {
 					let mut state = self.state.lock();
+					state.started = true;
 					let start = state.items.len();
 					let ids = texts
 						.into_iter()
@@ -854,6 +1143,11 @@ impl PoolActor {
 					let indices = (start..state.items.len()).collect::<Vec<_>>();
 					(ids, indices)
 				};
+				if let Err(error) = self.persist("workpool.push").await {
+					let _ = reply.send(Err(error));
+					self.cancel.cancel();
+					return;
+				}
 				let _ = reply.send(Ok(ids));
 				for index in indices {
 					self.schedule(index).await;
@@ -875,6 +1169,9 @@ impl PoolActor {
 					}
 					dropped
 				};
+				if self.persist("workpool.close").await.is_err() {
+					self.cancel.cancel();
+				}
 				let _ = reply.send(dropped);
 			},
 		}
@@ -935,6 +1232,10 @@ impl PoolActor {
 			}
 		};
 		if let Some((worker, prior)) = worker {
+			if self.persist("workpool.item.queued").await.is_err() {
+				self.cancel.cancel();
+				return;
+			}
 			let (id, text, target) = {
 				let state = self.state.lock();
 				(
@@ -983,18 +1284,22 @@ impl PoolActor {
 			.producer
 			.spawned(handle.id.as_str(), sf!("Worker {} admitted", handle.id))?;
 		let receipt = self.deliver(Ok(staged)).await?;
-		let mut state = self.state.lock();
-		state.last_receipt = Some(receipt.clone());
-		state.workers.push(Worker {
-			handle,
-			queue: VecDeque::new(),
-			active: None,
-			turns: 0,
-			context_tokens: None,
-			context_window: None,
-			last_receipt: receipt,
-		});
-		Ok(state.workers.len() - 1)
+		let worker = {
+			let mut state = self.state.lock();
+			state.last_receipt = Some(receipt.clone());
+			state.workers.push(Worker {
+				handle,
+				queue: VecDeque::new(),
+				active: None,
+				turns: 0,
+				context_tokens: None,
+				context_window: None,
+				last_receipt: receipt,
+			});
+			state.workers.len() - 1
+		};
+		self.persist("workpool.worker.spawned").await?;
+		Ok(worker)
 	}
 
 	async fn dispatch(&mut self, worker: usize, items: Vec<usize>, follow_up: bool) {
@@ -1032,6 +1337,10 @@ impl PoolActor {
 				state.workers[worker].handle.id.clone(),
 			)
 		};
+		if self.persist("workpool.batch.running").await.is_err() {
+			self.cancel.cancel();
+			return;
+		}
 		let summary = batch
 			.items
 			.iter()
@@ -1119,11 +1428,21 @@ impl PoolActor {
 					let queued = live.queue.drain(..).collect::<Vec<_>>();
 					(worker_index, receipt, queued)
 				};
+				if self.persist("workpool.batch.settled").await.is_err() {
+					self.cancel.cancel();
+					return;
+				}
 				let body =
 					sf!("Batch {batch} {}\n{retained}", if success { "completed" } else { "failed" });
-				let _ = self
+				if self
 					.producer
-					.deliver_result_once(worker.as_str(), body, &receipt);
+					.deliver_result_once(worker.as_str(), body, &receipt, &self.cancel)
+					.await
+					.is_err()
+				{
+					self.cancel.cancel();
+					return;
+				}
 				if self.fresh_agents || !alive {
 					self.remove_worker(worker_index, queued, !alive).await;
 				} else if !queued.is_empty() {
@@ -1177,8 +1496,14 @@ impl PoolActor {
 			}
 			worker
 		};
+		if self.persist("workpool.worker.removed").await.is_err() {
+			self.cancel.cancel();
+		}
 		if retry {
 			worker.handle.cancel.cancel();
+		}
+		self.retired.push((worker.handle.finished, worker.handle.abort));
+		if retry {
 			for item in requeue {
 				self.schedule(item).await;
 			}
@@ -1218,19 +1543,15 @@ impl PoolActor {
 		}
 	}
 
-	fn drained(&self) -> bool {
-		!self
-			.state
-			.lock()
-			.items
-			.iter()
-			.any(|item| matches!(item.state, ItemState::Queued | ItemState::Running))
-	}
-
 	async fn finish(&mut self, cancelled: bool) -> JobSettlement {
 		let (last, workers, summary) = {
 			let mut state = self.state.lock();
 			state.closed = true;
+			state.terminal_status = Some(Str::new_static(if cancelled {
+				"cancelled"
+			} else {
+				"completed"
+			}));
 			if cancelled {
 				for item in &mut state.items {
 					if matches!(item.state, ItemState::Queued | ItemState::Running) {
@@ -1244,36 +1565,97 @@ impl PoolActor {
 				}
 			}
 			let last = state.last_receipt.clone();
-			let workers = state
-				.workers
-				.drain(..)
-				.map(|worker| worker.handle.cancel)
-				.collect::<Vec<_>>();
+			let mut workers = Vec::with_capacity(state.workers.len());
+			for worker in &mut state.workers {
+				let (replacement_batches, replacement_batch_rx) = flume::unbounded();
+				drop(replacement_batch_rx);
+				let batches =
+					std::mem::replace(&mut worker.handle.batches, replacement_batches);
+				let (replacement_finished_tx, replacement_finished) = flume::unbounded();
+				drop(replacement_finished_tx);
+				let finished =
+					std::mem::replace(&mut worker.handle.finished, replacement_finished);
+				workers.push((
+					worker.handle.cancel.clone(),
+					batches,
+					finished,
+					worker.handle.abort.clone(),
+				));
+			}
 			let summary = aggregate(&self.name, &state);
 			(last, workers, summary)
 		};
-		if cancelled {
-			for worker in workers {
-				worker.cancel();
+		let terminal_cancel = CancellationToken::new();
+		let terminal_persist = self.persist_with(
+			if cancelled {
+				"workpool.cancelled"
+			} else {
+				"workpool.completed"
+			},
+			&terminal_cancel,
+		);
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(1), terminal_persist).await;
+		let mut completions = std::mem::take(&mut self.retired);
+		for (cancel, batches, finished, abort) in workers {
+			if cancelled {
+				cancel.cancel();
+			}
+			drop(batches);
+			completions.push((finished, abort));
+		}
+		let cancellation_deadline =
+			tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+		for (completion, abort) in completions {
+			if cancelled {
+				let remaining =
+					cancellation_deadline.saturating_duration_since(tokio::time::Instant::now());
+				if tokio::time::timeout(remaining, completion.recv_async())
+					.await
+					.is_err()
+				{
+					abort.abort();
+				}
+			} else {
+				let _ = completion.recv_async().await;
 			}
 		}
 		if cancelled {
-			let _ = self
+			let staged = self
 				.producer
-				.cancel(sf!("Pool `{}` cancelled", self.name), last.as_ref());
+				.cancelled(sf!("Pool `{}` cancelled", self.name), last.as_ref());
+			self.deliver_terminal(staged).await;
 		} else if let Some(last) = last {
-			if let Ok(staged) = self
+			let staged = self
 				.producer
-				.completed(sf!("Pool `{}` drained", self.name), &last)
-			{
-				let _ = self.producer.try_deliver(&staged);
-			}
+				.completed(sf!("Pool `{}` drained", self.name), &last);
+			self.deliver_terminal(staged).await;
 		}
 		JobSettlement {
 			status:     Str::new_static(if cancelled { "cancelled" } else { "completed" }),
 			output:     serde_json::value::to_raw_value(&json!({ "text": summary })).ok(),
 			error:      cancelled.then(|| Str::new_static("workpool was cancelled")),
 			completion: None,
+		}
+	}
+
+	async fn deliver_terminal(
+		&self,
+		staged: Result<super::workpool::StagedWorkpoolObservation, WorkpoolProducerError>,
+	) {
+		let Ok(staged) = staged else {
+			return;
+		};
+		let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+		loop {
+			match self.producer.try_deliver(&staged) {
+				Ok(_) => return,
+				Err(WorkpoolProducerError::MailboxFull { .. })
+					if tokio::time::Instant::now() < deadline =>
+				{
+					tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+				},
+				Err(_) => return,
+			}
 		}
 	}
 
@@ -1531,9 +1913,18 @@ pub enum WorkpoolSchedulerError {
 	/// Authenticated observation producer rejected a transition.
 	#[error(transparent)]
 	Producer(#[from] WorkpoolProducerError),
+	/// Kernel actor stopped before applying a requested session mutation.
+	#[error("workpool session mutation actor is disconnected")]
+	MutationDisconnected,
+	/// Pool cancellation won before a requested session mutation committed.
+	#[error("workpool session mutation was cancelled")]
+	MutationCancelled,
 	/// Parent journal mutation failed.
 	#[error(transparent)]
 	Session(#[from] omp_session::SessionError),
+	/// Workpool snapshot retention failed.
+	#[error(transparent)]
+	Blob(#[from] omp_journal::blob::Error),
 	/// JSON projection failed.
 	#[error(transparent)]
 	Json(#[from] serde_json::Error),

@@ -1133,6 +1133,26 @@ fn engage_yield_ladder(request: &ChildRequest, session: &mut Session) -> Result<
 	Ok(())
 }
 
+/// Engages the same bounded yield ladder for a workpool batch, but keeps the
+/// Director active until the batch-local yield payload reports every item
+/// complete (or one item failed).
+pub(super) fn engage_workpool_yield_ladder(session: &mut Session) -> Result<(), SpawnError> {
+	let mut directors = DirectorStack::from_dom(session.dom(), &DirectorRegistry::standard());
+	directors.engage(
+		session,
+		Box::new(
+			ForceTool::new(
+				"yield",
+				ForceUntil::TerminalYield,
+				Some(Str::new_static(YIELD_REMINDER)),
+				MAX_YIELD_RETRIES,
+			)
+			.deferred(),
+		),
+	)?;
+	Ok(())
+}
+
 fn structured_output(
 	request: &ChildRequest,
 	session: &Session,

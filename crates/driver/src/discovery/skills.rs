@@ -4,7 +4,7 @@
 //! Sources follow pi (`packages/coding-agent/src/extensibility/skills.ts`,
 //! `discovery/{builtin,agents,claude,codex,opencode}.ts`): native `.omp/skills`
 //! (project walk-up) and `<config root>/agent/skills`, then `.claude/skills`,
-//! `.agent[s]/skills`, user/project `.codex/skills`, user/project OpenCode
+//! `.agent[s]/skills`, opted-in user/project `.codex/skills`, project OpenCode
 //! skills, then
 //! `sv_skills_custom_directories`, then the isolated managed-skills root dead
 //! last. Within a name, the first source in that order wins; a custom
@@ -423,13 +423,12 @@ pub fn sources(
 		push("agents", home.join(".agent/skills"), SkillLevel::User);
 		push("agents", home.join(".agents/skills"), SkillLevel::User);
 	}
-	// Claude, Codex, and OpenCode enumerate their user source before
-	// the project source; native and `.agent[s]` retain project-first order.
+	// Claude and Codex enumerate their opted-in user source before the project
+	// source; native and `.agent[s]` retain project-first order.
 	if policy.codex_user {
 		push("codex", home.join(".codex/skills"), SkillLevel::User);
 	}
 	push("codex", project_root.join(".codex/skills"), SkillLevel::Project);
-	push("opencode", home.join(".config/opencode/skills"), SkillLevel::User);
 	push("opencode", project_root.join(".opencode/skills"), SkillLevel::Project);
 	for dir in &policy.custom_directories {
 		push("custom", dir.clone(), SkillLevel::User);
@@ -1381,6 +1380,8 @@ mod tests {
 			expect("agents", repo.join(".agents/skills"), SkillLevel::Project),
 			expect("agents", home.join(".agent/skills"), SkillLevel::User),
 			expect("agents", home.join(".agents/skills"), SkillLevel::User),
+			expect("codex", nested.join(".codex/skills"), SkillLevel::Project),
+			expect("opencode", nested.join(".opencode/skills"), SkillLevel::Project),
 			expect("custom", PathBuf::from("/opt/skills"), SkillLevel::User),
 			expect("omp-managed", config.join("agent/managed-skills"), SkillLevel::User),
 		]);
