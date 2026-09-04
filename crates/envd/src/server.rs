@@ -122,7 +122,7 @@ use super::{
 	search_backend::SearchBridgeHost,
 	site::{SiteError, SiteMaterializer, record_modules},
 	tool_document::{PrivilegedMutationFault, privileged_unlink, privileged_write},
-	tool_settings::{ApprovalMode, ToolSettings},
+	tool_settings::{ApprovalMode, GithubCacheSettings, ToolSettings},
 	tool_shell::{AcpExecBackend, AcpExecSlot},
 	tool_url::UrlResolver,
 	tools::{
@@ -1867,6 +1867,7 @@ fn production_control_authorities(
 	journal_external: &ExternalJournalActor,
 	domain_control: Arc<DomainControlSlot>,
 	convars: Arc<dyn ControlAuthorityFactory>,
+	extension_tool_call_timeout: Duration,
 ) -> ProductionControlBindings {
 	let resources = Arc::new(sync::OnceLock::new());
 	let manifests = Arc::new(
@@ -1910,6 +1911,7 @@ fn production_control_authorities(
 		callbacks.clone(),
 		BTreeMap::new(),
 		extension_settings,
+		extension_tool_call_timeout,
 	);
 	hooks.bind_mcp_drop_journal(Arc::clone(telemetry), session_id.clone());
 	let hooks_factory: Arc<dyn ControlAuthorityFactory> = hooks.clone();
@@ -2356,6 +2358,11 @@ fn update_refusal_wire(refusal: omp_ext::upgrade::UpdateRefusal) -> pb::Extensio
 }
 
 impl EnvServer {
+	/// Clones the process lifecycle authority used by daemon-idle policy.
+	pub(crate) fn process_host(&self) -> ExecHost {
+		self.exec.clone()
+	}
+
 	fn new(
 		identity: ServerIdentity,
 		environment: Option<EnvironmentAuthorities>,
@@ -2485,8 +2492,11 @@ impl EnvServer {
 		ext_host_config.bind_workspace_root(workspace.root());
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
 		let github_cache = Arc::new(
-			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
-				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
+			GithubCache::open(
+				state_dir.join("github-cache.sqlite3"),
+				GithubCacheSettings::from_con(con).policy(),
+			)
+			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
 		let blobs = BlobHost::open_managed(state_dir.join("blobs"), state_dir.join("sessions"))?;
 		ext_host_config.bind_result_store(blobs.clone());
@@ -2519,6 +2529,7 @@ impl EnvServer {
 			&journal_external,
 			ext_host_config.domain_control_factories(),
 			Arc::clone(&convars),
+			crate::pi_settings::extension_tool_call_timeout(con),
 		);
 		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
@@ -2755,8 +2766,11 @@ impl EnvServer {
 		ext_host_config.bind_workspace_root(&root);
 		ext_host_config.bind_data_authority(Arc::clone(&authority));
 		let github_cache = Arc::new(
-			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
-				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
+			GithubCache::open(
+				state_dir.join("github-cache.sqlite3"),
+				GithubCacheSettings::from_con(con).policy(),
+			)
+			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
 		let blobs = BlobHost::open_managed(state_dir.join("blobs"), state_dir.join("sessions"))?;
 		ext_host_config.bind_result_store(blobs.clone());
@@ -2793,6 +2807,7 @@ impl EnvServer {
 			&journal_external,
 			ext_host_config.domain_control_factories(),
 			Arc::clone(&convars),
+			crate::pi_settings::extension_tool_call_timeout(con),
 		);
 		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
@@ -2965,8 +2980,11 @@ impl EnvServer {
 				.with_agent_plugin_roots(bridges.content.agent_plugin_roots.clone()),
 		);
 		let github_cache = Arc::new(
-			GithubCache::open(state_dir.join("github-cache.sqlite3"), Duration::from_secs(5 * 60))
-				.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
+			GithubCache::open(
+				state_dir.join("github-cache.sqlite3"),
+				GithubCacheSettings::from_con(con).policy(),
+			)
+			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 		);
 		let blobs = BlobHost::open_managed(state_dir.join("blobs"), state_dir.join("sessions"))?;
 		ext_host_config.bind_result_store(blobs.clone());
@@ -3005,6 +3023,7 @@ impl EnvServer {
 			&journal_external,
 			ext_host_config.domain_control_factories(),
 			Arc::clone(&convars),
+			crate::pi_settings::extension_tool_call_timeout(con),
 		);
 		mcp_manager.bind_notification_sink(control_bindings.hooks.clone());
 		ext_host_config.bind_control_authorities(Arc::clone(&control_bindings.factory));
@@ -3704,8 +3723,9 @@ impl EnvServer {
 				Err(error) if error.kind() == io::ErrorKind::NotFound => {},
 				Err(error) => return Err(error.into()),
 			}
-			// Bind under a staging name, restrict, then rename into place so the
-			// published path never exposes a permissive-mode window to connectors.
+			// Bind under a staging name, restrict, then publish with an atomic
+			// no-replace link. A competing daemon that wins the path race keeps
+			// ownership; this listener never overwrites its reachable socket.
 			let staging = path.with_extension(format!("staging-{}", process::id()));
 			match tokio::fs::symlink_metadata(&staging).await {
 				Ok(_) => tokio::fs::remove_file(&staging).await?,
@@ -3713,8 +3733,11 @@ impl EnvServer {
 				Err(error) => return Err(error.into()),
 			}
 			let listener = UnixListener::bind(&staging)?;
+			let staging_metadata = fs::symlink_metadata(&staging)?;
+			let staging_guard = UnixSocketPathGuard::new(staging.clone(), &staging_metadata);
 			tokio::fs::set_permissions(&staging, fs::Permissions::from_mode(0o600)).await?;
-			tokio::fs::rename(&staging, path).await?;
+			tokio::fs::hard_link(&staging, path).await?;
+			drop(staging_guard);
 			let metadata = fs::symlink_metadata(path)?;
 			(listener, metadata)
 		};
@@ -11865,6 +11888,7 @@ pub async fn run_with_registry(
 	let idle_timeout = Duration::from_secs(args.idle_timeout);
 	let idle_state_dir = state_dir.clone();
 	let idle_server_build = Str::from(omp_env::build_id::current());
+	let idle_processes = server.process_host();
 	let idle = async move {
 		wait_idle(
 			env_connection_rx,
@@ -11873,6 +11897,7 @@ pub async fn run_with_registry(
 			idle_timeout,
 			idle_state_dir,
 			idle_server_build,
+			idle_processes,
 		)
 		.await;
 	};
@@ -11919,17 +11944,28 @@ async fn wait_idle(
 	timeout: Duration,
 	state_dir: PathBuf,
 	server_build: Str,
+	processes: ExecHost,
 ) {
 	const BUILD_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
 	let mut env_open = true;
 	let mut docs_open = true;
 	loop {
-		while *env.borrow() != 0 || *docs.borrow() > reserved_docs {
+		while *env.borrow() != 0
+			|| *docs.borrow() > reserved_docs
+			|| processes.has_live_persistent_processes()
+		{
 			tokio::select! {
 				result = env.changed(), if env_open => env_open = result.is_ok(),
 				result = docs.changed(), if docs_open => docs_open = result.is_ok(),
-				else => future::pending::<()>().await,
+				() = time::sleep(BUILD_CHECK_INTERVAL) => {
+					if *env.borrow() == 0
+						&& *docs.borrow() <= reserved_docs
+						&& crate::launcher_build_is_stale(&state_dir, server_build.as_str())
+					{
+						return;
+					}
+				},
 			}
 		}
 		if crate::launcher_build_is_stale(&state_dir, server_build.as_str()) {
@@ -11961,6 +11997,9 @@ async fn wait_idle(
 				() = time::sleep(BUILD_CHECK_INTERVAL) => {
 					if crate::launcher_build_is_stale(&state_dir, server_build.as_str()) {
 						return;
+					}
+					if processes.has_live_persistent_processes() {
+						break;
 					}
 				},
 			}
@@ -13629,6 +13668,7 @@ mod tests {
 			window,
 			state.path().to_path_buf(),
 			sf!("same-build"),
+			ExecHost::new(),
 		));
 		time::sleep(Duration::from_millis(5)).await;
 		assert!(!busy.is_finished(), "busy environment was considered idle");
@@ -13650,6 +13690,7 @@ mod tests {
 			window,
 			state.path().to_path_buf(),
 			sf!("same-build"),
+			ExecHost::new(),
 		));
 		time::sleep(Duration::from_millis(15)).await;
 		env_tx.send_replace(1);
@@ -13659,6 +13700,46 @@ mod tests {
 		assert!(!reset.is_finished(), "activity did not reset the idle window");
 		time::sleep(Duration::from_millis(15)).await;
 		reset.await.expect("reset idle wait task");
+
+		let processes = ExecHost::new();
+		processes
+			.start_process(env_pb::StartProcess {
+				name: String::from("persistent-idle"),
+				spec: Some(env_pb::ProcessSpec {
+					source: Some(env_pb::Script {
+						text: String::from("sleep 0.2"),
+						..Default::default()
+					}),
+					cwd_uri: Url::from_directory_path(state.path())
+						.expect("state directory URI")
+						.to_string(),
+					persist: true,
+					..Default::default()
+				}),
+				..Default::default()
+			})
+			.await
+			.expect("start persistent process");
+		let (_env_tx, env_rx) = watch::channel(0);
+		let (_docs_tx, docs_rx) = watch::channel(1);
+		let persistent = tokio::spawn(wait_idle(
+			env_rx,
+			docs_rx,
+			1,
+			window,
+			state.path().to_path_buf(),
+			sf!("same-build"),
+			processes,
+		));
+		time::sleep(Duration::from_millis(75)).await;
+		assert!(
+			!persistent.is_finished(),
+			"live persistent process did not hold the daemon open"
+		);
+		time::timeout(Duration::from_secs(1), persistent)
+			.await
+			.expect("idle window did not begin after the persistent process exited")
+			.expect("persistent idle task");
 	}
 
 	#[cfg(unix)]
@@ -13860,6 +13941,7 @@ mod tests {
 			Duration::from_secs(60),
 			state.path().to_path_buf(),
 			old_config.server_build().clone(),
+			ExecHost::new(),
 		));
 		time::sleep(Duration::from_millis(75)).await;
 		assert!(!idle.is_finished(), "stale daemon shut down before its client drained");

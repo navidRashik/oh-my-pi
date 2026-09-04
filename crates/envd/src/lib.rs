@@ -100,7 +100,10 @@ use exthost::{
 use github_url::GithubCredentialBridge;
 use miette::IntoDiagnostic as _;
 #[cfg(unix)]
-use nix::unistd::User;
+use nix::{
+	sys::signal::{self, Signal},
+	unistd::{Pid, User},
+};
 use omp_agent::KernelSender;
 use omp_con::Ctx;
 use omp_core::{Hash32, Str, Ulid, sf};
@@ -2212,9 +2215,11 @@ async fn spawn_project_daemon_with(
 		command.as_std_mut().process_group(0);
 	}
 	let mut child = command.spawn()?;
+	let process_group = child.id();
 	let deadline = Instant::now() + deadline;
 	loop {
 		if let Some(status) = child.try_wait()? {
+			terminate_spawned_daemon(&mut child, process_group).await;
 			return Err(
 				io::Error::other(format!("project daemon exited during startup: {status}")).into(),
 			);
@@ -2227,16 +2232,38 @@ async fn spawn_project_daemon_with(
 			return Ok(());
 		}
 		if Instant::now() >= deadline {
-			let _ = child.start_kill();
-			tokio::spawn(async move {
-				let _ = child.wait().await;
-			});
+			terminate_spawned_daemon(&mut child, process_group).await;
 			return Err(
 				io::Error::new(io::ErrorKind::TimedOut, "project daemon did not become ready").into(),
 			);
 		}
 		time::sleep(Duration::from_millis(50)).await;
 	}
+}
+
+#[cfg(unix)]
+async fn terminate_spawned_daemon(
+	child: &mut tokio::process::Child,
+	process_group: Option<u32>,
+) {
+	if let Some(process_group) = process_group {
+		let group = Pid::from_raw(process_group.cast_signed());
+		let _ = signal::killpg(group, Signal::SIGTERM);
+		time::sleep(Duration::from_millis(250)).await;
+		let _ = signal::killpg(group, Signal::SIGKILL);
+	} else {
+		let _ = child.start_kill();
+	}
+	let _ = child.wait().await;
+}
+
+#[cfg(not(unix))]
+async fn terminate_spawned_daemon(
+	child: &mut tokio::process::Child,
+	_process_group: Option<u32>,
+) {
+	let _ = child.start_kill();
+	let _ = child.wait().await;
 }
 
 #[cfg(unix)]
@@ -2478,12 +2505,45 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn same_binary_daemon_spawn_reenters_the_public_envd_boundary() {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let scratch = tempfile::tempdir().expect("scratch script directory");
+		let script = scratch.path().join("capture.sh");
+		let capture = scratch.path().join("argv.txt");
+		fs::write(
+			&script,
+			format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\nexit 17\n", capture.display()),
+		)
+		.expect("write argument capture script");
+		fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+			.expect("mark script executable");
+
+		let error = spawn_with(&script, 5_000)
+			.await
+			.expect_err("capture process must exit during startup");
+		assert!(error.to_string().contains("exited during startup"), "unexpected error: {error}");
+		assert_eq!(
+			fs::read_to_string(capture).expect("captured daemon selector"),
+			"envd"
+		);
+	}
+
+	#[tokio::test]
 	async fn spawn_kills_a_daemon_that_never_becomes_ready() {
 		use std::os::unix::fs::PermissionsExt as _;
 
 		let scratch = tempfile::tempdir().expect("scratch script directory");
 		let script = scratch.path().join("hang.sh");
-		fs::write(&script, "#!/bin/sh\nexec sleep 30\n").expect("write hang script");
+		let child_pid_path = scratch.path().join("child.pid");
+		fs::write(
+			&script,
+			format!(
+				"#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nwait\n",
+				child_pid_path.display()
+			),
+		)
+		.expect("write hang script");
 		fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
 			.expect("mark script executable");
 
@@ -2494,5 +2554,18 @@ mod tests {
 			panic!("unexpected error: {error}");
 		};
 		assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+		let child_pid = fs::read_to_string(child_pid_path)
+			.expect("daemon descendant pid")
+			.parse::<i32>()
+			.expect("numeric daemon descendant pid");
+		let child = Pid::from_raw(child_pid);
+		let reaped = time::timeout(Duration::from_secs(2), async {
+			while signal::kill(child, None).is_ok() {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await;
+		assert!(reaped.is_ok(), "startup timeout left a daemon descendant alive");
 	}
 }

@@ -1,5 +1,8 @@
 //! Literal pi-setting convars not otherwise owned by a narrower runtime module.
 
+use std::time::Duration;
+
+use omp_con::Ctx;
 use omp_core::Str;
 
 omp_con::var! {
@@ -68,6 +71,18 @@ omp_con::var! {
 		default: 500,
 		flags: archive,
 	};
+	/// Positive active-work ceiling for one extension `tool_call` handler.
+	pub static AI_EXTENSION_HANDLERS_TOOL_CALL_TIMEOUT_MS = ai_extension_handlers_tool_call_timeout_ms: i64 {
+		default: 30000,
+		validate: |_ctx, value| {
+			if *value > 0 {
+				Ok(())
+			} else {
+				Err(Str::new_static("extension tool-call timeout must be positive"))
+			}
+		},
+		flags: archive,
+	};
 	/// pi `searxng.token` (string, default: undefined).
 	pub static SV_SEARXNG_TOKEN = sv_searxng_token: Str {
 		default: Str::new_static(""),
@@ -103,6 +118,15 @@ omp_con::var! {
 	};
 }
 
+/// Resolves the extension `tool_call` handler deadline at environment-host
+/// activation.
+#[must_use]
+pub fn extension_tool_call_timeout(ctx: &Ctx) -> Duration {
+	let milliseconds = u64::try_from(AI_EXTENSION_HANDLERS_TOOL_CALL_TIMEOUT_MS.get(ctx))
+		.expect("the convar minimum keeps extension handler timeouts positive");
+	Duration::from_millis(milliseconds)
+}
+
 /// Exact pi setting keys and their command-stream convar names.
 pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("skills.enabled", "sv_skills_enabled"),
@@ -115,9 +139,16 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("browser.relayUrl", "sv_browser_relay_url"),
 	("browser.cmux", "sv_browser_cmux"),
 	("browser.screenshotDir", "sv_browser_screenshot_dir"),
+	("github.cache.enabled", "sv_github_cache_enabled"),
+	("github.cache.softTtlSec", "sv_github_cache_soft_ttl_sec"),
+	("github.cache.hardTtlSec", "sv_github_cache_hard_ttl_sec"),
 	("mcp.renderMarkdownResults", "sv_mcp_render_markdown_results"),
 	("mcp.notifications", "sv_mcp_notifications"),
 	("mcp.notificationDebounceMs", "sv_mcp_notification_debounce_ms"),
+	(
+		"extensionHandlers.toolCallTimeoutMs",
+		"ai_extension_handlers_tool_call_timeout_ms",
+	),
 	("searxng.token", "sv_searxng_token"),
 	("searxng.basicUsername", "sv_searxng_basic_username"),
 	("searxng.basicPassword", "sv_searxng_basic_password"),
@@ -126,3 +157,19 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("searxng.language", "sv_searxng_language"),
 	("searxng.safesearch", "sv_searxng_safesearch"),
 ];
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn extension_tool_call_timeout_resolves_positive_milliseconds() {
+		let ctx = Ctx::new();
+		assert_eq!(extension_tool_call_timeout(&ctx), Duration::from_secs(30));
+		AI_EXTENSION_HANDLERS_TOOL_CALL_TIMEOUT_MS
+			.set(&ctx, 125)
+			.expect("set extension handler timeout");
+		assert_eq!(extension_tool_call_timeout(&ctx), Duration::from_millis(125));
+		assert!(AI_EXTENSION_HANDLERS_TOOL_CALL_TIMEOUT_MS.set(&ctx, 0).is_err());
+	}
+}

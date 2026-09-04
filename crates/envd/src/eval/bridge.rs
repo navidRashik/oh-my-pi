@@ -817,6 +817,11 @@ pub trait ParentSessionHost: Send + Sync {
 	/// binding is retired or replaced. Durable observations remain journaled.
 	fn release_eval_owner(&self) {}
 
+	/// Whether this parent owns a completion implementation.
+	fn completion_available(&self) -> bool {
+		true
+	}
+
 	/// Runs a parent-session model completion and forwards ordered progress to
 	/// the eval caller.
 	async fn completion(
@@ -824,6 +829,11 @@ pub trait ParentSessionHost: Send + Sync {
 		args: Value,
 		progress: &dyn BridgeProgressSink,
 	) -> Result<Value, BridgeHostError>;
+	/// Whether this parent owns a child-agent implementation.
+	fn agent_available(&self) -> bool {
+		true
+	}
+
 	/// Runs a parent-session child agent and forwards ordered progress to the
 	/// eval caller.
 	async fn agent(
@@ -846,9 +856,19 @@ pub trait ParentSessionHost: Send + Sync {
 		let _ = (args, progress);
 		Err(BridgeHostError::message("eval workpool is unavailable for this parent session"))
 	}
+	/// Whether this parent owns concurrency controls.
+	fn concurrency_available(&self) -> bool {
+		true
+	}
+
 	/// Applies the parent session's concurrency operation to extension-supplied
 	/// arguments.
 	async fn concurrency(&self, args: Value) -> Result<Value, BridgeHostError>;
+	/// Whether this parent owns budget controls.
+	fn budget_available(&self) -> bool {
+		true
+	}
+
 	/// Reads or updates parent-session budget state using extension-supplied
 	/// arguments.
 	async fn budget(&self, args: Value) -> Result<Value, BridgeHostError>;
@@ -1059,14 +1079,41 @@ impl SessionBridgeHost {
 		if parents.is_empty() {
 			return Ok(capabilities);
 		}
+		let has_completion = parents
+			.values()
+			.all(|binding| binding.parent.completion_available());
+		let has_agent = parents
+			.values()
+			.all(|binding| binding.parent.agent_available());
+		let has_concurrency = parents
+			.values()
+			.all(|binding| binding.parent.concurrency_available());
+		let has_budget = parents
+			.values()
+			.all(|binding| binding.parent.budget_available());
 		let has_workpool = parents
 			.values()
 			.all(|binding| binding.parent.workpool_available());
-		let capabilities = capabilities
-			.with_completion()
-			.with_agent()
-			.with_concurrency()
-			.with_budget();
+		let capabilities = if has_completion {
+			capabilities.with_completion()
+		} else {
+			capabilities
+		};
+		let capabilities = if has_agent {
+			capabilities.with_agent()
+		} else {
+			capabilities
+		};
+		let capabilities = if has_concurrency {
+			capabilities.with_concurrency()
+		} else {
+			capabilities
+		};
+		let capabilities = if has_budget {
+			capabilities.with_budget()
+		} else {
+			capabilities
+		};
 		Ok(if has_workpool {
 			capabilities.with_workpool()
 		} else {

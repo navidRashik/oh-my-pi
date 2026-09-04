@@ -16,7 +16,7 @@ use std::{
 use futures::StreamExt as _;
 use omp_agent::{
 	GateDecision, GateEvent, GateOutcome, HookDispatch as AgentHookDispatch, HookGate, HookPatch,
-	HookPhase, KernelSender,
+	HookPhase, KernelSender, OBSERVE_HANDLER_CAP,
 };
 use omp_cache::{github_cache::GithubCache, telemetry_cache::TelemetryIndex};
 use omp_catalog::{ModelKey, ProviderId, snapshot::Catalog};
@@ -1430,7 +1430,21 @@ pub struct HookControlFactory {
 	mcp_journal:                  Arc<RwLock<Option<(Arc<TelemetryIndex>, Str)>>>,
 	provider_response_subscribed: Arc<AtomicBool>,
 	settings:                     Arc<BTreeMap<(Str, Str, Str), JsonMap<String, JsonValue>>>,
+	tool_call_timeout:            time::Duration,
 	admission_gate:               Arc<HookGate>,
+}
+
+fn extension_callback_timeout(
+	event: &str,
+	configured: time::Duration,
+	subscription: Option<time::Duration>,
+	event_default: time::Duration,
+) -> time::Duration {
+	if event == "tool_call" {
+		subscription.map_or(configured, |timeout| timeout.min(configured))
+	} else {
+		subscription.unwrap_or(event_default)
+	}
 }
 
 impl HookControlFactory {
@@ -1440,8 +1454,13 @@ impl HookControlFactory {
 		dispatcher: Arc<dyn CallbackDispatcher>,
 		policies: BTreeMap<Str, HookEventPolicy>,
 		settings: BTreeMap<(Str, Str, Str), JsonMap<String, JsonValue>>,
+		tool_call_timeout: time::Duration,
 	) -> Arc<Self> {
-		let (admission_gate, dispatches) = HookGate::delegated_channel();
+		let admission_timeout = tool_call_timeout
+			.checked_mul(OBSERVE_HANDLER_CAP as u32)
+			.unwrap_or(time::Duration::MAX);
+		let (admission_gate, dispatches) =
+			HookGate::delegated_channel_with_tool_call_timeout(admission_timeout);
 		let owner = Arc::new(Self {
 			registries,
 			dispatcher: Arc::clone(&dispatcher),
@@ -1453,6 +1472,7 @@ impl HookControlFactory {
 			mcp_journal: Arc::new(RwLock::new(None)),
 			provider_response_subscribed: Arc::new(AtomicBool::new(false)),
 			settings: Arc::new(settings),
+			tool_call_timeout,
 			admission_gate: Arc::new(admission_gate),
 		});
 		let weak = Arc::downgrade(&owner);
@@ -1475,6 +1495,20 @@ impl HookControlFactory {
 			.get(&(identity.layer.clone(), identity.tier.clone(), identity.extension.clone()))
 			.cloned()
 			.unwrap_or_default()
+	}
+
+	fn callback_timeout(
+		&self,
+		event: &str,
+		subscription: &HookSubscription,
+		policy: &HookEventPolicy,
+	) -> time::Duration {
+		extension_callback_timeout(
+			event,
+			self.tool_call_timeout,
+			subscription.timeout,
+			policy.timeout,
+		)
 	}
 
 	async fn answer_admission_dispatch(&self, dispatch: AgentHookDispatch) {
@@ -1511,6 +1545,7 @@ impl HookControlFactory {
 							return;
 						}
 						let shutdown_bounded = event == "session_shutdown";
+						let event_id = Str::from(event.as_str());
 						let mut arguments = JsonMap::new();
 						arguments.insert("event".to_owned(), JsonValue::String(event.clone()));
 						arguments
@@ -1525,7 +1560,7 @@ impl HookControlFactory {
 								phase: InvocationPhase::EffectsAuthorized,
 								session,
 								turn: None,
-								event: Some(Str::from(event)),
+								event: Some(event_id.clone()),
 								call: None,
 								device: None,
 								effects: Box::new([]),
@@ -1541,22 +1576,27 @@ impl HookControlFactory {
 								direct_filesystem: None,
 							}),
 						};
-						let composed = if shutdown_bounded {
-							match tokio::time::timeout(
-								time::Duration::from_secs(2),
-								self.compose(&context, &arguments),
-							)
-							.await
-							{
-								Ok(result) => result,
-								Err(_) => Ok(json!({"kind": "defer"})),
-							}
+						if dispatch.phase == HookPhase::Observe {
+							self.observe(&context, event_id.as_str(), &payload).await;
+							GateDecision::Defer
 						} else {
-							self.compose(&context, &arguments).await
-						};
-						match composed {
-							Ok(value) => gate_decision_from_json(value, payload),
-							Err(error) => GateDecision::Deny(error.message),
+							let composed = if shutdown_bounded {
+								match tokio::time::timeout(
+									time::Duration::from_secs(2),
+									self.compose(&context, &arguments),
+								)
+								.await
+								{
+									Ok(result) => result,
+									Err(_) => Ok(json!({"kind": "defer"})),
+								}
+							} else {
+								self.compose(&context, &arguments).await
+							};
+							match composed {
+								Ok(value) => gate_decision_from_json(value, payload),
+								Err(error) => GateDecision::Deny(error.message),
+							}
 						}
 					},
 					None => GateDecision::Deny(sf!("malformed hook admission payload")),
@@ -1683,7 +1723,15 @@ impl HookControlFactory {
 			.flatten()
 			.filter_map(|row| hook_event_id(row.event.as_str()))
 			.fold(0_u128, |mask, event| mask | (1_u128 << event as u32));
-		self.admission_gate.replace_union_mask(mask);
+		let fail_closed = subscriptions
+			.values()
+			.flatten()
+			.filter(|row| {
+				row.on_failure.unwrap_or(row.event_policy.on_failure) == HookFailurePolicy::Deny
+			})
+			.filter_map(|row| hook_event_id(row.event.as_str()))
+			.fold(0_u128, |mask, event| mask | (1_u128 << event as u32));
+		self.admission_gate.replace_masks(mask, fail_closed);
 		Ok(())
 	}
 
@@ -1921,6 +1969,71 @@ impl HookControlFactory {
 		}
 	}
 
+	async fn observe(
+		&self,
+		context: &ControlRequestContext,
+		event: &str,
+		payload: &JsonValue,
+	) {
+		let scoped_provider = payload.get("provider").and_then(JsonValue::as_str);
+		let mut rows = self
+			.subscriptions
+			.read()
+			.values()
+			.flat_map(|rows| rows.iter())
+			.filter(|row| {
+				row.event == event
+					&& row.phase == "observe"
+					&& row.identity.session_generation == context.connection.session_generation
+					&& row.providers.as_ref().is_none_or(|providers| {
+						scoped_provider.is_none_or(|provider| {
+							providers
+								.iter()
+								.any(|candidate| candidate.as_str() == provider)
+						})
+					}) && lifecycle_hook_recipient(
+					event,
+					payload,
+					row.identity.extension.as_str(),
+				)
+			})
+			.cloned()
+			.collect::<Vec<_>>();
+		rows.sort_by(|left, right| {
+			left
+				.identity
+				.layer
+				.cmp(&right.identity.layer)
+				.then_with(|| left.identity.tier.cmp(&right.identity.tier))
+				.then_with(|| left.identity.extension.cmp(&right.identity.extension))
+				.then_with(|| left.name.cmp(&right.name))
+		});
+		rows.truncate(OBSERVE_HANDLER_CAP);
+		let deliveries = rows.into_iter().map(|row| {
+			let mut callback = JsonMap::new();
+			callback.insert(String::from("event"), JsonValue::String(event.to_owned()));
+			callback.insert(String::from("phase"), JsonValue::String(String::from("observe")));
+			callback.insert(String::from("name"), JsonValue::String(row.name.to_string()));
+			callback.insert(String::from("payload"), payload.clone());
+			async move {
+				let _ = self
+					.callbacks
+					.dispatch(
+						Arc::clone(&row.identity),
+						context,
+						"omp.hooks.dispatch",
+						callback,
+						row.concurrency,
+						row.timeout.unwrap_or(row.event_policy.timeout),
+						Some(row.event.clone()),
+						None,
+					)
+					.await;
+			}
+		});
+		let _ = futures::future::join_all(deliveries).await;
+	}
+
 	async fn compose(
 		&self,
 		context: &ControlRequestContext,
@@ -1947,6 +2060,7 @@ impl HookControlFactory {
 			.flat_map(|rows| rows.iter())
 			.filter(|row| {
 				row.event == event
+					&& row.phase != "observe"
 					&& row.identity.session_generation == context.connection.session_generation
 					&& row.providers.as_ref().is_none_or(|providers| {
 						scoped_provider.is_none_or(|provider| {
@@ -1966,10 +2080,13 @@ impl HookControlFactory {
 			hook_phase_rank(&left.phase)
 				.cmp(&hook_phase_rank(&right.phase))
 				.then_with(|| left.order.cmp(&right.order))
-				.then_with(|| left.name.cmp(&right.name))
+				.then_with(|| left.identity.layer.cmp(&right.identity.layer))
+				.then_with(|| left.identity.tier.cmp(&right.identity.tier))
 				.then_with(|| left.identity.extension.cmp(&right.identity.extension))
+				.then_with(|| left.name.cmp(&right.name))
 		});
 		let mut modification: Option<JsonMap<String, JsonValue>> = None;
+		let mut approvals = Vec::new();
 		for row in rows {
 			let mut callback = JsonMap::new();
 			callback.insert(String::from("event"), JsonValue::String(event.to_string()));
@@ -1984,7 +2101,7 @@ impl HookControlFactory {
 					"omp.hooks.dispatch",
 					callback,
 					row.concurrency,
-					row.timeout.unwrap_or(policy.timeout),
+					self.callback_timeout(event.as_str(), &row, &policy),
 					Some(event.clone()),
 					None,
 				)
@@ -2006,33 +2123,81 @@ impl HookControlFactory {
 			} else {
 				result
 			};
-			let decision = result.as_object().ok_or_else(|| {
-				ControlProtocolError::new(
+			let Some(decision) = result.as_object() else {
+				let error = ControlProtocolError::new(
 					"HookContractError",
 					"hook callback returned a non-object decision",
-				)
-			})?;
-			match decision.get("kind").and_then(JsonValue::as_str) {
-				Some("deny" | "require_approval") => return Ok(result),
+				);
+				match hook_callback_failure(row.on_failure.unwrap_or(policy.on_failure), error) {
+					None => continue,
+					Some(decision) => return Ok(decision),
+				}
+			};
+			let kind = decision.get("kind").and_then(JsonValue::as_str);
+			if !hook_decision_is_legal(row.phase.as_str(), kind) {
+				let error = ControlProtocolError::new(
+					"HookContractError",
+					"hook callback returned a decision illegal in its phase",
+				);
+				match hook_callback_failure(row.on_failure.unwrap_or(policy.on_failure), error) {
+					None => continue,
+					Some(decision) => return Ok(decision),
+				}
+			}
+			match kind {
+				Some("deny") => return Ok(result),
+				Some("require_approval") => {
+					let Some(spec) = decision.get("spec").cloned() else {
+						let error = ControlProtocolError::new(
+							"HookContractError",
+							"approval decision omitted its specification",
+						);
+						match hook_callback_failure(
+							row.on_failure.unwrap_or(policy.on_failure),
+							error,
+						) {
+							None => continue,
+							Some(decision) => return Ok(decision),
+						}
+					};
+					approvals.push(approval_spec_with_provenance(
+						spec,
+						row.name.as_str(),
+						row.identity.extension.as_str(),
+						row.identity.host_generation,
+						row.identity.session_generation,
+					));
+				},
 				Some("allow" | "defer") => {},
 				Some("modify") => {
-					compose_hook_modify(
+					if let Err(error) = compose_hook_modify(
 						event.as_str(),
 						&policy,
 						&mut payload,
 						&mut modification,
 						decision,
-					)?;
+					) {
+						match hook_callback_failure(
+							row.on_failure.unwrap_or(policy.on_failure),
+							error,
+						) {
+							None => continue,
+							Some(decision) => return Ok(decision),
+						}
+					}
 				},
-				_ => {
-					return Err(ControlProtocolError::new(
-						"HookContractError",
-						"hook callback returned an unknown decision kind",
-					));
-				},
+				_ => unreachable!("phase legality checked the closed decision vocabulary"),
 			}
 		}
-		Ok(modification.map_or_else(|| policy.default.clone(), JsonValue::Object))
+		if approvals.is_empty() {
+			Ok(modification.map_or_else(|| policy.default.clone(), JsonValue::Object))
+		} else {
+			Ok(json!({
+				"kind": "require_approvals",
+				"specs": approvals,
+				"effective": payload,
+			}))
+		}
 	}
 }
 
@@ -2166,6 +2331,42 @@ fn gate_decision_from_json(value: JsonValue, mut payload: JsonValue) -> GateDeci
 				.and_then(crate::policy::approval_spec)
 			{
 				Ok(spec) => GateDecision::RequireApproval(spec),
+				Err(error) => GateDecision::Deny(error.message),
+			}
+		},
+		Some("require_approvals") => {
+			let specs = decision
+				.get("specs")
+				.and_then(JsonValue::as_array)
+				.ok_or_else(|| {
+					ControlProtocolError::new(
+						"HookContractError",
+						"composed approval decision omitted its specifications",
+					)
+				})
+				.and_then(|specs| {
+					specs
+						.iter()
+						.cloned()
+						.map(crate::policy::approval_spec)
+						.collect::<Result<Vec<_>, _>>()
+				});
+			match specs {
+				Ok(specs) if !specs.is_empty() => {
+					let patch = decision
+						.get("effective")
+						.map(serde_json::to_vec)
+						.transpose()
+						.map(|args| args.map(bytes::Bytes::from))
+						.map(|args| args.map(|args| HookPatch { target: None, args: Some(args) }));
+					match patch {
+						Ok(patch) => GateDecision::RequireApprovals { specs, patch },
+						Err(error) => GateDecision::Deny(Str::from(format!(
+							"could not encode effective hook payload: {error}"
+						))),
+					}
+				},
+				Ok(_) => GateDecision::Deny(sf!("composed approval decision was empty")),
 				Err(error) => GateDecision::Deny(error.message),
 			}
 		},
@@ -2858,6 +3059,40 @@ fn hook_callback_failure(
 			"code": error.code.as_str(),
 		})
 	})
+}
+
+fn hook_decision_is_legal(phase: &str, kind: Option<&str>) -> bool {
+	matches!(
+		(phase, kind),
+		("precheck", Some("deny" | "defer"))
+			| ("transform", Some("modify" | "defer"))
+			| ("review", Some("allow" | "deny" | "defer"))
+			| ("approval", Some("allow" | "deny" | "defer" | "require_approval"))
+			| ("domain", Some("allow" | "deny" | "defer" | "modify"))
+	)
+}
+
+fn approval_spec_with_provenance(
+	mut spec: JsonValue,
+	hook: &str,
+	extension: &str,
+	host_generation: u64,
+	session_generation: u64,
+) -> JsonValue {
+	if let Some(object) = spec.as_object_mut() {
+		let evidence = object
+			.entry(String::from("evidence"))
+			.or_insert_with(|| JsonValue::Array(Vec::new()));
+		if !evidence.is_array() {
+			*evidence = JsonValue::Array(Vec::new());
+		}
+		let evidence = evidence.as_array_mut().expect("normalized to array");
+		evidence.push(JsonValue::String(format!(
+			"hook={hook} extension={extension} host_generation={host_generation} \
+			 session_generation={session_generation}",
+		)));
+	}
+	spec
 }
 
 /// Lifts a domain handler's raw return (Python returns the dataclass itself:
@@ -3784,7 +4019,9 @@ fn environment_declarations(
 	if browser_settings.enabled && tool_settings.enabled("browser") {
 		push(omp_tools::browser::spec(), long_tail_presentation(policy), builtin_device_claims());
 	}
-	push(omp_tools::computer::spec(), long_tail_presentation(policy), builtin_device_claims());
+	if tool_settings.enabled("computer") {
+		push(omp_tools::computer::spec(), long_tail_presentation(policy), builtin_device_claims());
+	}
 	if tool_settings.enabled("security_scan") {
 		push(omp_tools::security_scan::spec(), Presentation::Device, builtin_device_claims());
 	}
@@ -4110,7 +4347,7 @@ pub(crate) fn production_registry<
 			policy,
 		)?;
 	if browser_settings.enabled && tool_settings.enabled("browser") {
-		let browser_daemon = BrowserDaemon::start(blobs.clone(), *browser_settings);
+		let browser_daemon = BrowserDaemon::start(blobs.clone(), browser_settings.clone());
 		environment_registry(
 			&mut registry,
 			omp_tools::browser::tool(browser_daemon),
@@ -4118,13 +4355,15 @@ pub(crate) fn production_registry<
 			builtin_device_claims(),
 		)?;
 	}
-	let computer = ComputerSessionHost::new(blobs.clone(), con);
-	environment_registry(
-		&mut registry,
-		omp_tools::computer::tool(computer),
-		long_tail_presentation(policy),
-		builtin_device_claims(),
-	)?;
+	if tool_settings.enabled("computer") {
+		let computer = ComputerSessionHost::new(blobs.clone(), con);
+		environment_registry(
+			&mut registry,
+			omp_tools::computer::tool(computer),
+			long_tail_presentation(policy),
+			builtin_device_claims(),
+		)?;
+	}
 	let security = SecurityScanService::new(workspace.root().to_path_buf(), state_dir)
 		.with_credentials(Arc::clone(&github_credentials));
 	if tool_settings.enabled("security_scan") {
@@ -4196,7 +4435,8 @@ pub(crate) fn production_registry<
 			.map_err(|error| EnvdError::State(Str::new(error.to_string())))?,
 	);
 	let vault = VaultService::load_layered(&VaultPaths::new(&user_config_root, workspace.root()))
-		.map_err(|error| EnvdError::State(Str::new(error.to_string())))?;
+		.map_err(|error| EnvdError::State(Str::new(error.to_string())))?
+		.with_obsidian_enabled(omp_tools::pi_settings::SV_VAULT_ENABLED.get(con));
 	documents.set_resource_mutations(ResourceMutationServices {
 		ssh:   ssh.clone(),
 		vault: vault.clone(),
@@ -4663,19 +4903,18 @@ enum CheckpointWorkspace {
 #[derive(Clone)]
 struct ActiveCheckpoint {
 	binding_id: u64,
-	token:      Str,
-	snapshot:   env_wire::WorkspaceSnapshot,
+	info:       Arc<checkpoint::CheckpointInfo>,
 }
 
 /// Late-bound bridge from environment-owned checkpoint tools to the active
 /// Agent CONTROL mailbox.
 #[derive(Clone, Default)]
 pub struct AgentCheckpointControl {
-	sender:            Arc<RwLock<Option<CheckpointBinding>>>,
-	workspace:         Arc<RwLock<Option<CheckpointWorkspace>>>,
-	active_checkpoint: Arc<RwLock<Option<ActiveCheckpoint>>>,
-	last_completed:    Arc<RwLock<bool>>,
-	transition:        Arc<AsyncMutex<()>>,
+	sender:             Arc<RwLock<Option<CheckpointBinding>>>,
+	workspace:          Arc<RwLock<Option<CheckpointWorkspace>>>,
+	active_checkpoints: Arc<RwLock<Vec<ActiveCheckpoint>>>,
+	rewind_pending:     Arc<RwLock<bool>>,
+	transition:         Arc<AsyncMutex<()>>,
 }
 
 impl AgentCheckpointControl {
@@ -4692,8 +4931,8 @@ impl AgentCheckpointControl {
 	/// Replaces the active session binding.
 	pub fn bind(&self, id: u64, sender: KernelSender) {
 		*self.sender.write() = Some(CheckpointBinding { id, sender });
-		*self.active_checkpoint.write() = None;
-		*self.last_completed.write() = false;
+		self.active_checkpoints.write().clear();
+		*self.rewind_pending.write() = false;
 	}
 
 	/// Re-derives checkpoint execution state from the selected journal's DOM.
@@ -4708,52 +4947,66 @@ impl AgentCheckpointControl {
 		{
 			return;
 		}
-		let active = dom.handles().find_map(|handle| {
-			let node = dom.get(handle)?;
-			if node.tag != omp_dom::Tag::Custom(Str::new_static("rewind-checkpoint")) {
-				return None;
-			}
-			let text = |name: &'static str| {
-				node
-					.prop(&omp_dom::PropKey::Custom(Str::new_static(name)))
+		let checkpoints = dom
+			.handles()
+			.filter_map(|handle| {
+				let node = dom.get(handle)?;
+				if node.tag != omp_dom::Tag::Custom(Str::new_static("rewind-checkpoint")) {
+					return None;
+				}
+				let text = |name: &'static str| {
+					node
+						.prop(&omp_dom::PropKey::Custom(Str::new_static(name)))
+						.and_then(omp_dom::Value::as_str)
+						.map(Str::new)
+				};
+				let number = |name: &'static str| match node
+					.prop(&omp_dom::PropKey::Custom(Str::new_static(name)))?
+				{
+					omp_dom::Value::Int(value) => u64::try_from(*value).ok(),
+					_ => None,
+				};
+				let boolean = |name: &'static str| {
+					match node.prop(&omp_dom::PropKey::Custom(Str::new_static(name)))? {
+						omp_dom::Value::Bool(value) => Some(*value),
+						_ => None,
+					}
+				};
+				let label = node
+					.prop(&omp_dom::PropKey::from(omp_dom::PropId::Label))
 					.and_then(omp_dom::Value::as_str)
-					.map(Str::new)
-			};
-			let number = |name: &'static str| match node
-				.prop(&omp_dom::PropKey::Custom(Str::new_static(name)))?
-			{
-				omp_dom::Value::Int(value) => u64::try_from(*value).ok(),
-				_ => None,
-			};
-			let token = text("token")?;
-			let snapshot_id = text("workspace-snapshot")?;
-			Some(ActiveCheckpoint {
-				binding_id: id,
-				token,
-				snapshot: env_wire::WorkspaceSnapshot {
-					snapshot_id: snapshot_id.to_string(),
+					.map(Str::new)?;
+				let snapshot = env_wire::WorkspaceSnapshot {
+					snapshot_id: text("workspace-snapshot")?.to_string(),
 					generation: number("workspace-generation")?,
 					root_uri: text("workspace-root")?.to_string(),
 					tree_hash: text("workspace-tree")?.to_string(),
 					files: number("workspace-files")?,
 					bytes: number("workspace-bytes")?,
 					entry_count: number("workspace-files")?,
-					created_ms: number("started-at")?,
+					created_ms: number("workspace-created-at")?,
+					label: Some(label.to_string()),
+					parent_snapshot_id: text("workspace-parent").map(|value| value.to_string()),
+					partial: boolean("workspace-partial")?,
 					wire_revision: omp_proto::SCHEMA_REV,
 					..Default::default()
-				},
+				};
+				Some(ActiveCheckpoint {
+					binding_id: id,
+					info: Arc::new(checkpoint::CheckpointInfo {
+						token: text("token")?,
+						label,
+						goal: text("goal")?,
+						started_at: number("started-at")?,
+						parent_token: text("parent-token"),
+						session_target: text("target"),
+						workspace: checkpoint_snapshot(&snapshot),
+					}),
+				})
 			})
-		});
-		let completed = dom.handles().any(|handle| {
-			dom.get(handle).is_some_and(|node| {
-				node.tag == omp_dom::Tag::Known(omp_dom::KnownTag::Developer)
-					&& node
-						.prop(&omp_dom::PropKey::Custom(Str::new_static("checkpoint-token")))
-						.is_some()
-			})
-		});
-		*self.active_checkpoint.write() = active;
-		*self.last_completed.write() = completed;
+			.collect();
+		*self.active_checkpoints.write() = checkpoints;
+		*self.rewind_pending.write() = false;
 	}
 
 	/// Releases the binding only when it is still owned by `id`, returning
@@ -4762,8 +5015,8 @@ impl AgentCheckpointControl {
 		let mut binding = self.sender.write();
 		if binding.as_ref().is_some_and(|binding| binding.id == id) {
 			*binding = None;
-			*self.active_checkpoint.write() = None;
-			*self.last_completed.write() = false;
+			self.active_checkpoints.write().clear();
+			*self.rewind_pending.write() = false;
 			true
 		} else {
 			false
@@ -4791,7 +5044,7 @@ impl AgentCheckpointControl {
 			Ok(())
 		} else {
 			Err(checkpoint_fault(
-				checkpoint::FaultCode::WrongToken,
+				checkpoint::FaultCode::NotFound,
 				"checkpoint belongs to another session",
 			))
 		}
@@ -4876,35 +5129,53 @@ impl CheckpointWorkspace {
 						"workspace restoration was cancelled",
 					));
 				}
-				workspace
-					.restore_workspace(request)
-					.await
-					.map_err(|source| {
-						tracing::warn!(?source, "checkpoint workspace restore failed");
-						checkpoint_fault(
-							checkpoint::FaultCode::RestoreFailed,
-							"workspace restoration failed",
-						)
-					})
+				let dry_run = request.dry_run;
+				let restore = workspace.restore_workspace(request);
+				tokio::pin!(restore);
+				let result = if dry_run {
+					tokio::select! {
+						result = &mut restore => result,
+						() = cancel.cancelled() => {
+							return Err(checkpoint_fault(
+								checkpoint::FaultCode::RestoreCancelled,
+								"workspace restoration was cancelled",
+							));
+						},
+					}
+				} else {
+					restore.await
+				};
+				result.map_err(|source| {
+					tracing::warn!(?source, "checkpoint workspace restore failed");
+					checkpoint_fault(
+						checkpoint::FaultCode::RestoreFailed,
+						"workspace restoration failed",
+					)
+				})
 			},
 		}
 	}
 }
 
 impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
-	async fn checkpoint(
+	async fn create_checkpoint(
 		&self,
 		goal: Str,
+		label: Str,
 		cancel: CancellationToken,
 	) -> Result<omp_tools::checkpoint::CheckpointAck, omp_tools::checkpoint::CheckpointFault> {
 		let _transition = self.transition.lock().await;
-		if self.active_checkpoint.read().is_some() {
-			return Err(checkpoint_fault(
-				checkpoint::FaultCode::AlreadyActive,
-				"a checkpoint is already active",
-			));
-		}
 		let binding = self.binding()?;
+		let parent_token = {
+			let checkpoints = self.active_checkpoints.read();
+			if checkpoints.iter().any(|checkpoint| checkpoint.info.label == label) {
+				return Err(checkpoint_fault(
+					checkpoint::FaultCode::DuplicateLabel,
+					"checkpoint label already exists on the selected branch",
+				));
+			}
+			checkpoints.last().map(|checkpoint| checkpoint.info.token.clone())
+		};
 		let started_at = epoch_millis()?;
 		let token = sf!("checkpoint-{}-{}", binding.id, Ulid::generate());
 		let snapshot = self
@@ -4912,7 +5183,7 @@ impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
 			.snapshot(
 				env_wire::SnapshotWorkspace {
 					scope: "checkpoint".to_owned(),
-					label: Some(token.to_string()),
+					label: Some(label.to_string()),
 					wire_revision: omp_proto::SCHEMA_REV,
 					..Default::default()
 				},
@@ -4920,49 +5191,110 @@ impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
 			)
 			.await?;
 		self.ensure_binding(binding.id)?;
-		let workspace = checkpoint_snapshot(&snapshot);
+		let info = Arc::new(checkpoint::CheckpointInfo {
+			token: token.clone(),
+			label: label.clone(),
+			goal: goal.clone(),
+			started_at,
+			parent_token: parent_token.clone(),
+			session_target: None,
+			workspace: checkpoint_snapshot(&snapshot),
+		});
 		binding
 			.sender
 			.send(omp_agent::Up::Env(omp_agent::EnvEvent::CheckpointOpened {
-				token: token.clone(),
-				goal: goal.clone(),
+				token,
+				label,
+				goal,
+				parent_token,
 				started_at,
-				workspace: snapshot.clone(),
+				workspace: snapshot,
 			}))
 			.map_err(|_| {
 				checkpoint_fault(checkpoint::FaultCode::Control, "active Agent mailbox is closed")
 			})?;
-		*self.active_checkpoint.write() =
-			Some(ActiveCheckpoint { binding_id: binding.id, token: token.clone(), snapshot });
-		Ok(omp_tools::checkpoint::CheckpointAck { token, started_at, workspace })
+		self
+			.active_checkpoints
+			.write()
+			.push(ActiveCheckpoint { binding_id: binding.id, info: info.clone() });
+		Ok(omp_tools::checkpoint::CheckpointAck { checkpoint: info })
+	}
+
+	fn list_checkpoints(
+		&self,
+		limit: u16,
+	) -> impl Future<
+		Output = Result<Vec<Arc<checkpoint::CheckpointInfo>>, omp_tools::checkpoint::CheckpointFault>,
+	> + Send {
+		let result = self.binding().map(|binding| {
+			self
+				.active_checkpoints
+				.read()
+				.iter()
+				.rev()
+				.filter(|checkpoint| checkpoint.binding_id == binding.id)
+				.take(usize::from(limit))
+				.map(|checkpoint| checkpoint.info.clone())
+				.collect()
+		});
+		std::future::ready(result)
 	}
 
 	async fn schedule_rewind(
 		&self,
+		selector: Str,
 		report: Str,
 		cancel: CancellationToken,
 	) -> Result<omp_tools::checkpoint::RewindAck, omp_tools::checkpoint::CheckpointFault> {
 		let _transition = self.transition.lock().await;
-		let binding = self.binding()?;
-		let active = self.active_checkpoint.read().clone().ok_or_else(|| {
-			if *self.last_completed.read() {
-				checkpoint_fault(
-					checkpoint::FaultCode::AlreadyCompleted,
-					"checkpoint already completed; continue from the retained rewind report",
-				)
-			} else {
-				checkpoint_fault(checkpoint::FaultCode::NoActive, "no active checkpoint")
-			}
-		})?;
-		if active.binding_id != binding.id {
+		if *self.rewind_pending.read() {
 			return Err(checkpoint_fault(
-				checkpoint::FaultCode::WrongToken,
-				"checkpoint belongs to another session",
+				checkpoint::FaultCode::AlreadyScheduled,
+				"a rewind is already scheduled",
 			));
 		}
+		let binding = self.binding()?;
+		let active = {
+			let checkpoints = self.active_checkpoints.read();
+			checkpoints
+				.iter()
+				.find(|checkpoint| {
+					checkpoint.binding_id == binding.id && checkpoint.info.token == selector
+				})
+				.cloned()
+				.or_else(|| {
+					let mut labels = checkpoints.iter().filter(|checkpoint| {
+						checkpoint.binding_id == binding.id && checkpoint.info.label == selector
+					});
+					let checkpoint = labels.next()?.clone();
+					labels.next().is_none().then_some(checkpoint)
+				})
+		}
+		.ok_or_else(|| {
+			let ambiguous = self
+				.active_checkpoints
+				.read()
+				.iter()
+				.filter(|checkpoint| {
+					checkpoint.binding_id == binding.id && checkpoint.info.label == selector
+				})
+				.count()
+				> 1;
+			if ambiguous {
+				checkpoint_fault(
+					checkpoint::FaultCode::AmbiguousSelector,
+					"checkpoint label is ambiguous; select by token",
+				)
+			} else {
+				checkpoint_fault(
+					checkpoint::FaultCode::NotFound,
+					"checkpoint token or label is not on the selected branch",
+				)
+			}
+		})?;
 		let workspace = self.workspace()?;
 		let request = env_wire::RestoreWorkspace {
-			snapshot_id: active.snapshot.snapshot_id.clone(),
+			snapshot_id: active.info.workspace.snapshot_id.to_string(),
 			dry_run: true,
 			scope: "checkpoint".to_owned(),
 			wire_revision: omp_proto::SCHEMA_REV,
@@ -4978,7 +5310,11 @@ impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
 			));
 		}
 		let restored = workspace
-			.restore(env_wire::RestoreWorkspace { dry_run: false, ..request }, &cancel)
+			.restore(env_wire::RestoreWorkspace {
+				dry_run: false,
+				expected_generation: preview.from_generation,
+				..request
+			}, &cancel)
 			.await?;
 		if let Err(fault) = ensure_complete_restore(&restored) {
 			if restored.partial {
@@ -4995,7 +5331,7 @@ impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
 		if binding
 			.sender
 			.send(omp_agent::Up::Env(omp_agent::EnvEvent::CheckpointRewind {
-				token: active.token.clone(),
+				token: active.info.token.clone(),
 				report: report.clone(),
 				receipt: receipt.clone(),
 				workspace: restored.clone(),
@@ -5009,10 +5345,9 @@ impl omp_tools::checkpoint::CheckpointControl for AgentCheckpointControl {
 				"active Agent mailbox is closed",
 			));
 		}
-		*self.active_checkpoint.write() = None;
-		*self.last_completed.write() = true;
+		*self.rewind_pending.write() = true;
 		Ok(omp_tools::checkpoint::RewindAck {
-			token: active.token,
+			checkpoint: active.info,
 			receipt,
 			workspace: checkpoint_restore(&restored),
 		})
@@ -5115,11 +5450,15 @@ fn checkpoint_snapshot(
 ) -> omp_tools::checkpoint::WorkspaceSnapshot {
 	omp_tools::checkpoint::WorkspaceSnapshot {
 		snapshot_id: Str::new(&snapshot.snapshot_id),
-		root_uri:    Str::new(&snapshot.root_uri),
-		generation:  snapshot.generation,
-		tree_hash:   Str::new(&snapshot.tree_hash),
-		files:       snapshot.files,
-		bytes:       snapshot.bytes,
+		root_uri: Str::new(&snapshot.root_uri),
+		generation: snapshot.generation,
+		tree_hash: Str::new(&snapshot.tree_hash),
+		files: snapshot.files,
+		bytes: snapshot.bytes,
+		label: snapshot.label.as_deref().map(Str::new),
+		parent_snapshot_id: snapshot.parent_snapshot_id.as_deref().map(Str::new),
+		created_at: snapshot.created_ms,
+		partial: snapshot.partial,
 	}
 }
 
@@ -5530,7 +5869,30 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn checkpoint_cache_rehydrates_from_the_selected_branch_and_clears_on_switch() {
+	fn extension_tool_call_timeout_caps_only_tool_call_handlers() {
+		let configured = time::Duration::from_millis(125);
+		let short = time::Duration::from_millis(25);
+		let long = time::Duration::from_secs(5);
+		assert_eq!(
+			extension_callback_timeout("tool_call", configured, None, long),
+			configured
+		);
+		assert_eq!(
+			extension_callback_timeout("tool_call", configured, Some(short), long),
+			short
+		);
+		assert_eq!(
+			extension_callback_timeout("tool_call", configured, Some(long), long),
+			configured
+		);
+		assert_eq!(
+			extension_callback_timeout("tool_result", configured, None, long),
+			long
+		);
+	}
+
+	#[tokio::test]
+	async fn checkpoint_cache_rehydrates_from_the_selected_branch_and_clears_on_switch() {
 		let control = AgentCheckpointControl::default();
 		let (sender, _mailbox) = flume::unbounded();
 		control.bind(7, sender);
@@ -5545,6 +5907,18 @@ mod tests {
 					.with_prop(
 						omp_dom::PropKey::Custom(sf!("token")),
 						omp_dom::Value::Str(sf!("checkpoint-1")),
+					)
+					.with_prop(
+						omp_dom::PropId::Label,
+						omp_dom::Value::Str(sf!("parser-baseline")),
+					)
+					.with_prop(
+						omp_dom::PropKey::Custom(sf!("goal")),
+						omp_dom::Value::Str(sf!("inspect parser")),
+					)
+					.with_prop(
+						omp_dom::PropKey::Custom(sf!("target")),
+						omp_dom::Value::Str(sf!("01K4TARGET")),
 					)
 					.with_prop(
 						omp_dom::PropKey::Custom(sf!("workspace-snapshot")),
@@ -5564,24 +5938,53 @@ mod tests {
 					)
 					.with_prop(omp_dom::PropKey::Custom(sf!("workspace-files")), omp_dom::Value::Int(2))
 					.with_prop(omp_dom::PropKey::Custom(sf!("workspace-bytes")), omp_dom::Value::Int(12))
+					.with_prop(
+						omp_dom::PropKey::Custom(sf!("workspace-parent")),
+						omp_dom::Value::Str(sf!("snapshot-0")),
+					)
+					.with_prop(
+						omp_dom::PropKey::Custom(sf!("workspace-created-at")),
+						omp_dom::Value::Int(42),
+					)
+					.with_prop(
+						omp_dom::PropKey::Custom(sf!("workspace-partial")),
+						omp_dom::Value::Bool(false),
+					)
 					.with_prop(omp_dom::PropKey::Custom(sf!("started-at")), omp_dom::Value::Int(42)),
 			}],
 		})
 		.expect("checkpoint DOM");
 
 		control.restore_session(7, &dom);
-		let active = control.active_checkpoint.read();
-		assert_eq!(active.as_ref().map(|value| value.token.as_str()), Some("checkpoint-1"));
+		let active = control.active_checkpoints.read();
+		assert_eq!(active.first().map(|value| value.info.token.as_str()), Some("checkpoint-1"));
 		assert_eq!(
 			active
-				.as_ref()
-				.map(|value| value.snapshot.snapshot_id.as_str()),
+				.first()
+				.map(|value| value.info.workspace.snapshot_id.as_str()),
 			Some("snapshot-1")
 		);
+		assert_eq!(
+			active
+				.first()
+				.and_then(|value| value.info.session_target.as_deref()),
+			Some("01K4TARGET")
+		);
+		assert_eq!(
+			active
+				.first()
+				.and_then(|value| value.info.workspace.parent_snapshot_id.as_deref()),
+			Some("snapshot-0")
+		);
 		drop(active);
+		let listed =
+			omp_tools::checkpoint::CheckpointControl::list_checkpoints(&control, 10)
+				.await
+				.expect("checkpoint list");
+		assert_eq!(listed.first().map(|value| value.label.as_str()), Some("parser-baseline"));
 
 		control.restore_session(7, &omp_dom::Dom::new());
-		assert!(control.active_checkpoint.read().is_none());
+		assert!(control.active_checkpoints.read().is_empty());
 	}
 
 	#[test]
@@ -5838,6 +6241,79 @@ mod tests {
 		assert_eq!(recipients, ["publisher.observer"]);
 		assert!(!lifecycle_hook_recipient("extension_unload", &payload, "publisher.subject",));
 		assert!(lifecycle_hook_recipient("extension_unload", &payload, "publisher.observer",));
+	}
+
+	#[test]
+	fn lifecycle_phase_vocabulary_is_closed_and_observe_cannot_authorize() {
+		for kind in ["deny", "defer"] {
+			assert!(hook_decision_is_legal("precheck", Some(kind)));
+		}
+		assert!(hook_decision_is_legal("transform", Some("modify")));
+		assert!(hook_decision_is_legal("review", Some("allow")));
+		assert!(hook_decision_is_legal("approval", Some("require_approval")));
+		assert!(!hook_decision_is_legal("observe", Some("allow")));
+		assert!(!hook_decision_is_legal("precheck", Some("require_approval")));
+		assert!(!hook_decision_is_legal("review", Some("modify")));
+	}
+
+	#[test]
+	fn approval_requirement_retains_authenticated_generation_evidence() {
+		let spec = approval_spec_with_provenance(
+			json!({
+				"title": "Approve",
+				"body": "Policy requires approval",
+				"subject": "bash",
+				"evidence": ["rule=destructive"],
+			}),
+			"publisher.guard",
+			"publisher.extension",
+			11,
+			19,
+		);
+		assert_eq!(
+			spec["evidence"],
+			json!([
+				"rule=destructive",
+				"hook=publisher.guard extension=publisher.extension host_generation=11 session_generation=19",
+			]),
+		);
+	}
+
+	#[test]
+	fn delegated_composer_decodes_every_merged_approval_requirement() {
+		let decision = json!({
+			"kind": "require_approvals",
+			"specs": [
+				{
+					"title": "Hook approval",
+					"body": "extension policy",
+					"subject": "bash",
+					"kind": "exec",
+					"evidence": ["host_generation=4"],
+				},
+				{
+					"title": "Capability approval",
+					"body": "native policy",
+					"subject": "network",
+					"kind": "network",
+				},
+			],
+			"effective": {"args": {"value": 2}},
+		});
+		let GateDecision::RequireApprovals { specs, patch } =
+			gate_decision_from_json(decision, json!({"args": {}}))
+		else {
+			panic!("merged approval decision");
+		};
+		assert_eq!(specs.len(), 2);
+		let patch = patch.expect("effective transform");
+		assert_eq!(
+			serde_json::from_slice::<JsonValue>(patch.args.as_deref().expect("argument patch"))
+				.expect("effective JSON"),
+			json!({"args": {"value": 2}}),
+		);
+		assert_eq!(specs[0].evidence, [sf!("host_generation=4")]);
+		assert_eq!(specs[1].subject, "network");
 	}
 
 	#[test]

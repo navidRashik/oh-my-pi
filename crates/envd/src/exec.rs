@@ -333,6 +333,7 @@ struct NamedProcess {
 	detached:        bool,
 	persist:         bool,
 	stopping:        AtomicBool,
+	restart_pending: AtomicBool,
 	timed_out:       AtomicBool,
 	timeout:         Option<Duration>,
 	deadline_cancel: CancellationToken,
@@ -1149,6 +1150,8 @@ impl ExecHost {
 						ProcessState::Starting as i32
 					},
 					ready_pending: ready_condition_names(&ready),
+					spec: Some(spec.clone()),
+					ready: ready.clone(),
 					props: spec.props.clone(),
 					..ProcessInfo::default()
 				},
@@ -1163,6 +1166,7 @@ impl ExecHost {
 			detached: false,
 			persist: spec.persist,
 			stopping: AtomicBool::new(false),
+			restart_pending: AtomicBool::new(false),
 			timed_out: AtomicBool::new(false),
 			timeout,
 			deadline_cancel: CancellationToken::new(),
@@ -1204,17 +1208,14 @@ impl ExecHost {
 		}
 		if !ready.is_empty() {
 			let mut stream = process.stream.lock();
-			if process_state_is_terminal(stream.info.state) {
-				return Err(ExecError::Readiness(sf!(
-					"process exited while readiness probes were running",
-				)));
+			if !process_state_is_terminal(stream.info.state) {
+				stream.info.state = ProcessState::Ready as i32;
+				stream.info.ready_pending.clear();
+				let info = stream.info.clone();
+				stream.broadcast(ProcessEvent::State(info));
+				drop(stream);
+				self.persist_process(&process, ProcessPhase::Running)?;
 			}
-			stream.info.state = ProcessState::Ready as i32;
-			stream.info.ready_pending.clear();
-			let info = stream.info.clone();
-			stream.broadcast(ProcessEvent::State(info));
-			drop(stream);
-			self.persist_process(&process, ProcessPhase::Running)?;
 		}
 		let log_offset = process.log.lock().end_offset();
 		let endpoint = process.stream.lock().info.endpoint.clone();
@@ -1346,6 +1347,8 @@ impl ExecHost {
 					},
 					identity: Some(identity.to_wire()),
 					ready_pending: ready_condition_names(&ready),
+					spec: Some(spec.clone()),
+					ready: ready.clone(),
 					props: spec.props.clone(),
 					..ProcessInfo::default()
 				},
@@ -1360,6 +1363,7 @@ impl ExecHost {
 			detached: true,
 			persist: true,
 			stopping: AtomicBool::new(false),
+			restart_pending: AtomicBool::new(false),
 			timed_out: AtomicBool::new(false),
 			timeout,
 			deadline_cancel: CancellationToken::new(),
@@ -1401,17 +1405,14 @@ impl ExecHost {
 		}
 		if !ready.is_empty() {
 			let mut stream = process.stream.lock();
-			if process_state_is_terminal(stream.info.state) {
-				return Err(ExecError::Readiness(sf!(
-					"process exited while readiness probes were running",
-				)));
+			if !process_state_is_terminal(stream.info.state) {
+				stream.info.state = ProcessState::Ready as i32;
+				stream.info.ready_pending.clear();
+				let info = stream.info.clone();
+				stream.broadcast(ProcessEvent::State(info));
+				drop(stream);
+				self.persist_process(&process, ProcessPhase::Running)?;
 			}
-			stream.info.state = ProcessState::Ready as i32;
-			stream.info.ready_pending.clear();
-			let info = stream.info.clone();
-			stream.broadcast(ProcessEvent::State(info));
-			drop(stream);
-			self.persist_process(&process, ProcessPhase::Running)?;
 		}
 		let log_offset = process.log.lock().end_offset();
 		let endpoint = process.stream.lock().info.endpoint.clone();
@@ -1469,6 +1470,11 @@ impl ExecHost {
 				.iter()
 				.map(|probe| probe.encode_to_vec())
 				.collect(),
+			status_wire: stream
+				.info
+				.status
+				.as_ref()
+				.map_or_else(Vec::new, |status| status.encode_to_vec()),
 			process_dir,
 			generation: process.generation,
 			identity: process.identity.clone(),
@@ -1478,6 +1484,7 @@ impl ExecHost {
 			log_start_offset: log.start_offset(),
 			log_end_offset: log.end_offset(),
 			log_rotations: log.rotations(),
+			restart_pending: process.restart_pending.load(Ordering::Acquire),
 			restart_count: supervisor.restart_count,
 			consecutive_failures: supervisor.consecutive_failures,
 			restart_history: supervisor.history.clone(),
@@ -1504,8 +1511,26 @@ impl ExecHost {
 		Ok(())
 	}
 
+	fn clear_restart_pending(&self, process: &Arc<NamedProcess>) {
+		process.restart_pending.store(false, Ordering::Release);
+		let current = self
+			.inner
+			.processes
+			.lock()
+			.get(&process.name)
+			.is_some_and(|current| Arc::ptr_eq(current, process));
+		if current {
+			let phase = phase_for_state(process.stream.lock().info.state);
+			let _ = self.persist_process(process, phase);
+		}
+	}
+
 	fn recover_records(&self, records: Vec<ProcessRecord>) -> Result<(), ExecError> {
 		for record in records {
+			if record.restart_pending {
+				self.recover_pending_restart(record);
+				continue;
+			}
 			if !record.phase.is_active() {
 				continue;
 			}
@@ -1566,6 +1591,8 @@ impl ExecHost {
 						} else {
 							Vec::new()
 						},
+						spec: Some(spec.clone()),
+						ready: ready.clone(),
 						props: spec.props.clone(),
 						..ProcessInfo::default()
 					},
@@ -1580,6 +1607,7 @@ impl ExecHost {
 				detached: true,
 				persist: true,
 				stopping: AtomicBool::new(false),
+				restart_pending: AtomicBool::new(false),
 				timed_out: AtomicBool::new(false),
 				timeout: spec
 					.timeout_ms
@@ -1601,6 +1629,64 @@ impl ExecHost {
 			}
 		}
 		Ok(())
+	}
+
+	fn recover_pending_restart(&self, record: ProcessRecord) {
+		let Ok(spec) = ProcessSpec::decode(record.spec_wire.as_slice()) else {
+			let _ = self.mark_recovered_terminal(&record, ProcessPhase::Failed);
+			return;
+		};
+		let ready = record
+			.ready_wire
+			.iter()
+			.filter_map(|wire| ReadyProbe::decode(wire.as_slice()).ok())
+			.collect::<Vec<_>>();
+		let timeout = spec
+			.timeout_ms
+			.filter(|timeout| *timeout != 0)
+			.map(Duration::from_millis);
+		let due_ms = record.restart_history.last().map_or(0, |restart| {
+			restart.at_ms.saturating_add(restart.delay_ms)
+		});
+		let delay = Duration::from_millis(due_ms.saturating_sub(unix_time_ms()));
+		if !self.inner.starting.lock().insert(record.name.clone()) {
+			let _ = self.mark_recovered_terminal(&record, ProcessPhase::Failed);
+			return;
+		}
+		let reservation = ProcessReservation {
+			host: Arc::downgrade(&self.inner),
+			name: record.name.clone(),
+		};
+		let Ok(runtime) = runtime::Handle::try_current() else {
+			let _ = self.mark_recovered_terminal(&record, ProcessPhase::Failed);
+			return;
+		};
+		let host = self.clone();
+		runtime.spawn(async move {
+			let _reservation = reservation;
+			time::sleep(delay).await;
+			let name = record.name.clone();
+			let generation = record.generation.saturating_add(1);
+			let launched = if record.detached {
+				host
+					.launch_detached(
+						name,
+						spec,
+						ready,
+						generation,
+						Some(&record),
+						timeout,
+					)
+					.await
+			} else {
+				host
+					.launch_attached(name, spec, ready, generation, Some(&record), timeout)
+					.await
+			};
+			if launched.is_err() {
+				let _ = host.mark_recovered_terminal(&record, ProcessPhase::Failed);
+			}
+		});
 	}
 
 	fn persisted_record(&self, name: &str) -> Option<ProcessRecord> {
@@ -1632,6 +1718,7 @@ impl ExecHost {
 			.find(|stored| stored.name == record.name)
 		{
 			stored.phase = phase;
+			stored.restart_pending = false;
 			stored.recent_order = self.inner.next_order.fetch_add(1, Ordering::Relaxed);
 		}
 		persistence.store.save(&persistence.snapshot)?;
@@ -1675,6 +1762,7 @@ impl ExecHost {
 					generation,
 					state: ProcessState::Running as i32,
 					status: None,
+					spec: Some(ProcessSpec::default()),
 					..ProcessInfo::default()
 				},
 				history:     Vec::new(),
@@ -1688,6 +1776,7 @@ impl ExecHost {
 			detached: false,
 			persist: false,
 			stopping: AtomicBool::new(false),
+			restart_pending: AtomicBool::new(false),
 			timed_out: AtomicBool::new(false),
 			timeout: None,
 			deadline_cancel: CancellationToken::new(),
@@ -1775,6 +1864,28 @@ impl ExecHost {
 				)
 				.await
 		}
+	}
+
+	/// Returns whether a live named process requires this daemon to remain
+	/// available after its last client disconnects.
+	pub(crate) fn has_live_persistent_processes(&self) -> bool {
+		self.inner.processes.lock().values().any(|process| {
+			process.persist
+				&& (!process_state_is_terminal(process.stream.lock().info.state)
+					|| process.restart_pending.load(Ordering::Acquire)
+						&& !process.stopping.load(Ordering::Acquire))
+		}) || self
+			.inner
+			.persistence
+			.lock()
+			.as_ref()
+			.is_some_and(|persistence| {
+				persistence
+					.snapshot
+					.processes
+					.iter()
+					.any(|record| record.persist && record.restart_pending)
+			})
 	}
 
 	/// Lists active processes oldest-to-newest followed by at most ten newest
@@ -1992,14 +2103,16 @@ impl ExecHost {
 		if !self.inner.starting.lock().insert(name.clone()) {
 			return Err(ExecError::ProcessExists(name));
 		}
+		let retained_generation =
+			self.persisted_record(&name).map_or(0, |record| record.generation);
 		let generation = if let Some(process) = self.inner.processes.lock().get(&name).cloned() {
 			if !process_state_is_terminal(process.stream.lock().info.state) {
 				self.inner.starting.lock().remove(&name);
 				return Err(ExecError::ProcessExists(name));
 			}
-			process.generation.saturating_add(1)
+			process.generation.max(retained_generation).saturating_add(1)
 		} else {
-			1
+			retained_generation.saturating_add(1)
 		};
 		Ok((ProcessReservation { host: Arc::downgrade(&self.inner), name }, generation))
 	}
@@ -3075,6 +3188,9 @@ fn settle_named_process(
 	} else {
 		ProcessPhase::Exited
 	};
+	process
+		.restart_pending
+		.store(restart_delay.is_some(), Ordering::Release);
 	let _ = host.persist_process(&process, phase);
 	let Some(delay) = restart_delay else {
 		return;
@@ -3089,23 +3205,29 @@ fn settle_named_process(
 	tokio::spawn(async move {
 		time::sleep(delay).await;
 		if process.stopping.load(Ordering::Acquire) {
+			host.clear_restart_pending(&process);
 			return;
 		}
 		let Ok((_reservation, current)) = host.reserve_process_generation(&name, process.generation)
 		else {
+			host.clear_restart_pending(&process);
 			return;
 		};
 		if !Arc::ptr_eq(&current, &process) {
+			host.clear_restart_pending(&process);
 			return;
 		}
-		if detached {
-			let _ = host
+		let launched = if detached {
+			host
 				.launch_detached(name, spec, ready, generation, record.as_ref(), timeout)
-				.await;
+				.await
 		} else {
-			let _ = host
+			host
 				.launch_attached(name, spec, ready, generation, record.as_ref(), timeout)
-				.await;
+				.await
+		};
+		if launched.is_err() {
+			host.clear_restart_pending(&process);
 		}
 	});
 }
@@ -3179,9 +3301,14 @@ fn ready_condition_names(ready: &[ReadyProbe]) -> Vec<String> {
 }
 
 fn process_info_from_record(record: &ProcessRecord) -> ProcessInfo {
-	let props = ProcessSpec::decode(record.spec_wire.as_slice())
-		.ok()
-		.and_then(|spec| spec.props);
+	let spec = ProcessSpec::decode(record.spec_wire.as_slice()).ok();
+	let props = spec.as_ref().and_then(|spec| spec.props.clone());
+	let status = ExecStatusMsg::decode(record.status_wire.as_slice()).ok();
+	let ready = record
+		.ready_wire
+		.iter()
+		.filter_map(|wire| ReadyProbe::decode(wire.as_slice()).ok())
+		.collect();
 	let state = match record.phase {
 		ProcessPhase::Starting | ProcessPhase::WaitingReady => ProcessState::Starting,
 		ProcessPhase::Running => ProcessState::Running,
@@ -3193,11 +3320,14 @@ fn process_info_from_record(record: &ProcessRecord) -> ProcessInfo {
 		name: record.name.to_string(),
 		generation: record.generation,
 		state: state as i32,
+		status,
 		identity: Some(record.identity.to_wire()),
 		log_start_offset: record.log_start_offset,
 		log_end_offset: record.log_end_offset,
 		restart_count: record.restart_count,
 		consecutive_failures: record.consecutive_failures,
+		spec,
+		ready,
 		props,
 		..ProcessInfo::default()
 	}
@@ -4649,6 +4779,65 @@ mod tests {
 		assert_eq!(second.generation, first.generation + 1);
 		wait_for_terminal(&host, &second.name, second.generation).await;
 		assert!(host.inner.sessions.lock().is_empty());
+	}
+
+	#[tokio::test]
+	async fn observed_readiness_survives_a_fast_process_exit() {
+		let root = tempfile::tempdir().unwrap();
+		let host = ExecHost::new();
+		let mut request = process_request("fast-ready-exit", root.path(), "printf READY");
+		request.ready.push(ReadyProbe {
+			probe: Some(ready_probe::Probe::Log(v1::ReadyLog {
+				pattern: String::from("READY"),
+				props: None,
+			})),
+			timeout_ms: 1_000,
+			props: None,
+		});
+		let started = host
+			.start_process(request)
+			.await
+			.expect("observed readiness must complete start");
+		let info = wait_for_terminal(&host, &started.name, started.generation).await;
+		assert_eq!(info.ready_match, "READY");
+	}
+
+	#[tokio::test]
+	async fn recovered_terminal_name_reuse_preserves_the_generation_fence() {
+		let root = tempfile::tempdir().unwrap();
+		let store = ProcessStore::new(root.path().join("processes").join("meta.json"));
+		let identity = ProcessIdentity::current().unwrap();
+		let mut snapshot = ProcessStoreSnapshot::new(identity.clone());
+		snapshot.processes.push(ProcessRecord {
+			name: Str::new_static("recovered-reuse"),
+			spec_wire: Vec::new(),
+			ready_wire: Vec::new(),
+			status_wire: Vec::new(),
+			process_dir: root.path().join("processes").join("recovered-reuse"),
+			generation: 41,
+			identity,
+			detached: false,
+			persist: false,
+			phase: ProcessPhase::Running,
+			log_start_offset: 0,
+			log_end_offset: 0,
+			log_rotations: 0,
+			restart_pending: false,
+			restart_count: 0,
+			consecutive_failures: 0,
+			restart_history: Vec::new(),
+			started_order: 1,
+			recent_order: 0,
+		});
+		store.save(&snapshot).unwrap();
+
+		let host = ExecHost::new().with_process_store(store).unwrap();
+		let started = host
+			.start_process(process_request("recovered-reuse", root.path(), "printf replacement"))
+			.await
+			.unwrap();
+		assert_eq!(started.generation, 42);
+		wait_for_terminal(&host, &started.name, started.generation).await;
 	}
 
 	#[tokio::test]
