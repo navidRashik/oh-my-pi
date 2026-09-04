@@ -1,18 +1,26 @@
 //! Stateful browser automation over a harness-owned supervised daemon.
 
-use std::sync::Arc;
+use std::sync::{
+	Arc,
+	atomic::{AtomicU64, Ordering},
+};
 
 use async_stream::stream;
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::Stream;
 use omp_core::{Str, sf};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, CommitError, Constraint, Effects, Ev, ExecEffects,
-	IncomingParams, ParamError, Part, PromptCaps, Rev, Tool, ToolSpec, ToolTerminal,
+	Abort, ArgIssue, ArgIssueKind, CallOutcome, CommitError, Constraint, Effects, Ev, ExecEffects,
+	IncomingParams, LiftedCall, ParamError, Part, PromptCaps, RecordedCall, Rev, Tool, ToolSpec,
+	ToolTerminal,
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// Browser lifecycle operation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, strum::Display)]
@@ -117,6 +125,56 @@ pub struct Params {
 	pub restart_for_mode_change: Option<bool>,
 }
 
+/// Retained browser binary output.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Artifact {
+	/// Content-addressed artifact URI.
+	pub uri:  Str,
+	/// Media type.
+	pub mime: Str,
+	/// Stable origin (`screenshot` or `download`).
+	pub kind:    Str,
+	/// Whether transcript actors should reveal the artifact inline.
+	pub visible:  bool,
+	/// Exact retained byte count.
+	pub byte_len: u64,
+}
+
+impl<'de> Deserialize<'de> for Artifact {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		#[derive(Deserialize)]
+		#[serde(untagged)]
+		enum Wire {
+			Legacy(Str),
+			Current {
+				uri: Str,
+				mime: Str,
+				kind: Str,
+				#[serde(default = "visible")]
+				visible: bool,
+				#[serde(default)]
+				byte_len: u64,
+			},
+		}
+		Ok(match Wire::deserialize(deserializer)? {
+			Wire::Legacy(uri) => Self {
+				uri,
+				mime: sf!("image/png"),
+				kind: sf!("screenshot"),
+				visible: true,
+				byte_len: 0,
+			},
+			Wire::Current { uri, mime, kind, visible, byte_len } => {
+				Self { uri, mime, kind, visible, byte_len }
+			},
+		})
+	}
+}
+
+const fn visible() -> bool {
+	true
+}
+
 /// Browser operation result.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Payload {
@@ -134,7 +192,7 @@ pub struct Payload {
 	/// JSON value returned by the run scope.
 	pub result:    Option<Value>,
 	/// Content-addressed artifacts created by the operation.
-	pub artifacts: Vec<Str>,
+	pub artifacts: Vec<Artifact>,
 	/// Backend mode the tab runs under (`headless` or `window`); pi's
 	/// `describeBrowser` meta. Absent on payloads journaled before it existed.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,35 +229,76 @@ pub struct Fault {
 	/// Backend mode when known.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub browser: Option<Str>,
+	/// Helper or lifecycle phase that failed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub operation: Option<Str>,
 }
 
-/// Browser operations currently settle as one bounded result.
+/// Typed browser progress streamed into the call element.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum Update {}
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Update {
+	/// Lifecycle work began.
+	Started {
+		/// Stable tab name.
+		name:      Str,
+		/// Lifecycle action.
+		action:    Action,
+		/// Selected backend mode.
+		browser:   Str,
+	},
+	/// One lifted JavaScript helper is running.
+	Helper {
+		/// Stable helper name such as `tab.click`.
+		operation: Str,
+	},
+	/// A screenshot or download was retained.
+	Artifact {
+		/// Content-addressed artifact URI.
+		uri:  Str,
+		/// Media type.
+		mime: Str,
+	},
+}
 
 /// Harness-owned browser daemon contract.
 #[async_trait]
 pub trait BrowserHost: Send + Sync + 'static {
 	/// Execute one lifecycle operation.
-	async fn execute(&self, params: Params) -> Result<Payload, Fault>;
+	async fn execute(
+		&self,
+		owner: Str,
+		params: Params,
+		cancellation: CancellationToken,
+		updates: flume::Sender<Update>,
+	) -> Result<Payload, Fault>;
+	/// Release every tab owned by one tool/session composition.
+	fn release_owner(&self, owner: &str);
 	/// Drop live browser surfaces and apply a new headless/windowed mode.
 	async fn restart_for_mode_change(&self, headless: bool) -> Result<(), Fault>;
 }
 
 /// Browser tool routed to one supervised daemon.
 pub struct Browser {
-	host: Arc<dyn BrowserHost>,
-	spec: ToolSpec,
+	host:  Arc<dyn BrowserHost>,
+	owner: Str,
+	spec:  ToolSpec,
 }
 
-/// Builds the host-free `browser@2` declaration.
+/// Builds the host-free `browser@3` declaration.
 pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("browser"),
-		rev:             Rev { family: Str::default(), n: 2 },
+		rev:             Rev { family: Str::default(), n: 3 },
 		description:     sf!(
-			"Controls named tabs through the supervised embedded browser daemon. Use open before run \
-			 and close when finished."
+			"Drives persistent, session-owned browser tabs through a composable JavaScript surface. \
+			 Call open before run and close when finished. run exposes page, browser, tab, display, \
+			 assert, and wait. tab provides url/title/goto, observe/ariaSnapshot, click/type/fill/\
+			 press/scroll/scrollIntoView/drag/select/uploadFile, evaluate/extract, screenshot/\
+			 download, waitFor/waitForSelector/waitForUrl/waitForResponse/waitForNavigation, and \
+			 id/ref element handles. app.path spawns an owned browser; app.cdp_url attaches without \
+			 owning the page; app.relay uses the logged-in relay browser. Request interception is \
+			 scoped to one run and is removed before settlement."
 		),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {
@@ -222,9 +321,16 @@ pub fn spec() -> ToolSpec {
 	}
 }
 
-/// Creates `browser@2`.
+/// Creates `browser@3`.
 pub fn tool(host: Arc<dyn BrowserHost>) -> Browser {
-	Browser { host, spec: spec() }
+	let owner = sf!("browser-owner-{}", NEXT_OWNER.fetch_add(1, Ordering::Relaxed));
+	Browser { host, owner, spec: spec() }
+}
+
+impl Drop for Browser {
+	fn drop(&mut self) {
+		self.host.release_owner(&self.owner);
+	}
 }
 
 impl Tool for Browser {
@@ -265,20 +371,110 @@ impl Tool for Browser {
 				yield Ev::Done(ToolTerminal::Done { result, useless: false });
 				return;
 			}
-			yield Ev::Done(ToolTerminal::Done { result: self.host.execute(params).await, useless: false });
+			let cancellation = CancellationToken::new();
+			let (updates, progress) = flume::unbounded();
+			let execution = self.host.execute(
+				self.owner.clone(),
+				params,
+				cancellation.clone(),
+				updates,
+			);
+			tokio::pin!(execution);
+			loop {
+				tokio::select! {
+					biased;
+					interrupt = incoming.next_interrupt() => {
+						cancellation.cancel();
+						let _ = execution.await;
+						if let Ok(interrupt) = interrupt {
+							yield Ev::Aborted(Abort::Interrupted { reason: interrupt.reason });
+						} else {
+							yield Ev::Aborted(Abort::InputDropped);
+						}
+						return;
+					},
+					result = &mut execution => {
+						yield Ev::Done(ToolTerminal::Done { result, useless: false });
+						return;
+					},
+					update = progress.recv_async() => match update {
+						Ok(update) => yield Ev::Update(update),
+						Err(_) => {},
+					},
+				}
+			}
 		}
 	}
 
-	fn prompt(&self, view: Result<&Payload, &Fault>, _: &PromptCaps) -> Vec<Part> {
-		vec![Part::Text {
-			text: match view {
-				Ok(payload) => {
-					Str::new(serde_json::to_string(payload).expect("browser payload serializes"))
-				},
-				Err(fault) => fault.message.clone(),
-			},
-		}]
+	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+		lift_legacy_call(from, call)
 	}
+
+	fn prompt(&self, view: Result<&Payload, &Fault>, caps: &PromptCaps) -> Vec<Part> {
+		match view {
+			Ok(payload) => {
+				let mut parts = vec![Part::Text {
+					text: Str::new(
+						serde_json::to_string(payload).expect("browser payload serializes"),
+					),
+				}];
+				if caps.media {
+					for artifact in payload
+						.artifacts
+						.iter()
+						.filter(|artifact| {
+							artifact.visible
+								&& artifact.byte_len != 0
+								&& artifact.mime.starts_with("image/")
+						})
+					{
+						if let Some(hash) = artifact.uri.strip_prefix("artifact://sha256/") {
+							parts.push(Part::Blob {
+								blob: omp_tool::BlobRef {
+									hash: Str::new(hash),
+									media_type: artifact.mime.clone(),
+									byte_len: artifact.byte_len,
+								},
+								alt: Some(sf!("Browser {}", artifact.kind)),
+							});
+						}
+					}
+				}
+				parts
+			},
+			Err(fault) => vec![Part::Text { text: fault.message.clone() }],
+		}
+	}
+}
+
+fn lift_legacy_call(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
+	if !from.family.is_empty() || !matches!(from.n, 1 | 2) {
+		return None;
+	}
+	let mut raw_args = serde_json::from_slice::<Value>(call.raw_args).ok()?;
+	let object = raw_args.as_object_mut()?;
+	let intent = object.remove("i");
+	let notrunc = object.remove("notrunc");
+	let params = serde_json::from_value::<Params>(raw_args.clone()).ok()?;
+	match params.action {
+		Action::Run if params.code.is_none() => return None,
+		Action::Close if params.code.is_some() || params.url.is_some() || params.app.is_some() => {
+			return None;
+		},
+		_ => {},
+	}
+	let verdict = serde_json::from_slice::<CallOutcome<Payload, Fault>>(call.verdict).ok()?;
+	let object = raw_args.as_object_mut()?;
+	if let Some(intent) = intent {
+		object.insert("i".to_owned(), intent);
+	}
+	if let Some(notrunc) = notrunc {
+		object.insert("notrunc".to_owned(), notrunc);
+	}
+	Some(LiftedCall {
+		raw_args: Bytes::from(serde_json::to_vec(&raw_args).ok()?),
+		verdict:  Bytes::from(serde_json::to_vec(&verdict).ok()?),
+	})
 }
 
 fn param_event(error: ParamError) -> Ev<Update, Payload, Fault> {
@@ -313,9 +509,11 @@ fn protocol_issue(message: Str) -> ArgIssue {
 
 #[cfg(test)]
 mod tests {
+	use omp_core::Str;
+	use omp_tool::{CallOutcome, RecordedCall, Rev};
 	use serde_json::{Value, json};
 
-	use super::{Action, Params, spec};
+	use super::{Action, Artifact, Params, Payload, lift_legacy_call, spec};
 
 	#[test]
 	fn browser_schema_keeps_only_open_run_close_code_surface() {
@@ -371,5 +569,59 @@ mod tests {
 		.expect("reference browser arguments");
 		assert_eq!(params.action, Action::Open);
 		assert_eq!(params.viewport.expect("viewport").width, 1280);
+	}
+
+	#[test]
+	fn browser_contract_revision_covers_lifted_runtime_and_typed_artifacts() {
+		assert_eq!(spec().rev.n, 3);
+		let legacy: Artifact =
+			serde_json::from_value(json!("artifact://sha256/abc")).expect("legacy artifact");
+		assert_eq!(legacy.uri, "artifact://sha256/abc");
+		assert_eq!(legacy.mime, "image/png");
+		assert_eq!(legacy.kind, "screenshot");
+		let current: Artifact = serde_json::from_value(json!({
+			"uri": "artifact://sha256/def",
+			"mime": "application/pdf",
+			"kind": "download",
+			"visible": false,
+			"byte_len": 42
+		}))
+		.expect("typed artifact");
+		assert_eq!(current.kind, "download");
+		assert!(!current.visible);
+	}
+
+	#[test]
+	fn revision_two_calls_lift_typed_artifact_metadata() {
+		let args = br#"{"i":"Capturing page","action":"run","code":"return 1"}"#;
+		let payload = Payload {
+			action: Action::Run,
+			name: "main".into(),
+			url: None,
+			title: None,
+			display: Vec::new(),
+			result: Some(json!(1)),
+			artifacts: vec![Artifact {
+				uri: "artifact://sha256/abc".into(),
+				mime: "image/png".into(),
+				kind: "screenshot".into(),
+				visible: true,
+				byte_len: 0,
+			}],
+			browser: Some("headless".into()),
+		};
+		let mut verdict = serde_json::to_value(CallOutcome::<Payload, super::Fault>::Ok(payload))
+			.expect("verdict value");
+		verdict["value"]["artifacts"] = json!(["artifact://sha256/abc"]);
+		let verdict = serde_json::to_vec(&verdict).expect("legacy verdict");
+		let lifted = lift_legacy_call(
+			&Rev { family: Str::default(), n: 2 },
+			RecordedCall { raw_args: args, verdict: &verdict },
+		)
+		.expect("lift");
+		let lifted: CallOutcome<Payload, super::Fault> =
+			serde_json::from_slice(&lifted.verdict).expect("typed lifted verdict");
+		let CallOutcome::Ok(payload) = lifted else { panic!("expected ok") };
+		assert_eq!(payload.artifacts[0].kind, "screenshot");
 	}
 }

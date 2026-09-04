@@ -98,9 +98,7 @@ fn render_github_payload(state: &GithubState, payload: &GithubPayload) -> El {
 		return render_github_search(state, payload);
 	}
 
-	let content = (payload.op == GithubOperation::FileRead)
-		.then(|| payload.result.get("content").and_then(Value::as_str))
-		.flatten();
+	let content = (payload.op == GithubOperation::FileRead).then_some(payload.output.as_str());
 	view! {
 		<col gap=0>
 			{github_header(state, payload)}
@@ -251,6 +249,7 @@ pub(super) struct BrowserState {
 	name:   Option<Str>,
 	url:    Option<Str>,
 	code:   Option<Str>,
+	status: Option<Str>,
 }
 
 pub(super) struct BrowserRenderer;
@@ -260,8 +259,16 @@ impl RenderFold for BrowserRenderer {
 	type State = BrowserState;
 	type Update = BrowserUpdate;
 
-	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
-		match update {}
+	fn fold(&self, state: &mut Self::State, update: Self::Update) {
+		match update {
+			BrowserUpdate::Started { name, action, browser } => {
+				state.name = Some(name);
+				state.action = Some(action);
+				state.status = Some(browser);
+			},
+			BrowserUpdate::Helper { operation } => state.status = Some(operation),
+			BrowserUpdate::Artifact { uri, .. } => state.status = Some(uri),
+		}
 	}
 
 	fn fold_args(&self, state: &mut Self::State, args: &omp_slopjson::Value, _complete: bool) {
@@ -311,6 +318,9 @@ fn render_browser_live(state: &BrowserState) -> El {
 					<pre max-rows=16 overflow="lines">{code}</pre>
 				}
 			}
+			if let Some(status) = state.status.as_deref() {
+				<text fg=muted>{status}</text>
+			}
 		</col>
 	}
 }
@@ -340,7 +350,7 @@ fn render_browser_payload(state: &BrowserState, payload: &BrowserPayload) -> El 
 			if !payload.artifacts.is_empty() {
 				<text bold>{"Artifacts"}</text>
 				for artifact in &payload.artifacts {
-					<fact label="Artifact"><text fg=accent>{artifact}</text></fact>
+					<fact label="Artifact"><text fg=accent>{&artifact.uri}</text></fact>
 				}
 			}
 		</col>
@@ -434,6 +444,7 @@ fn labeled_value(label: &'static str, value: &Value) -> El {
 
 #[derive(Default)]
 pub(super) struct ComputerState {
+	action:  Str,
 	code:    Str,
 	summary: Str,
 }
@@ -445,11 +456,25 @@ impl RenderFold for ComputerRenderer {
 	type State = ComputerState;
 	type Update = ComputerUpdate;
 
-	fn fold(&self, _state: &mut Self::State, update: Self::Update) {
-		match update {}
+	fn fold(&self, state: &mut Self::State, update: Self::Update) {
+		match update {
+			ComputerUpdate::Started { action } => {
+				if state.summary.is_empty() {
+					state.summary = Str::new(<&'static str>::from(action));
+				}
+			},
+			ComputerUpdate::Operation { operation } => {
+				state.summary = Str::new(<&'static str>::from(operation));
+			},
+			ComputerUpdate::Artifact { .. } => {},
+		}
 	}
 
 	fn fold_args(&self, state: &mut Self::State, args: &omp_slopjson::Value, _complete: bool) {
+		state.action = args
+			.get("action")
+			.and_then(omp_slopjson::Value::as_str)
+			.map_or_else(|| Str::new_static("run"), Str::new);
 		state.code = args
 			.get("code")
 			.and_then(omp_slopjson::Value::as_str)
@@ -469,6 +494,13 @@ impl RenderFold for ComputerRenderer {
 
 fn computer_arg_summary(args: &omp_slopjson::Value) -> Str {
 	let mut summary = String::new();
+	if let Some(action) = args
+		.get("action")
+		.and_then(omp_slopjson::Value::as_str)
+		.filter(|action| *action != "run")
+	{
+		summary.push_str(action);
+	}
 	if args
 		.get("read_only")
 		.and_then(omp_slopjson::Value::as_bool)
@@ -510,7 +542,7 @@ fn push_summary_field(output: &mut String, label: &str, value: &str) {
 }
 
 fn render_computer_live(state: &ComputerState) -> El {
-	if state.code.is_empty() {
+	if state.code.is_empty() && (state.action.is_empty() || state.action == "run") {
 		return live_view("Computer", "waiting for code");
 	}
 	view! {
@@ -523,6 +555,10 @@ fn render_computer_live(state: &ComputerState) -> El {
 }
 
 fn render_computer_payload(state: &ComputerState, payload: &ComputerPayload) -> El {
+	let capabilities = payload
+		.capabilities
+		.as_ref()
+		.map(|value| serde_json::to_value(value).expect("computer capabilities serialize"));
 	view! {
 		<col gap=0>
 			<row gap=1>
@@ -531,13 +567,18 @@ fn render_computer_payload(state: &ComputerState, payload: &ComputerPayload) -> 
 					<text fg=muted>{&state.summary}</text>
 				}
 			</row>
-			<text bold>{"Code"}</text>
-			<pre max-rows=16 overflow="lines">{&payload.code}</pre>
+			if let Some(code) = &payload.code {
+				<text bold>{"Code"}</text>
+				<pre max-rows=16 overflow="lines">{code}</pre>
+			}
 			for (index, result) in payload.results.iter().enumerate() {
 				{labeled_value(if index == 0 { "result" } else { "next" }, result)}
 			}
+			if let Some(capabilities) = &capabilities {
+				{labeled_value("capabilities", capabilities)}
+			}
 			for artifact in &payload.artifacts {
-				<fact label="Screenshot"><text fg=accent>{artifact}</text></fact>
+				<fact label="Screenshot"><text fg=accent>{&artifact.uri}</text></fact>
 			}
 		</col>
 	}
@@ -578,7 +619,7 @@ pub(crate) fn gallery_fixtures(
 			streaming_args: r#"{"op":"search_prs","query":"is:open review-requested:@me sort:up"#,
 			args: r#"{"op":"search_prs","query":"is:open review-requested:@me sort:updated","repo":"oh-my-pi/pi","limit":10}"#,
 			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"op":"search_prs","result":{"repo":"oh-my-pi/pi","total_count":4,"summary":"4 open pull requests requesting your review","items":[{"number":1842,"title":"feat(tui): virtualized scrollback for tool output","author":"openyou","age":"2h ago","additions":312,"deletions":47},{"number":1839,"title":"fix(agent): retry stream on transient 529","author":"dvir","age":"5h ago","additions":18,"deletions":4},{"number":1830,"title":"refactor(edit): unify hashline + ast_edit previews","author":"mira","age":"1d ago","additions":540,"deletions":210},{"number":1817,"title":"docs: document gallery fixtures contract","author":"leo","age":"2d ago","additions":96,"deletions":0}]},"rate_limit_remaining":4876,"rate_limit_reset":null}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"op":"search_prs","result":{"repo":"oh-my-pi/pi","total_count":4,"summary":"4 open pull requests requesting your review","items":[{"number":1842,"title":"feat(tui): virtualized scrollback for tool output","author":"openyou","age":"2h ago","additions":312,"deletions":47},{"number":1839,"title":"fix(agent): retry stream on transient 529","author":"dvir","age":"5h ago","additions":18,"deletions":4},{"number":1830,"title":"refactor(edit): unify hashline + ast_edit previews","author":"mira","age":"1d ago","additions":540,"deletions":210},{"number":1817,"title":"docs: document gallery fixtures contract","author":"leo","age":"2d ago","additions":96,"deletions":0}]},"output":"4 open pull requests requesting your review","artifact":null,"useless":false,"rate_limit_remaining":4876,"rate_limit_reset":null}}"#,
 			error_outcome: br#"{"kind":"faulted","value":{"code":"github_http","message":"gh: Could not resolve to a Repository with the name 'oh-my-pi/pi'. (HTTP 404)"}}"#,
 		},
 		RendererGalleryFixture {
@@ -591,11 +632,11 @@ pub(crate) fn gallery_fixtures(
 		},
 		RendererGalleryFixture {
 			identity: computer,
-			streaming_args: r#"{"code":"const shot = await desktop.screenshot({\"maxWidth\":1440,\"maxHeight\":9"#,
-			args: r#"{"code":"const shot = await desktop.screenshot({\"maxWidth\":1440,\"maxHeight\":900});\nassert(shot.width > 0);","read_only":true,"timeout":30}"#,
+			streaming_args: r#"{"action":"run","code":"const shot = await desktop.screenshot({\"maxWidth\":1440,\"maxHeight\":9"#,
+			args: r#"{"action":"run","code":"const shot = await desktop.screenshot({\"maxWidth\":1440,\"maxHeight\":900});\nassert(shot.width > 0);","read_only":true,"timeout":30}"#,
 			progress_update: None,
-			success_outcome: br#"{"kind":"ok","value":{"code":"const shot = await desktop.screenshot({\"maxWidth\":1440,\"maxHeight\":900});\nassert(shot.width > 0);","results":[{"message":"Captured 1440\u00d7900 screenshot","width":1440,"height":900,"bytes":482193},true],"artifacts":["artifact://sha256/8f9b0dd1e9c0a05d4f1d6d2ae9742d7a"]}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"code":"desktop_permission","message":"Screen Recording permission is required to capture the primary display"}}"#,
+			success_outcome: br#"{"kind":"ok","value":{"action":"run","code":"const shot = await desktop.screenshot({\"maxWidth\":1440,\"maxHeight\":900});\nassert(shot.width > 0);","results":[{"artifact":"artifact://sha256/8f9b0dd1e9c0a05d4f1d6d2ae9742d7a","width":1440,"height":900,"source_width":2880,"source_height":1800,"coordinate_space":"capture_pixels"},true],"artifacts":[{"uri":"artifact://sha256/8f9b0dd1e9c0a05d4f1d6d2ae9742d7a","mime":"image/png","visible":true,"byte_len":482193,"width":1440,"height":900,"source_width":2880,"source_height":1800,"target":"desktop"}],"capabilities":null}}"#,
+			error_outcome: br#"{"kind":"faulted","value":{"code":"permission_denied","message":"required desktop permission is unavailable","operation":"capture"}}"#,
 		},
 	]
 }
@@ -608,7 +649,10 @@ mod tests {
 	use super::*;
 
 	fn identity(name: &'static str) -> ToolIdentity {
-		ToolIdentity { name: Str::new_static(name), rev: Rev { family: Str::default(), n: 1 } }
+		ToolIdentity {
+			name: Str::new_static(name),
+			rev: Rev { family: Str::default(), n: if name == "github" { 3 } else { 1 } },
+		}
 	}
 
 	#[test]
@@ -771,6 +815,7 @@ mod tests {
 			url:     Some(Str::new_static("https://bun.sh/docs")),
 			title:   None,
 			browser: Some(Str::new_static("headless")),
+			operation: None,
 		};
 		let rendered = BrowserRenderer
 			.view(&state, Some(&CallOutcome::Faulted(fault)))
@@ -796,7 +841,15 @@ mod tests {
 				"display_outputs": [{"value": "<shown>"}],
 				"return_value": true
 			})),
-			artifacts: vec![Str::new_static("artifact://browser/result")],
+			artifacts: vec![crate::browser::Artifact {
+				uri: Str::new_static(
+					"artifact://sha256/0000000000000000000000000000000000000000000000000000000000000000",
+				),
+				mime: Str::new_static("image/png"),
+				kind: Str::new_static("screenshot"),
+				visible: true,
+				byte_len: 1,
+			}],
 			browser:   Some(Str::new_static("headless")),
 		};
 		let rendered = BrowserRenderer
@@ -831,20 +884,35 @@ mod tests {
 	#[test]
 	fn computer_structured_result_artifact_and_fault_are_semantic() {
 		let payload = ComputerPayload {
-			code:      Str::new_static("await desktop.screenshot()"),
-			results:   vec![serde_json::json!({"width": 1440, "height": 900})],
-			artifacts: vec![Str::new_static("artifact://computer/screenshot")],
+			action: crate::computer::Action::Run,
+			code: Some(Str::new_static("await desktop.screenshot()")),
+			results: vec![serde_json::json!({"width": 1440, "height": 900})],
+			artifacts: vec![crate::computer::Artifact {
+				uri: Str::new_static(
+					"artifact://sha256/0000000000000000000000000000000000000000000000000000000000000000",
+				),
+				mime: Str::new_static("image/png"),
+				visible: true,
+				byte_len: 1,
+				width: 1440,
+				height: 900,
+				source_width: 1440,
+				source_height: 900,
+				target: Str::new_static("desktop"),
+			}],
+			capabilities: None,
 		};
 		let rendered = ComputerRenderer
 			.view(&ComputerState::default(), Some(&CallOutcome::Ok(payload)))
 			.expect("computer result renders");
 		assert!(rendered.contains("<json max-depth=4 max-rows=10 max-chars=100>"));
 		assert!(rendered.contains("<fact label=Screenshot>"));
-		assert!(rendered.contains("artifact://computer/screenshot"));
+		assert!(rendered.contains("artifact://sha256/"));
 
 		let fault = ComputerFault {
-			code:    Str::new_static("desktop_permission"),
+			code: crate::computer::FaultCode::PermissionDenied,
 			message: Str::new_static("Screen Recording <required>"),
+			operation: Some(crate::computer::Operation::Capture),
 		};
 		let rendered = ComputerRenderer
 			.view(&ComputerState::default(), Some(&CallOutcome::Faulted(fault)))

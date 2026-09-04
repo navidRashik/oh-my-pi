@@ -1071,7 +1071,7 @@ mod tests {
 
 	#[test]
 	fn decode_rejects_pixel_bombs_before_allocating_and_rejects_truncated_images() {
-		let mut huge = vec![0; 24];
+		let mut huge = vec![0; 26];
 		huge[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
 		huge[12..16].copy_from_slice(b"IHDR");
 		huge[16..20].copy_from_slice(&100_000_u32.to_be_bytes());
@@ -1085,7 +1085,7 @@ mod tests {
 			})
 		);
 
-		let mut truncated = vec![0; 24];
+		let mut truncated = vec![0; 26];
 		truncated[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
 		truncated[12..16].copy_from_slice(b"IHDR");
 		truncated[16..20].copy_from_slice(&8_u32.to_be_bytes());

@@ -620,7 +620,7 @@ fn parse_roots(path: Option<&str>) -> Result<(Vec<SearchRoot>, Option<SearchRoot
 	let roots = entries.into_iter().map(parse_root).collect::<Result<Vec<_>, _>>()?;
 	let unsplit = path
 		.filter(|path| path.contains(';'))
-		.and_then(|path| parse_root(Str::new(path)).ok());
+		.and_then(|path| parse_root(Str::new(path.trim_end())).ok());
 	Ok((roots, unsplit))
 }
 
@@ -1134,7 +1134,7 @@ mod tests {
 			LineRange { start_line: 12, end_line: Some(13) },
 		]);
 		let unsplit = unsplit.expect("literal-preserving candidate");
-		assert_eq!(unsplit.original, " src ; tests/grep.rs:5-8,12-13 ");
+		assert_eq!(unsplit.original, " src ; tests/grep.rs:5-8,12-13");
 		assert_eq!(unsplit.path, " src ; tests/grep.rs");
 		assert_eq!(unsplit.ranges.as_ref(), [
 			LineRange { start_line: 5, end_line: Some(8) },

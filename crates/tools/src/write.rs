@@ -49,7 +49,11 @@ const DESCRIPTION: &str =
 	 `.tar.gz`/`.tgz`, and `.tar.zst` archive entries via `archive.ext:path/inside/archive`; other \
 	 archive formats (including `.asar`) are read-only\n- Supports SQLite row operations via \
 	 `db.sqlite:table` (insert), `db.sqlite:table:key` (update with JSON content, delete with \
-	 empty content)\n- Supports registered merge-conflict splices via `conflict://<id>` and \
+	 empty content)\n- Supports whole-file writes to configured or Obsidian-discovered \
+	 `vault://<name>/path` resources; Obsidian operations use `?op=create[&overwrite]`, \
+	 `?op=move&to=<path>`, `?op=delete[&permanent]`, or `?op=open[&newtab]` (the latter three \
+	 require empty content); partial selectors remain read-only\n- Supports registered merge-conflict \
+	 splices via `conflict://<id>` and \
 	 `@ours`/`@base`/`@theirs`/`@both`\n</conditions>\n\n<critical>\n- You SHOULD use Edit tool \
 	 for modifying existing files\n- You NEVER create documentation files (*.md, README) unless \
 	 explicitly requested\n- You NEVER use emojis unless requested\n</critical>";
@@ -57,7 +61,7 @@ const EXECUTABLE_NOTICE: &str = "[Notice: Made executable via chmod +x]";
 const STRIPPED_NOTICE: &str =
 	"Note: auto-stripped hashline display prefixes from content before writing.";
 
-/// Model arguments for `write@1`.
+/// Model arguments for `write@2`.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[schemars(description = "")]
 #[serde(deny_unknown_fields)]
@@ -227,7 +231,7 @@ pub struct ConflictBulkFailure {
 	pub message: Str,
 }
 
-/// Durable successful `write@1` result.
+/// Durable successful `write@2` result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Payload {
 	/// Canonical absolute committed path.
@@ -254,7 +258,7 @@ pub struct Payload {
 	pub operation:          WriteOperation,
 }
 
-/// Durable typed `write@1` failure.
+/// Durable typed `write@2` failure.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fault {
@@ -399,7 +403,7 @@ impl Default for SpecialWriteControl {
 	}
 }
 
-/// Session document boundary used by `write@1`.
+/// Session document boundary used by `write@2`.
 ///
 /// Implementations MUST use the same transaction coordinator and hashline
 /// snapshot store as read/edit. A successful `write_plain` atomically creates
@@ -480,7 +484,7 @@ pub trait WriteDocuments: Send + Sync + 'static {
 	}
 }
 
-/// `write@1` executor.
+/// `write@2` executor.
 pub struct WriteTool<D> {
 	documents:       D,
 	conflicts:       Arc<ConflictRegistry>,
@@ -489,11 +493,11 @@ pub struct WriteTool<D> {
 	spec:            ToolSpec,
 }
 
-/// Returns the host-free `write@1` specification.
+/// Returns the host-free `write@2` specification.
 pub fn spec() -> ToolSpec {
 	ToolSpec {
 		name:            sf!("write"),
-		rev:             Rev { family: Str::new(""), n: 1 },
+		rev:             Rev { family: Str::new(""), n: 2 },
 		description:     sf!(DESCRIPTION),
 		schema:          omp_tool::schema::<Params>(),
 		constraint:      Constraint::Schema {
@@ -524,7 +528,7 @@ pub fn tool<D: WriteDocuments>(documents: D) -> WriteTool<D> {
 	tool_with_conflicts(documents, Arc::new(ConflictRegistry::default()))
 }
 
-/// Construct `write@1` sharing conflict registrations with `read@1`.
+/// Construct `write@2` sharing conflict registrations with `read@2`.
 pub fn tool_with_conflicts<D: WriteDocuments>(
 	documents: D,
 	conflicts: Arc<ConflictRegistry>,
@@ -532,7 +536,7 @@ pub fn tool_with_conflicts<D: WriteDocuments>(
 	tool_with_policy_and_conflicts(documents, conflicts, FormatPolicy::BestEffort, true)
 }
 
-/// Constructs `write@1` with frozen formatting policy and shared conflicts.
+/// Constructs `write@2` with frozen formatting policy and shared conflicts.
 pub fn tool_with_policy_and_conflicts<D: WriteDocuments>(
 	documents: D,
 	conflicts: Arc<ConflictRegistry>,

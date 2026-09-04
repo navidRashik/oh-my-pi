@@ -90,6 +90,20 @@ fn render_web_search_payload(query: Option<&str>, payload: &WebSearchPayload) ->
 					}
 				</col>
 			}
+			if !response.citations.is_empty() {
+				<text bold>{"Citations"}</text>
+				<col max-rows=8 overflow="citations">
+					for citation in &response.citations {
+						<col>
+							<text>{if citation.title.is_empty() { citation.url.as_str() } else { citation.title.as_str() }}</text>
+							<text fg=muted>{citation.url.as_str()}</text>
+							if !citation.cited_text.is_empty() {
+								<text fg=muted>{citation.cited_text.as_str()}</text>
+							}
+						</col>
+					}
+				</col>
+			}
 			<text bold>{"Metadata"}</text>
 			if !response.engine.is_empty() {
 				<fact label="Provider">{response.engine.as_str()}</fact>
@@ -138,9 +152,13 @@ fn source_domain(url: &str) -> Option<&str> {
 }
 
 fn render_web_search_fault(fault: &WebSearchFault) -> El {
-	let WebSearchFault::Search { code, message, .. } = fault;
+	let WebSearchFault::Search { category, code, status, .. } = fault;
+	let category: &'static str = (*category).into();
 	view! {
-		<callout kind="error">{"Provider error ("}{code}{"): "}{message}</callout>
+		<callout kind="error">
+			{"Provider error ("}{category}{": "}{code}{")"}
+			if let Some(status) = status { {sf!(" HTTP {status}")} }
+		</callout>
 	}
 }
 
@@ -153,7 +171,7 @@ pub(crate) fn gallery_fixtures(web_search: ToolIdentity) -> Vec<RendererGalleryF
 			args: r#"{"query":"Bun vs Node.js performance benchmarks 2026","recency":"month","limit":4}"#,
 			progress_update: None,
 			success_outcome: br#"{"kind":"ok","value":{"response":{"engine":"sonar-pro @ Perplexity","answer":"Bun continues to outperform Node.js on raw HTTP throughput and cold-start time thanks to its JavaScriptCore engine and native-Zig runtime, while Node.js retains an edge in ecosystem maturity and long-term stability.\n\nFor script-heavy workflows, Bun's faster startup is the decisive factor.","sources":[{"title":"Bun 1.2 Benchmarks: HTTP, SQLite, and Startup Time","url":"https://bun.sh/blog/bun-v1.2-benchmarks","snippet":"Bun serves roughly 2.5x the requests per second of Node.js on a simple HTTP server and starts in under 10ms.","published_at":"12d ago","author":"The Bun Team"},{"title":"Node.js vs Bun: A 2026 Performance Deep Dive","url":"https://blog.platformatic.dev/nodejs-vs-bun-2026","snippet":"Across CPU-bound workloads the gap narrows, but Bun's faster module resolution keeps cold starts ahead.","published_at":"3d ago","author":"Matteo Collina"},{"title":"Real-world API latency: Bun, Deno, and Node compared","url":"https://www.theregister.com/2026/05/18/js_runtime_latency/","snippet":"Under sustained load p99 latencies converge, suggesting runtime choice matters less for steady-state services.","published_at":"19d ago"},{"title":"Why we migrated our CLI tooling from Node to Bun","url":"https://engineering.example.com/posts/bun-cli-migration","snippet":"Startup dropped from 180ms to 22ms, shaving seconds off every developer command invocation.","published_at":"27d ago","author":"Dana Whitfield"}],"citations":[{"url":"https://bun.sh/blog/bun-v1.2-benchmarks","title":"Bun 1.2 Benchmarks","cited_text":"Bun serves roughly 2.5x the requests per second of Node.js"}],"search_queries":["bun vs node.js performance benchmarks 2026","bun http throughput vs node"],"usage":{"input_tokens":312,"output_tokens":248,"total_tokens":560,"server_tools":{"web_search_requests":2}},"auth_mode":"api_key"}}}"#,
-			error_outcome: br#"{"kind":"faulted","value":{"kind":"search","code":"rate_limit","message":"Perplexity provider returned HTTP 429 (rate limited). Retry after 30s."}}"#,
+			error_outcome: br#"{"kind":"faulted","value":{"kind":"search","provider":"perplexity","category":"rate_limited","code":"resource_exhausted","status":429}}"#,
 		},
 	]
 }
@@ -165,7 +183,7 @@ mod tests {
 	use super::*;
 
 	fn identity(name: &'static str) -> ToolIdentity {
-		ToolIdentity { name: Str::new_static(name), rev: Rev { family: Default::default(), n: 1 } }
+		ToolIdentity { name: Str::new_static(name), rev: Rev { family: Default::default(), n: 2 } }
 	}
 
 	#[test]
@@ -197,6 +215,8 @@ mod tests {
 		assert!(view.contains("<row sep=\" · \"><text>Bun 1.2 Benchmarks"));
 		assert!(view.contains("<text fg=muted>bun.sh</text>"));
 		assert!(view.contains("<text fg=muted>12d ago</text>"));
+		assert!(view.contains("<text bold>Citations</text>"));
+		assert!(view.contains("Bun 1.2 Benchmarks"));
 		assert!(view.contains("<fact label=Provider>sonar-pro @ Perplexity</fact>"));
 		assert!(view.contains("<fact label=Usage><row sep=\" · \">"));
 		assert!(view.contains("<num value=560/>"));
@@ -205,10 +225,7 @@ mod tests {
 			renderer
 				.view(&state, Some(&error))
 				.expect("fault renders")
-				.contains(
-					"<callout kind=error>Provider error (rate_limit): Perplexity provider returned \
-					 HTTP 429"
-				),
+				.contains("<callout kind=error>Provider error (rate_limited: resource_exhausted) HTTP 429"),
 		);
 
 		let mut empty = match &success {

@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Model arguments for `todo@2`.
+/// Model arguments for `todo@3`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
@@ -57,6 +57,7 @@ pub struct Params {
 
 /// One phase of an `init` list.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InitListEntry {
 	/// Phase name.
 	#[schemars(description = "phase name")]
@@ -271,25 +272,34 @@ pub struct Todo {
 }
 /// Creates the core todo slot tool.
 pub fn tool() -> Todo {
-	Todo {
-		phases: Arc::new(Mutex::new(Vec::new())),
-		spec:   ToolSpec {
-			name:            sf!("todo"),
-			rev:             Rev { family: Str::default(), n: 2 },
-			description:     sf!(DESCRIPTION),
-			schema:          omp_tool::schema::<Params>(),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Effects::default(),
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("todo.rs"),
-			)
-			.into(),
+	Todo { phases: Arc::new(Mutex::new(Vec::new())), spec: spec() }
+}
+
+/// Returns the exact `todo@3` declaration shared by native and session-owned
+/// execution.
+///
+/// Production composition routes this identity through a session tool so the
+/// current phase tree is selected from `<meta><todo>` for every call. Keeping
+/// declaration construction here prevents the session adapter from drifting
+/// from the native contract used by revision lifting and isolated tool tests.
+#[must_use]
+pub fn spec() -> ToolSpec {
+	ToolSpec {
+		name:            sf!("todo"),
+		rev:             Rev { family: Str::default(), n: 3 },
+		description:     sf!(DESCRIPTION),
+		schema:          omp_tool::schema::<Params>(),
+		constraint:      Constraint::Schema {
+			priority:       100,
+			on_unsupported: omp_tool::Fallback::Unspecified,
 		},
+		effects:         Effects::default(),
+		projection_code: omp_tool::native_projection_code(
+			env!("CARGO_PKG_NAME"),
+			env!("CARGO_PKG_VERSION"),
+			include_bytes!("todo.rs"),
+		)
+		.into(),
 	}
 }
 
@@ -303,12 +313,18 @@ const DESCRIPTION: &str =
 	 (`list: [{phase, items}]`, or flattened `items` with optional `phase`) replaces the list; \
 	 `start` (`task`) marks in progress; `done`/`drop` (`task` or `phase`; omit both for every \
 	 task) mark completed/abandoned; `block` (`task` or `phase`, optional `reason`) marks open \
-	 tasks blocked; `unblock` (`task` or `phase`) returns blocked tasks to pending; `rm` (optional \
+	 tasks blocked while awaiting external input and excludes them from incomplete-work reminders; \
+	 blocking the active task promotes the next pending task. `unblock` (`task` or `phase`) returns \
+	 blocked tasks to pending; `rm` (optional \
 	 `task` or `phase`; omit both to clear) removes tasks; `append` (`phase`, `items`) adds tasks \
 	 and lazily creates the phase; `view` echoes the list read-only.\n\nTask content: 5-10 words, \
 	 what not how, unique. Phase name: short unique noun phrase, never numbered. Keep introduced \
-	 `task`/`phase` strings stable; when the exact text is lost, `view` echoes it. Batch todo \
-	 calls with real work, never as a turn's only call.";
+	 `task`/`phase` strings stable; when the exact text is lost, `view` echoes it. Mark tasks done \
+	 immediately and \
+	 complete phases in order. Create a list for work with at least three distinct steps, whenever \
+	 the user requests one or supplies multiple items, and when new instructions arrive mid-task. \
+	 A user-provided checklist is exhaustive: initialize every item separately, never summarize or \
+	 track part of it from memory. Batch todo calls with real work, never as a turn's only call.";
 
 /// Phase name for a flattened `init` that supplies `items` without `phase`.
 const DEFAULT_INIT_PHASE: &str = "Tasks";
@@ -359,15 +375,7 @@ impl Tool for Todo {
 	}
 
 	fn prompt(&self, view: Result<&Payload, &Fault>, _: &PromptCaps) -> Vec<Part> {
-		let text = match view {
-			Ok(payload) => summary(&payload.phases, payload.op == Op::View),
-			Err(fault) => {
-				let mut text = String::from("Errors: ");
-				let _ = write!(text, "{fault}");
-				text
-			},
-		};
-		vec![Part::Text { text: Str::from(text) }]
+		vec![Part::Text { text: Str::from(model_output(view)) }]
 	}
 
 	fn lift(&self, from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
@@ -397,7 +405,15 @@ struct LenientParams {
 /// Validates execute-time arguments, repairing an omitted `op` when the payload
 /// shape is unambiguous: `list` → `init`; `items` + `phase` → `append`; bare
 /// `items` with nothing tracked → `init`.
-fn resolve_params(raw: serde_json::Value, has_existing_phases: bool) -> Result<Params, ArgIssue> {
+///
+/// # Errors
+///
+/// Returns a structured argument issue when the object is malformed or its
+/// missing operation cannot be inferred without risking state loss.
+pub fn resolve_params(
+	raw: serde_json::Value,
+	has_existing_phases: bool,
+) -> Result<Params, ArgIssue> {
 	let LenientParams { op, list, task, phase, items, reason } = serde_json::from_value(raw)
 		.map_err(|_| ArgIssue {
 			path:     Vec::new(),
@@ -742,6 +758,19 @@ fn completion_transitions(previous: &[Phase], updated: &[Phase]) -> Vec<Completi
 		.collect()
 }
 
+/// Builds the model-facing text for either terminal todo outcome.
+#[must_use]
+pub fn model_output(view: Result<&Payload, &Fault>) -> String {
+	match view {
+		Ok(payload) => summary(&payload.phases, payload.op == Op::View),
+		Err(fault) => {
+			let mut text = String::from("Errors: ");
+			let _ = write!(text, "{fault}");
+			text
+		},
+	}
+}
+
 /// Model-facing summary of a phase tree: remaining work, overall counts, the
 /// active phase, and the full checklist.
 pub fn summary(phases: &[Phase], read_only: bool) -> String {
@@ -1048,10 +1077,21 @@ impl Rev1Phase {
 	}
 }
 
-/// Migrates a `todo@1` call to `todo@2`. Faulted verdicts carried prose
-/// messages with no typed equivalent and stay transcript data.
+/// Migrates historical todo calls to `todo@3`. Revision 2 already has the
+/// current argument and payload shapes, so its lift is byte-preserving.
+/// Revision 1 faulted verdicts carried prose with no typed equivalent and stay
+/// transcript data.
 fn lift_rev1(from: &Rev, call: RecordedCall<'_>) -> Option<LiftedCall> {
-	if !from.family.is_empty() || from.n != 1 {
+	if !from.family.is_empty() {
+		return None;
+	}
+	if from.n == 2 {
+		return Some(LiftedCall {
+			raw_args: Bytes::copy_from_slice(call.raw_args),
+			verdict: Bytes::copy_from_slice(call.verdict),
+		});
+	}
+	if from.n != 1 {
 		return None;
 	}
 	let args = serde_json::from_slice::<Rev1Params>(call.raw_args).ok()?;
@@ -1207,9 +1247,9 @@ mod tests {
 	}
 
 	#[test]
-	fn revision_two_schema_is_the_pi_todo_wire_contract() {
+	fn revision_three_schema_is_the_pi_todo_wire_contract() {
 		let todo = tool();
-		assert_eq!(todo.spec().rev, Rev { family: Str::default(), n: 2 });
+		assert_eq!(todo.spec().rev, Rev { family: Str::default(), n: 3 });
 		let schema: serde_json::Value =
 			serde_json::from_slice(&todo.spec().schema).expect("todo schema is JSON");
 		let properties = schema["properties"].as_object().expect("object properties");
@@ -1839,9 +1879,21 @@ mod tests {
 				.lift(&from, RecordedCall { raw_args, verdict: faulted })
 				.is_none()
 		);
+		let rev_two_args =
+			br#"{"i":"Tracking","op":"view","task":"port"}"#;
+		let rev_two_verdict =
+			br#"{"kind":"ok","value":{"op":"view","phases":[{"name":"Build","tasks":[{"content":"port","status":"in_progress"}]}]}}"#;
+		let rev_two = todo
+			.lift(
+				&Rev { family: Str::default(), n: 2 },
+				RecordedCall { raw_args: rev_two_args, verdict: rev_two_verdict },
+			)
+			.expect("rev 2 lifts byte-for-byte");
+		assert_eq!(rev_two.raw_args.as_ref(), rev_two_args);
+		assert_eq!(rev_two.verdict.as_ref(), rev_two_verdict);
 		assert!(
 			todo
-				.lift(&Rev { family: Str::default(), n: 2 }, RecordedCall { raw_args, verdict })
+				.lift(&Rev { family: Str::default(), n: 3 }, RecordedCall { raw_args, verdict })
 				.is_none()
 		);
 	}

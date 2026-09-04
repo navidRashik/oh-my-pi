@@ -250,7 +250,8 @@ omp_con::var! {
 		default: false,
 		flags: archive,
 	};
-	/// pi `vault.enabled` (boolean, default: false).
+	/// Enables Obsidian discovery and CLI operations; configured filesystem
+	/// vaults remain available independently (pi `vault.enabled`, default false).
 	pub static SV_VAULT_ENABLED = sv_vault_enabled: bool {
 		default: false,
 		flags: archive,
@@ -258,21 +259,6 @@ omp_con::var! {
 	/// pi `github.enabled` (boolean, default: false).
 	pub static SV_GITHUB_ENABLED = sv_github_enabled: bool {
 		default: false,
-		flags: archive,
-	};
-	/// pi `github.cache.enabled` (boolean, default: true).
-	pub static SV_GITHUB_CACHE_ENABLED = sv_github_cache_enabled: bool {
-		default: true,
-		flags: archive,
-	};
-	/// pi `github.cache.softTtlSec` (number, default: 300).
-	pub static SV_GITHUB_CACHE_SOFT_TTL_SEC = sv_github_cache_soft_ttl_sec: i64 {
-		default: 300,
-		flags: archive,
-	};
-	/// pi `github.cache.hardTtlSec` (number, default: 604800).
-	pub static SV_GITHUB_CACHE_HARD_TTL_SEC = sv_github_cache_hard_ttl_sec: i64 {
-		default: 604800,
 		flags: archive,
 	};
 	/// pi `exa.enabled` (boolean, default: true).
@@ -342,9 +328,6 @@ pub const LEGACY_CONVAR_MAPPINGS: &[(&str, &str)] = &[
 	("checkpoint.enabled", "sv_checkpoint_enabled"),
 	("vault.enabled", "sv_vault_enabled"),
 	("github.enabled", "sv_github_enabled"),
-	("github.cache.enabled", "sv_github_cache_enabled"),
-	("github.cache.softTtlSec", "sv_github_cache_soft_ttl_sec"),
-	("github.cache.hardTtlSec", "sv_github_cache_hard_ttl_sec"),
 	("exa.enabled", "sv_exa_enabled"),
 	("exa.searchDelayMs", "sv_exa_search_delay_ms"),
 ];

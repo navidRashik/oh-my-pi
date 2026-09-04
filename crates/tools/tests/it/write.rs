@@ -1,4 +1,4 @@
-//! `write@1` schema, guards, transactions, and exact output contracts.
+//! `write@2` schema, guards, transactions, and exact output contracts.
 
 use std::{future, future::Future, sync::Arc, time::Duration};
 
@@ -168,7 +168,7 @@ fn generated_schema_definition_and_revision_are_exact() {
 	);
 	let tool = write::tool(documents);
 	assert_eq!(tool.spec().name, "write");
-	assert_eq!(tool.spec().rev.to_string(), "1");
+	assert_eq!(tool.spec().rev.to_string(), "2");
 	assert_eq!(
 		tool.spec().schema.as_ref(),
 		omp_tool::schema::<write::Params>().as_ref(),
@@ -209,7 +209,11 @@ fn generated_schema_definition_and_revision_are_exact() {
 		 `.tar.gz`/`.tgz`, and `.tar.zst` archive entries via `archive.ext:path/inside/archive`; \
 		 other archive formats (including `.asar`) are read-only\n- Supports SQLite row operations \
 		 via `db.sqlite:table` (insert), `db.sqlite:table:key` (update with JSON content, delete \
-		 with empty content)\n- Supports registered merge-conflict splices via `conflict://<id>` \
+		 with empty content)\n- Supports whole-file writes to configured or Obsidian-discovered \
+		 `vault://<name>/path` resources; Obsidian operations use `?op=create[&overwrite]`, \
+		 `?op=move&to=<path>`, `?op=delete[&permanent]`, or `?op=open[&newtab]` (the latter three \
+		 require empty content); partial selectors remain read-only\n- Supports registered \
+		 merge-conflict splices via `conflict://<id>` \
 		 and `@ours`/`@base`/`@theirs`/`@both`\n</conditions>\n\n<critical>\n- You SHOULD use Edit \
 		 tool for modifying existing files\n- You NEVER create documentation files (*.md, README) \
 		 unless explicitly requested\n- You NEVER use emojis unless requested\n</critical>"

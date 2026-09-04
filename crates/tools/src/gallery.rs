@@ -63,7 +63,10 @@ pub fn builtin_renderer_gallery() -> BuiltinRendererGallery {
 	let lsp = identity("lsp", "");
 	let debug = identity("debug", "");
 	let goal = identity("goal", "");
-	let github = identity("github", "");
+	let github = ToolIdentity {
+		name: Str::new_static("github"),
+		rev: Rev { family: Str::default(), n: 3 },
+	};
 	let browser = identity("browser", "");
 	let computer = identity("computer", "");
 	let identities = BuiltinRendererIdentities {

@@ -69,6 +69,7 @@ const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, d
 - Internal resources enforce owner byte/entry ceilings; path-only resolution returns metadata without content. Binary/oversized resources return selector or materialized-path guidance rather than inline bytes.
 - `ssh://host/<path>` reads remote files/directories; bare `ssh://` lists hosts; specific remote files are searchable with `grep`.
   Literal `:`, `?`, `#` → percent-encode (`%3A`/`%3F`/`%23`). For remote operations unsupported by `ssh://`, use `bash` with a remote SSH command or mount with `sshfs`.
+- `vault://<name>/<path>` reads configured or Obsidian-discovered vault files/directories; bare `vault://` lists effective roots. `?op=read` uses Obsidian's CLI and `?op=search&q=…` searches a vault. Create/move/delete/open operations route through `write`.
 - Literal `:`, `?`, `#` in other URI-like member paths → percent-encode (`%3A`/`%3F`/`%23`).
 
 <critical>

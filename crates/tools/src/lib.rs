@@ -69,7 +69,7 @@ pub mod ast_edit;
 pub mod ast_grep;
 /// Supervised embedded browser automation.
 pub mod browser;
-/// Durable exploration checkpoint and boundary-rewind tools.
+/// Named durable workspace/session checkpoint and boundary-rewind tools.
 pub mod checkpoint;
 /// Native desktop capture, input, and accessibility.
 pub mod computer;

@@ -135,7 +135,7 @@ pub(crate) fn gallery_fixtures(goal: ToolIdentity) -> Vec<RendererGalleryFixture
 		streaming_args: r#"{"op":"create","objective":"Ship the auth hardening pass: per-account rate"#,
 		args: r#"{"op":"create","objective":"Ship the auth hardening pass: per-account rate limits and sliding session expiry.","token_budget":500000}"#,
 		progress_update: None,
-		success_outcome: br#"{"kind":"ok","value":{"op":"create","goal":{"id":"goal_8f2a","objective":"Ship the auth hardening pass: per-account rate limits and sliding session expiry.","status":"active","token_budget":500000,"tokens_used":48200,"time_used_secs":312},"remaining_tokens":451800,"completion_report":null}}"#,
+		success_outcome: br#"{"kind":"ok","value":{"op":"create","goal":{"id":"goal_8f2a","objective":"Ship the auth hardening pass: per-account rate limits and sliding session expiry.","status":"active","token_budget":500000,"tokens_used":48200,"time_used_secs":312,"created_at_ms":1749200000000,"updated_at_ms":1749200312000},"remaining_tokens":451800,"completion_report":null}}"#,
 		error_outcome: br#"{"kind":"faulted","value":{"kind":"objective_required"}}"#,
 	}]
 }
@@ -179,6 +179,8 @@ mod tests {
 				token_budget:   Some(500_000),
 				tokens_used:    48_200,
 				time_used_secs: 312,
+				created_at_ms:  0,
+				updated_at_ms:  0,
 			}),
 			remaining_tokens:  Some(451_800),
 			completion_report: None,
@@ -210,6 +212,8 @@ mod tests {
 				token_budget:   None,
 				tokens_used:    987,
 				time_used_secs: 0,
+				created_at_ms:  0,
+				updated_at_ms:  0,
 			}),
 			remaining_tokens:  None,
 			completion_report: Some(Str::new_static("Shipped <all> renderers & fixtures")),
