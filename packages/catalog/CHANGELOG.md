@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed GitHub Copilot (and other discovered providers) inheriting a cross-provider `requestModelId` when a served model id collides with a model bundled only under another provider, which sent an invalid wire model and returned HTTP 400 `model_not_supported` ([#10796](https://github.com/can1357/oh-my-pi/issues/10796)).
+- Fixed GitHub Copilot (and other discovered providers) inheriting a cross-provider `requestModelId` when a served model id collides with a model bundled only under another provider, which sent an invalid wire model and returned HTTP 400 `model_not_supported`; upgrading invalidates the affected GitHub Copilot model cache so poisoned rows refetch instead of persisting for the cache TTL ([#10796](https://github.com/can1357/oh-my-pi/issues/10796)).
 
 ## [18.1.9] - 2026-09-04
 

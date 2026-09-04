@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { createModelManager } from "@oh-my-pi/pi-catalog/model-manager";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { githubCopilotModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
@@ -387,6 +389,48 @@ describe("github copilot model limits mapping", () => {
 		// Provider-independent metadata still crosses (this is why the global
 		// index exists): the cursor context window is inherited.
 		expect(model?.contextWindow).toBe(collision!.contextWindow);
+	});
+	it("abandons a pre-fix cache row carrying a cross-provider requestModelId (#10796)", async () => {
+		// The sanitizer only runs during discovery. A user who discovered a
+		// colliding model on a pre-fix build has an authoritative cache row that
+		// still carries the leaked `requestModelId`; `online-if-uncached` serves
+		// it for the full TTL without re-probing, so the invalid wire model keeps
+		// 400ing until expiry. Bumping the namespace to `models-v2` strands that
+		// row: the manager now keys on a namespace the poisoned row never used, so
+		// the read misses and discovery re-runs the sanitizer.
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-copilot-xprovider-cache-"));
+		const cacheDbPath = path.join(tempDir, "models.db");
+		try {
+			const apiKey = "copilot-test-key";
+			const currentNamespace = githubCopilotModelManagerOptions({ apiKey }).cacheProviderId;
+			expect(currentNamespace).toContain(":models-v2:");
+			// The pre-fix build wrote the poisoned row under the v1 namespace.
+			const legacyNamespace = currentNamespace!.replace(":models-v2:", ":models-v1:");
+
+			const collision = getBundledModels("cursor").find(
+				candidate => candidate.requestModelId && candidate.id.startsWith("cursor-"),
+			);
+			expect(collision).toBeDefined();
+			const servedId = collision!.id;
+			const poisoned = buildModel({
+				...cachedCopilotCompletionModel(servedId, servedId),
+				requestModelId: collision!.requestModelId,
+			});
+			expect(poisoned.requestModelId).toBe(collision!.requestModelId);
+			writeModelCache(legacyNamespace, Date.now(), [poisoned], true, "pre-10796", cacheDbPath);
+
+			const legacy = readModelCache(legacyNamespace, Number.POSITIVE_INFINITY, Date.now, cacheDbPath);
+			const current = readModelCache(currentNamespace!, Number.POSITIVE_INFINITY, Date.now, cacheDbPath);
+			// The poisoned wire id is real and still present under the old namespace...
+			expect(legacy?.models.find(candidate => candidate.id === servedId)?.requestModelId).toBe(
+				collision!.requestModelId,
+			);
+			// ...but the namespace the manager now reads never sees it, forcing a
+			// sanitized refetch instead of serving the stale cross-provider id.
+			expect(current).toBeNull();
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
 	});
 	it("routes mai-code models to the openai-responses endpoint (#5612)", async () => {
 		// Copilot's /chat/completions rejects mai-* models with
