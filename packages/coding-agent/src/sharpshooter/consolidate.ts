@@ -158,10 +158,6 @@ async function consolidateLocked(
 		// fresh isolated provider session from the CURRENT foreground session so it
 		// cannot advance the foreground turn or a concurrent side request (#10865).
 		using identity = sideRequestIdentity(options.modelRegistry.authStorage, options.getSessionId(), model.provider);
-		// Resolve the isolated credential before building metadata so account_uuid
-		// matches the bearer this session is pinned to, not a first-account fallback (#10869).
-		await options.modelRegistry.getApiKey(model, identity.sessionId);
-		const metadata = identity.metadata(model.provider);
 		const response = await retryTransientCompletion(() =>
 			completeSimple(
 				model,
@@ -173,7 +169,7 @@ async function consolidateLocked(
 				{
 					apiKey: options.modelRegistry.resolver(model, identity.sessionId),
 					sessionId: identity.sessionId,
-					metadata,
+					metadataResolver: identity.metadata,
 					maxTokens: 8192,
 					reasoning: clampThinkingLevelForModel(model, Effort.Medium),
 					toolChoice: "required",

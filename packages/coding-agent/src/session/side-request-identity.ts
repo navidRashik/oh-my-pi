@@ -37,14 +37,19 @@ export interface SideRequestIdentity {
 	 * request's own retries because it is captured once, before the retry loop.
 	 */
 	readonly sessionId: string;
+	/** Seed the foreground account preference before resolving a provider credential. */
+	prepare(provider: string): void;
 	/**
-	 * Isolated `metadata` payload for the request's target provider. Build it
-	 * *after* resolving this session's credential (`getApiKey`/`resolver`), so
-	 * `account_uuid` reflects the account whose bearer the request actually uses.
+	 * Isolated metadata for the request's target provider. Pass this method as
+	 * `SimpleStreamOptions.metadataResolver`: the stream resolves it after each
+	 * credential selection, so `account_uuid` follows the bearer selected for
+	 * every auth-retry attempt. Direct callers MUST invoke it only after resolving
+	 * that attempt's credential.
+	 *
 	 * The first call for a provider also seeds the foreground session's active
-	 * OAuth account as this session's initial preference (a no-op once the factory
-	 * seeded the same provider); it never re-pins, so a credential rotation
-	 * recorded on this session (blocked/exhausted account) survives.
+	 * OAuth account as this session's initial preference (a no-op once
+	 * {@link prepare} or the factory seeded it); it never re-pins, so a credential
+	 * rotation recorded on this session survives.
 	 */
 	metadata(provider: string): Record<string, unknown>;
 	/** Release this request's ephemeral credential affinity and persistent sticky rows. */
@@ -84,13 +89,13 @@ export function seedSideRequestCredential(
  * released at scope exit. Pass `authStorage` (from `modelRegistry.authStorage`)
  * so OAuth credential affinity is preserved while the request is active.
  *
- * Pass `provider` when it is known up front (every completion call site knows
- * its model's provider): the foreground account is seeded onto this session
- * *before* the caller resolves the credential, so `getApiKey` reuses that
- * account instead of hash-ranking to a different one — and the metadata built
- * afterwards attributes to the resolved bearer. Seeding lazily inside
- * {@link SideRequestIdentity.metadata} would run after `getApiKey` and no-op,
- * losing the affinity.
+ * Pass `provider` when it is known up front. If the model/provider is resolved
+ * later, call {@link SideRequestIdentity.prepare} immediately before
+ * `getApiKey`. Either path seeds the foreground account onto this session
+ * before credential selection, so a healthy warm account is retained instead
+ * of hash-ranking to another. Pass {@link SideRequestIdentity.metadata} as the
+ * request metadata resolver so attribution follows whichever account selection
+ * or auth retry actually uses.
  */
 export function sideRequestIdentity(
 	authStorage: AuthStorage | undefined,
@@ -107,6 +112,7 @@ export function sideRequestIdentity(
 	if (provider !== undefined) seed(provider);
 	return {
 		sessionId,
+		prepare: seed,
 		metadata(target: string): Record<string, unknown> {
 			seed(target);
 			return buildSessionMetadata(sessionId, target, authStorage);

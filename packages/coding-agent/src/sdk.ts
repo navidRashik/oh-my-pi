@@ -1193,7 +1193,7 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
 /** Provider identity and credentials captured atomically for one auto-learn run. */
 interface AutoLearnCaptureIdentity {
 	sessionId: string;
-	metadata: Record<string, unknown> | undefined;
+	metadataResolver: (provider: string) => Record<string, unknown> | undefined;
 	getApiKey?: AgentOptions["getApiKey"];
 	/** Release this capture's ephemeral credential affinity. */
 	[Symbol.dispose](): void;
@@ -1209,10 +1209,10 @@ export interface AutoLearnCaptureRunnerOptions {
 	/**
 	 * Snapshot an isolated provider identity for one capture. Invoked at capture
 	 * start because the controller survives `newSession`/`switchSession`; the
-	 * returned session id, metadata, and credential resolver must all describe
-	 * that same foreground session.
+	 * returned session id, metadata resolver, and credential resolver must all
+	 * describe that same foreground session.
 	 */
-	createIdentity?: (model: Model) => AutoLearnCaptureIdentity | Promise<AutoLearnCaptureIdentity>;
+	createIdentity?: (model: Model) => AutoLearnCaptureIdentity;
 }
 
 /** Build a private capture runner over a detached message snapshot and provider session. */
@@ -1224,7 +1224,7 @@ export function createAutoLearnCaptureRunner(
 		const captureModel = options.sourceAgent.state.model;
 		if (!captureModel) return;
 
-		using identity = await options.createIdentity?.(captureModel);
+		using identity = options.createIdentity?.(captureModel);
 		const captureSessionId = identity?.sessionId ?? Bun.randomUUIDv7();
 		const captureProviderSessionState = new Map<string, ProviderSessionState>();
 		const captureMessages = options.sourceAgent.state.messages.map((message): AgentMessage => {
@@ -1252,11 +1252,9 @@ export function createAutoLearnCaptureRunner(
 			onPayload: options.onPayload,
 			onResponse: options.onResponse,
 		});
-		if (identity) {
-			captureAgent.metadata = identity.metadata;
-		} else {
-			captureAgent.setMetadataResolver(provider => options.sourceAgent.metadataForProvider(provider));
-		}
+		captureAgent.setMetadataResolver(
+			identity?.metadataResolver ?? (provider => options.sourceAgent.metadataForProvider(provider)),
+		);
 		const captureMessage: CustomMessage = {
 			role: "custom",
 			customType: "autolearn-nudge",
@@ -4153,14 +4151,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const runAutoLearnCapture = createAutoLearnCaptureRunner({
 			sourceAgent: agent,
 			captureTools: autoLearnCaptureTools,
-			createIdentity: async captureModel => {
+			createIdentity: captureModel => {
 				const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, captureModel.provider);
-				// Resolve the isolated credential before freezing metadata so its
-				// account_uuid matches the bearer this capture will use (#10869).
-				await modelRegistry.getApiKey(captureModel, identity.sessionId);
 				return {
 					sessionId: identity.sessionId,
-					metadata: identity.metadata(captureModel.provider),
+					metadataResolver: identity.metadata,
 					getApiKey: requestModel => modelRegistry.resolver(requestModel, identity.sessionId),
 					[Symbol.dispose]: () => identity[Symbol.dispose](),
 				};

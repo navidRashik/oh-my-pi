@@ -3,7 +3,14 @@ import type * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { type ApiKey, completeSimple, Effort, type Model, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import {
+	type ApiKey,
+	completeSimple,
+	Effort,
+	type Model,
+	retryTransientCompletion,
+	type SimpleStreamOptions,
+} from "@oh-my-pi/pi-ai";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { getAgentDbPath, getMemoriesDir, isEnoent, logger, parseJsonlLenient, prompt } from "@oh-my-pi/pi-utils";
 
@@ -405,9 +412,6 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 			// its own isolated provider session so they cannot advance the foreground
 			// turn or one another (#10865).
 			using identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, phase1Model.provider);
-			// Resolve the isolated credential before building metadata (below) so
-			// account_uuid matches the bearer this session is pinned to (#10869).
-			await modelRegistry.getApiKey(phase1Model, identity.sessionId);
 			const result = await runStage1Job({
 				claim,
 				model: phase1Model,
@@ -415,7 +419,7 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 				sessionId: identity.sessionId,
 				modelMaxTokens: computeModelTokenBudget(phase1Model, config),
 				config,
-				metadata: identity.metadata(phase1Model.provider),
+				metadataResolver: identity.metadata,
 			});
 			if (!isMemoryStartupActive(options)) return;
 
@@ -539,8 +543,8 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 			return;
 		}
 		using identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, phase2Model.provider);
-		// Resolve the isolated session's credential (not the foreground's) so the pin
-		// it records is the account the metadata built below attributes to (#10869).
+		// Resolve the initial credential on the isolated session (not the
+		// foreground); request-time metadata follows this pin and retry rotation.
 		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, identity.sessionId);
 		if (!phase2ApiKey) {
 			markPhase2FailureWithFallback(db, {
@@ -579,7 +583,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 				model: phase2Model,
 				apiKey: modelRegistry.resolver(phase2Model, identity.sessionId),
 				sessionId: identity.sessionId,
-				metadata: identity.metadata(phase2Model.provider),
+				metadataResolver: identity.metadata,
 			});
 			if (!isMemoryStartupActive(options)) return;
 			await applyConsolidation(memoryRoot, consolidated);
@@ -740,7 +744,7 @@ async function runStage1Job(options: {
 	sessionId: string;
 	modelMaxTokens: number;
 	config: MemoryRuntimeConfig;
-	metadata?: Record<string, unknown>;
+	metadataResolver?: SimpleStreamOptions["metadataResolver"];
 }): Promise<
 	| {
 			kind: "output";
@@ -775,7 +779,7 @@ async function runStage1Job(options: {
 				{
 					apiKey,
 					sessionId: options.sessionId,
-					metadata: options.metadata,
+					metadataResolver: options.metadataResolver,
 					maxTokens: Math.max(1024, Math.min(4096, Math.floor(modelMaxTokens * 0.2))),
 					reasoning: clampThinkingLevelForModel(model, Effort.Low),
 				},
@@ -886,7 +890,7 @@ async function runConsolidationModel(options: {
 	model: Model;
 	apiKey: ApiKey;
 	sessionId: string;
-	metadata?: Record<string, unknown>;
+	metadataResolver?: SimpleStreamOptions["metadataResolver"];
 }): Promise<{
 	memoryMd: string;
 	memorySummary: string;
@@ -916,7 +920,7 @@ async function runConsolidationModel(options: {
 			{
 				apiKey,
 				sessionId: options.sessionId,
-				metadata: options.metadata,
+				metadataResolver: options.metadataResolver,
 				maxTokens: 8192,
 				reasoning: clampThinkingLevelForModel(model, Effort.Medium),
 			},

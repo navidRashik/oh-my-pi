@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { applyInferenceHeaders } from "@oh-my-pi/pi-ai/providers/inference-headers";
 import { buildSessionMetadata } from "@oh-my-pi/pi-coding-agent/session/session-metadata";
 import { sideRequestIdentity } from "@oh-my-pi/pi-coding-agent/session/side-request-identity";
 
@@ -62,6 +63,23 @@ describe("side-request identity (issue #10865)", () => {
 		// carry a different one so it cannot advance the foreground provider session.
 		expect(sideSessionId).toBe(identity.sessionId);
 		expect(sideSessionId).not.toBe(foregroundSessionId);
+	});
+
+	it("projects the isolated identity into final Anthropic metadata and session header", () => {
+		const foreground = "provider-session-foreground";
+		using identity = sideRequestIdentity(undefined, foreground, "anthropic");
+		const headers: Record<string, string> = {};
+		applyInferenceHeaders(headers, {
+			provider: "anthropic",
+			protocol: "anthropic",
+			sessionId: identity.sessionId,
+		});
+
+		expect(headers["X-Claude-Code-Session-Id"]).toBe(identity.sessionId);
+		expect(headers["X-Claude-Code-Session-Id"]).not.toBe(foreground);
+		const userId = readUserId(identity.metadata("anthropic"));
+		expect(userId.session_id).toBe(identity.sessionId);
+		expect(userId.session_id).not.toBe(foreground);
 	});
 
 	it("seeds the foreground's active OAuth account while isolating the session id", async () => {

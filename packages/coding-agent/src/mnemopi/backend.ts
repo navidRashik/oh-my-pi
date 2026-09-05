@@ -602,9 +602,6 @@ async function resolveMnemopiProviderOptions(
 					});
 					return null;
 				}
-				// Build metadata after the credential resolves so account_uuid matches
-				// the bearer this session was pinned to, not a first-account fallback (#10869).
-				const metadata = identity.metadata(model.provider);
 				const message = await retryTransientCompletion(() =>
 					completeSimple(
 						model,
@@ -615,7 +612,7 @@ async function resolveMnemopiProviderOptions(
 						{
 							apiKey: modelRegistry.resolver(model, identity.sessionId),
 							sessionId: identity.sessionId,
-							metadata,
+							metadataResolver: identity.metadata,
 							maxTokens: opts?.maxTokens,
 							temperature: opts?.temperature,
 						},

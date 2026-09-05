@@ -145,7 +145,7 @@ describe("runSharpshooterConsolidation", () => {
 		expect(sentSessionId).not.toBe(foregroundSessionId);
 		// The metadata ordering identity must match that isolated session id, not
 		// the foreground one.
-		const rawUserId = options?.metadata?.user_id;
+		const rawUserId = options?.metadataResolver?.("anthropic")?.user_id;
 		if (typeof rawUserId !== "string") throw new Error("expected metadata.user_id string");
 		const userId: unknown = JSON.parse(rawUserId);
 		if (!userId || typeof userId !== "object" || !("session_id" in userId) || typeof userId.session_id !== "string") {

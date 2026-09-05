@@ -626,6 +626,7 @@ export class ModelControls {
 					sessionId: identity.sessionId,
 					signal: controller.signal,
 					metadataResolver: identity.metadata,
+					prepareProvider: identity.prepare,
 					onUsage: usage => {
 						const entryId = this.#host.sessionManager.appendModelUsage(
 							{ purpose: "auto-thinking", ...usage },

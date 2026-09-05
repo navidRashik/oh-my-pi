@@ -299,9 +299,9 @@ export async function attemptEditAutoRepair(options: {
 	// continuation; give it an isolated provider session so its completion does
 	// not insert unrelated provider state into the foreground turn (#10865).
 	using identity = sideRequestIdentity(registry.authStorage, sessionId ?? "", model.provider);
-	// Resolve the isolated key eagerly so the session-sticky credential is
-	// recorded before metadata is built — account_uuid must match the bearer
-	// (#10869) — and an unauthenticated smol role bails before any region work.
+	// Resolve the initial isolated key eagerly so an unauthenticated smol role
+	// bails before any region work. The request-time metadata resolver below
+	// follows this pin and any later auth-retry rotation (#10869).
 	const apiKey = await registry.getApiKey(model, identity.sessionId);
 	if (!apiKey) return undefined;
 	// Repair against the bytes on disk, not the snapshot: a later operation in
@@ -326,7 +326,7 @@ export async function attemptEditAutoRepair(options: {
 					{
 						apiKey: registry.resolver(model, identity.sessionId),
 						sessionId: identity.sessionId,
-						metadata: identity.metadata(model.provider),
+						metadataResolver: identity.metadata,
 						maxTokens: COMPLETION_MAX_TOKENS,
 						disableReasoning: true,
 						signal,

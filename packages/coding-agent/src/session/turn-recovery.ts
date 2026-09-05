@@ -936,6 +936,7 @@ export class TurnRecovery {
 					registry: this.#host.modelRegistry,
 					sessionId: identity.sessionId,
 					metadataResolver: identity.metadata,
+					prepareProvider: identity.prepare,
 					signal: controller.signal,
 				});
 			} finally {

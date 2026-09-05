@@ -86,9 +86,6 @@ export class SpeechEnhancer {
 			using identity = sideRequestIdentity(registry.authStorage, this.#deps.getSessionId(), model.provider);
 			const apiKey = await registry.getApiKey(model, identity.sessionId);
 			if (!apiKey) return null;
-			// Build metadata after the credential resolves so account_uuid matches the
-			// bearer this session was pinned to, not a first-account fallback (#10869).
-			const metadata = identity.metadata(model.provider);
 			const response = await retryTransientCompletion(
 				() => {
 					const timeout = AbortSignal.timeout(REWRITE_TIMEOUT_MS);
@@ -103,7 +100,7 @@ export class SpeechEnhancer {
 							sessionId: identity.sessionId,
 							maxTokens: ANSWER_MAX_TOKENS,
 							disableReasoning: true,
-							metadata,
+							metadataResolver: identity.metadata,
 							signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 						},
 					);

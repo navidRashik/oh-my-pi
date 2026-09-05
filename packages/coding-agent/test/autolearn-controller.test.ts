@@ -381,7 +381,7 @@ describe("isolated auto-learn capture", () => {
 			captureTools: [manageSkillTool],
 			createIdentity: () => ({
 				sessionId: "0193c8f2-7b1a-7c4d-9e2f-123456789abc",
-				metadata: undefined,
+				metadataResolver: () => undefined,
 				[Symbol.dispose]: () => {},
 			}),
 			createAgent: options => {
@@ -517,7 +517,7 @@ describe("isolated auto-learn capture", () => {
 				if (!foregroundSessionId) throw new Error("expected active foreground session");
 				return {
 					sessionId: `capture-${foregroundSessionId}`,
-					metadata: { user_id: accountsBySession[foregroundSessionId] },
+					metadataResolver: () => ({ user_id: accountsBySession[foregroundSessionId] }),
 					getApiKey: () => async () => {
 						resolvedAffinities.push(foregroundSessionId);
 						return credentialsBySession[foregroundSessionId];
