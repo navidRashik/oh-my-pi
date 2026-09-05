@@ -216,7 +216,10 @@ async function runSharpshooterExtraction(
 	// Extraction starts as soon as a user message is committed and runs without
 	// blocking, so it can overlap the foreground turn: isolate its provider
 	// session so it cannot advance the foreground one (#10865).
-	using identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
+	using identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, model.provider);
+	// Resolve the isolated credential before building metadata so account_uuid
+	// matches the bearer this session is pinned to, not a first-account fallback (#10869).
+	await modelRegistry.getApiKey(model, identity.sessionId);
 	const metadata = identity.metadata(model.provider);
 	const response = await retryTransientCompletion(() =>
 		completeSimple(

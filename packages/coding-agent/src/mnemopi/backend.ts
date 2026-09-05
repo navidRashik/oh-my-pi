@@ -593,8 +593,7 @@ async function resolveMnemopiProviderOptions(
 				// a completion cannot advance the foreground turn or another memory
 				// request, and never authenticates a switched session against the
 				// account captured at startup (#10865).
-				using identity = sideRequestIdentity(modelRegistry.authStorage, getForegroundSessionId());
-				const metadata = identity.metadata(model.provider);
+				using identity = sideRequestIdentity(modelRegistry.authStorage, getForegroundSessionId(), model.provider);
 				const hasApiKey = await modelRegistry.getApiKey(model, identity.sessionId);
 				if (!hasApiKey) {
 					logger.warn("Mnemopi: smol completion requested but no current API key is available.", {
@@ -603,6 +602,9 @@ async function resolveMnemopiProviderOptions(
 					});
 					return null;
 				}
+				// Build metadata after the credential resolves so account_uuid matches
+				// the bearer this session was pinned to, not a first-account fallback (#10869).
+				const metadata = identity.metadata(model.provider);
 				const message = await retryTransientCompletion(() =>
 					completeSimple(
 						model,

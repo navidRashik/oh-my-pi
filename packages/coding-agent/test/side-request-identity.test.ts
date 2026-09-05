@@ -92,6 +92,47 @@ describe("side-request identity (issue #10865)", () => {
 		}
 	});
 
+	it("seeds the foreground account at construction, before the credential is resolved", async () => {
+		const storage = twoAccountStorage();
+		try {
+			await storage.reload();
+			storage.clearConfigApiKeys();
+			const foreground = "provider-session-foreground";
+			const accountB = storage.listOAuthAccounts("anthropic").find(account => account.accountId === "account-b");
+			if (!accountB) throw new Error("expected account-b credential");
+			expect(storage.pinSessionOAuthAccount("anthropic", foreground, accountB.credentialId)).toBe(true);
+
+			// Passing the provider seeds affinity now, so a later getApiKey reuses the
+			// foreground account instead of hash-ranking to another (#10869). Assert it
+			// before any metadata() call — the seed must not depend on metadata.
+			using identity = sideRequestIdentity(storage, foreground, "anthropic");
+			expect(storage.getOAuthAccountId("anthropic", identity.sessionId)).toBe("account-b");
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("attributes metadata to the account resolved for the session, not the first account", async () => {
+		const storage = twoAccountStorage();
+		try {
+			await storage.reload();
+			storage.clearConfigApiKeys();
+			const foreground = "provider-session-foreground";
+			const accounts = storage.listOAuthAccounts("anthropic");
+			const accountB = accounts.find(account => account.accountId === "account-b");
+			if (!accountB) throw new Error("expected account-b credential");
+			// No foreground pin: seeding is a no-op, so account_uuid would fall back to
+			// the first stored account (account-a) if metadata were built too early.
+			using identity = sideRequestIdentity(storage, foreground, "anthropic");
+			// getApiKey selects/pins account-b for this session (here simulated by the pin
+			// getApiKey records). Metadata built afterwards must reflect that bearer.
+			expect(storage.pinSessionOAuthAccount("anthropic", identity.sessionId, accountB.credentialId)).toBe(true);
+			expect(readUserId(identity.metadata("anthropic")).account_uuid).toBe("account-b");
+		} finally {
+			storage.close();
+		}
+	});
+
 	it("releases ephemeral credential affinity after the request scope exits", async () => {
 		const storage = twoAccountStorage();
 		try {

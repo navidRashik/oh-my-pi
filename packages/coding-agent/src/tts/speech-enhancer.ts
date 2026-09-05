@@ -83,11 +83,12 @@ export class SpeechEnhancer {
 			// Each rewrite can overlap the still-streaming foreground answer, so it
 			// runs under a fresh isolated provider session derived from the CURRENT
 			// foreground session; it never advances the foreground turn (#10865).
-			using identity = sideRequestIdentity(registry.authStorage, this.#deps.getSessionId());
-			// Resolve metadata after credential selection so account_uuid matches.
-			const metadata = identity.metadata(model.provider);
+			using identity = sideRequestIdentity(registry.authStorage, this.#deps.getSessionId(), model.provider);
 			const apiKey = await registry.getApiKey(model, identity.sessionId);
 			if (!apiKey) return null;
+			// Build metadata after the credential resolves so account_uuid matches the
+			// bearer this session was pinned to, not a first-account fallback (#10869).
+			const metadata = identity.metadata(model.provider);
 			const response = await retryTransientCompletion(
 				() => {
 					const timeout = AbortSignal.timeout(REWRITE_TIMEOUT_MS);

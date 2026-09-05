@@ -295,15 +295,15 @@ export async function attemptEditAutoRepair(options: {
 	const model = resolveRoleSelection(["smol"], session.settings, registry.getAvailable())?.model;
 	if (!model) return undefined;
 	const sessionId = session.getSessionId?.() ?? undefined;
-	// Resolve the key eagerly so the session-sticky credential is recorded and
-	// an unauthenticated smol role bails before any region work.
-	const apiKey = await registry.getApiKey(model, sessionId);
-	if (!apiKey) return undefined;
-
 	// Auto-repair runs after a foreground tool call and before the next
 	// continuation; give it an isolated provider session so its completion does
 	// not insert unrelated provider state into the foreground turn (#10865).
-	using identity = sideRequestIdentity(registry.authStorage, sessionId ?? "");
+	using identity = sideRequestIdentity(registry.authStorage, sessionId ?? "", model.provider);
+	// Resolve the isolated key eagerly so the session-sticky credential is
+	// recorded before metadata is built — account_uuid must match the bearer
+	// (#10869) — and an unauthenticated smol role bails before any region work.
+	const apiKey = await registry.getApiKey(model, identity.sessionId);
+	if (!apiKey) return undefined;
 	// Repair against the bytes on disk, not the snapshot: a later operation in
 	// the same call or a format-on-write pass may have moved the file since the
 	// observation — and may even have restored the parse.

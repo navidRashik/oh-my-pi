@@ -38,12 +38,13 @@ export interface SideRequestIdentity {
 	 */
 	readonly sessionId: string;
 	/**
-	 * Isolated `metadata` payload for the request's target provider. On the first
-	 * call for a provider it seeds the foreground session's active OAuth account
-	 * as this session's initial preference, so the request authenticates and
-	 * attributes to the same account; it never re-pins afterward, so a later
-	 * credential rotation on this session (blocked/exhausted account) is
-	 * preserved and reflected in `account_uuid`.
+	 * Isolated `metadata` payload for the request's target provider. Build it
+	 * *after* resolving this session's credential (`getApiKey`/`resolver`), so
+	 * `account_uuid` reflects the account whose bearer the request actually uses.
+	 * The first call for a provider also seeds the foreground session's active
+	 * OAuth account as this session's initial preference (a no-op once the factory
+	 * seeded the same provider); it never re-pins, so a credential rotation
+	 * recorded on this session (blocked/exhausted account) survives.
 	 */
 	metadata(provider: string): Record<string, unknown>;
 	/** Release this request's ephemeral credential affinity and persistent sticky rows. */
@@ -82,27 +83,39 @@ export function seedSideRequestCredential(
  * retries, unique across separate requests, and its credential affinity is
  * released at scope exit. Pass `authStorage` (from `modelRegistry.authStorage`)
  * so OAuth credential affinity is preserved while the request is active.
+ *
+ * Pass `provider` when it is known up front (every completion call site knows
+ * its model's provider): the foreground account is seeded onto this session
+ * *before* the caller resolves the credential, so `getApiKey` reuses that
+ * account instead of hash-ranking to a different one — and the metadata built
+ * afterwards attributes to the resolved bearer. Seeding lazily inside
+ * {@link SideRequestIdentity.metadata} would run after `getApiKey` and no-op,
+ * losing the affinity.
  */
 export function sideRequestIdentity(
 	authStorage: AuthStorage | undefined,
 	foregroundSessionId: string,
+	provider?: string,
 ): SideRequestIdentity {
 	const sessionId = Bun.randomUUIDv7();
-	const providers = new Set<string>();
+	const seeded = new Set<string>();
+	const seed = (target: string): void => {
+		if (seeded.has(target)) return;
+		seeded.add(target);
+		seedSideRequestCredential(authStorage, target, sessionId, foregroundSessionId);
+	};
+	if (provider !== undefined) seed(provider);
 	return {
 		sessionId,
-		metadata(provider: string): Record<string, unknown> {
-			if (!providers.has(provider)) {
-				providers.add(provider);
-				seedSideRequestCredential(authStorage, provider, sessionId, foregroundSessionId);
-			}
-			return buildSessionMetadata(sessionId, provider, authStorage);
+		metadata(target: string): Record<string, unknown> {
+			seed(target);
+			return buildSessionMetadata(sessionId, target, authStorage);
 		},
 		[Symbol.dispose](): void {
-			for (const provider of providers) {
-				authStorage?.releaseSessionCredentialForReselection(provider, sessionId);
+			for (const target of seeded) {
+				authStorage?.releaseSessionCredentialForReselection(target, sessionId);
 			}
-			providers.clear();
+			seeded.clear();
 		},
 	};
 }

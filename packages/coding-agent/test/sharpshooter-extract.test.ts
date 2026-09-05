@@ -57,6 +57,7 @@ function extractionDependencies(cwd: string, messages: AgentMessage[], sessionId
 	const modelRegistry = {
 		getAll: () => [model],
 		getAvailable: () => [model],
+		getApiKey: async () => "test-key",
 		resolver: () => async () => "test-key",
 	} as unknown as ModelRegistry;
 	const session = {

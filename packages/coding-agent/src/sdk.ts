@@ -1212,7 +1212,7 @@ export interface AutoLearnCaptureRunnerOptions {
 	 * returned session id, metadata, and credential resolver must all describe
 	 * that same foreground session.
 	 */
-	createIdentity?: (model: Model) => AutoLearnCaptureIdentity;
+	createIdentity?: (model: Model) => AutoLearnCaptureIdentity | Promise<AutoLearnCaptureIdentity>;
 }
 
 /** Build a private capture runner over a detached message snapshot and provider session. */
@@ -1224,7 +1224,7 @@ export function createAutoLearnCaptureRunner(
 		const captureModel = options.sourceAgent.state.model;
 		if (!captureModel) return;
 
-		using identity = options.createIdentity?.(captureModel);
+		using identity = await options.createIdentity?.(captureModel);
 		const captureSessionId = identity?.sessionId ?? Bun.randomUUIDv7();
 		const captureProviderSessionState = new Map<string, ProviderSessionState>();
 		const captureMessages = options.sourceAgent.state.messages.map((message): AgentMessage => {
@@ -4153,8 +4153,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const runAutoLearnCapture = createAutoLearnCaptureRunner({
 			sourceAgent: agent,
 			captureTools: autoLearnCaptureTools,
-			createIdentity: captureModel => {
-				const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
+			createIdentity: async captureModel => {
+				const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, captureModel.provider);
+				// Resolve the isolated credential before freezing metadata so its
+				// account_uuid matches the bearer this capture will use (#10869).
+				await modelRegistry.getApiKey(captureModel, identity.sessionId);
 				return {
 					sessionId: identity.sessionId,
 					metadata: identity.metadata(captureModel.provider),

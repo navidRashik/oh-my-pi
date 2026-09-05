@@ -157,7 +157,10 @@ async function consolidateLocked(
 		// Scheduled consolidation can start during any foreground turn: derive a
 		// fresh isolated provider session from the CURRENT foreground session so it
 		// cannot advance the foreground turn or a concurrent side request (#10865).
-		using identity = sideRequestIdentity(options.modelRegistry.authStorage, options.getSessionId());
+		using identity = sideRequestIdentity(options.modelRegistry.authStorage, options.getSessionId(), model.provider);
+		// Resolve the isolated credential before building metadata so account_uuid
+		// matches the bearer this session is pinned to, not a first-account fallback (#10869).
+		await options.modelRegistry.getApiKey(model, identity.sessionId);
 		const metadata = identity.metadata(model.provider);
 		const response = await retryTransientCompletion(() =>
 			completeSimple(

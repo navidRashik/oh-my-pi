@@ -404,7 +404,10 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 			// the next foreground turn, and several jobs run concurrently: give each
 			// its own isolated provider session so they cannot advance the foreground
 			// turn or one another (#10865).
-			using identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
+			using identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, phase1Model.provider);
+			// Resolve the isolated credential before building metadata (below) so
+			// account_uuid matches the bearer this session is pinned to (#10869).
+			await modelRegistry.getApiKey(phase1Model, identity.sessionId);
 			const result = await runStage1Job({
 				claim,
 				model: phase1Model,
@@ -535,8 +538,10 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 			});
 			return;
 		}
-		using identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
-		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.sessionId);
+		using identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, phase2Model.provider);
+		// Resolve the isolated session's credential (not the foreground's) so the pin
+		// it records is the account the metadata built below attributes to (#10869).
+		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, identity.sessionId);
 		if (!phase2ApiKey) {
 			markPhase2FailureWithFallback(db, {
 				claim,
