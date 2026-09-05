@@ -46,6 +46,8 @@ export interface SideRequestIdentity {
 	 * preserved and reflected in `account_uuid`.
 	 */
 	metadata(provider: string): Record<string, unknown>;
+	/** Release this request's ephemeral credential affinity and persistent sticky rows. */
+	[Symbol.dispose](): void;
 }
 
 /**
@@ -55,7 +57,9 @@ export interface SideRequestIdentity {
  * there is nothing to isolate, no auth storage, or no active foreground OAuth
  * account (single-key/API-key setups resolve the same credential regardless of
  * session id). Does not overwrite an existing preference on the isolated
- * session, so a rotation already recorded there survives.
+ * session, so a rotation already recorded there survives. The owning
+ * {@link SideRequestIdentity} releases the resulting ephemeral affinity when
+ * disposed.
  */
 export function seedSideRequestCredential(
 	authStorage: AuthStorage | undefined,
@@ -73,25 +77,32 @@ export function seedSideRequestCredential(
 
 /**
  * Mint an isolated {@link SideRequestIdentity} for one logical side request,
- * derived from the *current* foreground session id. Call it once per request
- * (before any retry wrapper) so the id is stable for that request's retries but
- * unique across separate requests. Pass `authStorage` (from
- * `modelRegistry.authStorage`) so OAuth credential affinity is preserved.
+ * derived from the *current* foreground session id. Bind it with `using` once
+ * per request (before any retry wrapper) so the id is stable for that request's
+ * retries, unique across separate requests, and its credential affinity is
+ * released at scope exit. Pass `authStorage` (from `modelRegistry.authStorage`)
+ * so OAuth credential affinity is preserved while the request is active.
  */
 export function sideRequestIdentity(
 	authStorage: AuthStorage | undefined,
 	foregroundSessionId: string,
 ): SideRequestIdentity {
 	const sessionId = Bun.randomUUIDv7();
-	const seededProviders = new Set<string>();
+	const providers = new Set<string>();
 	return {
 		sessionId,
 		metadata(provider: string): Record<string, unknown> {
-			if (!seededProviders.has(provider)) {
-				seededProviders.add(provider);
+			if (!providers.has(provider)) {
+				providers.add(provider);
 				seedSideRequestCredential(authStorage, provider, sessionId, foregroundSessionId);
 			}
 			return buildSessionMetadata(sessionId, provider, authStorage);
+		},
+		[Symbol.dispose](): void {
+			for (const provider of providers) {
+				authStorage?.releaseSessionCredentialForReselection(provider, sessionId);
+			}
+			providers.clear();
 		},
 	};
 }

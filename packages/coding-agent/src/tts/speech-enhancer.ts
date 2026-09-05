@@ -83,7 +83,7 @@ export class SpeechEnhancer {
 			// Each rewrite can overlap the still-streaming foreground answer, so it
 			// runs under a fresh isolated provider session derived from the CURRENT
 			// foreground session; it never advances the foreground turn (#10865).
-			const identity = sideRequestIdentity(registry.authStorage, this.#deps.getSessionId());
+			using identity = sideRequestIdentity(registry.authStorage, this.#deps.getSessionId());
 			// Resolve metadata after credential selection so account_uuid matches.
 			const metadata = identity.metadata(model.provider);
 			const apiKey = await registry.getApiKey(model, identity.sessionId);

@@ -9476,7 +9476,7 @@ export class AgentSession {
 			const model = this.model!;
 			// Branch summarization is an independent side request; isolate its
 			// provider identity from the foreground turn (#10865).
-			const identity = sideRequestIdentity(this.#modelRegistry.authStorage, this.sessionId);
+			using identity = sideRequestIdentity(this.#modelRegistry.authStorage, this.sessionId);
 			const apiKey = await this.#modelRegistry.getApiKey(model, identity.sessionId);
 			if (!apiKey) {
 				throw new Error(`No API key for ${model.provider}`);

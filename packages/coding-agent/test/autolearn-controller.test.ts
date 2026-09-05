@@ -382,6 +382,7 @@ describe("isolated auto-learn capture", () => {
 			createIdentity: () => ({
 				sessionId: "0193c8f2-7b1a-7c4d-9e2f-123456789abc",
 				metadata: undefined,
+				[Symbol.dispose]: () => {},
 			}),
 			createAgent: options => {
 				captureMessages = options.initialState?.messages ?? [];
@@ -521,6 +522,7 @@ describe("isolated auto-learn capture", () => {
 						resolvedAffinities.push(foregroundSessionId);
 						return credentialsBySession[foregroundSessionId];
 					},
+					[Symbol.dispose]: () => {},
 				};
 			},
 			createAgent: options =>

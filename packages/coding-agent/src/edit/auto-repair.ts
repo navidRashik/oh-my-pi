@@ -303,7 +303,7 @@ export async function attemptEditAutoRepair(options: {
 	// Auto-repair runs after a foreground tool call and before the next
 	// continuation; give it an isolated provider session so its completion does
 	// not insert unrelated provider state into the foreground turn (#10865).
-	const identity = sideRequestIdentity(registry.authStorage, sessionId ?? "");
+	using identity = sideRequestIdentity(registry.authStorage, sessionId ?? "");
 	// Repair against the bytes on disk, not the snapshot: a later operation in
 	// the same call or a format-on-write pass may have moved the file since the
 	// observation — and may even have restored the parse.

@@ -92,6 +92,33 @@ describe("side-request identity (issue #10865)", () => {
 		}
 	});
 
+	it("releases ephemeral credential affinity after the request scope exits", async () => {
+		const storage = twoAccountStorage();
+		try {
+			await storage.reload();
+			storage.clearConfigApiKeys();
+			const foreground = "provider-session-foreground";
+			const accountB = storage.listOAuthAccounts("anthropic").find(account => account.accountId === "account-b");
+			if (!accountB) throw new Error("expected account-b credential");
+			expect(storage.pinSessionOAuthAccount("anthropic", foreground, accountB.credentialId)).toBe(true);
+
+			let isolatedSessionId = "";
+			{
+				using identity = sideRequestIdentity(storage, foreground);
+				isolatedSessionId = identity.sessionId;
+				identity.metadata("anthropic");
+				expect(storage.getOAuthAccountId("anthropic", isolatedSessionId)).toBe("account-b");
+			}
+
+			// Both the in-memory affinity and its persistent session_sticky row are
+			// gone: re-reading the isolated session does not restore an active account.
+			expect(storage.listOAuthAccounts("anthropic", isolatedSessionId).some(account => account.active)).toBe(false);
+			expect(storage.getOAuthAccountId("anthropic", foreground)).toBe("account-b");
+		} finally {
+			storage.close();
+		}
+	});
+
 	it("preserves credential rotation instead of re-pinning the seeded account", async () => {
 		const storage = twoAccountStorage();
 		try {

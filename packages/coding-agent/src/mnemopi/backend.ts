@@ -593,7 +593,7 @@ async function resolveMnemopiProviderOptions(
 				// a completion cannot advance the foreground turn or another memory
 				// request, and never authenticates a switched session against the
 				// account captured at startup (#10865).
-				const identity = sideRequestIdentity(modelRegistry.authStorage, getForegroundSessionId());
+				using identity = sideRequestIdentity(modelRegistry.authStorage, getForegroundSessionId());
 				const metadata = identity.metadata(model.provider);
 				const hasApiKey = await modelRegistry.getApiKey(model, identity.sessionId);
 				if (!hasApiKey) {

@@ -404,7 +404,7 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 			// the next foreground turn, and several jobs run concurrently: give each
 			// its own isolated provider session so they cannot advance the foreground
 			// turn or one another (#10865).
-			const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
+			using identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
 			const result = await runStage1Job({
 				claim,
 				model: phase1Model,
@@ -535,7 +535,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 			});
 			return;
 		}
-		const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
+		using identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
 		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.sessionId);
 		if (!phase2ApiKey) {
 			markPhase2FailureWithFallback(db, {

@@ -617,7 +617,7 @@ export class ModelControls {
 				sessionId: this.#host.sessionManager.getSessionId(),
 				parentId: this.#host.sessionManager.getLeafId(),
 			};
-			const identity = sideRequestIdentity(this.#host.modelRegistry.authStorage, this.#host.sessionId());
+			using identity = sideRequestIdentity(this.#host.modelRegistry.authStorage, this.#host.sessionId());
 			try {
 				resolved = await classifyDifficulty(promptText, {
 					settings: this.#host.settings,

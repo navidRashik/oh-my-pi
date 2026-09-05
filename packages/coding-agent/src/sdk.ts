@@ -1195,6 +1195,8 @@ interface AutoLearnCaptureIdentity {
 	sessionId: string;
 	metadata: Record<string, unknown> | undefined;
 	getApiKey?: AgentOptions["getApiKey"];
+	/** Release this capture's ephemeral credential affinity. */
+	[Symbol.dispose](): void;
 }
 
 /** Dependencies used to construct an isolated auto-learn capture agent. */
@@ -1222,7 +1224,7 @@ export function createAutoLearnCaptureRunner(
 		const captureModel = options.sourceAgent.state.model;
 		if (!captureModel) return;
 
-		const identity = options.createIdentity?.(captureModel);
+		using identity = options.createIdentity?.(captureModel);
 		const captureSessionId = identity?.sessionId ?? Bun.randomUUIDv7();
 		const captureProviderSessionState = new Map<string, ProviderSessionState>();
 		const captureMessages = options.sourceAgent.state.messages.map((message): AgentMessage => {
@@ -4157,6 +4159,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					sessionId: identity.sessionId,
 					metadata: identity.metadata(captureModel.provider),
 					getApiKey: requestModel => modelRegistry.resolver(requestModel, identity.sessionId),
+					[Symbol.dispose]: () => identity[Symbol.dispose](),
 				};
 			},
 			onPayload,
