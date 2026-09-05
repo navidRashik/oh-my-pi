@@ -216,7 +216,7 @@ async function runSharpshooterExtraction(
 	// Extraction starts as soon as a user message is committed and runs without
 	// blocking, so it can overlap the foreground turn: isolate its provider
 	// session so it cannot advance the foreground one (#10865).
-	const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, "sharpshooter");
+	const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
 	const metadata = identity.metadata(model.provider);
 	const response = await retryTransientCompletion(() =>
 		completeSimple(

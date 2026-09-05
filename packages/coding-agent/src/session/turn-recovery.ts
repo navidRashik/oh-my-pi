@@ -929,11 +929,7 @@ export class TurnRecovery {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), UNEXPECTED_STOP_TIMEOUT_MS);
 			let classification: boolean | undefined;
-			const identity = sideRequestIdentity(
-				this.#host.modelRegistry.authStorage,
-				this.#host.sessionId(),
-				"unexpected-stop",
-			);
+			const identity = sideRequestIdentity(this.#host.modelRegistry.authStorage, this.#host.sessionId());
 			try {
 				classification = await classifyUnexpectedStop(text, {
 					settings: this.#host.settings,

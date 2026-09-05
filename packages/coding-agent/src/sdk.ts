@@ -4152,7 +4152,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			sourceAgent: agent,
 			captureTools: autoLearnCaptureTools,
 			createIdentity: captureModel => {
-				const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, "autolearn");
+				const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
 				return {
 					sessionId: identity.sessionId,
 					metadata: identity.metadata(captureModel.provider),

@@ -18,6 +18,7 @@ import { diffLineRuns, editDiffString, summarizeCode } from "@oh-my-pi/pi-native
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { WritethroughCallback } from "../lsp";
+import { sideRequestIdentity } from "../session/side-request-identity";
 import type { ToolSession } from "../tools";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
 import repairPromptSource from "./auto-repair.md" with { type: "text" };
@@ -299,6 +300,10 @@ export async function attemptEditAutoRepair(options: {
 	const apiKey = await registry.getApiKey(model, sessionId);
 	if (!apiKey) return undefined;
 
+	// Auto-repair runs after a foreground tool call and before the next
+	// continuation; give it an isolated provider session so its completion does
+	// not insert unrelated provider state into the foreground turn (#10865).
+	const identity = sideRequestIdentity(registry.authStorage, sessionId ?? "");
 	// Repair against the bytes on disk, not the snapshot: a later operation in
 	// the same call or a format-on-write pass may have moved the file since the
 	// observation — and may even have restored the parse.
@@ -319,8 +324,9 @@ export async function attemptEditAutoRepair(options: {
 					model,
 					{ messages: [{ role: "user", content: builtPrompt, timestamp: Date.now() }] },
 					{
-						apiKey: registry.resolver(model, sessionId),
-						sessionId,
+						apiKey: registry.resolver(model, identity.sessionId),
+						sessionId: identity.sessionId,
+						metadata: identity.metadata(model.provider),
 						maxTokens: COMPLETION_MAX_TOKENS,
 						disableReasoning: true,
 						signal,

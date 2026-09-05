@@ -366,10 +366,7 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 			logger.debug("Phase1 skipped: no model available");
 			return;
 		}
-		// Rollout-memory analysis is independent background work that can overlap
-		// the next foreground turn: isolate its provider session (#10865).
-		const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, "rollout-memory");
-		const phase1ApiKey = await modelRegistry.getApiKey(phase1Model, identity.sessionId);
+		const phase1ApiKey = await modelRegistry.getApiKey(phase1Model, session.sessionId);
 		if (!phase1ApiKey) {
 			logger.debug("Phase1 skipped: no API key for phase1 model", {
 				provider: phase1Model.provider,
@@ -403,6 +400,11 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 
 		await runWithConcurrency(claims, config.stage1Concurrency, async claim => {
 			if (!isMemoryStartupActive(options)) return;
+			// Rollout-memory analysis is independent background work that can overlap
+			// the next foreground turn, and several jobs run concurrently: give each
+			// its own isolated provider session so they cannot advance the foreground
+			// turn or one another (#10865).
+			const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
 			const result = await runStage1Job({
 				claim,
 				model: phase1Model,
@@ -533,8 +535,8 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 			});
 			return;
 		}
-		const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId, "rollout-memory");
-		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, identity.sessionId);
+		const identity = sideRequestIdentity(modelRegistry.authStorage, session.sessionId);
+		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.sessionId);
 		if (!phase2ApiKey) {
 			markPhase2FailureWithFallback(db, {
 				claim,

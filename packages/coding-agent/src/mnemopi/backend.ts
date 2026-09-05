@@ -128,7 +128,13 @@ export const mnemopiBackend: MemoryBackend = {
 		}
 
 		try {
-			const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, sessionId);
+			const config = await loadMnemopiConfigWithProviders(
+				settings,
+				agentDir,
+				modelRegistry,
+				sessionId,
+				() => session.sessionId || sessionId,
+			);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 			await installMnemopiState(session, config);
 		} catch (error) {
@@ -184,6 +190,7 @@ export const mnemopiBackend: MemoryBackend = {
 					agentDir,
 					session.modelRegistry,
 					session.sessionId,
+					() => session.sessionId || "",
 				);
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 				state = await installMnemopiState(session, config);
@@ -480,9 +487,16 @@ async function loadMnemopiConfigWithProviders(
 	agentDir: string,
 	modelRegistry: ModelRegistry,
 	sessionId: string,
+	getForegroundSessionId: () => string,
 ): Promise<MnemopiBackendConfig> {
 	const config = loadMnemopiConfig(settings, agentDir);
-	config.providerOptions = await resolveMnemopiProviderOptions(config, settings, modelRegistry, sessionId);
+	config.providerOptions = await resolveMnemopiProviderOptions(
+		config,
+		settings,
+		modelRegistry,
+		sessionId,
+		getForegroundSessionId,
+	);
 	return config;
 }
 
@@ -510,6 +524,7 @@ async function resolveMnemopiProviderOptions(
 	settings: MemoryBackendStartOptions["settings"],
 	modelRegistry: ModelRegistry,
 	sessionId: string,
+	getForegroundSessionId: () => string,
 ): Promise<MnemopiProviderOptions> {
 	const base: MnemopiProviderOptions = {
 		noEmbeddings: config.providerOptions.noEmbeddings,
@@ -568,14 +583,17 @@ async function resolveMnemopiProviderOptions(
 			logger.warn("Mnemopi: llmMode=smol but no tiny/smol model resolved; continuing without LLM.");
 			return base;
 		}
-		// Independent memory completion: isolate its provider session so an
-		// extraction that overlaps the next foreground prompt cannot advance the
-		// foreground provider session and 400 the waiting turn (#10865).
-		const identity = sideRequestIdentity(modelRegistry.authStorage, sessionId, "mnemopi");
 		return {
 			...base,
 			llm: async (prompt, opts) => {
 				const request = resolveMemoryCompletionInput(prompt, opts);
+				// Extraction/consolidation can overlap the next foreground prompt and
+				// can run concurrently with each other; derive a fresh isolated
+				// provider session per call, from the CURRENT foreground session, so
+				// a completion cannot advance the foreground turn or another memory
+				// request, and never authenticates a switched session against the
+				// account captured at startup (#10865).
+				const identity = sideRequestIdentity(modelRegistry.authStorage, getForegroundSessionId());
 				const metadata = identity.metadata(model.provider);
 				const hasApiKey = await modelRegistry.getApiKey(model, identity.sessionId);
 				if (!hasApiKey) {

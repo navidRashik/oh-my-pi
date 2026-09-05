@@ -14,58 +14,48 @@
  * Automatic title requests already isolate their identity this way (PR #10621);
  * this module generalizes that pattern for every other automatic side request
  * (memory extraction/consolidation, speech rewriting, sharpshooter, learn
- * capture, auto-thinking, unexpected-stop, branch summary).
+ * capture, auto-thinking, unexpected-stop, branch summary, edit auto-repair).
+ *
+ * Each call to {@link sideRequestIdentity} mints a fresh id, so two side
+ * requests of the same kind that run concurrently (e.g. several rollout-memory
+ * jobs, overlapping speech rewrites) never advance one another. Derive the
+ * identity when a logical request starts — passing the *current* foreground
+ * session id — so a long-lived component does not keep authenticating a later
+ * session against an earlier one's account after `newSession`/`switchSession`.
  */
 
 import type { AuthStorage } from "./auth-storage";
 import { buildSessionMetadata } from "./session-metadata";
-/** A provider identity for one side-request scope, isolated from the foreground. */
+
+/** A provider identity for one logical side request, isolated from the foreground. */
 export interface SideRequestIdentity {
 	/**
-	 * Distinct, stable provider session id for this scope. Pass as the request's
+	 * Fresh provider session id for this request. Pass as the request's
 	 * `sessionId` option and to the model registry's `resolver`/`getApiKey` so
-	 * both the metadata envelope and the session header differ from the foreground.
+	 * both the metadata envelope and the session header differ from the
+	 * foreground turn (and from any concurrent side request). Stable across the
+	 * request's own retries because it is captured once, before the retry loop.
 	 */
 	readonly sessionId: string;
 	/**
-	 * Isolated `metadata` payload for the request's target provider. Seeds the
-	 * foreground session's active OAuth account onto the isolated session first,
-	 * so auth/attribution/billing stay on the same account while the ordering
-	 * identity is separated. Call it before resolving the request's API key.
+	 * Isolated `metadata` payload for the request's target provider. On the first
+	 * call for a provider it seeds the foreground session's active OAuth account
+	 * as this session's initial preference, so the request authenticates and
+	 * attributes to the same account; it never re-pins afterward, so a later
+	 * credential rotation on this session (blocked/exhausted account) is
+	 * preserved and reflected in `account_uuid`.
 	 */
 	metadata(provider: string): Record<string, unknown>;
 }
 
-/** Namespace prefix so a derived side id can never coincide with a real id. */
-const SIDE_REQUEST_NAMESPACE = "omp.side-request";
-
 /**
- * Derive a stable, foreground-distinct provider session id for `scope`.
- *
- * Deterministic (a hash of the foreground id + scope) so repeated requests of
- * one kind reuse a single side identity — matching the cached title/advisor
- * identities — without threading a shared cache through every call path. The
- * result is shaped like an RFC 4122 v8 UUID so it is indistinguishable from a
- * normal provider session id on the wire.
- */
-export function deriveSideRequestSessionId(foregroundSessionId: string, scope: string): string {
-	const digest = new Bun.CryptoHasher("sha256")
-		.update(`${SIDE_REQUEST_NAMESPACE}\u0000${scope}\u0000${foregroundSessionId}`)
-		.digest("hex");
-	const hex = digest.slice(0, 32).split("");
-	// version 8 (custom) in the 13th nibble; RFC 4122 variant (10xx) in the 17th.
-	hex[12] = "8";
-	hex[16] = "89ab"[Number.parseInt(digest[16], 16) & 0x3];
-	const s = hex.join("");
-	return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20, 32)}`;
-}
-
-/**
- * Copy the foreground session's active OAuth account onto `isolatedSessionId`
- * so a side request authenticates and attributes to the same account while
- * ordering under a distinct id. No-op when there is nothing to isolate, no auth
- * storage, or no active foreground OAuth account (single-key/API-key setups
- * resolve the same credential regardless of session id).
+ * Seed the foreground session's active OAuth account onto `isolatedSessionId` as
+ * its initial credential preference, so a side request authenticates and
+ * attributes to the same account while ordering under a distinct id. No-op when
+ * there is nothing to isolate, no auth storage, or no active foreground OAuth
+ * account (single-key/API-key setups resolve the same credential regardless of
+ * session id). Does not overwrite an existing preference on the isolated
+ * session, so a rotation already recorded there survives.
  */
 export function seedSideRequestCredential(
 	authStorage: AuthStorage | undefined,
@@ -75,24 +65,32 @@ export function seedSideRequestCredential(
 ): void {
 	if (!authStorage || isolatedSessionId === foregroundSessionId) return;
 	const active = authStorage.listOAuthAccounts(provider, foregroundSessionId).find(account => account.active);
-	if (active) authStorage.pinSessionOAuthAccount(provider, isolatedSessionId, active.credentialId);
+	if (!active) return;
+	const alreadyPinned = authStorage.listOAuthAccounts(provider, isolatedSessionId).some(account => account.active);
+	if (alreadyPinned) return;
+	authStorage.pinSessionOAuthAccount(provider, isolatedSessionId, active.credentialId);
 }
 
 /**
- * Build an isolated {@link SideRequestIdentity} for `scope` derived from the
- * foreground session id. Pass `authStorage` (from `modelRegistry.authStorage`)
- * so OAuth credential affinity is preserved.
+ * Mint an isolated {@link SideRequestIdentity} for one logical side request,
+ * derived from the *current* foreground session id. Call it once per request
+ * (before any retry wrapper) so the id is stable for that request's retries but
+ * unique across separate requests. Pass `authStorage` (from
+ * `modelRegistry.authStorage`) so OAuth credential affinity is preserved.
  */
 export function sideRequestIdentity(
 	authStorage: AuthStorage | undefined,
 	foregroundSessionId: string,
-	scope: string,
 ): SideRequestIdentity {
-	const sessionId = deriveSideRequestSessionId(foregroundSessionId, scope);
+	const sessionId = Bun.randomUUIDv7();
+	const seededProviders = new Set<string>();
 	return {
 		sessionId,
 		metadata(provider: string): Record<string, unknown> {
-			seedSideRequestCredential(authStorage, provider, sessionId, foregroundSessionId);
+			if (!seededProviders.has(provider)) {
+				seededProviders.add(provider);
+				seedSideRequestCredential(authStorage, provider, sessionId, foregroundSessionId);
+			}
 			return buildSessionMetadata(sessionId, provider, authStorage);
 		},
 	};

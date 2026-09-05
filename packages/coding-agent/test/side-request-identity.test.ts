@@ -2,10 +2,7 @@ import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { buildSessionMetadata } from "@oh-my-pi/pi-coding-agent/session/session-metadata";
-import {
-	deriveSideRequestSessionId,
-	sideRequestIdentity,
-} from "@oh-my-pi/pi-coding-agent/session/side-request-identity";
+import { sideRequestIdentity } from "@oh-my-pi/pi-coding-agent/session/side-request-identity";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -23,32 +20,43 @@ function readUserId(metadata: Record<string, unknown>): { session_id: string; ac
 	return { session_id: parsed.session_id, account_uuid: accountUuid };
 }
 
+function twoAccountStorage(): AuthStorage {
+	const store = new SqliteAuthCredentialStore(new Database(":memory:"));
+	store.saveOAuth("anthropic", {
+		access: "account-a-token",
+		refresh: "account-a-refresh",
+		expires: Date.now() + 60_000,
+		accountId: "account-a",
+	});
+	store.saveOAuth("anthropic", {
+		access: "account-b-token",
+		refresh: "account-b-refresh",
+		expires: Date.now() + 60_000,
+		accountId: "account-b",
+	});
+	return new AuthStorage(store);
+}
+
 describe("side-request identity (issue #10865)", () => {
-	it("derives a foreground-distinct, stable, per-scope provider session id", () => {
-		const foreground = "01J8FOREGROUND0000000000000000";
-		const a = deriveSideRequestSessionId(foreground, "mnemopi");
-		const b = deriveSideRequestSessionId(foreground, "mnemopi");
-		const other = deriveSideRequestSessionId(foreground, "sharpshooter");
+	it("mints a fresh, foreground-distinct id for every logical request", () => {
+		const foreground = "provider-session-foreground";
+		const a = sideRequestIdentity(undefined, foreground).sessionId;
+		const b = sideRequestIdentity(undefined, foreground).sessionId;
 
 		// UUID-shaped so it is indistinguishable from a real provider session id.
 		expect(a).toMatch(UUID_RE);
 		// Never the foreground id: a background request must not order under it.
 		expect(a).not.toBe(foreground);
-		// Stable per (foreground, scope): repeated requests reuse one side identity.
-		expect(b).toBe(a);
-		// Distinct scopes never collide with each other.
-		expect(other).not.toBe(a);
-		// Distinct foreground sessions never collide.
-		expect(deriveSideRequestSessionId("other-foreground", "mnemopi")).not.toBe(a);
+		// Distinct per call: two same-kind requests that overlap (e.g. concurrent
+		// rollout-memory jobs) never advance one another.
+		expect(b).not.toBe(a);
 	});
 
 	it("isolates the metadata ordering identity from the foreground session", () => {
 		const foreground = "provider-session-foreground";
-		const identity = sideRequestIdentity(undefined, foreground, "mnemopi");
-		const metadata = identity.metadata("anthropic");
-
+		const identity = sideRequestIdentity(undefined, foreground);
+		const sideSessionId = readUserId(identity.metadata("anthropic")).session_id;
 		const foregroundSessionId = readUserId(buildSessionMetadata(foreground, "anthropic", undefined)).session_id;
-		const sideSessionId = readUserId(metadata).session_id;
 
 		// The provider orders on metadata.user_id.session_id; the side request must
 		// carry a different one so it cannot advance the foreground provider session.
@@ -56,21 +64,8 @@ describe("side-request identity (issue #10865)", () => {
 		expect(sideSessionId).not.toBe(foregroundSessionId);
 	});
 
-	it("keeps the foreground's active OAuth account while isolating the session id", async () => {
-		const store = new SqliteAuthCredentialStore(new Database(":memory:"));
-		store.saveOAuth("anthropic", {
-			access: "account-a-token",
-			refresh: "account-a-refresh",
-			expires: Date.now() + 60_000,
-			accountId: "account-a",
-		});
-		store.saveOAuth("anthropic", {
-			access: "account-b-token",
-			refresh: "account-b-refresh",
-			expires: Date.now() + 60_000,
-			accountId: "account-b",
-		});
-		const storage = new AuthStorage(store);
+	it("seeds the foreground's active OAuth account while isolating the session id", async () => {
+		const storage = twoAccountStorage();
 		try {
 			await storage.reload();
 			storage.clearConfigApiKeys();
@@ -80,7 +75,7 @@ describe("side-request identity (issue #10865)", () => {
 			// Foreground turn resolved onto account-b.
 			expect(storage.pinSessionOAuthAccount("anthropic", foreground, accountB.credentialId)).toBe(true);
 
-			const identity = sideRequestIdentity(storage, foreground, "mnemopi");
+			const identity = sideRequestIdentity(storage, foreground);
 			const sideMeta = readUserId(identity.metadata("anthropic"));
 			const foregroundMeta = readUserId(buildSessionMetadata(foreground, "anthropic", storage));
 
@@ -92,6 +87,34 @@ describe("side-request identity (issue #10865)", () => {
 			expect(sideMeta.session_id).not.toBe(foregroundMeta.session_id);
 			// The isolated session now resolves to the same account for auth.
 			expect(storage.getOAuthAccountId("anthropic", identity.sessionId)).toBe("account-b");
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("preserves credential rotation instead of re-pinning the seeded account", async () => {
+		const storage = twoAccountStorage();
+		try {
+			await storage.reload();
+			storage.clearConfigApiKeys();
+			const foreground = "provider-session-foreground";
+			const accounts = storage.listOAuthAccounts("anthropic");
+			const accountA = accounts.find(account => account.accountId === "account-a");
+			const accountB = accounts.find(account => account.accountId === "account-b");
+			if (!accountA || !accountB) throw new Error("expected both accounts");
+			// Foreground resolved onto account-a.
+			expect(storage.pinSessionOAuthAccount("anthropic", foreground, accountA.credentialId)).toBe(true);
+
+			const identity = sideRequestIdentity(storage, foreground);
+			// First metadata call seeds the isolated session with the foreground's A.
+			expect(readUserId(identity.metadata("anthropic")).account_uuid).toBe("account-a");
+
+			// Credential resolution then rotates this isolated session to B (as
+			// getApiKey does when A is blocked/exhausted).
+			expect(storage.pinSessionOAuthAccount("anthropic", identity.sessionId, accountB.credentialId)).toBe(true);
+
+			// A later metadata build must reflect the rotation, not force back to A.
+			expect(readUserId(identity.metadata("anthropic")).account_uuid).toBe("account-b");
 		} finally {
 			storage.close();
 		}

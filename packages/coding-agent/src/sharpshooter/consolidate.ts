@@ -84,7 +84,7 @@ export async function runSharpshooterConsolidation(options: {
 	cwd: string;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
-	sessionId: string;
+	getSessionId: () => string;
 	force?: boolean;
 }): Promise<SharpshooterConsolidationResult> {
 	const bankDir = sharpshooterBankDir(options.agentDir, options.cwd);
@@ -116,7 +116,7 @@ async function consolidateLocked(
 		cwd: string;
 		settings: Settings;
 		modelRegistry: ModelRegistry;
-		sessionId: string;
+		getSessionId: () => string;
 		force?: boolean;
 	},
 	bankDir: string,
@@ -154,9 +154,10 @@ async function consolidateLocked(
 			maxFileLines: SHARPSHOOTER_MAX_FILE_LINES,
 		});
 
-		// Scheduled consolidation can start during any foreground turn: isolate its
-		// provider session so it cannot advance the foreground one (#10865).
-		const identity = sideRequestIdentity(options.modelRegistry.authStorage, options.sessionId, "sharpshooter");
+		// Scheduled consolidation can start during any foreground turn: derive a
+		// fresh isolated provider session from the CURRENT foreground session so it
+		// cannot advance the foreground turn or a concurrent side request (#10865).
+		const identity = sideRequestIdentity(options.modelRegistry.authStorage, options.getSessionId());
 		const metadata = identity.metadata(model.provider);
 		const response = await retryTransientCompletion(() =>
 			completeSimple(
