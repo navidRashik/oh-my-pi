@@ -16,10 +16,8 @@ target/
 /result-*
 
 # Environment
-.env
 
 # Editors
-.vscode/
 .zed/
 .idea/
 *.swp
