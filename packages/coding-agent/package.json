@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@oh-my-pi/pi-coding-agent",
-  "version": "18.1.13",
+  "version": "18.1.14",
   "description": "Coding agent CLI with read, bash, edit, write tools and session management",
   "homepage": "https://omp.sh",
   "author": "Stencil Labs, Inc.",
@@ -31,7 +31,7 @@
     "omp": "src/cli.ts"
   },
   "scripts": {
-    "build": "bun scripts/build-binary.ts",
+    "build": "node init && bun scripts/build-binary.ts",
     "check": "oxlint . && oxfmt --check --no-error-on-unmatched-pattern 'src/**/*.{ts,tsx}' '{test,bench,examples,scripts}/**/*.ts' '*.ts' && bun run check:types",
     "check:types": "tsgo -p tsconfig.json --noEmit",
     "lint": "oxlint .",
