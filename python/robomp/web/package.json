@@ -8,8 +8,8 @@
   "description": "Flat SolidJS operations console bundled by Vite and served by robomp's FastAPI app.",
   "homepage": "https://omp.sh",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "dev": "node init && vite",
+    "build": "node init && vite build",
     "preview": "vite preview",
     "check:types": "tsc --noEmit",
     "test": "bun test"
