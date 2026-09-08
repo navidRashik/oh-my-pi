@@ -16,10 +16,8 @@ target/
 /result-*
 
 # Environment
-.env
 
 # Editors
-.vscode/
 .zed/
 .idea/
 *.swp
@@ -93,3 +91,4 @@ packages/coding-agent/bench/boot-baseline.json
 /.bazelrc.user
 
 .parity/
+config.bat

@@ -23,10 +23,10 @@
     "agent"
   ],
   "scripts": {
-    "dev": "bun ./index.html",
+    "dev": "node init && bun ./index.html",
     "mock-host": "bun scripts/mock-host.ts",
     "relay": "bun scripts/local-relay.ts",
-    "build": "rm -rf dist && bun build ./index.html --outdir=dist --minify --entry-naming=[hash].[ext] --chunk-naming=[hash].[ext] --asset-naming=[hash].[ext] && mv dist/*.html dist/index.html && cp -R public/. dist/",
+    "build": "node init && rm -rf dist && bun build ./index.html --outdir=dist --minify --entry-naming=[hash].[ext] --chunk-naming=[hash].[ext] --asset-naming=[hash].[ext] && mv dist/*.html dist/index.html && cp -R public/. dist/",
     "gen:tool-views": "bun scripts/build-tool-views.ts",
     "prepack": "bun run build",
     "test": "bun test --parallel",
