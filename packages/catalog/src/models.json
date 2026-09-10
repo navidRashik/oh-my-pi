@@ -54106,13 +54106,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 272000,
-			"maxTokens": null,
-			"identity": {
-				"class": "openai",
-				"family": "codex",
-				"revision": "5.3.0"
-			},
-			"requiresGlyphTokenization": false,
+			"maxTokens": 65536,
 			"thinking": {
 				"mode": "effort",
 				"efforts": [
@@ -54122,6 +54116,13 @@
 					"xhigh"
 				]
 			},
+			"identity": {
+				"class": "openai",
+				"family": "codex",
+				"revision": "5.3.0"
+			},
+			"requiresGlyphTokenization": false,
+			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": false,
 				"supportsDeveloperRole": false,
@@ -54175,8 +54176,7 @@
 				"rejectRootObjectUnion": false,
 				"retryWithoutStrictOnGrammarError": false,
 				"supportsPromptCacheKey": false
-			},
-			"supportsComputerUse": false
+			}
 		},
 		"gpt-5.4": {
 			"id": "gpt-5.4",
