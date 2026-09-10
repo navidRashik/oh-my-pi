@@ -53479,19 +53479,20 @@
 				"text"
 			],
 			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
+				"input": 0.15,
+				"output": 0.6,
+				"cacheRead": 0.003,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1000000,
 			"maxTokens": 65536,
+			"tokenizer": "deepseek-v3",
 			"identity": {
 				"class": "deepseek",
 				"family": "flash"
 			},
 			"requiresGlyphTokenization": false,
-			"tokenizer": "deepseek-v3",
+			"supportsComputerUse": false,
 			"compat": {
 				"supportsStore": false,
 				"supportsDeveloperRole": false,
@@ -53546,8 +53547,7 @@
 				"rejectRootObjectUnion": false,
 				"retryWithoutStrictOnGrammarError": false,
 				"supportsPromptCacheKey": false
-			},
-			"supportsComputerUse": false
+			}
 		},
 		"google/gemini-3.1-flash-lite": {
 			"id": "google/gemini-3.1-flash-lite",
