@@ -33853,7 +33853,8 @@
 				"promptCacheMinimumTokens": 0,
 				"promptCacheMaximumCheckpoints": 0,
 				"streamIdleTimeoutMs": 600000
-			}
+			},
+			"requiresToolResultImageHoisting": true
 		},
 		"global.openai.gpt-5.6-sol": {
 			"id": "global.openai.gpt-5.6-sol",
@@ -33896,7 +33897,8 @@
 				"promptCacheMinimumTokens": 0,
 				"promptCacheMaximumCheckpoints": 0,
 				"streamIdleTimeoutMs": 600000
-			}
+			},
+			"requiresToolResultImageHoisting": true
 		},
 		"global.openai.gpt-5.6-terra": {
 			"id": "global.openai.gpt-5.6-terra",
@@ -33939,7 +33941,8 @@
 				"promptCacheMinimumTokens": 0,
 				"promptCacheMaximumCheckpoints": 0,
 				"streamIdleTimeoutMs": 600000
-			}
+			},
+			"requiresToolResultImageHoisting": true
 		},
 		"google.gemma-3-27b-it": {
 			"id": "google.gemma-3-27b-it",
