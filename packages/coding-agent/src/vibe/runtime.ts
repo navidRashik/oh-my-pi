@@ -24,7 +24,7 @@ import {
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { logger, prompt, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
 import { validateAgentAccountPools } from "../config/account-pools";
 import { resolveAgentModelSelection } from "../config/model-resolver";
@@ -131,6 +131,8 @@ interface VibeTurn {
 	trace: VibeTraceEntry[];
 	/** Total completed tool calls (trace may be narrower than this). */
 	toolCount: number;
+	/** Messages steered into this turn while it streamed, oldest first. */
+	steered?: string[];
 }
 
 interface VibeRecord {
@@ -908,6 +910,7 @@ export class VibeSessionRegistry {
 			const live = registered?.session;
 			if (live?.isStreaming) {
 				await live.steer(message, undefined, { attribution: "agent" });
+				record.turn.steered = [...(record.turn.steered ?? []), message];
 				record.lastActivityAt = Date.now();
 				return { id: record.id, mode: "steered" };
 			}
@@ -1400,7 +1403,7 @@ export class VibeSessionRegistry {
 								subagentEventBus: session.subagentEventBus,
 								artifactsDir: session.getSessionFile()?.slice(0, -6),
 							});
-					return await this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result);
+					return await this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result, signal);
 				} catch (error) {
 					if (error instanceof VibeTurnError) throw error;
 					await this.#finishTurn(session, manager, record, ownJobId);
@@ -1416,6 +1419,32 @@ export class VibeSessionRegistry {
 		turn.jobId = jobId;
 		record.turn = turn;
 		return jobId;
+	}
+
+	/**
+	 * A steer still queued when the driven turn yields is consumed after that
+	 * yield: the worker streams a continuation the driven turn never observed,
+	 * and its ref stays `running` past the turn. Wait for that continuation to
+	 * settle, return the ref to `idle` once nothing streams, and return the
+	 * continuation's final answer so the turn result carries the steered work.
+	 */
+	async #awaitSteeredContinuation(
+		record: VibeRecord,
+		turn: VibeTurn,
+		signal: AbortSignal,
+	): Promise<string | undefined> {
+		const steered = turn.steered;
+		if (!steered?.length) return undefined;
+		const ref = this.#registeredAgent(record);
+		const live = ref?.session;
+		if (!ref || !live) return undefined;
+		if (ref.status === "running" && live.isStreaming) {
+			await untilAborted(signal, () => live.waitForIdle());
+		}
+		if (ref.status === "running" && !live.isStreaming) {
+			AgentRegistry.global().setStatus(record.id, "idle", live);
+		}
+		return steeredContinuationAnswer(live.messages, turn.message, steered[steered.length - 1]);
 	}
 
 	/** Post-turn bookkeeping shared by success and failure paths: clear the in-flight turn, flush the queue. */
@@ -1476,7 +1505,9 @@ export class VibeSessionRegistry {
 		settledJobId: string,
 		turnIndex: number,
 		result: SingleResult,
+		signal: AbortSignal,
 	): Promise<string> {
+		const continuation = await this.#awaitSteeredContinuation(record, turn, signal);
 		await this.#finishTurn(session, manager, record, settledJobId);
 		const failed = result.exitCode !== 0 || result.aborted === true;
 		const status = result.aborted ? "aborted" : failed ? "failed" : "completed";
@@ -1491,6 +1522,9 @@ export class VibeSessionRegistry {
 		);
 		const traceOverflow = Math.max(0, turn.toolCount - turn.trace.length);
 		let response = result.output.trim() || "(no output)";
+		if (continuation) {
+			response += `\n\nSteered continuation (your mid-turn message reached the worker after the result above; it handled the message next):\n${continuation}`;
+		}
 		let responseTruncated = false;
 		if (response.length > RESPONSE_PREVIEW_MAX) {
 			const slice = response.slice(0, RESPONSE_PREVIEW_MAX);
@@ -1537,6 +1571,74 @@ export class VibeSessionRegistry {
 		if (failed) throw new VibeTurnError(text);
 		return text;
 	}
+}
+
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map(part =>
+			part && typeof part === "object" && part.type === "text" && typeof part.text === "string" ? part.text : "",
+		)
+		.join("");
+}
+
+function isYieldCall(message: { role: string; content?: unknown }): boolean {
+	return (
+		message.role === "assistant" &&
+		Array.isArray(message.content) &&
+		message.content.some(part => part?.type === "toolCall" && part.name === "yield")
+	);
+}
+
+/**
+ * The final answer of a steered continuation, or undefined when the steer was
+ * consumed inside the driven turn. A continuation exists exactly when the
+ * driven turn had already yielded (after its prompt) before the steered user
+ * message entered the transcript; its answer is the last assistant message
+ * after that steer: the `yield` payload, else the assistant text.
+ */
+export function steeredContinuationAnswer(
+	messages: ReadonlyArray<{ role: string; content?: unknown }>,
+	turnPrompt: string,
+	lastSteer: string,
+): string | undefined {
+	let steerAt = -1;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === "user" && messageText(messages[i].content) === lastSteer) {
+			steerAt = i;
+			break;
+		}
+	}
+	if (steerAt < 0) return undefined;
+	let promptAt = -1;
+	for (let i = steerAt - 1; i >= 0; i--) {
+		if (messages[i].role === "user" && messageText(messages[i].content).includes(turnPrompt)) {
+			promptAt = i;
+			break;
+		}
+	}
+	let yieldedBeforeSteer = false;
+	for (let i = steerAt - 1; i > promptAt; i--) {
+		if (isYieldCall(messages[i])) {
+			yieldedBeforeSteer = true;
+			break;
+		}
+	}
+	if (!yieldedBeforeSteer) return undefined;
+	for (let i = messages.length - 1; i > steerAt; i--) {
+		const message = messages[i];
+		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+		for (const part of message.content) {
+			if (part?.type === "toolCall" && part.name === "yield") {
+				const args = part.arguments as { data?: unknown } | undefined;
+				return JSON.stringify(args?.data ?? args ?? null);
+			}
+		}
+		const text = messageText(message.content).trim();
+		if (text) return text;
+	}
+	return "(the continuation ended without an answer)";
 }
 
 /**

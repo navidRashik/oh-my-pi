@@ -6,6 +6,7 @@
 
 - Fixed Mnemopi memory completions ignoring the memory role's thinking suffix, including one inherited from `tiny` or `smol` when `modelRoles.memory` is unset; each `retry.fallbackChains.memory` entry sends its own level, and `:off` disables reasoning ([#16378](https://github.com/can1357/oh-my-pi/pull/16378) by [@alphastorm](https://github.com/alphastorm))
 - Fixed `/move` path completion jumping into a subfolder on Tab: `..`, `.`, and `~` now complete to `../`, `./`, and `~/` before listing their children, a trailing `\` lists a folder on Windows, absolute Windows paths (`C:/…`) are no longer rewritten as relative paths, and the project directory is offered as `./` instead of `/`
+- Fixed vibe sessions reported dead (`Vibe session "…" is dead`) right after a turn when a `vibe_send` steer arrived while the worker was writing its `yield`: the steer ran after the yield in a continuation the turn never waited for, so the turn marked the still-running worker unrecoverable and dropped the continuation's answer. The turn now waits for that continuation, includes its answer in the turn result, and leaves the worker resumable
 
 ## [18.12.3] - 2026-10-19
 
